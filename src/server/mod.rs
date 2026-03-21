@@ -10,6 +10,9 @@
 //!   - `GET /api/workspaces/:id` — workspace details
 //!   - `POST /api/workspaces/:id/submit` — submit workspace for merge
 //!   - `DELETE /api/workspaces/:id` — discard a workspace
+//!   - `GET /api/versions` — list version history (optional `?limit=N`)
+//!   - `GET /api/versions/:id` — version details with entity-level changes
+//!   - `POST /api/versions/rollback` — rollback to a prior version
 //!
 //! ## WebSocket Endpoints
 //!   - `GET /ws/events?key=<api_key>` — real-time event stream
@@ -40,6 +43,7 @@ use tokio::sync::broadcast;
 use crate::auth;
 use crate::merge;
 use crate::repo;
+use crate::version;
 use crate::workspace;
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -310,6 +314,15 @@ impl From<merge::MergeError> for ApiError {
     }
 }
 
+impl From<version::VersionError> for ApiError {
+    fn from(e: version::VersionError) -> Self {
+        match &e {
+            version::VersionError::NotFound(_) => ApiError::not_found(e.to_string()),
+            _ => ApiError::internal(e.to_string()),
+        }
+    }
+}
+
 // ── API response types ────────────────────────────────────────────────────────
 
 /// Response body for `GET /api/status`.
@@ -376,6 +389,24 @@ impl From<merge::SubmitResult> for SubmitResponse {
             auto_resolved: r.auto_resolved,
         }
     }
+}
+
+/// Query parameters for `GET /api/versions`.
+#[derive(Debug, Deserialize)]
+struct ListVersionsQuery {
+    /// Maximum number of versions to return (default: unlimited).
+    limit: Option<usize>,
+}
+
+/// Request body for `POST /api/versions/rollback`.
+#[derive(Debug, Deserialize)]
+struct RollbackRequest {
+    /// Version identifier to roll back (e.g., `"v3"`).
+    version: String,
+    /// If `true`, proceed even when downstream versions depend on the changes.
+    /// If `false` (default) and downstream impacts exist, returns 409.
+    #[serde(default)]
+    force: bool,
 }
 
 // ── Route handlers ────────────────────────────────────────────────────────────
@@ -501,6 +532,76 @@ async fn discard_workspace_handler(
     });
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/versions` — lists all versions in chronological order.
+///
+/// Optional `?limit=N` query parameter truncates the result to the N most
+/// recent versions (the list is already oldest-first, so we truncate from
+/// the end after reversing).
+async fn list_versions_handler(
+    State(state): State<Arc<AppState>>,
+    AxumQuery(params): AxumQuery<ListVersionsQuery>,
+) -> Result<Json<Vec<version::VersionMeta>>, ApiError> {
+    let mut versions =
+        version::list_versions(&state.vai_dir).map_err(ApiError::from)?;
+    if let Some(limit) = params.limit {
+        // Keep the N most-recent: the list is oldest-first, so drop from the front.
+        let len = versions.len();
+        if limit < len {
+            versions.drain(..len - limit);
+        }
+    }
+    Ok(Json(versions))
+}
+
+/// `GET /api/versions/:id` — returns details for a single version, including
+/// entity-level and file-level changes derived from the event log.
+///
+/// Returns 404 if the version does not exist.
+async fn get_version_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<version::VersionChanges>, ApiError> {
+    let changes =
+        version::get_version_changes(&state.vai_dir, &id).map_err(ApiError::from)?;
+    Ok(Json(changes))
+}
+
+/// `POST /api/versions/rollback` — rolls back the changes introduced by a
+/// specific version by creating a new append-only version that restores the
+/// prior state.
+///
+/// If `force` is `false` (the default) and downstream versions depend on the
+/// target version's changes, returns **409 Conflict** with a JSON body
+/// containing both an error message and the full `ImpactAnalysis`.
+///
+/// If `force` is `true`, the rollback proceeds regardless of downstream impact.
+async fn rollback_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RollbackRequest>,
+) -> Response {
+    // Compute impact analysis before attempting the rollback.
+    let impact = match version::analyze_rollback_impact(&state.vai_dir, &body.version) {
+        Ok(i) => i,
+        Err(e) => return ApiError::from(e).into_response(),
+    };
+
+    if !body.force && !impact.downstream_impacts.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "downstream versions depend on these changes; use \"force\": true to override",
+                "impact": impact,
+            })),
+        )
+            .into_response();
+    }
+
+    match version::rollback(&state.vai_dir, &state.repo_root, &body.version, None) {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
+    }
 }
 
 // ── WebSocket handler ─────────────────────────────────────────────────────────
@@ -706,6 +807,11 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/workspaces/:id", get(get_workspace_handler))
         .route("/api/workspaces/:id/submit", post(submit_workspace_handler))
         .route("/api/workspaces/:id", delete(discard_workspace_handler))
+        .route("/api/versions", get(list_versions_handler))
+        // Static route registered before the dynamic one so that
+        // POST /api/versions/rollback is never captured by :id.
+        .route("/api/versions/rollback", post(rollback_handler))
+        .route("/api/versions/:id", get(get_version_handler))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -1235,6 +1341,255 @@ mod tests {
             nothing.is_err(),
             "expected no WorkspaceCreated to arrive on a WorkspaceDiscarded-only subscription"
         );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    // ── Version endpoint tests ─────────────────────────────────────────────────
+
+    /// Helper: create a workspace, write a file into its overlay, and submit it.
+    /// Returns the new version ID.
+    async fn create_version_via_submit(
+        root: &std::path::Path,
+        addr: SocketAddr,
+        key: &str,
+        intent: &str,
+        overlay_content: &[u8],
+    ) -> String {
+        let client = reqwest::Client::new();
+
+        // Create workspace.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(key)
+            .json(&serde_json::json!({ "intent": intent }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let ws: serde_json::Value = resp.json().await.unwrap();
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        // Write overlay file.
+        let vai_dir = root.join(".vai");
+        let overlay = vai_dir.join("workspaces").join(&ws_id).join("overlay");
+        fs::create_dir_all(overlay.join("src")).unwrap();
+        fs::write(overlay.join("src/lib.rs"), overlay_content).unwrap();
+
+        // Submit.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces/{ws_id}/submit"))
+            .bearer_auth(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let result: serde_json::Value = resp.json().await.unwrap();
+        result["version"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn list_versions_endpoint() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Initially only v1 exists.
+        let resp = client
+            .get(format!("http://{addr}/api/versions"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let versions: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(versions.as_array().unwrap().len(), 1);
+        assert_eq!(versions[0]["version_id"], "v1");
+
+        // Submit to create v2.
+        create_version_via_submit(
+            root,
+            addr,
+            &key,
+            "add world",
+            b"pub fn hello() {}\npub fn world() {}\n",
+        )
+        .await;
+
+        // Now two versions.
+        let resp = client
+            .get(format!("http://{addr}/api/versions"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let versions: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(versions.as_array().unwrap().len(), 2);
+        assert_eq!(versions[0]["version_id"], "v1");
+        assert_eq!(versions[1]["version_id"], "v2");
+
+        // ?limit=1 returns only v2 (most recent).
+        let resp = client
+            .get(format!("http://{addr}/api/versions?limit=1"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let versions: serde_json::Value = resp.json().await.unwrap();
+        let arr = versions.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["version_id"], "v2");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn get_version_details_endpoint() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Create v2 with a new function.
+        create_version_via_submit(
+            root,
+            addr,
+            &key,
+            "add world function",
+            b"pub fn hello() {}\npub fn world() -> u32 { 42 }\n",
+        )
+        .await;
+
+        // GET /api/versions/v2 returns version changes.
+        let resp = client
+            .get(format!("http://{addr}/api/versions/v2"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["version"]["version_id"], "v2");
+        assert_eq!(body["version"]["intent"], "add world function");
+        assert!(
+            body["file_changes"].as_array().unwrap().len() > 0,
+            "v2 should have file changes"
+        );
+
+        // GET /api/versions/v999 → 404.
+        let resp = client
+            .get(format!("http://{addr}/api/versions/v999"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn rollback_endpoint_no_downstream() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Create v2.
+        create_version_via_submit(
+            root,
+            addr,
+            &key,
+            "add world",
+            b"pub fn hello() {}\npub fn world() {}\n",
+        )
+        .await;
+
+        // Rollback v2 — no downstream, so should succeed with force: false.
+        let resp = client
+            .post(format!("http://{addr}/api/versions/rollback"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "version": "v2", "force": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "rollback with no downstream should succeed");
+        let result: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(result["new_version"]["version_id"], "v3");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn rollback_endpoint_blocks_when_downstream_without_force() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Create v2 modifying src/lib.rs.
+        create_version_via_submit(
+            root,
+            addr,
+            &key,
+            "add world",
+            b"pub fn hello() {}\npub fn world() {}\n",
+        )
+        .await;
+
+        // Create v3 also modifying src/lib.rs (downstream of v2).
+        create_version_via_submit(
+            root,
+            addr,
+            &key,
+            "add foo",
+            b"pub fn hello() {}\npub fn world() {}\npub fn foo() {}\n",
+        )
+        .await;
+
+        // Rolling back v2 without force should return 409 because v3 depends on it.
+        let resp = client
+            .post(format!("http://{addr}/api/versions/rollback"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "version": "v2", "force": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "should be blocked by downstream v3");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap().contains("downstream"));
+        assert!(body["impact"].is_object());
+
+        // With force: true the rollback should proceed.
+        let resp = client
+            .post(format!("http://{addr}/api/versions/rollback"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "version": "v2", "force": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "force rollback should succeed");
+        let result: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(result["new_version"]["version_id"], "v4");
 
         shutdown_tx.send(()).ok();
     }
