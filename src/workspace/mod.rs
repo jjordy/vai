@@ -119,7 +119,20 @@ pub fn create(
     intent: &str,
     base_version: &str,
 ) -> Result<CreateResult, WorkspaceError> {
-    let id = Uuid::new_v4();
+    create_with_id(vai_dir, intent, base_version, Uuid::new_v4())
+}
+
+/// Creates a new workspace using an explicitly supplied UUID.
+///
+/// Used by the remote workflow so the local workspace ID matches the ID
+/// assigned by the server when the workspace was registered there.
+/// Behaviour is otherwise identical to [`create`].
+pub fn create_with_id(
+    vai_dir: &Path,
+    intent: &str,
+    base_version: &str,
+    id: Uuid,
+) -> Result<CreateResult, WorkspaceError> {
     let now = Utc::now();
 
     let ws_dir = vai_dir.join("workspaces").join(id.to_string());

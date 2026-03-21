@@ -14,6 +14,7 @@ use crate::clone as remote_clone;
 use crate::diff;
 use crate::graph::{GraphSnapshot, GraphStats};
 use crate::merge;
+use crate::remote_workspace;
 use crate::repo;
 use crate::server;
 use crate::sync as remote_sync;
@@ -55,6 +56,9 @@ pub enum CliError {
     #[error("Sync error: {0}")]
     Sync(#[from] remote_sync::SyncError),
 
+    #[error("Remote workspace error: {0}")]
+    RemoteWorkspace(#[from] remote_workspace::RemoteWorkspaceError),
+
     #[error("{0}")]
     Other(String),
 }
@@ -81,7 +85,12 @@ pub enum Commands {
     /// Initialize a new vai repository in the current directory.
     Init,
     /// Show repository status, active workspaces, and graph stats.
-    Status,
+    Status {
+        /// Query the remote server for other agents' active workspaces.
+        /// Only valid in a cloned repository.
+        #[arg(long)]
+        others: bool,
+    },
     /// Manage workspaces.
     #[command(subcommand)]
     Workspace(WorkspaceCommands),
@@ -299,7 +308,23 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
 
             match ws_cmd {
                 WorkspaceCommands::Create { intent } => {
-                    let result = workspace::create(&vai_dir, &intent, &head)?;
+                    // In a cloned repo, register the workspace on the server
+                    // first so both sides share the same UUID.
+                    let result = if let Some(remote) = remote_clone::read_remote_config(&vai_dir) {
+                        let server_meta = tokio::runtime::Runtime::new()
+                            .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?
+                            .block_on(remote_workspace::register_workspace(&remote, &intent))?;
+
+                        let server_id: uuid::Uuid = server_meta
+                            .id
+                            .parse()
+                            .map_err(|e| CliError::Other(format!("invalid server workspace ID: {e}")))?;
+
+                        workspace::create_with_id(&vai_dir, &intent, &head, server_id)?
+                    } else {
+                        workspace::create(&vai_dir, &intent, &head)?
+                    };
+
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&result).unwrap());
                     } else {
@@ -423,18 +448,80 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     }
                 }
                 WorkspaceCommands::Submit => {
-                    let result = merge::submit(&vai_dir, &root)?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    if let Some(remote) = remote_clone::read_remote_config(&vai_dir) {
+                        // ── Remote submit path ─────────────────────────────
+                        // 1. Determine active workspace ID.
+                        let active_id = workspace::active_id(&vai_dir)
+                            .ok_or_else(|| CliError::Other("no active workspace".to_string()))?;
+                        let overlay = workspace::overlay_dir(&vai_dir, &active_id);
+
+                        // 2. Upload overlay files to server workspace.
+                        let rt = tokio::runtime::Runtime::new()
+                            .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?;
+
+                        let uploaded = rt.block_on(remote_workspace::upload_overlay_files(
+                            &remote,
+                            &active_id,
+                            &overlay,
+                        ))?;
+
+                        if !cli.quiet && !cli.json {
+                            if uploaded.is_empty() {
+                                println!("No files in workspace overlay — nothing to upload.");
+                            } else {
+                                println!("  Uploaded : {} file(s)", uploaded.len());
+                            }
+                        }
+
+                        // 3. Trigger server-side merge.
+                        let submit_result = rt
+                            .block_on(remote_workspace::submit_workspace(&remote, &active_id))
+                            .map_err(|e| match e {
+                                remote_workspace::RemoteWorkspaceError::MergeConflict(body) => {
+                                    CliError::Other(format!("merge conflict on server: {body}"))
+                                }
+                                other => CliError::RemoteWorkspace(other),
+                            })?;
+
+                        // 4. Update local HEAD to match the new server version.
+                        std::fs::write(
+                            vai_dir.join("head"),
+                            format!("{}\n", submit_result.version),
+                        )
+                        .map_err(|e| CliError::Other(format!("update local HEAD: {e}")))?;
+
+                        // 5. Mark local workspace as submitted.
+                        let mut meta = workspace::get(&vai_dir, &active_id)?;
+                        meta.status = workspace::WorkspaceStatus::Submitted;
+                        meta.updated_at = chrono::Utc::now();
+                        workspace::update_meta(&vai_dir, &meta)?;
+
+                        if cli.json {
+                            println!("{}", serde_json::to_string_pretty(&submit_result).unwrap());
+                        } else {
+                            println!(
+                                "{} Merged workspace → {} (server)",
+                                "✓".green().bold(),
+                                submit_result.version.bold()
+                            );
+                            println!("  Files    : {}", submit_result.files_applied);
+                            println!("  Entities : {}", submit_result.entities_changed);
+                        }
                     } else {
-                        println!(
-                            "{} Merged workspace → {}",
-                            "✓".green().bold(),
-                            result.version.version_id.bold()
-                        );
-                        println!("  Intent   : {}", result.version.intent);
-                        println!("  Files    : {}", result.files_applied);
-                        println!("  Entities : {}", result.entities_changed);
+                        // ── Local submit path ──────────────────────────────
+                        let result = merge::submit(&vai_dir, &root)?;
+                        if cli.json {
+                            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                        } else {
+                            println!(
+                                "{} Merged workspace → {}",
+                                "✓".green().bold(),
+                                result.version.version_id.bold()
+                            );
+                            println!("  Intent   : {}", result.version.intent);
+                            println!("  Files    : {}", result.files_applied);
+                            println!("  Entities : {}", result.entities_changed);
+                        }
                     }
                 }
             }
@@ -597,7 +684,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 }
             }
         }
-        Some(Commands::Status) => {
+        Some(Commands::Status { others }) => {
             let cwd = std::env::current_dir()
                 .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
             match repo::find_root(&cwd) {
@@ -610,6 +697,41 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 }
                 Some(root) => {
                     let vai_dir = root.join(".vai");
+
+                    // ── --others: list remote workspaces ──────────────────
+                    if others {
+                        let remote = remote_clone::read_remote_config(&vai_dir)
+                            .ok_or_else(|| CliError::Other(
+                                "--others requires a cloned repository with a remote server".to_string(),
+                            ))?;
+                        let remote_workspaces = tokio::runtime::Runtime::new()
+                            .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?
+                            .block_on(remote_workspace::list_workspaces(&remote))?;
+
+                        if cli.json {
+                            println!("{}", serde_json::to_string_pretty(&remote_workspaces).unwrap());
+                        } else if remote_workspaces.is_empty() {
+                            println!("No active workspaces on server {}.", remote.server_url.cyan());
+                        } else {
+                            println!(
+                                "Active workspaces on {} ({}):",
+                                remote.server_url.cyan(),
+                                remote_workspaces.len()
+                            );
+                            println!("{:<38}  {:<8}  Intent", "ID", "Status");
+                            println!("{}", "-".repeat(80));
+                            for ws in &remote_workspaces {
+                                println!(
+                                    "{:<38}  {:<8}  {}",
+                                    ws.id,
+                                    ws.status,
+                                    truncate(&ws.intent, 50),
+                                );
+                            }
+                        }
+                        return Ok(());
+                    }
+
                     let config = repo::read_config(&vai_dir)
                         .map_err(|e| CliError::Other(format!("cannot read config: {e}")))?;
                     let head = repo::read_head(&vai_dir)

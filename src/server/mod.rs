@@ -2680,4 +2680,82 @@ mod tests {
 
         shutdown_tx.send(()).ok();
     }
+
+    /// Full remote workspace workflow: server running → register workspace →
+    /// upload files → submit → verify new version on server.
+    #[tokio::test]
+    async fn remote_workspace_register_upload_submit() {
+        use crate::clone::RemoteConfig;
+        use crate::remote_workspace;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Repo has one source file.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() -> u32 { 42 }\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+
+        let remote = RemoteConfig {
+            server_url: format!("http://{addr}"),
+            api_key: key.clone(),
+            repo_name: "test-repo".to_string(),
+            cloned_at_version: "v1".to_string(),
+        };
+
+        // 1. Register a workspace on the server.
+        let meta = remote_workspace::register_workspace(&remote, "add logging feature")
+            .await
+            .expect("register_workspace should succeed");
+
+        assert_eq!(meta.intent, "add logging feature");
+        assert_eq!(meta.status, "Created");
+        assert!(!meta.id.is_empty());
+        let ws_id = meta.id.clone();
+
+        // 2. Verify it appears in the list.
+        let workspaces = remote_workspace::list_workspaces(&remote)
+            .await
+            .expect("list_workspaces should succeed");
+        assert!(workspaces.iter().any(|w| w.id == ws_id));
+
+        // 3. Upload an overlay file.
+        let overlay_dir = tmp.path().join("overlay");
+        fs::create_dir_all(overlay_dir.join("src")).unwrap();
+        fs::write(
+            overlay_dir.join("src/lib.rs"),
+            b"pub fn hello() -> u32 { 42 }\npub fn log(msg: &str) { eprintln!(\"{}\", msg); }\n",
+        )
+        .unwrap();
+
+        let uploaded = remote_workspace::upload_overlay_files(&remote, &ws_id, &overlay_dir)
+            .await
+            .expect("upload_overlay_files should succeed");
+        assert_eq!(uploaded, vec!["src/lib.rs"]);
+
+        // 4. Submit the workspace — triggers server-side semantic merge.
+        let submit_result = remote_workspace::submit_workspace(&remote, &ws_id)
+            .await
+            .expect("submit_workspace should succeed");
+
+        assert!(!submit_result.version.is_empty());
+        assert!(submit_result.files_applied > 0);
+
+        // 5. Server HEAD should have advanced.
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/api/status"))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_ne!(
+            body["head_version"].as_str().unwrap(),
+            "v1",
+            "server HEAD should advance after submit"
+        );
+
+        shutdown_tx.send(()).ok();
+    }
 }

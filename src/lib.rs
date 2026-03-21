@@ -10,6 +10,7 @@ pub mod diff;
 pub mod event_log;
 pub mod graph;
 pub mod merge;
+pub mod remote_workspace;
 pub mod repo;
 pub mod server;
 pub mod sync;
