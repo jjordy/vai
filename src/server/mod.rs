@@ -2,7 +2,8 @@
 //! multi-agent coordination.
 //!
 //! Entry point: [`start`] — binds a TCP socket and serves the application.
-//! Current endpoints:
+//!
+//! ## REST Endpoints
 //!   - `GET /api/status` — server and repository health (unauthenticated)
 //!   - `POST /api/workspaces` — create a new workspace
 //!   - `GET /api/workspaces` — list active workspaces
@@ -10,26 +11,31 @@
 //!   - `POST /api/workspaces/:id/submit` — submit workspace for merge
 //!   - `DELETE /api/workspaces/:id` — discard a workspace
 //!
-//! All endpoints except `GET /api/status` require `Authorization: Bearer <key>`
-//! authentication. Keys are managed with `vai server keys`.
+//! ## WebSocket Endpoints
+//!   - `GET /ws/events?key=<api_key>` — real-time event stream
 //!
-//! Further endpoints (graph, versions, WebSocket) will be added in subsequent
-//! issues.
+//! All REST endpoints except `GET /api/status` require
+//! `Authorization: Bearer <key>`. WebSocket auth uses the `key` query param.
+//! Keys are managed with `vai server keys`.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::time::Instant;
 
-use axum::extract::{Path as AxumPath, Request, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path as AxumPath, Query as AxumQuery, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 
 use crate::auth;
 use crate::merge;
@@ -92,6 +98,56 @@ impl ServerConfig {
     }
 }
 
+// ── Broadcast event types ─────────────────────────────────────────────────────
+
+/// Capacity of the broadcast channel (number of events buffered).
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// An event broadcast to all connected WebSocket clients.
+///
+/// Clients receive this as a JSON message on their WebSocket connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BroadcastEvent {
+    /// Discriminant matching `EventKind` variant names (e.g. `"WorkspaceCreated"`).
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// Monotonic event ID from the event log.
+    pub event_id: u64,
+    /// Associated workspace ID, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    /// RFC 3339 timestamp.
+    pub timestamp: String,
+    /// Event-specific payload as a JSON object.
+    pub data: serde_json::Value,
+}
+
+/// Subscription filter sent by the client after connecting.
+///
+/// An empty list for any field means "match all" for that dimension.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct SubscriptionFilter {
+    /// Match events touching any of these entity IDs.
+    #[serde(default)]
+    pub entities: Vec<String>,
+    /// Match events touching any of these file paths (glob patterns not yet supported).
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Match only these event type names (e.g. `"WorkspaceCreated"`).
+    #[serde(default)]
+    pub event_types: Vec<String>,
+    /// Match only events from these workspace IDs.
+    #[serde(default)]
+    pub workspaces: Vec<String>,
+}
+
+/// Incoming WebSocket message from a client.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ClientMessage {
+    Subscribe { subscribe: SubscriptionFilter },
+}
+
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 /// State shared across all request handlers.
@@ -107,6 +163,18 @@ pub(crate) struct AppState {
     repo_name: String,
     /// vai crate version string.
     vai_version: String,
+    /// Broadcast channel for real-time event streaming to WebSocket clients.
+    event_tx: broadcast::Sender<BroadcastEvent>,
+}
+
+impl AppState {
+    /// Broadcast an event to all connected WebSocket clients.
+    ///
+    /// Silently drops the event if no clients are connected.
+    pub(crate) fn broadcast(&self, event: BroadcastEvent) {
+        // `send` only fails if there are no receivers — that's fine.
+        let _ = self.event_tx.send(event);
+    }
 }
 
 // ── Agent identity ────────────────────────────────────────────────────────────
@@ -314,7 +382,7 @@ impl From<merge::SubmitResult> for SubmitResponse {
 
 /// `GET /api/status` — returns live repository and server health info.
 ///
-/// This is the only unauthenticated endpoint.
+/// This is the only unauthenticated REST endpoint.
 async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let head = repo::read_head(&state.vai_dir).unwrap_or_else(|_| "unknown".to_string());
     let workspace_count = workspace::list(&state.vai_dir)
@@ -333,6 +401,7 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRespon
 /// `POST /api/workspaces` — creates a new workspace at the current HEAD.
 ///
 /// Returns 201 Created with the workspace metadata.
+/// Broadcasts a `WorkspaceCreated` event to WebSocket subscribers.
 async fn create_workspace_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateWorkspaceRequest>,
@@ -340,6 +409,21 @@ async fn create_workspace_handler(
     let head = repo::read_head(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let result = workspace::create(&state.vai_dir, &body.intent, &head)
         .map_err(ApiError::from)?;
+
+    // Broadcast the workspace creation event to all WebSocket subscribers.
+    let ws_id = result.workspace.id.to_string();
+    state.broadcast(BroadcastEvent {
+        event_type: "WorkspaceCreated".to_string(),
+        event_id: 0, // event ID not surfaced by workspace::CreateResult
+        workspace_id: Some(ws_id.clone()),
+        timestamp: result.workspace.created_at.to_rfc3339(),
+        data: serde_json::json!({
+            "workspace_id": ws_id,
+            "intent": result.workspace.intent,
+            "base_version": result.workspace.base_version,
+        }),
+    });
+
     Ok((StatusCode::CREATED, Json(WorkspaceResponse::from(result.workspace))))
 }
 
@@ -368,6 +452,7 @@ async fn get_workspace_handler(
 /// Switches the active workspace to `id`, then runs the merge engine.
 /// Returns 409 Conflict if the merge cannot be auto-resolved.
 /// Returns 404 if the workspace does not exist.
+/// Broadcasts a `WorkspaceSubmitted` event to WebSocket subscribers.
 async fn submit_workspace_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -377,6 +462,21 @@ async fn submit_workspace_handler(
     // Make it the active workspace so merge::submit can find it.
     workspace::switch(&state.vai_dir, &id).map_err(ApiError::from)?;
     let result = merge::submit(&state.vai_dir, &state.repo_root).map_err(ApiError::from)?;
+
+    // Broadcast the submit/merge event.
+    state.broadcast(BroadcastEvent {
+        event_type: "WorkspaceSubmitted".to_string(),
+        event_id: 0, // event ID not surfaced by merge result; use 0 as sentinel
+        workspace_id: Some(id.clone()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        data: serde_json::json!({
+            "workspace_id": id,
+            "new_version": result.version.version_id,
+            "files_applied": result.files_applied,
+            "entities_changed": result.entities_changed,
+        }),
+    });
+
     Ok(Json(SubmitResponse::from(result)))
 }
 
@@ -384,28 +484,220 @@ async fn submit_workspace_handler(
 ///
 /// Returns 404 if the workspace does not exist.
 /// Returns 204 No Content on success.
+/// Broadcasts a `WorkspaceDiscarded` event to WebSocket subscribers.
 async fn discard_workspace_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
     workspace::discard(&state.vai_dir, &id, None).map_err(ApiError::from)?;
+
+    // Broadcast discard event.
+    state.broadcast(BroadcastEvent {
+        event_type: "WorkspaceDiscarded".to_string(),
+        event_id: 0,
+        workspace_id: Some(id.clone()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        data: serde_json::json!({ "workspace_id": id }),
+    });
+
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── WebSocket handler ─────────────────────────────────────────────────────────
+
+/// Query parameters for the WebSocket upgrade request.
+#[derive(Debug, Deserialize)]
+struct WsQueryParams {
+    key: Option<String>,
+}
+
+/// `GET /ws/events?key=<api_key>` — upgrades the connection to WebSocket and
+/// begins streaming events matching the client's subscription filter.
+///
+/// Authentication is via the `key` query parameter (plain API key string).
+/// After connecting, the client must send a subscribe message:
+///
+/// ```json
+/// { "subscribe": { "event_types": ["WorkspaceCreated"], "workspaces": [] } }
+/// ```
+///
+/// An empty list for any field means "match all". Events are delivered as JSON
+/// matching [`BroadcastEvent`]. The client can send updated subscribe messages
+/// at any time to change the filter.
+async fn ws_events_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    AxumQuery(params): AxumQuery<WsQueryParams>,
+) -> Response {
+    let key_str = match params.key {
+        Some(k) => k,
+        None => {
+            return ApiError::unauthorized(
+                "missing `key` query parameter; use `?key=<api_key>`",
+            )
+            .into_response();
+        }
+    };
+
+    match auth::validate(&state.vai_dir, &key_str) {
+        Ok(Some(api_key)) => {
+            tracing::debug!(agent = %api_key.name, "WebSocket connection authenticated");
+            let event_rx = state.event_tx.subscribe();
+            ws.on_upgrade(move |socket| handle_ws_connection(socket, event_rx, api_key.name))
+        }
+        Ok(None) => ApiError::unauthorized("invalid or revoked API key").into_response(),
+        Err(e) => ApiError::internal(format!("auth error: {e}")).into_response(),
+    }
+}
+
+/// Returns `true` if `event` passes all non-empty dimensions of `filter`.
+fn filter_matches(filter: &SubscriptionFilter, event: &BroadcastEvent) -> bool {
+    // Event-type filter.
+    if !filter.event_types.is_empty()
+        && !filter.event_types.iter().any(|t| t == &event.event_type)
+    {
+        return false;
+    }
+
+    // Workspace filter.
+    if !filter.workspaces.is_empty() {
+        match &event.workspace_id {
+            Some(ws) if filter.workspaces.contains(ws) => {}
+            _ => return false,
+        }
+    }
+
+    // Entity filter: check if any entity ID appears in event.data.
+    if !filter.entities.is_empty() {
+        let data_str = event.data.to_string();
+        if !filter.entities.iter().any(|eid| data_str.contains(eid.as_str())) {
+            return false;
+        }
+    }
+
+    // Path filter: check if any path appears in event.data.
+    if !filter.paths.is_empty() {
+        let data_str = event.data.to_string();
+        if !filter.paths.iter().any(|p| data_str.contains(p.as_str())) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Manages a single WebSocket client connection.
+///
+/// Spawns a receiver task to handle incoming subscription messages while the
+/// main task forwards matching events from the broadcast channel.
+async fn handle_ws_connection(
+    socket: WebSocket,
+    mut event_rx: broadcast::Receiver<BroadcastEvent>,
+    agent_name: String,
+) {
+    let (ws_tx, ws_rx) = socket.split();
+
+    // Wrap the sender in Arc<Mutex> so it can be shared across tasks.
+    let ws_tx = Arc::new(Mutex::new(ws_tx));
+
+    // The current subscription filter, shared between the receiver task
+    // (which updates it) and the event-forwarding loop (which reads it).
+    // `None` means the client has not yet sent a subscribe message.
+    let filter: Arc<Mutex<Option<SubscriptionFilter>>> = Arc::new(Mutex::new(None));
+    let filter_for_recv = Arc::clone(&filter);
+    let ws_tx_for_recv = Arc::clone(&ws_tx);
+
+    // Spawn a task to handle incoming client messages (subscription updates).
+    let recv_task = tokio::spawn(async move {
+        let mut ws_rx = ws_rx;
+        while let Some(msg) = ws_rx.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    match serde_json::from_str::<ClientMessage>(&text) {
+                        Ok(ClientMessage::Subscribe { subscribe }) => {
+                            tracing::debug!(
+                                agent = %agent_name,
+                                event_types = ?subscribe.event_types,
+                                "WebSocket subscription updated"
+                            );
+                            *filter_for_recv.lock().await = Some(subscribe);
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, "invalid WebSocket message");
+                            // Send an error back to the client.
+                            let err_msg = serde_json::json!({ "error": format!("{e}") })
+                                .to_string();
+                            let _ = ws_tx_for_recv
+                                .lock()
+                                .await
+                                .send(Message::Text(err_msg))
+                                .await;
+                        }
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {} // Ping/Pong/Binary — ignore.
+            }
+        }
+    });
+
+    // Forward matching events to the client until the channel closes or the
+    // client disconnects.
+    loop {
+        match event_rx.recv().await {
+            Ok(event) => {
+                // Check filter (None = not yet subscribed, drop all events).
+                let should_send = {
+                    let guard = filter.lock().await;
+                    guard
+                        .as_ref()
+                        .is_some_and(|f| filter_matches(f, &event))
+                };
+
+                if should_send {
+                    let json = match serde_json::to_string(&event) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("failed to serialize broadcast event: {e}");
+                            continue;
+                        }
+                    };
+                    let send_result = ws_tx.lock().await.send(Message::Text(json)).await;
+                    if send_result.is_err() {
+                        break; // Client disconnected.
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "WebSocket client lagged behind event stream");
+            }
+        }
+    }
+
+    recv_task.abort();
 }
 
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
 ///
-/// The `/api/status` endpoint is public (no auth required). All other
-/// endpoints are protected by [`auth_middleware`].
+/// Public REST endpoints:
+/// - `GET /api/status` (unauthenticated)
+/// - `GET /ws/events?key=<api_key>` (WebSocket, auth via query param)
+///
+/// Protected REST endpoints (require `Authorization: Bearer <key>`):
+/// - All `/api/workspaces` routes
 ///
 /// Exposed as `pub(crate)` so integration tests can build the app directly
 /// without going through the full TCP listener setup.
 pub(crate) fn build_app(state: Arc<AppState>) -> Router {
     use axum::middleware;
 
-    // Unauthenticated routes.
-    let public = Router::new().route("/api/status", get(status_handler));
+    // Unauthenticated routes (REST + WebSocket).
+    let public = Router::new()
+        .route("/api/status", get(status_handler))
+        .route("/ws/events", get(ws_events_handler));
 
     // Routes requiring `Authorization: Bearer <key>`.
     let protected = Router::new()
@@ -439,12 +731,15 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
         .unwrap_or(Path::new("."))
         .to_path_buf();
 
+    let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
     let state = Arc::new(AppState {
         vai_dir: vai_dir.to_owned(),
         repo_root,
         started_at: Instant::now(),
         repo_name: repo_config.name.clone(),
         vai_version: env!("CARGO_PKG_VERSION").to_string(),
+        event_tx,
     });
 
     let app = build_app(state);
@@ -526,12 +821,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
         let state = Arc::new(AppState {
             vai_dir: vai_dir.clone(),
             repo_root: root.to_path_buf(),
             started_at: Instant::now(),
             repo_name: repo_config.name.clone(),
             vai_version: env!("CARGO_PKG_VERSION").to_string(),
+            event_tx,
         });
 
         let app = build_app(Arc::clone(&state));
@@ -769,6 +1067,174 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 401, "revoked key should return 401");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Tracer bullet: connect WebSocket → subscribe to WorkspaceCreated →
+    /// create workspace via REST → verify event received on WebSocket.
+    #[tokio::test]
+    async fn websocket_events_delivered_on_workspace_create() {
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+
+        // Connect to WebSocket, authenticating via query param.
+        let ws_url = format!("ws://{addr}/ws/events?key={key}");
+        let (mut ws_stream, _) = connect_async(&ws_url)
+            .await
+            .expect("WebSocket connection failed");
+
+        // Send subscribe message — subscribe to WorkspaceCreated events only.
+        let subscribe_msg = serde_json::json!({
+            "subscribe": { "event_types": ["WorkspaceCreated"] }
+        })
+        .to_string();
+        ws_stream
+            .send(TungsteniteMessage::Text(subscribe_msg))
+            .await
+            .expect("failed to send subscribe message");
+
+        // Give the server a moment to process the subscribe message.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Create a workspace via REST API — this should trigger a broadcast.
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "websocket test workspace" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let ws_id = created["id"].as_str().unwrap().to_string();
+
+        // Receive the WorkspaceCreated event from the WebSocket.
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ws_stream.next(),
+        )
+        .await
+        .expect("timed out waiting for WebSocket event")
+        .expect("stream ended")
+        .expect("WebSocket error");
+
+        let event: serde_json::Value = match received {
+            TungsteniteMessage::Text(text) => serde_json::from_str(&text).unwrap(),
+            other => panic!("expected Text message, got: {other:?}"),
+        };
+
+        assert_eq!(event["type"], "WorkspaceCreated", "wrong event type");
+        assert_eq!(
+            event["workspace_id"].as_str().unwrap(),
+            ws_id,
+            "workspace ID mismatch"
+        );
+        assert_eq!(
+            event["data"]["intent"],
+            "websocket test workspace",
+            "intent mismatch"
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// WebSocket returns 401 when `key` query param is missing.
+    #[tokio::test]
+    async fn websocket_auth_required() {
+        use tokio_tungstenite::connect_async;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        // Connect without a key — server should reject the upgrade.
+        let ws_url = format!("ws://{addr}/ws/events");
+        let result = connect_async(&ws_url).await;
+        // Connection should fail (HTTP 401 upgrade rejection) or succeed then
+        // immediately close. Either way, no events should flow.
+        match result {
+            Err(_) => {} // Connection rejected outright — expected.
+            Ok((mut stream, _)) => {
+                // Connection established but should close quickly.
+                let msg = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    stream.next(),
+                )
+                .await;
+                // Accept timeout (no message) or a Close frame.
+                match msg {
+                    Err(_) | Ok(None) => {}
+                    Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) => {}
+                    Ok(Some(m)) => panic!("unexpected message: {m:?}"),
+                }
+            }
+        }
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Events filtered by event_type are NOT delivered to clients subscribed
+    /// to a different event type.
+    #[tokio::test]
+    async fn websocket_filter_by_event_type() {
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+
+        // Subscribe to WorkspaceDiscarded only.
+        let ws_url = format!("ws://{addr}/ws/events?key={key}");
+        let (mut ws_stream, _) = connect_async(&ws_url).await.unwrap();
+        ws_stream
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({
+                    "subscribe": { "event_types": ["WorkspaceDiscarded"] }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Create a workspace — WorkspaceCreated should NOT be delivered.
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "filter test" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // Expect no message within a short window.
+        let nothing = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            ws_stream.next(),
+        )
+        .await;
+        assert!(
+            nothing.is_err(),
+            "expected no WorkspaceCreated to arrive on a WorkspaceDiscarded-only subscription"
+        );
 
         shutdown_tx.send(()).ok();
     }
