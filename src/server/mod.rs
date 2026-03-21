@@ -28,9 +28,11 @@
 //! `Authorization: Bearer <key>`. WebSocket auth uses the `key` query param.
 //! Keys are managed with `vai server keys`.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use std::time::Instant;
 
@@ -119,6 +121,81 @@ impl ServerConfig {
 /// Capacity of the broadcast channel (number of events buffered).
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Maximum number of events retained in the server-side replay buffer.
+const BUFFER_MAX_EVENTS: usize = 10_000;
+
+/// Maximum age (seconds) of events kept in the replay buffer (1 hour).
+const BUFFER_MAX_AGE_SECS: i64 = 3600;
+
+// ── Replay buffer ─────────────────────────────────────────────────────────────
+
+/// Server-side ring buffer of recent [`BroadcastEvent`]s.
+///
+/// Agents that disconnect and reconnect can request replay of events they
+/// missed by passing `?last_event_id=N` on the WebSocket URL.  The buffer
+/// retains at most [`BUFFER_MAX_EVENTS`] events **or** the last
+/// [`BUFFER_MAX_AGE_SECS`] seconds of events, whichever bound is reached first.
+struct EventBuffer {
+    events: VecDeque<BroadcastEvent>,
+}
+
+impl EventBuffer {
+    fn new() -> Self {
+        EventBuffer { events: VecDeque::new() }
+    }
+
+    /// Appends `event` and evicts entries that exceed the count or age limits.
+    fn push(&mut self, event: BroadcastEvent) {
+        self.events.push_back(event);
+
+        // Evict by count.
+        while self.events.len() > BUFFER_MAX_EVENTS {
+            self.events.pop_front();
+        }
+
+        // Evict by age.
+        let cutoff =
+            chrono::Utc::now() - chrono::Duration::seconds(BUFFER_MAX_AGE_SECS);
+        while let Some(front) = self.events.front() {
+            match chrono::DateTime::parse_from_rfc3339(&front.timestamp) {
+                Ok(ts) if ts < cutoff => {
+                    self.events.pop_front();
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// Returns `(buffer_exceeded, missed_events)` for an agent reconnecting
+    /// after `last_event_id`.
+    ///
+    /// `buffer_exceeded` is `true` when the buffer cannot guarantee continuity
+    /// — i.e. events between `last_event_id` and the oldest buffered event may
+    /// have been dropped.  In that case the agent should perform a full sync.
+    ///
+    /// `missed_events` contains every buffered event with
+    /// `event_id > last_event_id`, in insertion order.
+    fn events_since(&self, last_event_id: u64) -> (bool, Vec<BroadcastEvent>) {
+        let missed: Vec<BroadcastEvent> = self
+            .events
+            .iter()
+            .filter(|e| e.event_id > last_event_id)
+            .cloned()
+            .collect();
+
+        // Buffer exceeded when the oldest retained event is not the immediate
+        // successor of last_event_id (meaning some events were evicted).
+        let buffer_exceeded = match self.events.front() {
+            // Buffer is empty: if the agent had a non-zero last_event_id there
+            // may have been events we can no longer deliver.
+            None => last_event_id > 0,
+            Some(oldest) => oldest.event_id > last_event_id + 1,
+        };
+
+        (buffer_exceeded, missed)
+    }
+}
+
 /// An event broadcast to all connected WebSocket clients.
 ///
 /// Clients receive this as a JSON message on their WebSocket connection.
@@ -181,15 +258,30 @@ pub(crate) struct AppState {
     vai_version: String,
     /// Broadcast channel for real-time event streaming to WebSocket clients.
     event_tx: broadcast::Sender<BroadcastEvent>,
+    /// Monotonic counter — each broadcast event gets a unique, increasing ID.
+    event_seq: Arc<AtomicU64>,
+    /// Server-side replay buffer for reconnecting agents.
+    event_buffer: Arc<StdMutex<EventBuffer>>,
     /// Conflict engine — tracks workspace scopes and detects overlaps.
     conflict_engine: Arc<Mutex<conflict::ConflictEngine>>,
 }
 
 impl AppState {
-    /// Broadcast an event to all connected WebSocket clients.
+    /// Assigns a monotonic `event_id`, appends to the replay buffer, then
+    /// broadcasts to all connected WebSocket clients.
     ///
-    /// Silently drops the event if no clients are connected.
-    pub(crate) fn broadcast(&self, event: BroadcastEvent) {
+    /// Silently drops the send if no WebSocket clients are connected.
+    pub(crate) fn broadcast(&self, mut event: BroadcastEvent) {
+        // Assign a server-wide monotonic ID.
+        let seq = self.event_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        event.event_id = seq;
+
+        // Append to the replay buffer before sending so reconnecting agents
+        // never miss an event that was already acknowledged by live clients.
+        if let Ok(mut buf) = self.event_buffer.lock() {
+            buf.push(event.clone());
+        }
+
         // `send` only fails if there are no receivers — that's fine.
         let _ = self.event_tx.send(event);
     }
@@ -644,6 +736,13 @@ async fn rollback_handler(
 #[derive(Debug, Deserialize)]
 struct WsQueryParams {
     key: Option<String>,
+    /// The `event_id` of the last event the agent received before disconnecting.
+    ///
+    /// When present, the server replays all buffered events that occurred after
+    /// this ID (filtered by the agent's subscription).  If the buffer has been
+    /// exceeded a `{"buffer_exceeded": true}` message is sent first so the
+    /// agent knows to perform a full sync.
+    last_event_id: Option<u64>,
 }
 
 /// `GET /ws/events?key=<api_key>` — upgrades the connection to WebSocket and
@@ -678,7 +777,11 @@ async fn ws_events_handler(
         Ok(Some(api_key)) => {
             tracing::debug!(agent = %api_key.name, "WebSocket connection authenticated");
             let event_rx = state.event_tx.subscribe();
-            ws.on_upgrade(move |socket| handle_ws_connection(socket, event_rx, api_key.name))
+            let event_buffer = Arc::clone(&state.event_buffer);
+            let last_event_id = params.last_event_id;
+            ws.on_upgrade(move |socket| {
+                handle_ws_connection(socket, event_rx, api_key.name, event_buffer, last_event_id)
+            })
         }
         Ok(None) => ApiError::unauthorized("invalid or revoked API key").into_response(),
         Err(e) => ApiError::internal(format!("auth error: {e}")).into_response(),
@@ -725,10 +828,18 @@ fn filter_matches(filter: &SubscriptionFilter, event: &BroadcastEvent) -> bool {
 ///
 /// Spawns a receiver task to handle incoming subscription messages while the
 /// main task forwards matching events from the broadcast channel.
+///
+/// If `last_event_id` is `Some`, the server replays buffered events that the
+/// agent missed since that ID (filtered by the agent's subscription filter).
+/// The replay happens immediately after the first subscribe message arrives.
+/// If the replay buffer has been exceeded a `{"buffer_exceeded": true}` JSON
+/// message is sent before the replayed events so the agent knows to sync.
 async fn handle_ws_connection(
     socket: WebSocket,
     mut event_rx: broadcast::Receiver<BroadcastEvent>,
     agent_name: String,
+    event_buffer: Arc<StdMutex<EventBuffer>>,
+    last_event_id: Option<u64>,
 ) {
     let (ws_tx, ws_rx) = socket.split();
 
@@ -741,6 +852,11 @@ async fn handle_ws_connection(
     let filter: Arc<Mutex<Option<SubscriptionFilter>>> = Arc::new(Mutex::new(None));
     let filter_for_recv = Arc::clone(&filter);
     let ws_tx_for_recv = Arc::clone(&ws_tx);
+
+    // Whether the missed-event replay has already been performed for this
+    // connection.  Reset to false on fresh connects (last_event_id == None).
+    let replay_done = Arc::new(std::sync::atomic::AtomicBool::new(last_event_id.is_none()));
+    let replay_done_for_recv = Arc::clone(&replay_done);
 
     // Spawn a task to handle incoming client messages (subscription updates).
     let recv_task = tokio::spawn(async move {
@@ -755,6 +871,67 @@ async fn handle_ws_connection(
                                 event_types = ?subscribe.event_types,
                                 "WebSocket subscription updated"
                             );
+
+                            // On the first subscribe message of a reconnection,
+                            // replay any buffered events the agent missed.
+                            if !replay_done_for_recv.swap(true, Ordering::Relaxed) {
+                                if let Some(last_id) = last_event_id {
+                                    let (buffer_exceeded, missed) = {
+                                        match event_buffer.lock() {
+                                            Ok(buf) => buf.events_since(last_id),
+                                            Err(_) => (true, vec![]),
+                                        }
+                                    };
+
+                                    let mut sender = ws_tx_for_recv.lock().await;
+
+                                    if buffer_exceeded {
+                                        let flag = serde_json::json!({ "buffer_exceeded": true })
+                                            .to_string();
+                                        if sender
+                                            .send(Message::Text(flag))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                        tracing::info!(
+                                            agent = %agent_name,
+                                            last_event_id,
+                                            "replay buffer exceeded; agent should sync"
+                                        );
+                                    }
+
+                                    let count = missed.len();
+                                    for event in missed {
+                                        if filter_matches(&subscribe, &event) {
+                                            match serde_json::to_string(&event) {
+                                                Ok(json) => {
+                                                    if sender
+                                                        .send(Message::Text(json))
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        return;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "failed to serialize replayed event: {e}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    tracing::debug!(
+                                        agent = %agent_name,
+                                        replayed = count,
+                                        "replayed missed events after reconnect"
+                                    );
+                                }
+                            }
+
                             *filter_for_recv.lock().await = Some(subscribe);
                         }
                         Err(e) => {
@@ -1475,6 +1652,8 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
         repo_name: repo_config.name.clone(),
         vai_version: env!("CARGO_PKG_VERSION").to_string(),
         event_tx,
+        event_seq: Arc::new(AtomicU64::new(0)),
+        event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
         conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
     });
 
@@ -1566,6 +1745,8 @@ mod tests {
             repo_name: repo_config.name.clone(),
             vai_version: env!("CARGO_PKG_VERSION").to_string(),
             event_tx,
+            event_seq: Arc::new(AtomicU64::new(0)),
+            event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
             conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
         });
 
@@ -1971,6 +2152,248 @@ mod tests {
         assert!(
             nothing.is_err(),
             "expected no WorkspaceCreated to arrive on a WorkspaceDiscarded-only subscription"
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Reconnecting agent receives events missed during disconnection via
+    /// `?last_event_id=N`.  Only events matching the subscription filter are
+    /// replayed.
+    #[tokio::test]
+    async fn websocket_event_replay_on_reconnect() {
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // ── Phase 1: connect, receive first event, then disconnect ─────────────
+
+        let ws_url = format!("ws://{addr}/ws/events?key={key}");
+        let (mut ws_stream, _) = connect_async(&ws_url).await.unwrap();
+
+        // Subscribe to all WorkspaceCreated events.
+        ws_stream
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({
+                    "subscribe": { "event_types": ["WorkspaceCreated"] }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Create workspace A — this event should be delivered live.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "workspace A" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        let live_msg = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ws_stream.next(),
+        )
+        .await
+        .expect("timed out waiting for live event")
+        .expect("stream ended")
+        .expect("WebSocket error");
+
+        let live_event: serde_json::Value = match live_msg {
+            TungsteniteMessage::Text(t) => serde_json::from_str(&t).unwrap(),
+            other => panic!("expected Text, got: {other:?}"),
+        };
+        assert_eq!(live_event["type"], "WorkspaceCreated");
+        assert_eq!(live_event["data"]["intent"], "workspace A");
+        let last_seen_id = live_event["event_id"].as_u64().expect("event_id must be u64");
+        assert!(last_seen_id > 0, "event_id must be a positive monotonic value");
+
+        // Disconnect.
+        drop(ws_stream);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // ── Phase 2: trigger events while disconnected ─────────────────────────
+
+        // Create workspace B — missed by disconnected agent.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "workspace B" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let ws_b: serde_json::Value = resp.json().await.unwrap();
+        let ws_b_id = ws_b["id"].as_str().unwrap().to_string();
+
+        // Discard workspace B — NOT a WorkspaceCreated event; should NOT appear
+        // in the replay (agent subscribed to WorkspaceCreated only).
+        let resp = client
+            .delete(format!("http://{addr}/api/workspaces/{ws_b_id}"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        // Create workspace C — also missed; matches subscription.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "workspace C" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // ── Phase 3: reconnect with last_event_id and verify replay ───────────
+
+        let reconnect_url =
+            format!("ws://{addr}/ws/events?key={key}&last_event_id={last_seen_id}");
+        let (mut ws_reconnect, _) = connect_async(&reconnect_url).await.unwrap();
+
+        // Send subscription — triggers replay.
+        ws_reconnect
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({
+                    "subscribe": { "event_types": ["WorkspaceCreated"] }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        // Collect up to 3 messages (replayed events + possible live events).
+        // We expect exactly: WorkspaceCreated(B) and WorkspaceCreated(C).
+        // WorkspaceDiscarded(B) must NOT appear.
+        let mut replayed: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..2 {
+            let msg = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                ws_reconnect.next(),
+            )
+            .await
+            .expect("timed out waiting for replayed event")
+            .expect("stream ended")
+            .expect("WebSocket error");
+
+            let event: serde_json::Value = match msg {
+                TungsteniteMessage::Text(t) => serde_json::from_str(&t).unwrap(),
+                other => panic!("expected Text, got: {other:?}"),
+            };
+
+            // No buffer_exceeded expected in this test (events are within buffer).
+            assert!(
+                event.get("buffer_exceeded").is_none(),
+                "unexpected buffer_exceeded: {event}"
+            );
+            assert_eq!(event["type"], "WorkspaceCreated", "unexpected event type: {event}");
+            assert!(
+                event["event_id"].as_u64().unwrap() > last_seen_id,
+                "replayed event_id must be newer than last_seen_id"
+            );
+            replayed.push(event);
+        }
+
+        let intents: Vec<&str> = replayed
+            .iter()
+            .map(|e| e["data"]["intent"].as_str().unwrap())
+            .collect();
+        assert!(
+            intents.contains(&"workspace B"),
+            "expected workspace B in replay; got: {intents:?}"
+        );
+        assert!(
+            intents.contains(&"workspace C"),
+            "expected workspace C in replay; got: {intents:?}"
+        );
+
+        // No third message should arrive within a short window.
+        let extra = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            ws_reconnect.next(),
+        )
+        .await;
+        // Only a timeout (no message) is acceptable here.
+        assert!(extra.is_err(), "unexpected extra message after replay");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// When the server's replay buffer has been exceeded the agent receives a
+    /// `{"buffer_exceeded": true}` message followed by whatever events are
+    /// still in the buffer.
+    #[tokio::test]
+    async fn websocket_buffer_exceeded_flag_sent_on_reconnect() {
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Create a workspace to register one real event.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "seed workspace" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // Manually drain the event buffer to simulate exceeded capacity — the
+        // agent's last_event_id will precede the oldest buffered event.
+        {
+            let mut buf = state.event_buffer.lock().unwrap();
+            buf.events.clear();
+        }
+
+        // Reconnect with an old last_event_id (before the cleared buffer).
+        let reconnect_url = format!("ws://{addr}/ws/events?key={key}&last_event_id=1");
+        let (mut ws_reconnect, _) = connect_async(&reconnect_url).await.unwrap();
+
+        ws_reconnect
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({
+                    "subscribe": { "event_types": ["WorkspaceCreated"] }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        // First message must be buffer_exceeded.
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ws_reconnect.next(),
+        )
+        .await
+        .expect("timed out waiting for buffer_exceeded message")
+        .expect("stream ended")
+        .expect("WebSocket error");
+
+        let flag: serde_json::Value = match msg {
+            TungsteniteMessage::Text(t) => serde_json::from_str(&t).unwrap(),
+            other => panic!("expected Text, got: {other:?}"),
+        };
+        assert_eq!(
+            flag["buffer_exceeded"], true,
+            "expected buffer_exceeded=true; got: {flag}"
         );
 
         shutdown_tx.send(()).ok();
