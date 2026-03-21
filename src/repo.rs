@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::event_log::{EventKind, EventLog};
 use crate::graph::{GraphSnapshot, GraphStats};
+pub use crate::version::VersionMeta;
 
 /// Errors that can occur during repository operations.
 #[derive(Debug, Error)]
@@ -80,23 +81,6 @@ impl Default for VaiToml {
             ],
         }
     }
-}
-
-/// Metadata for a single version, stored in `.vai/versions/v<N>.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VersionMeta {
-    /// Version identifier, e.g. `"v1"`.
-    pub version_id: String,
-    /// Parent version ID, if any.
-    pub parent_version_id: Option<String>,
-    /// Intent description for this version.
-    pub intent: String,
-    /// Agent or user who created this version.
-    pub created_by: String,
-    /// When this version was created.
-    pub created_at: DateTime<Utc>,
-    /// ID of the merge event in the event log that produced this version, if any.
-    pub merge_event_id: Option<u64>,
 }
 
 // ── Result type ───────────────────────────────────────────────────────────────

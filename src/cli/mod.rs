@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::diff;
 use crate::graph::GraphSnapshot;
+use crate::merge;
 use crate::repo;
 use crate::workspace;
 
@@ -27,6 +28,9 @@ pub enum CliError {
 
     #[error("Diff error: {0}")]
     Diff(#[from] diff::DiffError),
+
+    #[error("Merge error: {0}")]
+    Merge(#[from] merge::MergeError),
 
     #[error("{0}")]
     Other(String),
@@ -346,7 +350,19 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     }
                 }
                 WorkspaceCommands::Submit => {
-                    eprintln!("Command not yet implemented.");
+                    let result = merge::submit(&vai_dir, &root)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        println!(
+                            "{} Merged workspace → {}",
+                            "✓".green().bold(),
+                            result.version.version_id.bold()
+                        );
+                        println!("  Intent   : {}", result.version.intent);
+                        println!("  Files    : {}", result.files_applied);
+                        println!("  Entities : {}", result.entities_changed);
+                    }
                 }
             }
         }
