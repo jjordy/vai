@@ -4,6 +4,7 @@
 //! merge engine, and version history for AI-native version control.
 
 pub mod cli;
+pub mod diff;
 pub mod event_log;
 pub mod graph;
 pub mod merge;

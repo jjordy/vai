@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use thiserror::Error;
 
+use crate::diff;
 use crate::graph::GraphSnapshot;
 use crate::repo;
 use crate::workspace;
@@ -23,6 +24,9 @@ pub enum CliError {
 
     #[error("Workspace error: {0}")]
     Workspace(#[from] workspace::WorkspaceError),
+
+    #[error("Diff error: {0}")]
+    Diff(#[from] diff::DiffError),
 
     #[error("{0}")]
     Other(String),
@@ -285,7 +289,63 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         );
                     }
                 }
-                WorkspaceCommands::Diff { .. } | WorkspaceCommands::Submit => {
+                WorkspaceCommands::Diff { entities_only } => {
+                    let workspace_diff = diff::compute(&vai_dir, &root)?;
+
+                    // Record events and transition workspace to Active on first diff.
+                    diff::record_events(&vai_dir, &workspace_diff)?;
+
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&workspace_diff).unwrap()
+                        );
+                    } else if workspace_diff.is_empty() {
+                        println!("No changes in active workspace.");
+                    } else {
+                        println!(
+                            "{} workspace diff (base: {})",
+                            "●".cyan(),
+                            workspace_diff.base_version.bold()
+                        );
+
+                        if !entities_only && !workspace_diff.file_diffs.is_empty() {
+                            println!("\n{}", "Files changed:".bold());
+                            for fd in &workspace_diff.file_diffs {
+                                let sigil = match fd.change_type {
+                                    diff::FileChangeType::Added => "+".green(),
+                                    diff::FileChangeType::Modified => "M".yellow(),
+                                };
+                                println!("  {} {} ({} lines)", sigil, fd.path, fd.lines);
+                            }
+                        }
+
+                        if !workspace_diff.entity_changes.is_empty() {
+                            println!("\n{}", "Entities changed:".bold());
+                            for ec in &workspace_diff.entity_changes {
+                                let (sigil, label) = match ec.change_type {
+                                    diff::EntityChangeType::Added => ("+".green(), "added"),
+                                    diff::EntityChangeType::Modified => ("~".yellow(), "modified"),
+                                    diff::EntityChangeType::Removed => ("-".red(), "removed"),
+                                };
+                                let location = if let Some((start, end)) = ec.line_range {
+                                    format!("{}:{}-{}", ec.file_path, start, end)
+                                } else {
+                                    ec.file_path.clone()
+                                };
+                                println!(
+                                    "  {} {} {}  {}  {}",
+                                    sigil,
+                                    ec.kind.as_str().cyan(),
+                                    ec.qualified_name.bold(),
+                                    location,
+                                    label
+                                );
+                            }
+                        }
+                    }
+                }
+                WorkspaceCommands::Submit => {
                     eprintln!("Command not yet implemented.");
                 }
             }
