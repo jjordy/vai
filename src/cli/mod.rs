@@ -9,6 +9,7 @@ use colored::Colorize;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::auth;
 use crate::diff;
 use crate::graph::{GraphSnapshot, GraphStats};
 use crate::merge;
@@ -42,6 +43,9 @@ pub enum CliError {
 
     #[error("Server error: {0}")]
     Server(#[from] server::ServerError),
+
+    #[error("Auth error: {0}")]
+    Auth(#[from] auth::AuthError),
 
     #[error("{0}")]
     Other(String),
@@ -167,6 +171,27 @@ pub enum ServerCommands {
         /// Address to bind to.
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+    },
+    /// Manage API keys for server authentication.
+    #[command(subcommand)]
+    Keys(KeysCommands),
+}
+
+/// API key management subcommands.
+#[derive(Debug, Subcommand)]
+pub enum KeysCommands {
+    /// Generate a new API key. The key is printed once and cannot be recovered.
+    Create {
+        /// Human-readable name for this key (must be unique).
+        #[arg(long)]
+        name: String,
+    },
+    /// List all API keys (active and revoked).
+    List,
+    /// Revoke an API key by name.
+    Revoke {
+        /// Name of the key to revoke.
+        name: String,
     },
 }
 
@@ -739,6 +764,79 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     tokio::runtime::Runtime::new()
                         .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?
                         .block_on(server::start(&vai_dir, config))?;
+                }
+                ServerCommands::Keys(keys_cmd) => {
+                    match keys_cmd {
+                        KeysCommands::Create { name } => {
+                            let (meta, plaintext) = auth::create(&vai_dir, &name)?;
+                            if cli.json {
+                                let out = serde_json::json!({
+                                    "name": meta.name,
+                                    "key": plaintext,
+                                    "key_prefix": meta.key_prefix,
+                                    "created_at": meta.created_at.to_rfc3339(),
+                                });
+                                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                            } else {
+                                println!("{} API key created", "✓".green().bold());
+                                println!("  Name : {}", meta.name.bold());
+                                println!("  Key  : {}", plaintext.yellow().bold());
+                                println!();
+                                println!(
+                                    "  {} This key will not be shown again. Store it securely.",
+                                    "!".yellow().bold()
+                                );
+                            }
+                        }
+                        KeysCommands::List => {
+                            let keys = auth::list(&vai_dir)?;
+                            if cli.json {
+                                println!("{}", serde_json::to_string_pretty(&keys).unwrap());
+                            } else if keys.is_empty() {
+                                println!("No API keys. Use `vai server keys create --name <name>` to create one.");
+                            } else {
+                                println!("{:<24} {:<16} {:<28} STATUS", "NAME", "PREFIX", "CREATED");
+                                println!("{}", "-".repeat(80));
+                                for k in &keys {
+                                    let status = if k.revoked {
+                                        "revoked".red().to_string()
+                                    } else {
+                                        "active".green().to_string()
+                                    };
+                                    let last_used = k
+                                        .last_used_at
+                                        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                                        .unwrap_or_else(|| "never".to_string());
+                                    println!(
+                                        "{:<24} {:<16} {:<28} {}  (last used: {})",
+                                        k.name,
+                                        k.key_prefix,
+                                        k.created_at.format("%Y-%m-%d %H:%M UTC"),
+                                        status,
+                                        last_used,
+                                    );
+                                }
+                            }
+                        }
+                        KeysCommands::Revoke { name } => {
+                            auth::revoke(&vai_dir, &name)?;
+                            if cli.json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(
+                                        &serde_json::json!({ "revoked": name })
+                                    )
+                                    .unwrap()
+                                );
+                            } else {
+                                println!(
+                                    "{} API key '{}' revoked",
+                                    "✓".green().bold(),
+                                    name.bold()
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

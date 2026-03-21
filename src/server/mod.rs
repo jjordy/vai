@@ -3,12 +3,15 @@
 //!
 //! Entry point: [`start`] — binds a TCP socket and serves the application.
 //! Current endpoints:
-//!   - `GET /api/status` — server and repository health
+//!   - `GET /api/status` — server and repository health (unauthenticated)
 //!   - `POST /api/workspaces` — create a new workspace
 //!   - `GET /api/workspaces` — list active workspaces
 //!   - `GET /api/workspaces/:id` — workspace details
 //!   - `POST /api/workspaces/:id/submit` — submit workspace for merge
 //!   - `DELETE /api/workspaces/:id` — discard a workspace
+//!
+//! All endpoints except `GET /api/status` require `Authorization: Bearer <key>`
+//! authentication. Keys are managed with `vai server keys`.
 //!
 //! Further endpoints (graph, versions, WebSocket) will be added in subsequent
 //! issues.
@@ -18,8 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -27,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::net::TcpListener;
 
+use crate::auth;
 use crate::merge;
 use crate::repo;
 use crate::workspace;
@@ -44,6 +49,9 @@ pub enum ServerError {
 
     #[error("Workspace error: {0}")]
     Workspace(#[from] workspace::WorkspaceError),
+
+    #[error("Auth error: {0}")]
+    Auth(#[from] auth::AuthError),
 
     #[error("Invalid bind address `{addr}`: {source}")]
     BadAddress {
@@ -101,6 +109,61 @@ pub(crate) struct AppState {
     vai_version: String,
 }
 
+// ── Agent identity ────────────────────────────────────────────────────────────
+
+/// The authenticated agent making the current request.
+///
+/// Injected into request extensions by [`auth_middleware`] and available to
+/// handlers via `Extension<AgentIdentity>`.
+#[derive(Debug, Clone)]
+pub struct AgentIdentity {
+    /// Key record ID.
+    pub key_id: String,
+    /// Human-readable key name.
+    pub name: String,
+}
+
+// ── Authentication middleware ─────────────────────────────────────────────────
+
+/// Axum middleware that enforces `Authorization: Bearer <key>` on every request.
+///
+/// Valid keys result in an [`AgentIdentity`] being inserted into request
+/// extensions. Invalid or missing keys return 401 Unauthorized.
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let auth_header = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let key_str = match auth_header {
+        Some(ref h) if h.starts_with("Bearer ") => h[7..].trim().to_string(),
+        _ => {
+            return ApiError::unauthorized(
+                "missing or invalid Authorization header; expected `Bearer <key>`",
+            )
+            .into_response();
+        }
+    };
+
+    match auth::validate(&state.vai_dir, &key_str) {
+        Ok(Some(api_key)) => {
+            tracing::debug!(agent = %api_key.name, "authenticated request");
+            request.extensions_mut().insert(AgentIdentity {
+                key_id: api_key.id,
+                name: api_key.name,
+            });
+            next.run(request).await
+        }
+        Ok(None) => ApiError::unauthorized("invalid or revoked API key").into_response(),
+        Err(e) => ApiError::internal(format!("auth error: {e}")).into_response(),
+    }
+}
+
 // ── API error helper ──────────────────────────────────────────────────────────
 
 /// JSON body for error responses.
@@ -133,6 +196,13 @@ impl ApiError {
     fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: msg.into(),
+        }
+    }
+
+    fn unauthorized(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
             message: msg.into(),
         }
     }
@@ -243,6 +313,8 @@ impl From<merge::SubmitResult> for SubmitResponse {
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 /// `GET /api/status` — returns live repository and server health info.
+///
+/// This is the only unauthenticated endpoint.
 async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let head = repo::read_head(&state.vai_dir).unwrap_or_else(|_| "unknown".to_string());
     let workspace_count = workspace::list(&state.vai_dir)
@@ -324,17 +396,30 @@ async fn discard_workspace_handler(
 
 /// Constructs the axum [`Router`] with all registered routes.
 ///
+/// The `/api/status` endpoint is public (no auth required). All other
+/// endpoints are protected by [`auth_middleware`].
+///
 /// Exposed as `pub(crate)` so integration tests can build the app directly
 /// without going through the full TCP listener setup.
 pub(crate) fn build_app(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/api/status", get(status_handler))
+    use axum::middleware;
+
+    // Unauthenticated routes.
+    let public = Router::new().route("/api/status", get(status_handler));
+
+    // Routes requiring `Authorization: Bearer <key>`.
+    let protected = Router::new()
         .route("/api/workspaces", post(create_workspace_handler))
         .route("/api/workspaces", get(list_workspaces_handler))
         .route("/api/workspaces/:id", get(get_workspace_handler))
         .route("/api/workspaces/:id/submit", post(submit_workspace_handler))
         .route("/api/workspaces/:id", delete(discard_workspace_handler))
-        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth_middleware,
+        ));
+
+    public.merge(protected).with_state(state)
 }
 
 // ── Public start function ─────────────────────────────────────────────────────
@@ -423,15 +508,20 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+    use crate::auth;
     use crate::repo;
 
-    /// Initialise a repo in `root` and return a running test server address.
+    /// Initialise a repo in `root`, create a test API key, and return a
+    /// running test server address along with the plaintext key.
     async fn start_test_server(
         root: &Path,
-    ) -> (SocketAddr, oneshot::Sender<()>, Arc<AppState>) {
+    ) -> (SocketAddr, oneshot::Sender<()>, Arc<AppState>, String) {
         repo::init(root).unwrap();
         let vai_dir = root.join(".vai");
         let repo_config = repo::read_config(&vai_dir).unwrap();
+
+        // Create a test API key so authenticated requests can succeed.
+        let (_, key) = auth::create(&vai_dir, "test-agent").unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -459,7 +549,7 @@ mod tests {
         // Give the server a moment to accept connections.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        (addr, shutdown_tx, state)
+        (addr, shutdown_tx, state, key)
     }
 
     #[tokio::test]
@@ -470,9 +560,10 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, state) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, _key) = start_test_server(root).await;
         let client = reqwest::Client::new();
 
+        // status is unauthenticated
         let resp = client
             .get(format!("http://{addr}/api/status"))
             .send()
@@ -497,12 +588,13 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state) = start_test_server(root).await;
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
         let client = reqwest::Client::new();
 
         // POST /api/workspaces — create
         let resp = client
             .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "add hello world feature" }))
             .send()
             .await
@@ -517,6 +609,7 @@ mod tests {
         // GET /api/workspaces — list
         let resp = client
             .get(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
             .send()
             .await
             .unwrap();
@@ -528,6 +621,7 @@ mod tests {
         // GET /api/workspaces/:id — details
         let resp = client
             .get(format!("http://{addr}/api/workspaces/{ws_id}"))
+            .bearer_auth(&key)
             .send()
             .await
             .unwrap();
@@ -539,6 +633,7 @@ mod tests {
         // GET /api/workspaces/:id — 404 for unknown ID
         let resp = client
             .get(format!("http://{addr}/api/workspaces/nonexistent-id"))
+            .bearer_auth(&key)
             .send()
             .await
             .unwrap();
@@ -547,6 +642,7 @@ mod tests {
         // DELETE /api/workspaces/:id — discard
         let resp = client
             .delete(format!("http://{addr}/api/workspaces/{ws_id}"))
+            .bearer_auth(&key)
             .send()
             .await
             .unwrap();
@@ -555,12 +651,17 @@ mod tests {
         // After discard, workspace should not appear in list
         let resp = client
             .get(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let list: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(list.as_array().unwrap().len(), 0, "discarded workspace should not appear");
+        assert_eq!(
+            list.as_array().unwrap().len(),
+            0,
+            "discarded workspace should not appear"
+        );
 
         shutdown_tx.send(()).ok();
     }
@@ -573,12 +674,13 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state) = start_test_server(root).await;
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
         let client = reqwest::Client::new();
 
         // Create a workspace.
         let resp = client
             .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "extend hello" }))
             .send()
             .await
@@ -600,6 +702,7 @@ mod tests {
         // POST /api/workspaces/:id/submit
         let resp = client
             .post(format!("http://{addr}/api/workspaces/{ws_id}/submit"))
+            .bearer_auth(&key)
             .send()
             .await
             .unwrap();
@@ -607,6 +710,65 @@ mod tests {
         let result: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(result["version"], "v2", "submit should create v2");
         assert!(result["files_applied"].as_u64().unwrap() > 0);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn api_key_authentication() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // 1. Authenticated request succeeds.
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "valid key should be accepted");
+
+        // 2. Missing Authorization header returns 401.
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "missing auth should return 401");
+
+        // 3. Wrong key returns 401.
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces"))
+            .bearer_auth("vai_thisisnottherightkey00000000000")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "invalid key should return 401");
+
+        // 4. status endpoint does NOT require auth.
+        let resp = client
+            .get(format!("http://{addr}/api/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "status should be unauthenticated");
+
+        // 5. Revoked key returns 401.
+        let vai_dir = root.join(".vai");
+        auth::revoke(&vai_dir, "test-agent").unwrap();
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "revoked key should return 401");
 
         shutdown_tx.send(()).ok();
     }
