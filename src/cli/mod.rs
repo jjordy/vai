@@ -12,7 +12,9 @@ use thiserror::Error;
 use crate::auth;
 use crate::clone as remote_clone;
 use crate::diff;
+use crate::event_log::EventLog;
 use crate::graph::{GraphSnapshot, GraphStats};
+use crate::issue::{IssueFilter, IssueStore, IssuePriority, IssueResolution, IssueStatus};
 use crate::merge;
 use crate::remote_workspace;
 use crate::repo;
@@ -58,6 +60,9 @@ pub enum CliError {
 
     #[error("Remote workspace error: {0}")]
     RemoteWorkspace(#[from] remote_workspace::RemoteWorkspaceError),
+
+    #[error("Issue error: {0}")]
+    Issue(#[from] crate::issue::IssueError),
 
     #[error("{0}")]
     Other(String),
@@ -144,6 +149,71 @@ pub enum Commands {
     },
     /// Pull the latest changes from the remote server (incremental).
     Sync,
+    /// Manage issues.
+    #[command(subcommand)]
+    Issue(IssueCommands),
+}
+
+/// Issue management subcommands.
+#[derive(Debug, Subcommand)]
+pub enum IssueCommands {
+    /// Create a new issue.
+    Create {
+        /// Short summary of the issue.
+        #[arg(long)]
+        title: String,
+        /// Full description (optional).
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Priority level: critical, high, medium, low.
+        #[arg(long, default_value = "medium")]
+        priority: String,
+        /// Comma-separated labels (optional).
+        #[arg(long)]
+        label: Vec<String>,
+    },
+    /// List issues with optional filters.
+    List {
+        /// Filter by status: open, in_progress, resolved, closed.
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by priority: critical, high, medium, low.
+        #[arg(long)]
+        priority: Option<String>,
+        /// Filter by label substring.
+        #[arg(long)]
+        label: Option<String>,
+        /// Filter by creator (human username or agent ID).
+        #[arg(long)]
+        created_by: Option<String>,
+    },
+    /// Show details of a specific issue.
+    Show {
+        /// Issue ID (full UUID or prefix).
+        id: String,
+    },
+    /// Update mutable fields of an issue.
+    Update {
+        /// Issue ID.
+        id: String,
+        /// New priority level.
+        #[arg(long)]
+        priority: Option<String>,
+        /// Add a label (can be repeated).
+        #[arg(long)]
+        label: Vec<String>,
+        /// New title.
+        #[arg(long)]
+        title: Option<String>,
+    },
+    /// Close an issue with a resolution.
+    Close {
+        /// Issue ID.
+        id: String,
+        /// Resolution: resolved, wontfix, duplicate.
+        #[arg(long)]
+        resolution: String,
+    },
 }
 
 /// Workspace subcommands.
@@ -1032,6 +1102,173 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 remote_sync::print_sync_result(&result);
             }
         }
+        Some(Commands::Issue(issue_cmd)) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+
+            match issue_cmd {
+                IssueCommands::Create { title, description, priority, label } => {
+                    let prio = IssuePriority::from_str(&priority)
+                        .ok_or_else(|| CliError::Other(format!("unknown priority: {priority}")))?;
+                    let store = IssueStore::open(&vai_dir)?;
+                    let mut event_log = EventLog::open(&vai_dir)
+                        .map_err(|e| CliError::Other(format!("cannot open event log: {e}")))?;
+                    let issue = store.create(
+                        title,
+                        description,
+                        prio,
+                        label,
+                        whoami(),
+                        &mut event_log,
+                    )?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&issue).unwrap());
+                    } else {
+                        println!(
+                            "{} Created issue {}",
+                            "✓".green(),
+                            issue.id.to_string()[..8].cyan()
+                        );
+                        print_issue_summary(&issue);
+                    }
+                }
+                IssueCommands::List { status, priority, label, created_by } => {
+                    let status_filter = if let Some(s) = status {
+                        Some(IssueStatus::from_str(&s)
+                            .ok_or_else(|| CliError::Other(format!("unknown status: {s}")))?)
+                    } else {
+                        None
+                    };
+                    let priority_filter = if let Some(p) = priority {
+                        Some(IssuePriority::from_str(&p)
+                            .ok_or_else(|| CliError::Other(format!("unknown priority: {p}")))?)
+                    } else {
+                        None
+                    };
+                    let filter = IssueFilter {
+                        status: status_filter,
+                        priority: priority_filter,
+                        label,
+                        creator: created_by,
+                    };
+                    let store = IssueStore::open(&vai_dir)?;
+                    let issues = store.list(&filter)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&issues).unwrap());
+                    } else if issues.is_empty() {
+                        println!("No issues found.");
+                    } else {
+                        println!(
+                            "{:<10}  {:<8}  {:<8}  {:<30}  {}",
+                            "ID", "STATUS", "PRIORITY", "TITLE", "CREATED"
+                        );
+                        println!("{}", "-".repeat(80));
+                        for issue in &issues {
+                            let age = format_age(issue.created_at);
+                            println!(
+                                "{:<10}  {:<8}  {:<8}  {:<30}  {}",
+                                &issue.id.to_string()[..8],
+                                issue.status.as_str(),
+                                issue.priority.as_str(),
+                                truncate(&issue.title, 30),
+                                age,
+                            );
+                        }
+                    }
+                }
+                IssueCommands::Show { id } => {
+                    let store = IssueStore::open(&vai_dir)?;
+                    let issue = resolve_issue(&store, &id)?;
+                    if cli.json {
+                        let workspaces = store.linked_workspaces(issue.id)?;
+                        let out = serde_json::json!({
+                            "issue": &issue,
+                            "linked_workspaces": workspaces,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                    } else {
+                        println!("{} {}", "Issue".bold(), issue.id.to_string().cyan());
+                        println!("  Title       : {}", issue.title.bold());
+                        println!("  Status      : {}", colorize_status(&issue.status));
+                        println!("  Priority    : {}", colorize_priority(&issue.priority));
+                        if !issue.labels.is_empty() {
+                            println!("  Labels      : {}", issue.labels.join(", "));
+                        }
+                        println!("  Creator     : {}", issue.creator);
+                        if let Some(res) = &issue.resolution {
+                            println!("  Resolution  : {}", res);
+                        }
+                        println!("  Created     : {}", issue.created_at.format("%Y-%m-%d %H:%M UTC"));
+                        println!("  Updated     : {}", issue.updated_at.format("%Y-%m-%d %H:%M UTC"));
+                        if !issue.description.is_empty() {
+                            println!();
+                            println!("{}", issue.description);
+                        }
+                        let workspaces = store.linked_workspaces(issue.id)?;
+                        if !workspaces.is_empty() {
+                            println!();
+                            println!("Linked workspaces:");
+                            for ws_id in &workspaces {
+                                println!("  {}", ws_id);
+                            }
+                        }
+                    }
+                }
+                IssueCommands::Update { id, priority, label, title } => {
+                    let prio = if let Some(p) = priority {
+                        Some(IssuePriority::from_str(&p)
+                            .ok_or_else(|| CliError::Other(format!("unknown priority: {p}")))?)
+                    } else {
+                        None
+                    };
+                    let new_labels = if label.is_empty() { None } else { Some(label) };
+                    let store = IssueStore::open(&vai_dir)?;
+                    let mut event_log = EventLog::open(&vai_dir)
+                        .map_err(|e| CliError::Other(format!("cannot open event log: {e}")))?;
+                    let resolved = resolve_issue(&store, &id)?;
+                    let updated = store.update(
+                        resolved.id,
+                        title,
+                        None,
+                        prio,
+                        new_labels,
+                        &mut event_log,
+                    )?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&updated).unwrap());
+                    } else {
+                        println!(
+                            "{} Updated issue {}",
+                            "✓".green(),
+                            &updated.id.to_string()[..8].cyan()
+                        );
+                        print_issue_summary(&updated);
+                    }
+                }
+                IssueCommands::Close { id, resolution } => {
+                    let res = IssueResolution::from_str(&resolution)
+                        .ok_or_else(|| CliError::Other(format!("unknown resolution: {resolution}. Use: resolved, wontfix, duplicate")))?;
+                    let store = IssueStore::open(&vai_dir)?;
+                    let mut event_log = EventLog::open(&vai_dir)
+                        .map_err(|e| CliError::Other(format!("cannot open event log: {e}")))?;
+                    let resolved_issue = resolve_issue(&store, &id)?;
+                    let closed = store.close(resolved_issue.id, res, &mut event_log)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&closed).unwrap());
+                    } else {
+                        println!(
+                            "{} Closed issue {} ({})",
+                            "✓".green(),
+                            &closed.id.to_string()[..8].cyan(),
+                            closed.resolution.as_deref().unwrap_or(""),
+                        );
+                    }
+                }
+            }
+        }
         Some(Commands::Merge(merge_cmd)) => {
             let cwd = std::env::current_dir()
                 .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
@@ -1161,6 +1398,69 @@ fn format_age(dt: DateTime<Utc>) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86400)
+    }
+}
+
+/// Return the current user's login name (falls back to "human").
+fn whoami() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "human".to_string())
+}
+
+/// Resolve an issue by full UUID or 8-character prefix.
+fn resolve_issue(
+    store: &IssueStore,
+    id_str: &str,
+) -> Result<crate::issue::Issue, CliError> {
+    // Try exact UUID first.
+    if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
+        return Ok(store.get(uuid)?);
+    }
+    // Fall back to prefix search.
+    let all = store.list(&IssueFilter::default())?;
+    let prefix = id_str.to_lowercase();
+    let matches: Vec<_> = all
+        .into_iter()
+        .filter(|i| i.id.to_string().starts_with(&prefix))
+        .collect();
+    match matches.len() {
+        0 => Err(CliError::Other(format!("no issue found with id prefix: {id_str}"))),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => Err(CliError::Other(format!(
+            "ambiguous id prefix {id_str}: matches {} issues",
+            matches.len()
+        ))),
+    }
+}
+
+/// Print a one-line summary of an issue.
+fn print_issue_summary(issue: &crate::issue::Issue) {
+    println!("  Title    : {}", issue.title);
+    println!("  Status   : {}", colorize_status(&issue.status));
+    println!("  Priority : {}", colorize_priority(&issue.priority));
+    if !issue.labels.is_empty() {
+        println!("  Labels   : {}", issue.labels.join(", "));
+    }
+}
+
+/// Colorize an `IssueStatus` for terminal output.
+fn colorize_status(status: &IssueStatus) -> colored::ColoredString {
+    match status {
+        IssueStatus::Open => status.as_str().green(),
+        IssueStatus::InProgress => status.as_str().yellow(),
+        IssueStatus::Resolved => status.as_str().cyan(),
+        IssueStatus::Closed => status.as_str().dimmed(),
+    }
+}
+
+/// Colorize an `IssuePriority` for terminal output.
+fn colorize_priority(priority: &IssuePriority) -> colored::ColoredString {
+    match priority {
+        IssuePriority::Critical => priority.as_str().red().bold(),
+        IssuePriority::High => priority.as_str().red(),
+        IssuePriority::Medium => priority.as_str().yellow(),
+        IssuePriority::Low => priority.as_str().normal(),
     }
 }
 

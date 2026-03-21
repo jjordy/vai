@@ -61,7 +61,8 @@ impl IssuePriority {
         }
     }
 
-    fn from_str(s: &str) -> Option<Self> {
+    /// Parse from a string.
+    pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "critical" => Some(IssuePriority::Critical),
             "high" => Some(IssuePriority::High),
@@ -95,7 +96,8 @@ impl IssueStatus {
         }
     }
 
-    fn from_str(s: &str) -> Option<Self> {
+    /// Parse from a string.
+    pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "open" => Some(IssueStatus::Open),
             "in_progress" => Some(IssueStatus::InProgress),
