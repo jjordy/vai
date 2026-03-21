@@ -3,12 +3,14 @@
 //! Uses `clap` derive API to define all vai subcommands.
 //! Each command handler lives in its own submodule.
 
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use thiserror::Error;
 
 use crate::graph::GraphSnapshot;
 use crate::repo;
+use crate::workspace;
 
 /// Errors that can occur during CLI execution.
 #[derive(Debug, Error)]
@@ -18,6 +20,9 @@ pub enum CliError {
 
     #[error("Graph error: {0}")]
     Graph(#[from] crate::graph::GraphError),
+
+    #[error("Workspace error: {0}")]
+    Workspace(#[from] workspace::WorkspaceError),
 
     #[error("{0}")]
     Other(String),
@@ -202,9 +207,115 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 }
             }
         }
+        Some(Commands::Workspace(ws_cmd)) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+            let head = repo::read_head(&vai_dir)
+                .map_err(|e| CliError::Other(format!("cannot read HEAD: {e}")))?;
+
+            match ws_cmd {
+                WorkspaceCommands::Create { intent } => {
+                    let result = workspace::create(&vai_dir, &intent, &head)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        println!(
+                            "{} Created workspace {}",
+                            "✓".green(),
+                            result.workspace.id.to_string().cyan()
+                        );
+                        println!("  Intent : {}", result.workspace.intent);
+                        println!("  Base   : {}", result.workspace.base_version);
+                        println!("  Path   : {}", result.path.display());
+                    }
+                }
+                WorkspaceCommands::List => {
+                    let workspaces = workspace::list(&vai_dir)?;
+                    let active_id = workspace::active_id(&vai_dir);
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&workspaces).unwrap());
+                    } else if workspaces.is_empty() {
+                        println!("No active workspaces.");
+                    } else {
+                        println!("{:<38}  {:<8}  {:<30}  Created", "ID", "Status", "Intent");
+                        println!("{}", "-".repeat(100));
+                        for ws in &workspaces {
+                            let marker = if active_id.as_deref() == Some(&ws.id.to_string()) {
+                                "*"
+                            } else {
+                                " "
+                            };
+                            let age = format_age(ws.created_at);
+                            println!(
+                                "{}{:<38}  {:<8}  {:<30}  {}",
+                                marker,
+                                ws.id,
+                                ws.status.as_str(),
+                                truncate(&ws.intent, 30),
+                                age
+                            );
+                        }
+                    }
+                }
+                WorkspaceCommands::Switch { id } => {
+                    let meta = workspace::switch(&vai_dir, &id)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&meta).unwrap());
+                    } else {
+                        println!(
+                            "{} Switched to workspace {}",
+                            "✓".green(),
+                            meta.id.to_string().cyan()
+                        );
+                        println!("  Intent : {}", meta.intent);
+                    }
+                }
+                WorkspaceCommands::Discard { id } => {
+                    let meta = workspace::discard(&vai_dir, &id, None)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&meta).unwrap());
+                    } else {
+                        println!(
+                            "{} Discarded workspace {}",
+                            "✓".green(),
+                            meta.id.to_string().cyan()
+                        );
+                    }
+                }
+                WorkspaceCommands::Diff { .. } | WorkspaceCommands::Submit => {
+                    eprintln!("Command not yet implemented.");
+                }
+            }
+        }
         Some(cmd) => {
             eprintln!("Command not yet implemented: {cmd:?}");
         }
     }
     Ok(())
+}
+
+/// Truncates a string to `max` characters, appending `…` if needed.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max - 1])
+    }
+}
+
+/// Returns a human-readable age string (e.g. "5m ago", "2h ago").
+fn format_age(dt: DateTime<Utc>) -> String {
+    let secs = (Utc::now() - dt).num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
