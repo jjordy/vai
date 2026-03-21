@@ -15,6 +15,7 @@ pub mod issue;
 pub mod merge;
 pub mod remote_workspace;
 pub mod repo;
+pub mod scope_inference;
 pub mod server;
 pub mod sync;
 pub mod version;

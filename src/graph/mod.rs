@@ -178,7 +178,8 @@ pub struct Relationship {
 }
 
 impl Relationship {
-    fn new(kind: RelationshipKind, from_entity: &str, to_entity: &str) -> Self {
+    /// Creates a new `Relationship`, computing a stable ID from the kind and entity IDs.
+    pub fn new(kind: RelationshipKind, from_entity: &str, to_entity: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(kind.as_str().as_bytes());
         hasher.update(b"::");
@@ -362,6 +363,25 @@ impl GraphSnapshot {
              FROM entities WHERE name LIKE ?1 ORDER BY file_path, line_start",
         )?;
         let rows = stmt.query_map(params![like_pattern], row_to_entity)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Returns entities whose name, qualified name, or file path contains `term` (case-insensitive).
+    ///
+    /// Wider than [`search_entities_by_name`] — useful for intent-based scope inference
+    /// where a term might correspond to a file path component or module path.
+    pub fn search_entities_broad(&self, term: &str) -> Result<Vec<Entity>, GraphError> {
+        let like = format!("%{}%", term.to_lowercase());
+        let mut stmt = self.db.prepare(
+            "SELECT id, kind, name, qualified_name, file_path, byte_start, byte_end,
+                    line_start, line_end, parent_entity
+             FROM entities
+             WHERE lower(name) LIKE ?1
+                OR lower(qualified_name) LIKE ?2
+                OR lower(file_path) LIKE ?3
+             ORDER BY file_path, line_start",
+        )?;
+        let rows = stmt.query_map(params![like, like, like], row_to_entity)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 

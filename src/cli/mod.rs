@@ -14,6 +14,7 @@ use crate::clone as remote_clone;
 use crate::diff;
 use crate::event_log::EventLog;
 use crate::graph::{GraphSnapshot, GraphStats};
+use crate::scope_inference;
 use crate::escalation::{EscalationStatus, EscalationStore, ResolutionOption};
 use crate::issue::{IssueFilter, IssueStore, IssuePriority, IssueResolution, IssueStatus};
 use crate::merge;
@@ -67,6 +68,9 @@ pub enum CliError {
 
     #[error("Escalation error: {0}")]
     Escalation(#[from] crate::escalation::EscalationError),
+
+    #[error("Scope inference error: {0}")]
+    ScopeInference(#[from] scope_inference::ScopeInferenceError),
 
     #[error("{0}")]
     Other(String),
@@ -342,6 +346,14 @@ pub enum GraphCommands {
         /// Entity name to search for.
         name: String,
     },
+    /// Infer which entities are likely to be affected by a natural-language intent.
+    Infer {
+        /// Free-text description of the planned change.
+        intent: String,
+        /// Number of relationship hops to traverse from direct matches (default: 2).
+        #[arg(long, default_value_t = 2)]
+        hops: usize,
+    },
 }
 
 /// Execute a parsed CLI command.
@@ -400,6 +412,38 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                                 e.file_path,
                                 e.line_range.0,
                             );
+                        }
+                    }
+                }
+                GraphCommands::Infer { intent, hops } => {
+                    let result = scope_inference::infer(&snapshot, &intent, hops)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        println!("{}", "Scope inference".bold());
+                        println!("  Intent : {}", result.intent);
+                        println!("  Terms  : {}", result.terms.join(", "));
+                        println!(
+                            "  Found  : {} entities predicted",
+                            result.predicted_scope.len()
+                        );
+                        if result.predicted_scope.is_empty() {
+                            println!("\n  No matching entities found in graph.");
+                        } else {
+                            println!();
+                            for scoped in &result.predicted_scope {
+                                println!(
+                                    "  [{conf}] {kind} {name}  {file}:{line}",
+                                    conf = scoped.confidence.label().cyan(),
+                                    kind = scoped.entity.kind.as_str(),
+                                    name = scoped.entity.qualified_name.bold(),
+                                    file = scoped.entity.file_path,
+                                    line = scoped.entity.line_range.0,
+                                );
+                                if !cli.quiet {
+                                    println!("         ↳ {}", scoped.reason);
+                                }
+                            }
                         }
                     }
                 }
