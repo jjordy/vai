@@ -50,6 +50,7 @@ use tokio::sync::broadcast;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use crate::auth;
+use crate::conflict;
 use crate::event_log::{EventKind, EventLog};
 use crate::graph::GraphSnapshot;
 use crate::merge;
@@ -180,6 +181,8 @@ pub(crate) struct AppState {
     vai_version: String,
     /// Broadcast channel for real-time event streaming to WebSocket clients.
     event_tx: broadcast::Sender<BroadcastEvent>,
+    /// Conflict engine — tracks workspace scopes and detects overlaps.
+    conflict_engine: Arc<Mutex<conflict::ConflictEngine>>,
 }
 
 impl AppState {
@@ -507,10 +510,14 @@ async fn submit_workspace_handler(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<SubmitResponse>, ApiError> {
     // Verify the workspace exists before switching.
-    workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
+    let meta = workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
+    let workspace_uuid = meta.id;
     // Make it the active workspace so merge::submit can find it.
     workspace::switch(&state.vai_dir, &id).map_err(ApiError::from)?;
     let result = merge::submit(&state.vai_dir, &state.repo_root).map_err(ApiError::from)?;
+
+    // Remove from conflict engine — workspace is no longer active.
+    state.conflict_engine.lock().await.remove_workspace(&workspace_uuid);
 
     // Broadcast the submit/merge event.
     state.broadcast(BroadcastEvent {
@@ -538,7 +545,16 @@ async fn discard_workspace_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
+    // Resolve UUID before discarding so we can remove it from the conflict engine.
+    let ws_uuid = workspace::get(&state.vai_dir, &id)
+        .map(|m| m.id)
+        .ok();
     workspace::discard(&state.vai_dir, &id, None).map_err(ApiError::from)?;
+
+    // Remove from conflict engine — workspace is no longer active.
+    if let Some(uuid) = ws_uuid {
+        state.conflict_engine.lock().await.remove_workspace(&uuid);
+    }
 
     // Broadcast discard event.
     state.broadcast(BroadcastEvent {
@@ -962,10 +978,61 @@ async fn upload_workspace_files_handler(
     state.broadcast(BroadcastEvent {
         event_type: "FilesUploaded".to_string(),
         event_id: 0,
-        workspace_id: Some(id),
+        workspace_id: Some(id.clone()),
         timestamp: chrono::Utc::now().to_rfc3339(),
         data: serde_json::json!({ "paths": uploaded_paths }),
     });
+
+    // Run conflict overlap detection and notify affected workspaces.
+    {
+        let mut engine = state.conflict_engine.lock().await;
+        match engine.update_scope(workspace_uuid, &meta.intent, &uploaded_paths, &state.vai_dir) {
+            Ok(overlaps) => {
+                for overlap in overlaps {
+                    let ts = chrono::Utc::now().to_rfc3339();
+                    let payload = serde_json::json!({
+                        "type": "overlap_detected",
+                        "severity": overlap.level.as_str(),
+                        "your_workspace": overlap.your_workspace.to_string(),
+                        "other_workspace": overlap.other_workspace.to_string(),
+                        "other_intent": overlap.other_intent,
+                        "overlapping_files": overlap.overlapping_files,
+                        "overlapping_entities": overlap.overlapping_entities,
+                        "recommendation": overlap.recommendation,
+                    });
+                    // Notify the workspace whose scope was just updated.
+                    state.broadcast(BroadcastEvent {
+                        event_type: "OverlapDetected".to_string(),
+                        event_id: 0,
+                        workspace_id: Some(overlap.your_workspace.to_string()),
+                        timestamp: ts.clone(),
+                        data: payload.clone(),
+                    });
+                    // Also notify the other overlapping workspace.
+                    let mirrored = serde_json::json!({
+                        "type": "overlap_detected",
+                        "severity": overlap.level.as_str(),
+                        "your_workspace": overlap.other_workspace.to_string(),
+                        "other_workspace": overlap.your_workspace.to_string(),
+                        "other_intent": meta.intent,
+                        "overlapping_files": overlap.overlapping_files,
+                        "overlapping_entities": overlap.overlapping_entities,
+                        "recommendation": overlap.recommendation,
+                    });
+                    state.broadcast(BroadcastEvent {
+                        event_type: "OverlapDetected".to_string(),
+                        event_id: 0,
+                        workspace_id: Some(overlap.other_workspace.to_string()),
+                        timestamp: ts,
+                        data: mirrored,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!("conflict engine error: {e}");
+            }
+        }
+    }
 
     let count = uploaded_paths.len();
     Ok((
@@ -1408,6 +1475,7 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
         repo_name: repo_config.name.clone(),
         vai_version: env!("CARGO_PKG_VERSION").to_string(),
         event_tx,
+        conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
     });
 
     let app = build_app(state);
@@ -1498,6 +1566,7 @@ mod tests {
             repo_name: repo_config.name.clone(),
             vai_version: env!("CARGO_PKG_VERSION").to_string(),
             event_tx,
+            conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
         });
 
         let app = build_app(Arc::clone(&state));
