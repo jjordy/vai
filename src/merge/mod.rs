@@ -793,6 +793,7 @@ fn merge_by_entity_substitution(
 /// - Entity removed in workspace but still modified by HEAD.
 /// - Workspace-removed entity whose name is still referenced in HEAD content
 ///   (proxy for "old name used after rename").
+#[allow(clippy::too_many_arguments)]
 fn detect_referential_conflicts(
     file_path: &str,
     workspace_id: Uuid,

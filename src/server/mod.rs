@@ -13,6 +13,9 @@
 //!   - `GET /api/versions` — list version history (optional `?limit=N`)
 //!   - `GET /api/versions/:id` — version details with entity-level changes
 //!   - `POST /api/versions/rollback` — rollback to a prior version
+//!   - `POST /api/workspaces/:id/files` — upload files into a workspace overlay (base64 JSON)
+//!   - `GET /api/workspaces/:id/files/*path` — download a file from workspace (overlay or base)
+//!   - `GET /api/files/*path` — download a file from the current main version
 //!
 //! ## WebSocket Endpoints
 //!   - `GET /ws/events?key=<api_key>` — real-time event stream
@@ -40,7 +43,10 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
 use crate::auth;
+use crate::event_log::{EventKind, EventLog};
 use crate::merge;
 use crate::repo;
 use crate::version;
@@ -275,6 +281,13 @@ impl ApiError {
     fn unauthorized(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
+            message: msg.into(),
+        }
+    }
+
+    fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
             message: msg.into(),
         }
     }
@@ -779,6 +792,253 @@ async fn handle_ws_connection(
     recv_task.abort();
 }
 
+// ── File upload / download ────────────────────────────────────────────────────
+
+/// Maximum allowed size for a single uploaded file (10 MiB).
+const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024;
+
+/// A single file entry within an upload request.
+#[derive(Debug, Deserialize)]
+struct FileUploadEntry {
+    /// Path relative to the repository root (e.g. `src/auth.rs`).
+    path: String,
+    /// File content encoded as standard (padded) base64.
+    content_base64: String,
+}
+
+/// Request body for `POST /api/workspaces/:id/files`.
+#[derive(Debug, Deserialize)]
+struct UploadFilesRequest {
+    /// One or more files to upload into the workspace overlay.
+    files: Vec<FileUploadEntry>,
+}
+
+/// Response body for a successful file upload.
+#[derive(Debug, Serialize)]
+struct UploadFilesResponse {
+    /// Number of files successfully written.
+    uploaded: usize,
+    /// Repository-relative paths of all written files.
+    paths: Vec<String>,
+}
+
+/// Response body for file download endpoints.
+#[derive(Debug, Serialize)]
+struct FileDownloadResponse {
+    /// Path relative to the repository root.
+    path: String,
+    /// File content encoded as standard (padded) base64.
+    content_base64: String,
+    /// File size in bytes.
+    size: usize,
+    /// Where the file was sourced: `"overlay"` or `"base"`.
+    found_in: String,
+}
+
+/// Validates and normalises a client-supplied file path.
+///
+/// Returns `None` if the path is absolute or contains any parent-directory
+/// (`..`) components, preventing directory-traversal attacks.
+fn sanitize_path(raw: &str) -> Option<std::path::PathBuf> {
+    let trimmed = raw.trim_start_matches('/');
+    let pb = std::path::PathBuf::from(trimmed);
+    if pb.is_absolute() {
+        return None;
+    }
+    if pb.components().any(|c| c == std::path::Component::ParentDir) {
+        return None;
+    }
+    Some(pb)
+}
+
+/// Computes the hex-encoded SHA-256 digest of `data`.
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    format!("{:x}", h.finalize())
+}
+
+/// `POST /api/workspaces/:id/files` — uploads one or more files into the
+/// workspace overlay.
+///
+/// Each file's content must be standard base64-encoded. Binary files are fully
+/// supported. Files larger than 10 MiB are rejected with 400 Bad Request.
+///
+/// - If the file already exists in the overlay a `FileModified` event is
+///   recorded; otherwise a `FileAdded` event is recorded.
+/// - On first upload the workspace transitions from `Created` → `Active`.
+/// - Broadcasts a `FilesUploaded` WebSocket event on success.
+async fn upload_workspace_files_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<UploadFilesRequest>,
+) -> Result<(StatusCode, Json<UploadFilesResponse>), ApiError> {
+    let mut meta = workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
+    let overlay = workspace::overlay_dir(&state.vai_dir, &id);
+    let log_dir = state.vai_dir.join("event_log");
+    let workspace_uuid = meta.id;
+
+    let mut uploaded_paths: Vec<String> = Vec::new();
+
+    for entry in &body.files {
+        // Decode base64 content.
+        let content = BASE64
+            .decode(&entry.content_base64)
+            .map_err(|e| ApiError::bad_request(format!("base64 decode error for '{}': {e}", entry.path)))?;
+
+        // Enforce per-file size limit.
+        if content.len() > MAX_FILE_SIZE_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "file '{}' exceeds 10 MiB limit ({} bytes)",
+                entry.path,
+                content.len()
+            )));
+        }
+
+        // Validate and normalise the path.
+        let rel = sanitize_path(&entry.path)
+            .ok_or_else(|| ApiError::bad_request(format!("invalid path: '{}'", entry.path)))?;
+
+        let dest = overlay.join(&rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ApiError::internal(format!("create dirs: {e}")))?;
+        }
+
+        // Determine whether this is an add or a modify.
+        let new_hash = sha256_hex(&content);
+        let is_new = !dest.exists();
+        let old_hash = if !is_new {
+            sha256_hex(
+                &std::fs::read(&dest)
+                    .map_err(|e| ApiError::internal(format!("read existing overlay file: {e}")))?,
+            )
+        } else {
+            String::new()
+        };
+
+        std::fs::write(&dest, &content)
+            .map_err(|e| ApiError::internal(format!("write overlay file: {e}")))?;
+
+        // Append to event log.
+        let path_str = rel.to_string_lossy().replace('\\', "/");
+        let mut log = EventLog::open(&log_dir)
+            .map_err(|e| ApiError::internal(format!("event log: {e}")))?;
+        if is_new {
+            log.append(EventKind::FileAdded {
+                workspace_id: workspace_uuid,
+                path: path_str.clone(),
+                hash: new_hash,
+            })
+            .map_err(|e| ApiError::internal(format!("event log append: {e}")))?;
+        } else {
+            log.append(EventKind::FileModified {
+                workspace_id: workspace_uuid,
+                path: path_str.clone(),
+                old_hash,
+                new_hash,
+            })
+            .map_err(|e| ApiError::internal(format!("event log append: {e}")))?;
+        }
+
+        uploaded_paths.push(path_str);
+    }
+
+    // Transition workspace to Active on first file upload.
+    if meta.status == workspace::WorkspaceStatus::Created && !uploaded_paths.is_empty() {
+        meta.status = workspace::WorkspaceStatus::Active;
+        meta.updated_at = chrono::Utc::now();
+        workspace::update_meta(&state.vai_dir, &meta)
+            .map_err(|e| ApiError::internal(format!("update workspace meta: {e}")))?;
+    }
+
+    // Broadcast a WebSocket notification.
+    state.broadcast(BroadcastEvent {
+        event_type: "FilesUploaded".to_string(),
+        event_id: 0,
+        workspace_id: Some(id),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        data: serde_json::json!({ "paths": uploaded_paths }),
+    });
+
+    let count = uploaded_paths.len();
+    Ok((
+        StatusCode::OK,
+        Json(UploadFilesResponse {
+            uploaded: count,
+            paths: uploaded_paths,
+        }),
+    ))
+}
+
+/// `GET /api/workspaces/:id/files/*path` — downloads a file from a workspace.
+///
+/// The overlay is checked first; if the file is not present there the base
+/// repository (repo root) is used as a fallback. Returns 404 if the file
+/// exists in neither location. Response includes `found_in: "overlay"|"base"`.
+async fn get_workspace_file_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath((id, path)): AxumPath<(String, String)>,
+) -> Result<Json<FileDownloadResponse>, ApiError> {
+    // Verify workspace exists.
+    workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
+
+    let rel = sanitize_path(&path)
+        .ok_or_else(|| ApiError::bad_request(format!("invalid path: '{path}'")))?;
+
+    // Try overlay first.
+    let overlay_path = workspace::overlay_dir(&state.vai_dir, &id).join(&rel);
+    let (content, found_in) = if overlay_path.exists() {
+        let bytes = std::fs::read(&overlay_path)
+            .map_err(|e| ApiError::internal(format!("read overlay file: {e}")))?;
+        (bytes, "overlay".to_string())
+    } else {
+        let base_path = state.repo_root.join(&rel);
+        if !base_path.exists() {
+            return Err(ApiError::not_found(format!("file not found: '{path}'")));
+        }
+        let bytes = std::fs::read(&base_path)
+            .map_err(|e| ApiError::internal(format!("read base file: {e}")))?;
+        (bytes, "base".to_string())
+    };
+
+    let size = content.len();
+    Ok(Json(FileDownloadResponse {
+        path: rel.to_string_lossy().replace('\\', "/"),
+        content_base64: BASE64.encode(&content),
+        size,
+        found_in,
+    }))
+}
+
+/// `GET /api/files/*path` — downloads a file from the current main version.
+///
+/// Returns the file as base64-encoded content. Returns 404 if not found.
+async fn get_main_file_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(path): AxumPath<String>,
+) -> Result<Json<FileDownloadResponse>, ApiError> {
+    let rel = sanitize_path(&path)
+        .ok_or_else(|| ApiError::bad_request(format!("invalid path: '{path}'")))?;
+
+    let file_path = state.repo_root.join(&rel);
+    if !file_path.exists() {
+        return Err(ApiError::not_found(format!("file not found: '{path}'")));
+    }
+
+    let content = std::fs::read(&file_path)
+        .map_err(|e| ApiError::internal(format!("read file: {e}")))?;
+
+    let size = content.len();
+    Ok(Json(FileDownloadResponse {
+        path: rel.to_string_lossy().replace('\\', "/"),
+        content_base64: BASE64.encode(&content),
+        size,
+        found_in: "base".to_string(),
+    }))
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -806,7 +1066,10 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/workspaces", get(list_workspaces_handler))
         .route("/api/workspaces/:id", get(get_workspace_handler))
         .route("/api/workspaces/:id/submit", post(submit_workspace_handler))
+        .route("/api/workspaces/:id/files", post(upload_workspace_files_handler))
+        .route("/api/workspaces/:id/files/*path", get(get_workspace_file_handler))
         .route("/api/workspaces/:id", delete(discard_workspace_handler))
+        .route("/api/files/*path", get(get_main_file_handler))
         .route("/api/versions", get(list_versions_handler))
         // Static route registered before the dynamic one so that
         // POST /api/versions/rollback is never captured by :id.
@@ -1590,6 +1853,251 @@ mod tests {
         assert_eq!(resp.status(), 200, "force rollback should succeed");
         let result: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(result["new_version"]["version_id"], "v4");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    // ── File upload / download tests ───────────────────────────────────────────
+
+    /// Upload a text file and a binary file into a workspace, then download
+    /// each one back and verify the content round-trips correctly.
+    #[tokio::test]
+    async fn file_upload_download_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Create a workspace.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "file upload test" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let ws: serde_json::Value = resp.json().await.unwrap();
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        // Prepare a text file and a small binary file.
+        let text_content = b"pub fn new_func() -> u32 { 42 }\n";
+        let binary_content: Vec<u8> = (0u8..=255).collect(); // 256 bytes
+
+        let text_b64 = BASE64.encode(text_content);
+        let binary_b64 = BASE64.encode(&binary_content);
+
+        // Upload both files via POST /api/workspaces/:id/files.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "files": [
+                    { "path": "src/new.rs",  "content_base64": text_b64   },
+                    { "path": "data/bin.bin","content_base64": binary_b64 },
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "upload should return 200");
+        let upload_result: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(upload_result["uploaded"], 2);
+        let paths = upload_result["paths"].as_array().unwrap();
+        assert!(paths.iter().any(|p| p == "src/new.rs"), "src/new.rs should be listed");
+        assert!(paths.iter().any(|p| p == "data/bin.bin"), "data/bin.bin should be listed");
+
+        // Workspace should now be Active.
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces/{ws_id}"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        let ws_detail: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ws_detail["status"], "Active", "workspace should be Active after upload");
+
+        // Download text file from overlay.
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces/{ws_id}/files/src/new.rs"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let dl: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(dl["found_in"], "overlay");
+        assert_eq!(dl["size"], text_content.len() as u64);
+        let decoded = BASE64.decode(dl["content_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded, text_content);
+
+        // Download binary file from overlay.
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces/{ws_id}/files/data/bin.bin"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let dl: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(dl["found_in"], "overlay");
+        let decoded = BASE64.decode(dl["content_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded, binary_content);
+
+        // Download a file not in overlay — falls back to base (repo root).
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces/{ws_id}/files/src/lib.rs"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let dl: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(dl["found_in"], "base");
+        let decoded = BASE64.decode(dl["content_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded, b"pub fn hello() {}\n");
+
+        // Download from main version via GET /api/files/:path.
+        let resp = client
+            .get(format!("http://{addr}/api/files/src/lib.rs"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let dl: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(dl["found_in"], "base");
+        let decoded = BASE64.decode(dl["content_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded, b"pub fn hello() {}\n");
+
+        // 404 for non-existent file.
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces/{ws_id}/files/does/not/exist.txt"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        // 404 for non-existent main file.
+        let resp = client
+            .get(format!("http://{addr}/api/files/does/not/exist.txt"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Re-uploading a file that already exists in the overlay is treated as a
+    /// modify (FileModified event) rather than an add.
+    #[tokio::test]
+    async fn file_upload_modify_existing() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Create workspace.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "modify test" }))
+            .send()
+            .await
+            .unwrap();
+        let ws: serde_json::Value = resp.json().await.unwrap();
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        let upload_file = |content: &'static [u8]| {
+            let b64 = BASE64.encode(content);
+            serde_json::json!({
+                "files": [{ "path": "src/lib.rs", "content_base64": b64 }]
+            })
+        };
+
+        // First upload: FileAdded.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+            .bearer_auth(&key)
+            .json(&upload_file(b"pub fn hello() {}\npub fn world() {}\n"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Second upload of the same path: FileModified.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+            .bearer_auth(&key)
+            .json(&upload_file(b"pub fn hello() {}\npub fn world() {}\npub fn foo() {}\n"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Verify final content is the latest upload.
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces/{ws_id}/files/src/lib.rs"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let dl: serde_json::Value = resp.json().await.unwrap();
+        let decoded = BASE64.decode(dl["content_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            decoded,
+            b"pub fn hello() {}\npub fn world() {}\npub fn foo() {}\n"
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Path traversal attempts are rejected with 400 Bad Request.
+    #[tokio::test]
+    async fn file_upload_path_traversal_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Create workspace.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "traversal test" }))
+            .send()
+            .await
+            .unwrap();
+        let ws: serde_json::Value = resp.json().await.unwrap();
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        let b64 = BASE64.encode(b"evil content");
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "files": [{ "path": "../../etc/passwd", "content_base64": b64 }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "path traversal should be rejected");
 
         shutdown_tx.send(()).ok();
     }
