@@ -239,6 +239,12 @@ pub fn read_head(vai_dir: &Path) -> Result<String, RepoError> {
     Ok(head.trim().to_string())
 }
 
+/// Reads the repository configuration from `.vai/config.toml`.
+pub fn read_config(vai_dir: &Path) -> Result<RepoConfig, RepoError> {
+    let raw = fs::read_to_string(vai_dir.join("config.toml"))?;
+    Ok(toml::from_str(&raw)?)
+}
+
 // ── Source file collection ─────────────────────────────────────────────────────
 
 /// Recursively collects all `.rs` source files under `root`, respecting ignore patterns.

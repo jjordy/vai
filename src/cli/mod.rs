@@ -6,14 +6,17 @@
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::diff;
-use crate::graph::GraphSnapshot;
+use crate::graph::{GraphSnapshot, GraphStats};
 use crate::merge;
 use crate::repo;
+use crate::version::VersionMeta;
 use crate::version;
 use crate::workspace;
+use crate::workspace::WorkspaceMeta;
 
 /// Errors that can occur during CLI execution.
 #[derive(Debug, Error)]
@@ -528,11 +531,110 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 }
             }
         }
-        Some(cmd) => {
-            eprintln!("Command not yet implemented: {cmd:?}");
+        Some(Commands::Status) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            match repo::find_root(&cwd) {
+                None => {
+                    if cli.json {
+                        println!("{{\"error\":\"not inside a vai repository\"}}");
+                    } else {
+                        eprintln!("{} Not inside a vai repository (no .vai/ directory found)", "✗".red());
+                    }
+                }
+                Some(root) => {
+                    let vai_dir = root.join(".vai");
+                    let config = repo::read_config(&vai_dir)
+                        .map_err(|e| CliError::Other(format!("cannot read config: {e}")))?;
+                    let head = repo::read_head(&vai_dir)
+                        .map_err(|e| CliError::Other(format!("cannot read HEAD: {e}")))?;
+                    let head_version = version::get_version(&vai_dir, &head)?;
+                    let snapshot_path = vai_dir.join("graph").join("snapshot.db");
+                    let snapshot = GraphSnapshot::open(&snapshot_path)?;
+                    let graph_stats = snapshot.stats()?;
+                    let workspaces = workspace::list(&vai_dir)?;
+                    let active_id = workspace::active_id(&vai_dir);
+
+                    if cli.json {
+                        let out = StatusOutput {
+                            repo_name: config.name.clone(),
+                            head_version: head_version.clone(),
+                            graph_stats,
+                            workspaces: workspaces.clone(),
+                            pending_conflicts: 0,
+                        };
+                        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                    } else {
+                        println!("{} repository: {}", "vai".bold(), config.name.bold());
+                        println!(
+                            "Current version: {} \"{}\"",
+                            head_version.version_id.bold(),
+                            head_version.intent
+                        );
+                        println!();
+                        print_graph_stats(&graph_stats);
+                        println!();
+                        println!("Active workspaces: {}", workspaces.len());
+                        for ws in &workspaces {
+                            let marker = if active_id.as_deref() == Some(&ws.id.to_string()) {
+                                "*"
+                            } else {
+                                " "
+                            };
+                            let age = format_age(ws.created_at);
+                            println!(
+                                "  {}{}  {:<30}  {:<8}  {}",
+                                marker,
+                                ws.id.to_string()[..8].dimmed(),
+                                truncate(&ws.intent, 30),
+                                ws.status.as_str(),
+                                age
+                            );
+                        }
+                        println!();
+                        println!("Pending conflicts: 0");
+                    }
+                }
+            }
+        }
+        Some(Commands::Rollback { version, force: _, entity: _ }) => {
+            eprintln!("Command not yet implemented: rollback {version}");
+        }
+        Some(Commands::Merge(merge_cmd)) => {
+            eprintln!("Command not yet implemented: merge {merge_cmd:?}");
         }
     }
     Ok(())
+}
+
+/// Machine-readable output for `vai status`.
+#[derive(Debug, Serialize)]
+struct StatusOutput {
+    repo_name: String,
+    head_version: VersionMeta,
+    graph_stats: GraphStats,
+    workspaces: Vec<WorkspaceMeta>,
+    pending_conflicts: u32,
+}
+
+/// Prints graph statistics in the standard human-readable format.
+fn print_graph_stats(stats: &GraphStats) {
+    let by_kind_summary: Vec<String> = stats
+        .by_kind
+        .iter()
+        .map(|(k, v)| format!("{v} {k}s"))
+        .collect();
+    let summary = if by_kind_summary.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", by_kind_summary.join(", "))
+    };
+    println!("Semantic graph:");
+    println!(
+        "  {} entities{}",
+        stats.entity_count, summary
+    );
+    println!("  {} relationships", stats.relationship_count);
 }
 
 /// Truncates a string to `max` characters, appending `…` if needed.
@@ -555,5 +657,75 @@ fn format_age(dt: DateTime<Utc>) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86400)
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use tempfile::TempDir;
+
+    use crate::{graph::GraphSnapshot, repo, version, workspace};
+
+    /// Init a repo, create two workspaces, then verify the status data is correct.
+    #[test]
+    fn status_data_reflects_repo_state() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Write a small Rust source file so the graph has some entities.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src").join("lib.rs"),
+            b"pub fn greet() {}\npub struct Config;\n",
+        )
+        .unwrap();
+
+        repo::init(root).unwrap();
+        let vai_dir = root.join(".vai");
+
+        // HEAD should be v1 after init.
+        let head = repo::read_head(&vai_dir).unwrap();
+        assert_eq!(head, "v1");
+
+        // Config should round-trip correctly.
+        let config = repo::read_config(&vai_dir).unwrap();
+        assert_eq!(config.name, root.file_name().unwrap().to_string_lossy().as_ref());
+
+        // Head version metadata.
+        let head_version = version::get_version(&vai_dir, &head).unwrap();
+        assert_eq!(head_version.version_id, "v1");
+        assert_eq!(head_version.intent, "initial repository");
+
+        // Graph stats should reflect the parsed file.
+        let snapshot = GraphSnapshot::open(&vai_dir.join("graph").join("snapshot.db")).unwrap();
+        let stats = snapshot.stats().unwrap();
+        assert!(stats.entity_count >= 2, "expected at least 2 entities");
+
+        // No workspaces yet.
+        let ws_list = workspace::list(&vai_dir).unwrap();
+        assert!(ws_list.is_empty());
+
+        // Create two workspaces.
+        workspace::create(&vai_dir, "fix auth bug", &head).unwrap();
+        workspace::create(&vai_dir, "add logging", &head).unwrap();
+
+        let ws_list = workspace::list(&vai_dir).unwrap();
+        assert_eq!(ws_list.len(), 2);
+
+        // Active workspace should be the most recently created one.
+        let active_id = workspace::active_id(&vai_dir);
+        assert!(active_id.is_some());
+        assert_eq!(active_id.unwrap(), ws_list[0].id.to_string());
+    }
+
+    /// `read_config` should fail gracefully on a non-repo directory.
+    #[test]
+    fn read_config_fails_outside_repo() {
+        let tmp = TempDir::new().unwrap();
+        let result = repo::read_config(&tmp.path().join(".vai"));
+        assert!(result.is_err());
     }
 }
