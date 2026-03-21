@@ -1,19 +1,21 @@
 //! Repository management — initialization and discovery of `.vai/` repositories.
 //!
-//! This module handles `vai init` (creating the `.vai/` directory structure and
-//! recording the first event) and `find_root` (walking up the directory tree to
-//! locate an existing repository).
+//! This module handles `vai init` (creating the `.vai/` directory structure,
+//! recording the first event, and building the initial semantic graph) and
+//! `find_root` (walking up the directory tree to locate an existing repository).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::event_log::{EventKind, EventLog};
+use crate::graph::{GraphSnapshot, GraphStats};
 
 /// Errors that can occur during repository operations.
 #[derive(Debug, Error)]
@@ -29,6 +31,9 @@ pub enum RepoError {
 
     #[error("Event log error: {0}")]
     EventLog(#[from] crate::event_log::EventLogError),
+
+    #[error("Graph error: {0}")]
+    Graph(#[from] crate::graph::GraphError),
 
     #[error("vai repository already initialized at {0}")]
     AlreadyInitialized(PathBuf),
@@ -105,6 +110,10 @@ pub struct InitResult {
     pub config: RepoConfig,
     /// Initial version metadata.
     pub version: VersionMeta,
+    /// Number of source files parsed during initialization.
+    pub files_parsed: usize,
+    /// Semantic graph statistics after initial parse.
+    pub graph_stats: GraphStats,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -131,10 +140,14 @@ pub fn init(root: &Path) -> Result<InitResult, RepoError> {
 
     // ── vai.toml at project root ──────────────────────────────────────────────
     let vai_toml_path = root.join("vai.toml");
-    if !vai_toml_path.exists() {
-        let vai_toml = VaiToml::default();
-        fs::write(&vai_toml_path, toml::to_string_pretty(&vai_toml)?)?;
-    }
+    let vai_toml: VaiToml = if vai_toml_path.exists() {
+        let raw = fs::read_to_string(&vai_toml_path)?;
+        toml::from_str(&raw)?
+    } else {
+        let default = VaiToml::default();
+        fs::write(&vai_toml_path, toml::to_string_pretty(&default)?)?;
+        default
+    };
 
     // ── .vai/config.toml ─────────────────────────────────────────────────────
     let repo_name = root
@@ -178,10 +191,45 @@ pub fn init(root: &Path) -> Result<InitResult, RepoError> {
     // ── HEAD pointer ──────────────────────────────────────────────────────────
     fs::write(vai_dir.join("head"), "v1\n")?;
 
+    // ── Semantic graph: parse all source files ────────────────────────────────
+    let source_files = collect_source_files(root, &vai_toml.ignore);
+    let snapshot_path = vai_dir.join("graph").join("snapshot.db");
+    let snapshot = GraphSnapshot::open(&snapshot_path)?;
+
+    let pb = ProgressBar::new(source_files.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{prefix:.bold} [{bar:40}] {pos}/{len} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=> "),
+    );
+    pb.set_prefix("Parsing");
+
+    let mut files_parsed = 0usize;
+    for file_path in &source_files {
+        let rel = file_path
+            .strip_prefix(root)
+            .unwrap_or(file_path)
+            .to_string_lossy()
+            .into_owned();
+        pb.set_message(rel.clone());
+        if let Ok(source) = fs::read(file_path) {
+            // Errors on individual files are skipped — best-effort parse.
+            let _ = snapshot.update_file(&rel, &source);
+            files_parsed += 1;
+        }
+        pb.inc(1);
+    }
+    pb.finish_and_clear();
+
+    let graph_stats = snapshot.stats()?;
+
     Ok(InitResult {
         root: root.to_owned(),
         config,
         version,
+        files_parsed,
+        graph_stats,
     })
 }
 
@@ -207,6 +255,52 @@ pub fn read_head(vai_dir: &Path) -> Result<String, RepoError> {
     Ok(head.trim().to_string())
 }
 
+// ── Source file collection ─────────────────────────────────────────────────────
+
+/// Recursively collects all `.rs` source files under `root`, respecting ignore patterns.
+fn collect_source_files(root: &Path, ignore: &[String]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_recursive(root, ignore, &mut files);
+    files
+}
+
+fn collect_recursive(dir: &Path, ignore: &[String], files: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if path_should_ignore(&name, ignore) {
+            continue;
+        }
+        if path.is_dir() {
+            collect_recursive(&path, ignore, files);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            files.push(path);
+        }
+    }
+}
+
+/// Returns `true` if a file or directory `name` matches any ignore pattern.
+fn path_should_ignore(name: &str, ignore: &[String]) -> bool {
+    for pattern in ignore {
+        let p = pattern.trim_end_matches('/');
+        if let Some(ext) = p.strip_prefix("*.") {
+            if name.ends_with(&format!(".{ext}")) {
+                return true;
+            }
+        } else if name == p {
+            return true;
+        }
+    }
+    false
+}
+
 /// Prints the init result to stdout in human-readable format.
 pub fn print_init_result(result: &InitResult) {
     println!(
@@ -215,11 +309,18 @@ pub fn print_init_result(result: &InitResult) {
         result.config.name.bold()
     );
     println!(
-        "  Repository ID : {}",
+        "  Repository ID  : {}",
         result.config.repo_id.to_string().dimmed()
     );
     println!("  Initial version: v1 \"initial repository\"");
     println!("  Directory      : .vai/");
+    println!();
+    println!(
+        "  Semantic graph : {} entities, {} relationships ({} files parsed)",
+        result.graph_stats.entity_count,
+        result.graph_stats.relationship_count,
+        result.files_parsed,
+    );
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -301,5 +402,42 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let result = find_root(tmp.path());
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn init_builds_graph_for_rust_sources() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Write a sample Rust file before initializing.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src").join("lib.rs"),
+            b"pub fn hello() -> &'static str { \"hello\" }\npub struct Greeter;\n",
+        )
+        .unwrap();
+
+        let result = init(root).unwrap();
+
+        assert_eq!(result.files_parsed, 1, "expected 1 file parsed");
+        assert!(result.graph_stats.entity_count >= 2, "expected at least 2 entities");
+        assert_eq!(result.graph_stats.file_count, 1);
+
+        // The snapshot should be queryable.
+        use crate::graph::GraphSnapshot;
+        let snapshot =
+            GraphSnapshot::open(&root.join(".vai").join("graph").join("snapshot.db")).unwrap();
+        let entities = snapshot.search_entities_by_name("hello").unwrap();
+        assert!(!entities.is_empty(), "expected entity 'hello' in graph");
+    }
+
+    #[test]
+    fn path_should_ignore_matches_dir_and_glob() {
+        let ignore = vec![".vai/".to_string(), "target/".to_string(), "*.o".to_string()];
+        assert!(path_should_ignore(".vai", &ignore));
+        assert!(path_should_ignore("target", &ignore));
+        assert!(path_should_ignore("foo.o", &ignore));
+        assert!(!path_should_ignore("src", &ignore));
+        assert!(!path_should_ignore("main.rs", &ignore));
     }
 }

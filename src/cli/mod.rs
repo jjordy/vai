@@ -4,8 +4,10 @@
 //! Each command handler lives in its own submodule.
 
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 use thiserror::Error;
 
+use crate::graph::GraphSnapshot;
 use crate::repo;
 
 /// Errors that can occur during CLI execution.
@@ -13,6 +15,9 @@ use crate::repo;
 pub enum CliError {
     #[error("Repository error: {0}")]
     Repo(#[from] repo::RepoError),
+
+    #[error("Graph error: {0}")]
+    Graph(#[from] crate::graph::GraphError),
 
     #[error("{0}")]
     Other(String),
@@ -151,6 +156,50 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
             } else {
                 repo::print_init_result(&result);
+            }
+        }
+        Some(Commands::Graph(graph_cmd)) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let snapshot_path = root.join(".vai").join("graph").join("snapshot.db");
+            let snapshot = GraphSnapshot::open(&snapshot_path)?;
+
+            match graph_cmd {
+                GraphCommands::Show => {
+                    let stats = snapshot.stats()?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&stats).unwrap());
+                    } else {
+                        println!("{}", "Semantic graph".bold());
+                        println!("  Entities      : {}", stats.entity_count);
+                        for (kind, count) in &stats.by_kind {
+                            println!("    {kind:<15} {count}");
+                        }
+                        println!("  Relationships : {}", stats.relationship_count);
+                        println!("  Files         : {}", stats.file_count);
+                    }
+                }
+                GraphCommands::Query { name } => {
+                    let entities = snapshot.search_entities_by_name(&name)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&entities).unwrap());
+                    } else if entities.is_empty() {
+                        println!("No entities found matching {:?}", name);
+                    } else {
+                        println!("{} entities matching {:?}:", entities.len(), name);
+                        for e in &entities {
+                            println!(
+                                "  {} {} {}:{}",
+                                e.kind.as_str().cyan(),
+                                e.qualified_name.bold(),
+                                e.file_path,
+                                e.line_range.0,
+                            );
+                        }
+                    }
+                }
             }
         }
         Some(cmd) => {
