@@ -456,6 +456,137 @@ impl GraphSnapshot {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Returns entities filtered by optional `kind`, `file` path, and `name` substring.
+    ///
+    /// - `kind` — matches exact entity kind string (e.g. `"function"`)
+    /// - `file` — matches exact file path
+    /// - `name` — case-insensitive substring match on entity name
+    ///
+    /// All provided filters are combined with AND. Omit a filter by passing `None`.
+    pub fn filter_entities(
+        &self,
+        kind: Option<&str>,
+        file: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<Vec<Entity>, GraphError> {
+        let mut sql = String::from(
+            "SELECT id, kind, name, qualified_name, file_path, byte_start, byte_end,
+                    line_start, line_end, parent_entity
+             FROM entities WHERE 1=1",
+        );
+        let mut params: Vec<String> = Vec::new();
+
+        if let Some(k) = kind {
+            sql.push_str(" AND kind = ?");
+            params.push(k.to_string());
+        }
+        if let Some(f) = file {
+            sql.push_str(" AND file_path = ?");
+            params.push(f.to_string());
+        }
+        if let Some(n) = name {
+            sql.push_str(" AND name LIKE ?");
+            params.push(format!("%{n}%"));
+        }
+        sql.push_str(" ORDER BY file_path, line_start");
+
+        let mut stmt = self.db.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), row_to_entity)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Fetches entities by a list of IDs in a single query.
+    ///
+    /// IDs not present in the graph are silently omitted. Order of results is
+    /// not guaranteed to match the input order.
+    pub fn get_entities_by_ids(&self, ids: &[String]) -> Result<Vec<Entity>, GraphError> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT id, kind, name, qualified_name, file_path, byte_start, byte_end,
+                    line_start, line_end, parent_entity
+             FROM entities WHERE id IN ({placeholders}) ORDER BY file_path, line_start"
+        );
+        let mut stmt = self.db.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), row_to_entity)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Returns all incoming relationships for an entity (where it is the target).
+    pub fn get_incoming_relationships(
+        &self,
+        entity_id: &str,
+    ) -> Result<Vec<Relationship>, GraphError> {
+        let mut stmt = self.db.prepare(
+            "SELECT id, kind, from_entity, to_entity FROM relationships
+             WHERE to_entity = ?1",
+        )?;
+        let rows = stmt.query_map(params![entity_id], row_to_relationship)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Computes the set of entities reachable from a set of seed entity IDs within
+    /// `max_hops` relationship traversals (bidirectional BFS).
+    ///
+    /// The seed entities themselves are included in the result.
+    /// Returns entities and the relationships that connect them within the reached set.
+    pub fn reachable_entities(
+        &self,
+        seed_ids: &[&str],
+        max_hops: usize,
+    ) -> Result<(Vec<Entity>, Vec<Relationship>), GraphError> {
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+
+        for &id in seed_ids {
+            if visited.insert(id.to_string()) {
+                queue.push_back((id.to_string(), 0));
+            }
+        }
+
+        // BFS: collect all reachable entity IDs within max_hops.
+        while let Some((id, hops)) = queue.pop_front() {
+            if hops >= max_hops {
+                continue;
+            }
+            let rels = self.get_relationships_for_entity(&id)?;
+            for rel in rels {
+                let neighbor = if rel.from_entity == id {
+                    rel.to_entity.clone()
+                } else {
+                    rel.from_entity.clone()
+                };
+                if visited.insert(neighbor.clone()) {
+                    queue.push_back((neighbor, hops + 1));
+                }
+            }
+        }
+
+        let ids: Vec<String> = visited.into_iter().collect();
+        let entities = self.get_entities_by_ids(&ids)?;
+
+        // Collect relationships that connect entities within the reached set.
+        let entity_ids_set: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let mut seen_rels: HashMap<String, Relationship> = HashMap::new();
+        for id in &ids {
+            let rels = self.get_relationships_for_entity(id)?;
+            for rel in rels {
+                if entity_ids_set.contains(rel.from_entity.as_str())
+                    && entity_ids_set.contains(rel.to_entity.as_str())
+                {
+                    seen_rels.entry(rel.id.clone()).or_insert(rel);
+                }
+            }
+        }
+        let relationships = seen_rels.into_values().collect();
+
+        Ok((entities, relationships))
+    }
+
     // ── Incremental update ────────────────────────────────────────────────────
 
     /// Re-parses a single file and updates the graph with the new entities.

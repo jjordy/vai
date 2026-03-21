@@ -16,6 +16,10 @@
 //!   - `POST /api/workspaces/:id/files` — upload files into a workspace overlay (base64 JSON)
 //!   - `GET /api/workspaces/:id/files/*path` — download a file from workspace (overlay or base)
 //!   - `GET /api/files/*path` — download a file from the current main version
+//!   - `GET /api/graph/entities` — list entities with optional filters (`?kind=`, `?file=`, `?name=`)
+//!   - `GET /api/graph/entities/:id` — entity details and relationships
+//!   - `GET /api/graph/entities/:id/deps` — transitive dependencies (bidirectional)
+//!   - `GET /api/graph/blast-radius` — entities reachable from seeds (`?entities=id1,id2&hops=2`)
 //!
 //! ## WebSocket Endpoints
 //!   - `GET /ws/events?key=<api_key>` — real-time event stream
@@ -47,6 +51,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use crate::auth;
 use crate::event_log::{EventKind, EventLog};
+use crate::graph::GraphSnapshot;
 use crate::merge;
 use crate::repo;
 use crate::version;
@@ -1039,6 +1044,222 @@ async fn get_main_file_handler(
     }))
 }
 
+// ── Graph API types ───────────────────────────────────────────────────────────
+
+/// Query parameters for `GET /api/graph/entities`.
+#[derive(Debug, Default, Deserialize)]
+struct GraphEntityFilter {
+    /// Filter by entity kind (e.g. `"function"`, `"struct"`).
+    kind: Option<String>,
+    /// Filter by exact file path (relative to repo root).
+    file: Option<String>,
+    /// Filter by entity name substring (case-insensitive).
+    name: Option<String>,
+}
+
+/// Query parameters for `GET /api/graph/blast-radius`.
+#[derive(Debug, Deserialize)]
+struct BlastRadiusQuery {
+    /// Comma-separated entity IDs to use as seeds.
+    entities: String,
+    /// Maximum traversal depth from each seed (default: 2).
+    #[serde(default = "default_hops")]
+    hops: usize,
+}
+
+fn default_hops() -> usize {
+    2
+}
+
+/// Lightweight entity summary returned by graph list endpoints.
+#[derive(Debug, Serialize)]
+struct EntitySummary {
+    id: String,
+    kind: String,
+    name: String,
+    qualified_name: String,
+    file: String,
+    line_start: usize,
+    line_end: usize,
+    parent_entity: Option<String>,
+}
+
+impl From<crate::graph::Entity> for EntitySummary {
+    fn from(e: crate::graph::Entity) -> Self {
+        EntitySummary {
+            id: e.id,
+            kind: e.kind.to_string(),
+            name: e.name,
+            qualified_name: e.qualified_name,
+            file: e.file_path,
+            line_start: e.line_range.0,
+            line_end: e.line_range.1,
+            parent_entity: e.parent_entity,
+        }
+    }
+}
+
+/// Response body for `GET /api/graph/entities/:id`.
+#[derive(Debug, Serialize)]
+struct EntityDetailResponse {
+    entity: EntitySummary,
+    relationships: Vec<RelationshipSummary>,
+}
+
+/// Relationship summary used in graph API responses.
+#[derive(Debug, Serialize)]
+struct RelationshipSummary {
+    id: String,
+    kind: String,
+    from_entity: String,
+    to_entity: String,
+}
+
+impl From<crate::graph::Relationship> for RelationshipSummary {
+    fn from(r: crate::graph::Relationship) -> Self {
+        RelationshipSummary {
+            id: r.id,
+            kind: r.kind.as_str().to_string(),
+            from_entity: r.from_entity,
+            to_entity: r.to_entity,
+        }
+    }
+}
+
+/// Response body for `GET /api/graph/entities/:id/deps`.
+#[derive(Debug, Serialize)]
+struct EntityDepsResponse {
+    entity_id: String,
+    deps: Vec<EntitySummary>,
+    relationships: Vec<RelationshipSummary>,
+}
+
+/// Response body for `GET /api/graph/blast-radius`.
+#[derive(Debug, Serialize)]
+struct BlastRadiusResponse {
+    seed_entities: Vec<String>,
+    hops: usize,
+    entities: Vec<EntitySummary>,
+    relationships: Vec<RelationshipSummary>,
+}
+
+// ── Graph API helpers ─────────────────────────────────────────────────────────
+
+/// Opens the graph snapshot for the repository.
+fn open_graph(vai_dir: &std::path::Path) -> Result<GraphSnapshot, ApiError> {
+    let db_path = vai_dir.join("graph").join("snapshot.db");
+    GraphSnapshot::open(&db_path).map_err(|e| ApiError::internal(format!("graph error: {e}")))
+}
+
+// ── Graph API handlers ────────────────────────────────────────────────────────
+
+/// `GET /api/graph/entities` — lists entities with optional filters.
+///
+/// Query params: `kind`, `file`, `name` (all optional, combined with AND).
+async fn list_graph_entities_handler(
+    State(state): State<Arc<AppState>>,
+    AxumQuery(filter): AxumQuery<GraphEntityFilter>,
+) -> Result<Json<Vec<EntitySummary>>, ApiError> {
+    let graph = open_graph(&state.vai_dir)?;
+    let entities = graph
+        .filter_entities(
+            filter.kind.as_deref(),
+            filter.file.as_deref(),
+            filter.name.as_deref(),
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(entities.into_iter().map(Into::into).collect()))
+}
+
+/// `GET /api/graph/entities/:id` — entity details and its relationships.
+async fn get_graph_entity_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<EntityDetailResponse>, ApiError> {
+    let graph = open_graph(&state.vai_dir)?;
+    let entity = graph
+        .get_entity_by_id(&id)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(format!("entity '{id}' not found")))?;
+    let relationships = graph
+        .get_relationships_for_entity(&id)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(EntityDetailResponse {
+        entity: entity.into(),
+        relationships: relationships.into_iter().map(Into::into).collect(),
+    }))
+}
+
+/// `GET /api/graph/entities/:id/deps` — all entities transitively reachable
+/// from this entity following any relationship direction.
+async fn get_entity_deps_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<EntityDepsResponse>, ApiError> {
+    let graph = open_graph(&state.vai_dir)?;
+    // Verify the entity exists before traversal.
+    graph
+        .get_entity_by_id(&id)
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(format!("entity '{id}' not found")))?;
+
+    // Use a generous max-hops so we reach all transitive deps in practice.
+    let (entities, relationships) = graph
+        .reachable_entities(&[id.as_str()], 20)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Exclude the seed entity itself from the deps list.
+    let deps = entities
+        .into_iter()
+        .filter(|e| e.id != id)
+        .map(Into::into)
+        .collect();
+
+    Ok(Json(EntityDepsResponse {
+        entity_id: id,
+        deps,
+        relationships: relationships.into_iter().map(Into::into).collect(),
+    }))
+}
+
+/// `GET /api/graph/blast-radius` — entities reachable from a set of seeds within N hops.
+///
+/// Query params:
+/// - `entities` — comma-separated entity IDs
+/// - `hops` — max traversal depth (default: 2)
+async fn get_blast_radius_handler(
+    State(state): State<Arc<AppState>>,
+    AxumQuery(query): AxumQuery<BlastRadiusQuery>,
+) -> Result<Json<BlastRadiusResponse>, ApiError> {
+    let seed_ids: Vec<String> = query
+        .entities
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if seed_ids.is_empty() {
+        return Err(ApiError::bad_request(
+            "query param `entities` must contain at least one entity ID",
+        ));
+    }
+
+    let hops = query.hops;
+    let graph = open_graph(&state.vai_dir)?;
+
+    let seed_refs: Vec<&str> = seed_ids.iter().map(String::as_str).collect();
+    let (entities, relationships) = graph
+        .reachable_entities(&seed_refs, hops)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(Json(BlastRadiusResponse {
+        seed_entities: seed_ids,
+        hops,
+        entities: entities.into_iter().map(Into::into).collect(),
+        relationships: relationships.into_iter().map(Into::into).collect(),
+    }))
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -1075,6 +1296,15 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         // POST /api/versions/rollback is never captured by :id.
         .route("/api/versions/rollback", post(rollback_handler))
         .route("/api/versions/:id", get(get_version_handler))
+        // Graph query endpoints.
+        .route("/api/graph/entities", get(list_graph_entities_handler))
+        // Static sub-routes must come before the dynamic :id route.
+        .route("/api/graph/blast-radius", get(get_blast_radius_handler))
+        .route("/api/graph/entities/:id", get(get_graph_entity_handler))
+        .route(
+            "/api/graph/entities/:id/deps",
+            get(get_entity_deps_handler),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -2098,6 +2328,195 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400, "path traversal should be rejected");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    // ── Graph API tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn graph_entities_list_and_filter() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Create a Rust source file so the graph has something to query.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            b"pub fn hello() {}\npub struct World;\n",
+        )
+        .unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // List all entities — graph was populated during init.
+        let resp = client
+            .get(format!("http://{addr}/api/graph/entities"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let entities: serde_json::Value = resp.json().await.unwrap();
+        let arr = entities.as_array().unwrap();
+        assert!(!arr.is_empty(), "expected entities from src/lib.rs");
+
+        // Filter by kind=function — only functions should appear.
+        let resp = client
+            .get(format!("http://{addr}/api/graph/entities?kind=function"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let funcs: serde_json::Value = resp.json().await.unwrap();
+        let funcs_arr = funcs.as_array().unwrap();
+        assert!(
+            funcs_arr.iter().all(|e| e["kind"] == "function"),
+            "expected only functions"
+        );
+
+        // Filter by name=hello — should find at least one entity.
+        let resp = client
+            .get(format!("http://{addr}/api/graph/entities?name=hello"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let by_name: serde_json::Value = resp.json().await.unwrap();
+        let by_name_arr = by_name.as_array().unwrap();
+        assert!(
+            !by_name_arr.is_empty(),
+            "expected at least one entity named 'hello'"
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn graph_entity_detail_and_deps() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            b"pub fn hello() {}\npub struct World;\n",
+        )
+        .unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Get all entities and pick one ID.
+        let resp = client
+            .get(format!("http://{addr}/api/graph/entities"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        let entities: serde_json::Value = resp.json().await.unwrap();
+        let id = entities.as_array().unwrap()[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // GET /api/graph/entities/:id
+        let resp = client
+            .get(format!("http://{addr}/api/graph/entities/{id}"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let detail: serde_json::Value = resp.json().await.unwrap();
+        assert!(detail["entity"].is_object());
+        assert!(detail["relationships"].is_array());
+        assert_eq!(detail["entity"]["id"], id);
+
+        // GET /api/graph/entities/:id/deps
+        let resp = client
+            .get(format!("http://{addr}/api/graph/entities/{id}/deps"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let deps: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(deps["entity_id"], id);
+        assert!(deps["deps"].is_array());
+        assert!(deps["relationships"].is_array());
+
+        // 404 for non-existent entity.
+        let resp = client
+            .get(format!("http://{addr}/api/graph/entities/nonexistent-id"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn graph_blast_radius() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            b"pub fn hello() {}\npub struct World;\n",
+        )
+        .unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Get one entity ID to use as seed.
+        let resp = client
+            .get(format!("http://{addr}/api/graph/entities"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        let entities: serde_json::Value = resp.json().await.unwrap();
+        let id = entities.as_array().unwrap()[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // GET /api/graph/blast-radius?entities=<id>&hops=2
+        let resp = client
+            .get(format!(
+                "http://{addr}/api/graph/blast-radius?entities={id}&hops=2"
+            ))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let br: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(br["hops"], 2);
+        assert!(br["entities"].is_array());
+        assert!(br["relationships"].is_array());
+        assert!(br["seed_entities"].as_array().unwrap().contains(&serde_json::json!(id)));
+
+        // Missing `entities` param → 400.
+        let resp = client
+            .get(format!("http://{addr}/api/graph/blast-radius"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        // axum returns 400 when a required query parameter is missing.
+        assert!(
+            resp.status().is_client_error(),
+            "missing required param should return 4xx"
+        );
 
         shutdown_tx.send(()).ok();
     }
