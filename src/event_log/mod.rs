@@ -439,6 +439,20 @@ impl EventLog {
         Ok(n as u64)
     }
 
+    /// Returns the event with the given ID, or `None` if not found.
+    pub fn get_by_id(&self, id: u64) -> Result<Option<Event>, EventLogError> {
+        let rows = self.query_index(
+            "SELECT segment_file, byte_offset FROM events WHERE id = ?1",
+            params![id as i64],
+        )?;
+        match rows.into_iter().next() {
+            Some((segment_file, byte_offset)) => {
+                Ok(Some(self.read_event_at(&segment_file, byte_offset)?))
+            }
+            None => Ok(None),
+        }
+    }
+
     fn query_index(
         &self,
         sql: &str,

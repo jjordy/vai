@@ -12,6 +12,7 @@ use crate::diff;
 use crate::graph::GraphSnapshot;
 use crate::merge;
 use crate::repo;
+use crate::version;
 use crate::workspace;
 
 /// Errors that can occur during CLI execution.
@@ -31,6 +32,9 @@ pub enum CliError {
 
     #[error("Merge error: {0}")]
     Merge(#[from] merge::MergeError),
+
+    #[error("Version error: {0}")]
+    Version(#[from] version::VersionError),
 
     #[error("{0}")]
     Other(String),
@@ -362,6 +366,164 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         println!("  Intent   : {}", result.version.intent);
                         println!("  Files    : {}", result.files_applied);
                         println!("  Entities : {}", result.entities_changed);
+                    }
+                }
+            }
+        }
+        Some(Commands::Log { limit }) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+
+            let mut versions = version::list_versions(&vai_dir)?;
+            versions.reverse(); // most recent first
+
+            if let Some(n) = limit {
+                versions.truncate(n);
+            }
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&versions).unwrap());
+            } else if versions.is_empty() {
+                println!("No versions yet.");
+            } else {
+                for v in &versions {
+                    let age = format_age(v.created_at);
+                    println!("{:<4}  {:<50}  {}", v.version_id.bold(), v.intent, age);
+                }
+            }
+        }
+        Some(Commands::Show { version: version_id }) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+
+            let changes = version::get_version_changes(&vai_dir, &version_id)?;
+            let v = &changes.version;
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&changes).unwrap());
+            } else {
+                println!(
+                    "{} {}  {}",
+                    v.version_id.bold(),
+                    format!("\"{}\"", v.intent).italic(),
+                    format_age(v.created_at)
+                );
+                println!("  Created by : {}", v.created_by);
+                if let Some(parent) = &v.parent_version_id {
+                    println!("  Parent     : {}", parent);
+                }
+
+                if changes.file_changes.is_empty() && changes.entity_changes.is_empty() {
+                    println!("\n  (initial version — no changes)");
+                } else {
+                    if !changes.file_changes.is_empty() {
+                        println!("\n{}", "Files changed:".bold());
+                        for fc in &changes.file_changes {
+                            let sigil = match fc.change_type {
+                                version::VersionFileChangeType::Added => "+".green(),
+                                version::VersionFileChangeType::Modified => "M".yellow(),
+                                version::VersionFileChangeType::Removed => "-".red(),
+                            };
+                            println!("  {} {}", sigil, fc.path);
+                        }
+                    }
+                    if !changes.entity_changes.is_empty() {
+                        println!("\n{}", "Entities changed:".bold());
+                        for ec in &changes.entity_changes {
+                            let sigil = ec.change_type.sigil();
+                            let colored_sigil = match ec.change_type {
+                                version::VersionChangeType::Added => sigil.green(),
+                                version::VersionChangeType::Modified => sigil.yellow(),
+                                version::VersionChangeType::Removed => sigil.red(),
+                            };
+                            if let (Some(kind), Some(name), Some(path)) =
+                                (&ec.kind, &ec.qualified_name, &ec.file_path)
+                            {
+                                println!(
+                                    "  {} {} {}  {}  {}",
+                                    colored_sigil,
+                                    kind.cyan(),
+                                    name.bold(),
+                                    path,
+                                    ec.change_type.label()
+                                );
+                            } else if let Some(desc) = &ec.change_description {
+                                println!("  {} {}", colored_sigil, desc);
+                            } else {
+                                println!(
+                                    "  {} entity {} {}",
+                                    colored_sigil,
+                                    ec.entity_id,
+                                    ec.change_type.label()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(Commands::Diff {
+            version_a,
+            version_b,
+        }) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+
+            let all_changes = version::get_versions_diff(&vai_dir, &version_a, &version_b)?;
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&all_changes).unwrap());
+            } else if all_changes.is_empty() {
+                println!("No changes between {} and {}.", version_a, version_b);
+            } else {
+                println!(
+                    "{} Semantic diff: {} → {}",
+                    "●".cyan(),
+                    version_a.bold(),
+                    version_b.bold()
+                );
+                for vc in &all_changes {
+                    println!(
+                        "\n{}  {}",
+                        vc.version.version_id.bold(),
+                        format!("\"{}\"", vc.version.intent).italic()
+                    );
+                    for fc in &vc.file_changes {
+                        let sigil = match fc.change_type {
+                            version::VersionFileChangeType::Added => "+".green(),
+                            version::VersionFileChangeType::Modified => "M".yellow(),
+                            version::VersionFileChangeType::Removed => "-".red(),
+                        };
+                        println!("  {} {}", sigil, fc.path);
+                    }
+                    for ec in &vc.entity_changes {
+                        let sigil = ec.change_type.sigil();
+                        let colored_sigil = match ec.change_type {
+                            version::VersionChangeType::Added => sigil.green(),
+                            version::VersionChangeType::Modified => sigil.yellow(),
+                            version::VersionChangeType::Removed => sigil.red(),
+                        };
+                        if let (Some(kind), Some(name)) = (&ec.kind, &ec.qualified_name) {
+                            println!("  {} {} {}", colored_sigil, kind.cyan(), name.bold());
+                        } else if let Some(desc) = &ec.change_description {
+                            println!("  {} {}", colored_sigil, desc);
+                        } else {
+                            println!(
+                                "  {} entity {} {}",
+                                colored_sigil,
+                                ec.entity_id,
+                                ec.change_type.label()
+                            );
+                        }
                     }
                 }
             }
