@@ -9,5 +9,6 @@ pub mod event_log;
 pub mod graph;
 pub mod merge;
 pub mod repo;
+pub mod server;
 pub mod version;
 pub mod workspace;

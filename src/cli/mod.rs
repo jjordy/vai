@@ -13,6 +13,7 @@ use crate::diff;
 use crate::graph::{GraphSnapshot, GraphStats};
 use crate::merge;
 use crate::repo;
+use crate::server;
 use crate::version::VersionMeta;
 use crate::version;
 use crate::workspace;
@@ -38,6 +39,9 @@ pub enum CliError {
 
     #[error("Version error: {0}")]
     Version(#[from] version::VersionError),
+
+    #[error("Server error: {0}")]
+    Server(#[from] server::ServerError),
 
     #[error("{0}")]
     Other(String),
@@ -104,6 +108,9 @@ pub enum Commands {
     /// Query and inspect the semantic graph.
     #[command(subcommand)]
     Graph(GraphCommands),
+    /// Manage the vai HTTP server.
+    #[command(subcommand)]
+    Server(ServerCommands),
 }
 
 /// Workspace subcommands.
@@ -146,6 +153,20 @@ pub enum MergeCommands {
     Resolve {
         /// Conflict ID.
         conflict_id: String,
+    },
+}
+
+/// Server management subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ServerCommands {
+    /// Start the vai HTTP server for this repository.
+    Start {
+        /// Port to listen on.
+        #[arg(long, default_value = "7832")]
+        port: u16,
+        /// Address to bind to.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
     },
 }
 
@@ -704,6 +725,22 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 "  Files restored: {}, files deleted: {}",
                 result.files_restored, result.files_deleted
             );
+        }
+        Some(Commands::Server(server_cmd)) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+
+            match server_cmd {
+                ServerCommands::Start { port, bind } => {
+                    let config = server::ServerConfig { bind, port };
+                    tokio::runtime::Runtime::new()
+                        .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?
+                        .block_on(server::start(&vai_dir, config))?;
+                }
+            }
         }
         Some(Commands::Merge(merge_cmd)) => {
             let cwd = std::env::current_dir()
