@@ -16,6 +16,7 @@ use crate::graph::{GraphSnapshot, GraphStats};
 use crate::merge;
 use crate::repo;
 use crate::server;
+use crate::sync as remote_sync;
 use crate::version::VersionMeta;
 use crate::version;
 use crate::workspace;
@@ -50,6 +51,9 @@ pub enum CliError {
 
     #[error("Clone error: {0}")]
     Clone(#[from] remote_clone::CloneError),
+
+    #[error("Sync error: {0}")]
+    Sync(#[from] remote_sync::SyncError),
 
     #[error("{0}")]
     Other(String),
@@ -129,6 +133,8 @@ pub enum Commands {
         #[arg(long)]
         key: String,
     },
+    /// Pull the latest changes from the remote server (incremental).
+    Sync,
 }
 
 /// Workspace subcommands.
@@ -886,6 +892,22 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
             } else {
                 remote_clone::print_clone_result(&result);
+            }
+        }
+        Some(Commands::Sync) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+
+            let result = tokio::runtime::Runtime::new()
+                .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?
+                .block_on(remote_sync::sync(&root))?;
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            } else {
+                remote_sync::print_sync_result(&result);
             }
         }
         Some(Commands::Merge(merge_cmd)) => {
