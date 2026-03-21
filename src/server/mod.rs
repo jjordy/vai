@@ -1626,6 +1626,60 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
     public.merge(protected).with_state(state)
 }
 
+// ── Test helper ───────────────────────────────────────────────────────────────
+
+/// Starts an embedded vai server on a random available port.
+///
+/// Initialises shared state from the repository at `vai_dir`, binds to
+/// `127.0.0.1:0`, and returns the actual socket address together with a
+/// one-shot shutdown sender.  Call `shutdown_tx.send(())` to stop the server
+/// gracefully.  Intended for integration tests that need a live server without
+/// fixing a port.
+pub async fn start_for_testing(
+    vai_dir: &Path,
+) -> Result<(SocketAddr, tokio::sync::oneshot::Sender<()>), ServerError> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let repo_config = repo::read_config(vai_dir)?;
+    let repo_root = vai_dir
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+
+    let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
+    let state = Arc::new(AppState {
+        vai_dir: vai_dir.to_owned(),
+        repo_root,
+        started_at: Instant::now(),
+        repo_name: repo_config.name,
+        vai_version: env!("CARGO_PKG_VERSION").to_string(),
+        event_tx,
+        event_seq: Arc::new(AtomicU64::new(0)),
+        event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
+        conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
+    });
+
+    let app = build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                shutdown_rx.await.ok();
+            })
+            .await
+            .ok();
+    });
+
+    // Brief pause to let the server accept connections.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    Ok((addr, shutdown_tx))
+}
+
 // ── Public start function ─────────────────────────────────────────────────────
 
 /// Starts the vai HTTP server.
