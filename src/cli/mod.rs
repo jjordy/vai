@@ -171,8 +171,18 @@ pub enum Commands {
     /// Manage escalations requiring human attention.
     #[command(subcommand)]
     Escalations(EscalationCommands),
-    /// Launch the TUI dashboard for real-time agent oversight (local mode).
-    Dashboard,
+    /// Launch the TUI dashboard for real-time agent oversight.
+    ///
+    /// Without `--server`, polls the local `.vai/` directory.
+    /// With `--server vai://host:port`, connects via WebSocket for live updates.
+    Dashboard {
+        /// Remote server URL for live updates (e.g. `vai://localhost:7865`).
+        #[arg(long)]
+        server: Option<String>,
+        /// API key for authenticating with the remote server.
+        #[arg(long)]
+        key: Option<String>,
+    },
 }
 
 /// Issue management subcommands.
@@ -1821,14 +1831,20 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 }
             }
         }
-        Some(Commands::Dashboard) => {
+        Some(Commands::Dashboard { server, key }) => {
             let cwd = std::env::current_dir()
                 .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
             let root = repo::find_root(&cwd)
                 .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
             let vai_dir = root.join(".vai");
-            crate::dashboard::run(&vai_dir)
-                .map_err(|e| CliError::Other(e.to_string()))?;
+            if let Some(server_url) = server {
+                let api_key = key.unwrap_or_default();
+                crate::dashboard::run_server(&vai_dir, &server_url, &api_key)
+                    .map_err(|e| CliError::Other(e.to_string()))?;
+            } else {
+                crate::dashboard::run(&vai_dir)
+                    .map_err(|e| CliError::Other(e.to_string()))?;
+            }
         }
     }
     Ok(())

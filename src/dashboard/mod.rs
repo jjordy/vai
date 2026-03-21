@@ -11,6 +11,7 @@
 //!   or issue.  Enter to open, Esc to return.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -28,9 +29,13 @@ use ratatui::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+
 use crate::escalation::{Escalation, EscalationStatus, EscalationStore, ResolutionOption};
 use crate::graph::GraphSnapshot;
 use crate::issue::{Issue, IssueFilter, IssueStatus, IssueStore};
+use crate::server::BroadcastEvent;
 use crate::version;
 use crate::workspace;
 
@@ -57,6 +62,9 @@ pub enum DashboardError {
 
     #[error("Escalation error: {0}")]
     Escalation(#[from] crate::escalation::EscalationError),
+
+    #[error("Invalid server URL: {0}")]
+    InvalidServerUrl(String),
 }
 
 // ── Panel ─────────────────────────────────────────────────────────────────────
@@ -99,6 +107,52 @@ impl Panel {
         let idx = (self as usize + Panel::ALL.len() - 1) % Panel::ALL.len();
         Panel::ALL[idx]
     }
+}
+
+// ── Connection status ─────────────────────────────────────────────────────────
+
+/// WebSocket connection status in server mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectionStatus {
+    /// Local mode — no remote server.
+    #[default]
+    Local,
+    /// Connected to the remote server.
+    Connected,
+    /// Connection lost, showing cached state.
+    Disconnected,
+    /// Attempting to (re)connect.
+    Reconnecting,
+}
+
+impl ConnectionStatus {
+    fn label(self) -> &'static str {
+        match self {
+            ConnectionStatus::Local => "",
+            ConnectionStatus::Connected => "● connected",
+            ConnectionStatus::Disconnected => "○ disconnected",
+            ConnectionStatus::Reconnecting => "◌ reconnecting…",
+        }
+    }
+
+    fn color(self) -> ratatui::style::Color {
+        match self {
+            ConnectionStatus::Local => ratatui::style::Color::Gray,
+            ConnectionStatus::Connected => ratatui::style::Color::Green,
+            ConnectionStatus::Disconnected => ratatui::style::Color::Red,
+            ConnectionStatus::Reconnecting => ratatui::style::Color::Yellow,
+        }
+    }
+}
+
+/// Notifications sent from the background WebSocket thread to the TUI loop.
+enum WsNotification {
+    Connected,
+    Disconnected,
+    Reconnecting,
+    /// A server event arrived — triggers a data refresh.  The payload is
+    /// intentionally discarded; the TUI always does a full reload.
+    Event,
 }
 
 // ── DrillDown state ───────────────────────────────────────────────────────────
@@ -171,6 +225,10 @@ struct App {
     should_quit: bool,
     /// Feedback message shown at the bottom (e.g. "Resolved ✓").
     status_message: Option<String>,
+    /// WebSocket connection status (Local in offline mode).
+    connection_status: ConnectionStatus,
+    /// Receiver for events from the background WebSocket thread (server mode only).
+    event_rx: Option<mpsc::Receiver<WsNotification>>,
 }
 
 impl App {
@@ -186,9 +244,43 @@ impl App {
             filter_active: false,
             should_quit: false,
             status_message: None,
+            connection_status: ConnectionStatus::Local,
+            event_rx: None,
         };
         app.list_state.select(Some(0));
         app
+    }
+
+    /// Construct an App wired to a background WebSocket receiver (server mode).
+    fn new_server(vai_dir: PathBuf, rx: mpsc::Receiver<WsNotification>) -> Self {
+        let mut app = Self::new(vai_dir);
+        app.connection_status = ConnectionStatus::Reconnecting;
+        app.event_rx = Some(rx);
+        app
+    }
+
+    /// Drain pending WebSocket notifications, updating connection status and
+    /// triggering a data refresh when an event is received.
+    fn drain_ws_notifications(&mut self) {
+        let Some(rx) = &self.event_rx else { return };
+        while let Ok(notif) = rx.try_recv() {
+            match notif {
+                WsNotification::Connected => {
+                    self.connection_status = ConnectionStatus::Connected;
+                }
+                WsNotification::Disconnected => {
+                    self.connection_status = ConnectionStatus::Disconnected;
+                }
+                WsNotification::Reconnecting => {
+                    self.connection_status = ConnectionStatus::Reconnecting;
+                }
+                WsNotification::Event => {
+                    // Any inbound event means server state has changed — expire
+                    // the refresh timer so the next loop iteration reloads data.
+                    self.last_refresh = Instant::now() - Duration::from_secs(60);
+                }
+            }
+        }
     }
 
     /// Reload all data from disk.
@@ -555,6 +647,105 @@ pub fn snapshot(vai_dir: &Path) -> Result<DashboardSnapshot, DashboardError> {
     })
 }
 
+// ── WebSocket client ──────────────────────────────────────────────────────────
+
+/// Convert a `vai://host:port` URL into a WebSocket URL for the events endpoint.
+///
+/// Returns an error if the URL does not start with `vai://`.
+pub fn parse_server_url(server_url: &str, api_key: &str) -> Result<String, DashboardError> {
+    let authority = server_url
+        .strip_prefix("vai://")
+        .ok_or_else(|| DashboardError::InvalidServerUrl(
+            format!("expected vai://host:port, got: {server_url}"),
+        ))?;
+    Ok(format!("ws://{authority}/ws/events?key={api_key}"))
+}
+
+/// Spawn a background thread that maintains a WebSocket connection to the
+/// server, forwarding [`WsNotification`]s to `tx`.
+///
+/// The thread reconnects with exponential back-off (1 s → 30 s) on failure.
+fn spawn_ws_connection(ws_url: String, tx: mpsc::Sender<WsNotification>) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(ws_connection_loop(ws_url, tx));
+    });
+}
+
+/// Async reconnect loop — runs inside the background thread's tokio runtime.
+async fn ws_connection_loop(ws_url: String, tx: mpsc::Sender<WsNotification>) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if tx.send(WsNotification::Reconnecting).is_err() {
+            return;
+        }
+
+        match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok((stream, _)) => {
+                if tx.send(WsNotification::Connected).is_err() {
+                    return;
+                }
+                backoff = Duration::from_secs(1); // reset on successful connect
+
+                let (mut write, mut read) = stream.split();
+
+                // The server drops events until a subscribe message is received.
+                // Send an empty filter (match all event types) immediately.
+                let sub_msg = serde_json::json!({
+                    "subscribe": {
+                        "entities": [],
+                        "paths": [],
+                        "event_types": [],
+                        "workspaces": []
+                    }
+                })
+                .to_string();
+                if write
+                    .send(Message::Text(sub_msg))
+                    .await
+                    .is_err()
+                {
+                    let _ = tx.send(WsNotification::Disconnected);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+                // Drop the write half; we only need to read events.
+                drop(write);
+                while let Some(msg_result) = read.next().await {
+                    match msg_result {
+                        Ok(Message::Text(text)) => {
+                            // Any valid JSON event triggers a full refresh.
+                            if serde_json::from_str::<BroadcastEvent>(&text).is_ok()
+                                && tx.send(WsNotification::Event).is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok(Message::Close(_)) | Err(_) => break,
+                        _ => {}
+                    }
+                }
+
+                if tx.send(WsNotification::Disconnected).is_err() {
+                    return;
+                }
+            }
+            Err(_) => {
+                if tx.send(WsNotification::Disconnected).is_err() {
+                    return;
+                }
+            }
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Launch the TUI dashboard in local mode, polling `.vai/` for changes.
@@ -586,6 +777,45 @@ pub fn run(vai_dir: &Path) -> Result<(), DashboardError> {
     result
 }
 
+/// Launch the TUI dashboard in server mode, subscribing to a remote vai server
+/// via WebSocket for real-time updates.
+///
+/// `server_url` must be in the form `vai://host:port`.
+/// `api_key` is the plaintext API key to authenticate with the server.
+pub fn run_server(vai_dir: &Path, server_url: &str, api_key: &str) -> Result<(), DashboardError> {
+    if !vai_dir.exists() {
+        return Err(DashboardError::NotInitialised);
+    }
+
+    let ws_url = parse_server_url(server_url, api_key)?;
+
+    let (tx, rx) = mpsc::channel::<WsNotification>();
+    spawn_ws_connection(ws_url, tx);
+
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut app = App::new_server(vai_dir.to_path_buf(), rx);
+    // In server mode refresh more aggressively so events appear within 1 s.
+    let refresh_interval = Duration::from_millis(500);
+    let tick_rate = Duration::from_millis(100);
+
+    let result = run_loop(&mut terminal, &mut app, refresh_interval, tick_rate);
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    result
+}
+
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -593,6 +823,9 @@ fn run_loop<B: ratatui::backend::Backend>(
     tick_rate: Duration,
 ) -> Result<(), DashboardError> {
     loop {
+        // Drain WebSocket notifications before deciding whether to refresh.
+        app.drain_ws_notifications();
+
         if app.last_refresh.elapsed() >= refresh_interval {
             app.refresh();
         }
@@ -870,11 +1103,33 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         format!("{elapsed}s ago")
     };
 
+    let conn_part = if app.connection_status != ConnectionStatus::Local {
+        format!(" | {}", app.connection_status.label())
+    } else {
+        String::new()
+    };
+
     let msg_part = if let Some(msg) = &app.status_message {
         format!(" | {msg}")
     } else {
         String::new()
     };
+
+    // Build the title as styled spans so we can colour the connection indicator.
+    let base_text = format!(
+        " {entities} entities | {relationships} rels | {ws_count} ws | refreshed {refresh_str}{msg_part}"
+    );
+    let hint_text =
+        " | [Tab] nav  [/] filter  [Enter] drill-in  [r] refresh  [q] quit ".to_string();
+
+    let mut title_spans = vec![Span::styled(base_text, Style::default().fg(Color::Gray))];
+    if app.connection_status != ConnectionStatus::Local {
+        title_spans.push(Span::styled(
+            conn_part,
+            Style::default().fg(app.connection_status.color()),
+        ));
+    }
+    title_spans.push(Span::styled(hint_text, Style::default().fg(Color::Gray)));
 
     let tabs_titles: Vec<Line> = Panel::ALL
         .iter()
@@ -891,12 +1146,11 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let tabs = Tabs::new(tabs_titles)
-        .block(Block::default().borders(Borders::ALL).title(Span::styled(
-            format!(
-                " {entities} entities | {relationships} rels | {ws_count} ws | refreshed {refresh_str}{msg_part} | [Tab] nav  [/] filter  [Enter] drill-in  [r] refresh  [q] quit "
-            ),
-            Style::default().fg(Color::Gray),
-        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(title_spans)),
+        )
         .select(app.selected_panel as usize)
         .style(Style::default())
         .highlight_style(Style::default().fg(Color::Cyan));
