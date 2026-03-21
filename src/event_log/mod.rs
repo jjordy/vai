@@ -160,6 +160,39 @@ pub enum EventKind {
         new_version_id: String,
         entity_filter: Option<String>,
     },
+    /// An issue was created.
+    IssueCreated {
+        issue_id: Uuid,
+        title: String,
+        creator: String,
+        priority: String,
+    },
+    /// An issue's fields were updated.
+    IssueUpdated {
+        issue_id: Uuid,
+        fields_changed: Vec<String>,
+    },
+    /// An issue was assigned to an agent.
+    IssueAssigned {
+        issue_id: Uuid,
+        agent_id: String,
+    },
+    /// An issue was linked to a workspace.
+    IssueLinkedToWorkspace {
+        issue_id: Uuid,
+        workspace_id: Uuid,
+    },
+    /// An issue was resolved (workspace merged).
+    IssueResolved {
+        issue_id: Uuid,
+        resolution: String,
+        version_id: Option<String>,
+    },
+    /// An issue was closed.
+    IssueClosed {
+        issue_id: Uuid,
+        resolution: String,
+    },
 }
 
 impl EventKind {
@@ -181,6 +214,12 @@ impl EventKind {
             EventKind::MergeConflictDetected { .. } => "MergeConflictDetected",
             EventKind::MergeConflictResolved { .. } => "MergeConflictResolved",
             EventKind::RollbackCreated { .. } => "RollbackCreated",
+            EventKind::IssueCreated { .. } => "IssueCreated",
+            EventKind::IssueUpdated { .. } => "IssueUpdated",
+            EventKind::IssueAssigned { .. } => "IssueAssigned",
+            EventKind::IssueLinkedToWorkspace { .. } => "IssueLinkedToWorkspace",
+            EventKind::IssueResolved { .. } => "IssueResolved",
+            EventKind::IssueClosed { .. } => "IssueClosed",
         }
     }
 
