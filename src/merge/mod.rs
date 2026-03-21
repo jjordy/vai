@@ -101,8 +101,10 @@ pub struct SubmitResult {
 pub fn submit(vai_dir: &Path, repo_root: &Path) -> Result<SubmitResult, MergeError> {
     let ws_meta = workspace::active(vai_dir)?;
 
-    // 1. Compute diff (read-only; no events recorded here).
+    // 1. Compute diff and record file/entity events (idempotent — skipped if
+    //    events were already recorded by a prior `vai workspace diff` call).
     let workspace_diff = diff::compute(vai_dir, repo_root)?;
+    diff::record_events(vai_dir, &workspace_diff)?;
 
     // 2. Record WorkspaceSubmitted.
     let log_dir = vai_dir.join("event_log");
@@ -126,11 +128,16 @@ pub fn submit(vai_dir: &Path, repo_root: &Path) -> Result<SubmitResult, MergeErr
         });
     }
 
-    // 4. Apply overlay files to the project root.
+    // 4. Save pre-change snapshot for rollback support.
+    //    Must happen BEFORE applying overlay so we capture the pre-change state.
+    let new_version_id_preview = version::next_version_id(vai_dir)?;
+    save_pre_change_snapshot(vai_dir, &new_version_id_preview, &workspace_diff, repo_root)?;
+
+    // 5. Apply overlay files to the project root.
     let overlay = workspace::overlay_dir(vai_dir, &ws_meta.id.to_string());
     let files_applied = apply_overlay(&overlay, repo_root)?;
 
-    // 5. Update semantic graph for changed Rust files.
+    // 5b. Update semantic graph for changed Rust files.
     let snapshot_path = vai_dir.join("graph").join("snapshot.db");
     let snapshot = GraphSnapshot::open(&snapshot_path)?;
     for fd in &workspace_diff.file_diffs {
@@ -142,8 +149,8 @@ pub fn submit(vai_dir: &Path, repo_root: &Path) -> Result<SubmitResult, MergeErr
         }
     }
 
-    // 6. Determine next version ID.
-    let new_version_id = version::next_version_id(vai_dir)?;
+    // 6. Use the pre-computed version ID.
+    let new_version_id = new_version_id_preview;
 
     // 7a. Record MergeCompleted.
     let merge_event = log.append(EventKind::MergeCompleted {
@@ -192,6 +199,38 @@ pub fn submit(vai_dir: &Path, repo_root: &Path) -> Result<SubmitResult, MergeErr
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
+
+/// Saves the pre-change content of files that are about to be modified into
+/// `.vai/versions/<new_version_id>/snapshot/`.
+///
+/// This snapshot enables rollback to restore files to their state before this
+/// version was applied.
+fn save_pre_change_snapshot(
+    vai_dir: &Path,
+    new_version_id: &str,
+    workspace_diff: &diff::WorkspaceDiff,
+    repo_root: &Path,
+) -> Result<(), MergeError> {
+    let snapshot_dir = vai_dir
+        .join("versions")
+        .join(new_version_id)
+        .join("snapshot");
+
+    for fd in &workspace_diff.file_diffs {
+        let src = repo_root.join(&fd.path);
+        if src.exists() {
+            // Only snapshot files that already exist (modified or to-be-removed).
+            // Added files have no pre-change content to snapshot.
+            let dest = snapshot_dir.join(&fd.path);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&src, &dest)?;
+        }
+    }
+
+    Ok(())
+}
 
 /// Copies all files from the overlay directory into the project root.
 ///

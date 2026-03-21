@@ -154,6 +154,12 @@ pub enum EventKind {
         resolution: String,
         resolved_by: String,
     },
+    /// A rollback was performed, creating a new version that undoes changes.
+    RollbackCreated {
+        target_version_id: String,
+        new_version_id: String,
+        entity_filter: Option<String>,
+    },
 }
 
 impl EventKind {
@@ -174,6 +180,7 @@ impl EventKind {
             EventKind::MergeCompleted { .. } => "MergeCompleted",
             EventKind::MergeConflictDetected { .. } => "MergeConflictDetected",
             EventKind::MergeConflictResolved { .. } => "MergeConflictResolved",
+            EventKind::RollbackCreated { .. } => "RollbackCreated",
         }
     }
 

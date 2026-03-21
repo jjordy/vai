@@ -597,8 +597,113 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 }
             }
         }
-        Some(Commands::Rollback { version, force: _, entity: _ }) => {
-            eprintln!("Command not yet implemented: rollback {version}");
+        Some(Commands::Rollback { version, force, entity }) => {
+            let repo_root = repo::find_root(&std::env::current_dir().unwrap())
+                .ok_or_else(|| CliError::Other("not inside a vai repository".into()))?;
+            let vai_dir = repo_root.join(".vai");
+
+            // 1. Analyze impact.
+            let impact = version::analyze_rollback_impact(&vai_dir, &version)
+                .map_err(CliError::Version)?;
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&impact).unwrap());
+                return Ok(());
+            }
+
+            // 2. Display impact analysis.
+            println!(
+                "Analyzing impact of rolling back \"{}\"...",
+                impact.target_version.intent.bold()
+            );
+            println!();
+
+            if impact.target_changes.file_changes.is_empty()
+                && impact.target_changes.entity_changes.is_empty()
+            {
+                println!("  No changes recorded for {version} — nothing to roll back.");
+                return Ok(());
+            }
+
+            println!("Direct changes:");
+            for fc in &impact.target_changes.file_changes {
+                println!("  - {} ({:?})", fc.path, fc.change_type);
+            }
+            for ec in &impact.target_changes.entity_changes {
+                if let Some(qname) = &ec.qualified_name {
+                    println!("  - {} {:?}", qname, ec.change_type);
+                }
+            }
+            println!();
+
+            if impact.downstream_impacts.is_empty() {
+                println!("  No downstream dependencies affected.");
+            } else {
+                println!("Downstream dependencies:");
+                for item in &impact.downstream_impacts {
+                    for entity in &item.overlapping_entities {
+                        println!(
+                            "  {} {} \"{}\" references {}",
+                            item.risk.symbol(),
+                            item.version_id,
+                            item.intent,
+                            entity
+                        );
+                        let risk_label = match item.risk {
+                            version::RiskLevel::Low => "LOW",
+                            version::RiskLevel::Medium => "MEDIUM",
+                            version::RiskLevel::High => "HIGH",
+                        };
+                        println!("    Risk: {risk_label}");
+                    }
+                    for file in &item.overlapping_files {
+                        if item.overlapping_entities.is_empty() {
+                            println!(
+                                "  {} {} \"{}\" modifies {}",
+                                item.risk.symbol(),
+                                item.version_id,
+                                item.intent,
+                                file
+                            );
+                        }
+                    }
+                }
+            }
+            println!();
+
+            // 3. Confirm (unless --force).
+            if !force && !impact.downstream_impacts.is_empty() {
+                use std::io::{self, Write};
+                print!("Proceed with rollback? [y/N] ");
+                io::stdout().flush().ok();
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).ok();
+                let confirmed = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
+                if !confirmed {
+                    println!("Rollback cancelled.");
+                    return Ok(());
+                }
+            }
+
+            // 4. Perform rollback.
+            let result = version::rollback(
+                &vai_dir,
+                &repo_root,
+                &version,
+                entity.as_deref(),
+            )
+            .map_err(CliError::Version)?;
+
+            println!(
+                "{} Rolled back {} → {} created",
+                "✓".green().bold(),
+                version.bold(),
+                result.new_version.version_id.bold()
+            );
+            println!(
+                "  Files restored: {}, files deleted: {}",
+                result.files_restored, result.files_deleted
+            );
         }
         Some(Commands::Merge(merge_cmd)) => {
             eprintln!("Command not yet implemented: merge {merge_cmd:?}");

@@ -13,6 +13,7 @@
 //!     v3.toml     # second merge
 //! ```
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -220,6 +221,68 @@ pub struct VersionChanges {
     pub file_changes: Vec<VersionFileChange>,
 }
 
+// ── Rollback types ─────────────────────────────────────────────────────────────
+
+/// Risk level for a downstream version that depends on rolled-back changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RiskLevel {
+    /// Version references rolled-back entities but doesn't directly depend on changed logic.
+    Low,
+    /// Version modifies the same entities that are being rolled back.
+    Medium,
+    /// Version has strong semantic dependencies on rolled-back changes.
+    High,
+}
+
+impl RiskLevel {
+    /// Returns the display symbol for this risk level.
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            RiskLevel::Low => "ℹ",
+            RiskLevel::Medium => "⚠",
+            RiskLevel::High => "✖",
+        }
+    }
+}
+
+/// A downstream version that may be affected by rolling back a target version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactItem {
+    /// Version ID of the downstream version (e.g., `"v3"`).
+    pub version_id: String,
+    /// Intent of the downstream version.
+    pub intent: String,
+    /// Entity qualified names that overlap with the rolled-back changes.
+    pub overlapping_entities: Vec<String>,
+    /// File paths that overlap with the rolled-back changes.
+    pub overlapping_files: Vec<String>,
+    /// Assessed risk level.
+    pub risk: RiskLevel,
+}
+
+/// Full impact analysis for a prospective rollback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactAnalysis {
+    /// The version being rolled back.
+    pub target_version: VersionMeta,
+    /// Changes introduced by the target version.
+    pub target_changes: VersionChanges,
+    /// Downstream versions that depend on the target version's changes.
+    pub downstream_impacts: Vec<ImpactItem>,
+}
+
+/// Result of a successful rollback operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollbackResult {
+    /// The new version created by this rollback.
+    pub new_version: VersionMeta,
+    /// Number of files restored to their pre-target-version state.
+    pub files_restored: usize,
+    /// Number of files deleted (those that were added in the target version).
+    pub files_deleted: usize,
+}
+
 // ── Extended public API ────────────────────────────────────────────────────────
 
 /// Loads all changes introduced by a version by replaying the event log.
@@ -357,6 +420,198 @@ pub fn get_versions_diff(
     Ok(result)
 }
 
+/// Analyzes the impact of rolling back a given version.
+///
+/// Scans all versions that came after `version_id` and identifies those that
+/// modified or referenced the same entities or files. Returns an `ImpactAnalysis`
+/// with risk-rated downstream items.
+pub fn analyze_rollback_impact(
+    vai_dir: &Path,
+    version_id: &str,
+) -> Result<ImpactAnalysis, VersionError> {
+    let target_changes = get_version_changes(vai_dir, version_id)?;
+    let target_num = parse_version_number(version_id);
+
+    let target_entity_ids: HashSet<String> = target_changes
+        .entity_changes
+        .iter()
+        .map(|ec| ec.entity_id.clone())
+        .collect();
+
+    let target_file_paths: HashSet<String> = target_changes
+        .file_changes
+        .iter()
+        .map(|fc| fc.path.clone())
+        .collect();
+
+    let all_versions = list_versions(vai_dir)?;
+    let mut downstream_impacts = Vec::new();
+
+    for version in &all_versions {
+        let n = parse_version_number(&version.version_id);
+        if n <= target_num {
+            continue;
+        }
+
+        let changes = get_version_changes(vai_dir, &version.version_id)?;
+
+        let overlapping_entities: Vec<String> = changes
+            .entity_changes
+            .iter()
+            .filter(|ec| target_entity_ids.contains(&ec.entity_id))
+            .map(|ec| {
+                ec.qualified_name
+                    .clone()
+                    .unwrap_or_else(|| ec.entity_id.clone())
+            })
+            .collect();
+
+        let overlapping_files: Vec<String> = changes
+            .file_changes
+            .iter()
+            .filter(|fc| target_file_paths.contains(&fc.path))
+            .map(|fc| fc.path.clone())
+            .collect();
+
+        if overlapping_entities.is_empty() && overlapping_files.is_empty() {
+            continue;
+        }
+
+        let risk = if !overlapping_entities.is_empty() {
+            RiskLevel::High
+        } else {
+            RiskLevel::Low
+        };
+
+        downstream_impacts.push(ImpactItem {
+            version_id: version.version_id.clone(),
+            intent: version.intent.clone(),
+            overlapping_entities,
+            overlapping_files,
+            risk,
+        });
+    }
+
+    Ok(ImpactAnalysis {
+        target_version: target_changes.version.clone(),
+        target_changes,
+        downstream_impacts,
+    })
+}
+
+/// Rolls back the changes introduced by `version_id` by creating a new version
+/// that restores the prior state.
+///
+/// The rollback is append-only: a new version is created rather than rewriting
+/// history. Files are restored from the pre-change snapshot stored at
+/// `.vai/versions/<version_id>/snapshot/`.
+///
+/// If `entity_filter` is provided, only files associated with that entity name
+/// (matched by `qualified_name`) are restored.
+///
+/// Returns `VersionError::NotFound` if the target version does not exist.
+pub fn rollback(
+    vai_dir: &Path,
+    repo_root: &Path,
+    version_id: &str,
+    entity_filter: Option<&str>,
+) -> Result<RollbackResult, VersionError> {
+    let target_changes = get_version_changes(vai_dir, version_id)?;
+
+    // Determine which files to restore.  When an entity filter is given, only
+    // restore files that contain the matching entity changes.
+    let filtered_files: Option<HashSet<String>> = entity_filter.map(|name| {
+        target_changes
+            .entity_changes
+            .iter()
+            .filter(|ec| {
+                ec.qualified_name.as_deref() == Some(name)
+                    || ec.entity_id.contains(name)
+            })
+            .filter_map(|ec| ec.file_path.clone())
+            .collect()
+    });
+
+    let snapshot_dir = vai_dir
+        .join("versions")
+        .join(version_id)
+        .join("snapshot");
+
+    let mut files_restored: usize = 0;
+    let mut files_deleted: usize = 0;
+
+    for file_change in &target_changes.file_changes {
+        // Apply entity filter if set.
+        if let Some(ref allowed) = filtered_files {
+            if !allowed.contains(&file_change.path) {
+                continue;
+            }
+        }
+
+        match file_change.change_type {
+            VersionFileChangeType::Added => {
+                // File was added in the target version → delete it to roll back.
+                let dest = repo_root.join(&file_change.path);
+                if dest.exists() {
+                    std::fs::remove_file(&dest)?;
+                    files_deleted += 1;
+                }
+            }
+            VersionFileChangeType::Modified | VersionFileChangeType::Removed => {
+                // File was modified or removed → restore from pre-change snapshot.
+                let src = snapshot_dir.join(&file_change.path);
+                if src.exists() {
+                    let dest = repo_root.join(&file_change.path);
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::copy(&src, &dest)?;
+                    files_restored += 1;
+                }
+            }
+        }
+    }
+
+    // Record rollback events and create the new version.
+    let log_dir = vai_dir.join("event_log");
+    let mut log = EventLog::open(&log_dir)?;
+
+    let head = std::fs::read_to_string(vai_dir.join("head"))
+        .map(|s| s.trim().to_string())?;
+
+    let new_version_id = next_version_id(vai_dir)?;
+
+    log.append(EventKind::RollbackCreated {
+        target_version_id: version_id.to_string(),
+        new_version_id: new_version_id.clone(),
+        entity_filter: entity_filter.map(|s| s.to_string()),
+    })?;
+
+    log.append(EventKind::VersionCreated {
+        version_id: new_version_id.clone(),
+        parent_version_id: Some(head.clone()),
+        intent: format!("rollback {version_id}"),
+    })?;
+
+    let version_meta = create_version(
+        vai_dir,
+        &new_version_id,
+        Some(&head),
+        &format!("rollback {version_id}"),
+        "agent",
+        None,
+    )?;
+
+    // Advance HEAD.
+    std::fs::write(vai_dir.join("head"), format!("{new_version_id}\n"))?;
+
+    Ok(RollbackResult {
+        new_version: version_meta,
+        files_restored,
+        files_deleted,
+    })
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Parses the numeric part of a version ID like `"v3"` → `3`.
@@ -473,5 +728,218 @@ mod tests {
         assert_eq!(diff.len(), 2);
         assert_eq!(diff[0].version.version_id, "v2");
         assert_eq!(diff[1].version.version_id, "v3");
+    }
+
+    // ── Rollback tests ──────────────────────────────────────────────────────────
+
+    /// Sets up a full vai repository with two submitted versions and returns
+    /// `(TempDir, repo_root)`.  Version v2 adds `src/lib.rs`; version v3
+    /// adds `src/other.rs`.  Both use the merge machinery so the event log and
+    /// snapshots are properly populated.
+    fn setup_two_version_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        use crate::merge;
+        use crate::workspace;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        crate::repo::init(&root).unwrap();
+        let vai_dir = root.join(".vai");
+
+        // Create v2: add src/lib.rs
+        let ws = workspace::create(&vai_dir, "add lib", "v1").unwrap();
+        let overlay = vai_dir
+            .join("workspaces")
+            .join(ws.workspace.id.to_string())
+            .join("overlay");
+        fs::create_dir_all(overlay.join("src")).unwrap();
+        fs::write(overlay.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+        merge::submit(&vai_dir, &root).unwrap();
+
+        // Create v3: add src/other.rs
+        let ws2 = workspace::create(&vai_dir, "add other", "v2").unwrap();
+        let overlay2 = vai_dir
+            .join("workspaces")
+            .join(ws2.workspace.id.to_string())
+            .join("overlay");
+        fs::create_dir_all(overlay2.join("src")).unwrap();
+        fs::write(overlay2.join("src/other.rs"), b"pub fn other() {}\n").unwrap();
+        merge::submit(&vai_dir, &root).unwrap();
+
+        (dir, root)
+    }
+
+    #[test]
+    fn test_analyze_rollback_impact_no_downstream() {
+        // Rolling back v3 (the latest version) should have no downstream impacts.
+        let (_dir, root) = setup_two_version_repo();
+        let vai_dir = root.join(".vai");
+
+        let impact = analyze_rollback_impact(&vai_dir, "v3").unwrap();
+        assert_eq!(impact.target_version.version_id, "v3");
+        assert!(
+            impact.downstream_impacts.is_empty(),
+            "v3 is HEAD — no downstream versions"
+        );
+    }
+
+    #[test]
+    fn test_analyze_rollback_impact_detects_overlapping_file() {
+        // Rolling back v2 when v3 modifies the same file should flag v3.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        use crate::merge;
+        use crate::workspace;
+
+        crate::repo::init(&root).unwrap();
+        let vai_dir = root.join(".vai");
+
+        // v2: add src/lib.rs
+        let ws = workspace::create(&vai_dir, "add lib", "v1").unwrap();
+        let overlay = vai_dir
+            .join("workspaces")
+            .join(ws.workspace.id.to_string())
+            .join("overlay");
+        fs::create_dir_all(overlay.join("src")).unwrap();
+        fs::write(overlay.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+        merge::submit(&vai_dir, &root).unwrap();
+
+        // v3: modify the same src/lib.rs
+        let ws2 = workspace::create(&vai_dir, "modify lib", "v2").unwrap();
+        let overlay2 = vai_dir
+            .join("workspaces")
+            .join(ws2.workspace.id.to_string())
+            .join("overlay");
+        fs::create_dir_all(overlay2.join("src")).unwrap();
+        fs::write(
+            overlay2.join("src/lib.rs"),
+            b"pub fn hello() {}\npub fn world() {}\n",
+        )
+        .unwrap();
+        merge::submit(&vai_dir, &root).unwrap();
+
+        // Impact analysis of v2: v3 touches the same file → should be flagged.
+        let impact = analyze_rollback_impact(&vai_dir, "v2").unwrap();
+        assert_eq!(impact.target_version.version_id, "v2");
+        assert!(
+            !impact.downstream_impacts.is_empty(),
+            "v3 should be flagged as downstream of v2"
+        );
+        assert_eq!(impact.downstream_impacts[0].version_id, "v3");
+        assert!(
+            impact.downstream_impacts[0]
+                .overlapping_files
+                .contains(&"src/lib.rs".to_string()),
+            "src/lib.rs should be listed as an overlapping file"
+        );
+    }
+
+    #[test]
+    fn test_rollback_deletes_added_file() {
+        // Rolling back v2 (which added src/lib.rs) should delete src/lib.rs.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        use crate::merge;
+        use crate::workspace;
+
+        crate::repo::init(&root).unwrap();
+        let vai_dir = root.join(".vai");
+
+        // v2: add src/lib.rs
+        let ws = workspace::create(&vai_dir, "add lib", "v1").unwrap();
+        let overlay = vai_dir
+            .join("workspaces")
+            .join(ws.workspace.id.to_string())
+            .join("overlay");
+        fs::create_dir_all(overlay.join("src")).unwrap();
+        fs::write(overlay.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+        merge::submit(&vai_dir, &root).unwrap();
+
+        assert!(root.join("src/lib.rs").exists(), "file should exist before rollback");
+
+        // Rollback v2 → creates v3 that deletes src/lib.rs.
+        let result = rollback(&vai_dir, &root, "v2", None).unwrap();
+
+        assert_eq!(result.new_version.version_id, "v3");
+        assert_eq!(result.files_deleted, 1);
+        assert_eq!(result.files_restored, 0);
+        assert!(
+            !root.join("src/lib.rs").exists(),
+            "file should be deleted after rollback"
+        );
+
+        // HEAD should now point to v3.
+        let head = fs::read_to_string(vai_dir.join("head")).unwrap();
+        assert_eq!(head.trim(), "v3");
+    }
+
+    #[test]
+    fn test_rollback_restores_modified_file() {
+        // Rolling back v2 (which modified src/lib.rs) should restore the original content.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        use crate::merge;
+        use crate::workspace;
+
+        // Pre-populate src/lib.rs before init so v1 has the original content.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn original() {}\n").unwrap();
+
+        crate::repo::init(&root).unwrap();
+        let vai_dir = root.join(".vai");
+
+        // v2: modify src/lib.rs
+        let ws = workspace::create(&vai_dir, "modify lib", "v1").unwrap();
+        let overlay = vai_dir
+            .join("workspaces")
+            .join(ws.workspace.id.to_string())
+            .join("overlay");
+        fs::create_dir_all(overlay.join("src")).unwrap();
+        fs::write(overlay.join("src/lib.rs"), b"pub fn modified() {}\n").unwrap();
+        merge::submit(&vai_dir, &root).unwrap();
+
+        let content_after_v2 = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert_eq!(content_after_v2, "pub fn modified() {}\n");
+
+        // Rollback v2 → restores src/lib.rs to pre-v2 (original) content.
+        let result = rollback(&vai_dir, &root, "v2", None).unwrap();
+
+        assert_eq!(result.files_restored, 1);
+        let content_after_rollback = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert_eq!(
+            content_after_rollback, "pub fn original() {}\n",
+            "file should be restored to its pre-v2 content"
+        );
+    }
+
+    #[test]
+    fn test_rollback_creates_append_only_version() {
+        // Rollback must create a new version (append-only), never rewrite history.
+        let (_dir, root) = setup_two_version_repo();
+        let vai_dir = root.join(".vai");
+
+        let versions_before = list_versions(&vai_dir).unwrap();
+        assert_eq!(versions_before.len(), 3, "v1, v2, v3 before rollback");
+
+        rollback(&vai_dir, &root, "v2", None).unwrap();
+
+        let versions_after = list_versions(&vai_dir).unwrap();
+        assert_eq!(versions_after.len(), 4, "v1, v2, v3, v4 after rollback");
+        assert_eq!(versions_after[3].version_id, "v4");
+        assert_eq!(versions_after[3].intent, "rollback v2");
+        // Original v2 must still exist.
+        assert!(get_version(&vai_dir, "v2").is_ok(), "v2 must not be rewritten");
+    }
+
+    #[test]
+    fn test_analyze_rollback_impact_version_not_found() {
+        let dir = setup_versions_dir();
+        let vai_dir = dir.path().join(".vai");
+        // No event log present — version doesn't exist.
+        let result = analyze_rollback_impact(&vai_dir, "v99");
+        assert!(result.is_err());
     }
 }
