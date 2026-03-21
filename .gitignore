@@ -1,0 +1,5 @@
+/target
+.vai/
+*.swp
+*.swo
+.DS_Store
