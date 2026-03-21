@@ -94,6 +94,9 @@ pub struct WorkspaceMeta {
     pub created_at: DateTime<Utc>,
     /// When this workspace was last updated.
     pub updated_at: DateTime<Utc>,
+    /// Optional issue ID this workspace was created to address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_id: Option<Uuid>,
 }
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -145,6 +148,7 @@ pub fn create_with_id(
         status: WorkspaceStatus::Created,
         created_at: now,
         updated_at: now,
+        issue_id: None,
     };
 
     write_meta(&ws_dir, &meta)?;

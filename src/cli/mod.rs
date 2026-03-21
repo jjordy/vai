@@ -224,6 +224,9 @@ pub enum WorkspaceCommands {
         /// The intent describing what this workspace is for.
         #[arg(long)]
         intent: String,
+        /// Optional issue ID (full UUID or 8-char prefix) this workspace addresses.
+        #[arg(long)]
+        issue: Option<String>,
     },
     /// List all active workspaces.
     List,
@@ -377,10 +380,10 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 .map_err(|e| CliError::Other(format!("cannot read HEAD: {e}")))?;
 
             match ws_cmd {
-                WorkspaceCommands::Create { intent } => {
+                WorkspaceCommands::Create { intent, issue } => {
                     // In a cloned repo, register the workspace on the server
                     // first so both sides share the same UUID.
-                    let result = if let Some(remote) = remote_clone::read_remote_config(&vai_dir) {
+                    let mut result = if let Some(remote) = remote_clone::read_remote_config(&vai_dir) {
                         let server_meta = tokio::runtime::Runtime::new()
                             .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?
                             .block_on(remote_workspace::register_workspace(&remote, &intent))?;
@@ -395,6 +398,18 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         workspace::create(&vai_dir, &intent, &head)?
                     };
 
+                    // If --issue provided, link the workspace to the issue and transition it to InProgress.
+                    if let Some(issue_id_str) = &issue {
+                        let store = crate::issue::IssueStore::open(&vai_dir)?;
+                        let linked_issue = resolve_issue(&store, issue_id_str)?;
+                        let mut event_log = EventLog::open(&vai_dir.join("event_log"))
+                            .map_err(|e| CliError::Other(format!("cannot open event log: {e}")))?;
+                        store.set_in_progress(linked_issue.id, result.workspace.id, &mut event_log)?;
+                        // Persist issue_id in workspace meta for later discard/submit hooks.
+                        result.workspace.issue_id = Some(linked_issue.id);
+                        workspace::update_meta(&vai_dir, &result.workspace)?;
+                    }
+
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&result).unwrap());
                     } else {
@@ -406,6 +421,9 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         println!("  Intent : {}", result.workspace.intent);
                         println!("  Base   : {}", result.workspace.base_version);
                         println!("  Path   : {}", result.path.display());
+                        if let Some(issue_id) = result.workspace.issue_id {
+                            println!("  Issue  : {}", issue_id.to_string()[..8].cyan());
+                        }
                     }
                 }
                 WorkspaceCommands::List => {
@@ -451,6 +469,14 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 }
                 WorkspaceCommands::Discard { id } => {
                     let meta = workspace::discard(&vai_dir, &id, None)?;
+                    // If the workspace was linked to an issue, transition it back to Open.
+                    if let Some(issue_id) = meta.issue_id {
+                        let store = crate::issue::IssueStore::open(&vai_dir)?;
+                        let mut event_log = EventLog::open(&vai_dir.join("event_log"))
+                            .map_err(|e| CliError::Other(format!("cannot open event log: {e}")))?;
+                        // Best-effort: ignore if the issue is not in a state that allows reopening.
+                        let _ = store.reopen(issue_id, &mut event_log);
+                    }
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&meta).unwrap());
                     } else {
@@ -520,9 +546,11 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 WorkspaceCommands::Submit => {
                     if let Some(remote) = remote_clone::read_remote_config(&vai_dir) {
                         // ── Remote submit path ─────────────────────────────
-                        // 1. Determine active workspace ID.
+                        // 1. Determine active workspace ID and capture issue link.
                         let active_id = workspace::active_id(&vai_dir)
                             .ok_or_else(|| CliError::Other("no active workspace".to_string()))?;
+                        let active_ws_meta = workspace::get(&vai_dir, &active_id)?;
+                        let linked_issue_id = active_ws_meta.issue_id;
                         let overlay = workspace::overlay_dir(&vai_dir, &active_id);
 
                         // 2. Upload overlay files to server workspace.
@@ -566,6 +594,14 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         meta.updated_at = chrono::Utc::now();
                         workspace::update_meta(&vai_dir, &meta)?;
 
+                        // 6. If linked to an issue, resolve it.
+                        if let Some(issue_id) = linked_issue_id {
+                            let store = crate::issue::IssueStore::open(&vai_dir)?;
+                            let mut event_log = EventLog::open(&vai_dir.join("event_log"))
+                                .map_err(|e| CliError::Other(format!("cannot open event log: {e}")))?;
+                            let _ = store.resolve(issue_id, Some(submit_result.version.clone()), &mut event_log);
+                        }
+
                         if cli.json {
                             println!("{}", serde_json::to_string_pretty(&submit_result).unwrap());
                         } else {
@@ -579,7 +615,20 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         }
                     } else {
                         // ── Local submit path ──────────────────────────────
+                        // Capture linked issue before submit (workspace meta still accessible after).
+                        let active_ws_meta = workspace::active(&vai_dir)?;
+                        let linked_issue_id = active_ws_meta.issue_id;
+
                         let result = merge::submit(&vai_dir, &root)?;
+
+                        // If linked to an issue, resolve it now that the workspace merged.
+                        if let Some(issue_id) = linked_issue_id {
+                            let store = crate::issue::IssueStore::open(&vai_dir)?;
+                            let mut event_log = EventLog::open(&vai_dir.join("event_log"))
+                                .map_err(|e| CliError::Other(format!("cannot open event log: {e}")))?;
+                            let _ = store.resolve(issue_id, Some(result.version.version_id.clone()), &mut event_log);
+                        }
+
                         if cli.json {
                             println!("{}", serde_json::to_string_pretty(&result).unwrap());
                         } else {
@@ -813,6 +862,17 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     let workspaces = workspace::list(&vai_dir)?;
                     let active_id = workspace::active_id(&vai_dir);
 
+                    // Query issue counts (best-effort; zero if store doesn't exist yet).
+                    let issue_counts = {
+                        if let Ok(store) = crate::issue::IssueStore::open(&vai_dir) {
+                            let open = store.list(&IssueFilter { status: Some(IssueStatus::Open), ..Default::default() }).unwrap_or_default().len();
+                            let in_progress = store.list(&IssueFilter { status: Some(IssueStatus::InProgress), ..Default::default() }).unwrap_or_default().len();
+                            Some((open, in_progress))
+                        } else {
+                            None
+                        }
+                    };
+
                     if cli.json {
                         let out = StatusOutput {
                             repo_name: config.name.clone(),
@@ -859,6 +919,9 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                             );
                         }
                         println!();
+                        if let Some((open, in_progress)) = issue_counts {
+                            println!("Issues: {} open, {} in progress", open, in_progress);
+                        }
                         println!("Pending conflicts: 0");
                     }
                 }
