@@ -396,6 +396,13 @@ impl ApiError {
             message: msg.into(),
         }
     }
+
+    fn rate_limited(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -403,7 +410,16 @@ impl IntoResponse for ApiError {
         let body = Json(ErrorBody {
             error: self.message,
         });
-        (self.status, body).into_response()
+        let mut resp = (self.status, body).into_response();
+        if self.status == StatusCode::TOO_MANY_REQUESTS {
+            // Seconds remaining until the next hour boundary.
+            let now = chrono::Utc::now();
+            let secs_remaining = 3600u64 - (now.timestamp() as u64 % 3600);
+            if let Ok(val) = secs_remaining.to_string().parse() {
+                resp.headers_mut().insert("Retry-After", val);
+            }
+        }
+        resp
     }
 }
 
@@ -446,6 +462,7 @@ impl From<crate::issue::IssueError> for ApiError {
         match &e {
             crate::issue::IssueError::NotFound(_) => ApiError::not_found(e.to_string()),
             crate::issue::IssueError::InvalidTransition { .. } => ApiError::bad_request(e.to_string()),
+            crate::issue::IssueError::RateLimitExceeded { .. } => ApiError::rate_limited(e.to_string()),
             _ => ApiError::internal(e.to_string()),
         }
     }
@@ -552,6 +569,22 @@ struct CreateIssueRequest {
     /// Human username or agent ID creating this issue.
     #[serde(default = "default_creator")]
     creator: String,
+    /// When set, the issue is created on behalf of an agent with guardrails.
+    /// The value is the agent's ID.
+    created_by_agent: Option<String>,
+    /// Discovery metadata for agent-created issues.
+    source: Option<AgentSourceRequest>,
+    /// Max issues this agent may create per hour (default: 20).
+    #[serde(default = "default_max_per_hour")]
+    max_per_hour: u32,
+}
+
+/// Agent discovery source passed via the REST API.
+#[derive(Debug, Deserialize)]
+struct AgentSourceRequest {
+    source_type: String,
+    #[serde(default)]
+    details: serde_json::Value,
 }
 
 fn default_priority() -> String {
@@ -560,6 +593,10 @@ fn default_priority() -> String {
 
 fn default_creator() -> String {
     "api".to_string()
+}
+
+fn default_max_per_hour() -> u32 {
+    20
 }
 
 /// Request body for `PATCH /api/issues/:id`.
@@ -598,6 +635,11 @@ struct IssueResponse {
     labels: Vec<String>,
     creator: String,
     resolution: Option<String>,
+    /// Present when the issue was created by an agent.
+    agent_source: Option<serde_json::Value>,
+    /// Set on creation responses when a similar open issue was detected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    possible_duplicate_of: Option<String>,
     linked_workspace_ids: Vec<String>,
     created_at: String,
     updated_at: String,
@@ -605,6 +647,9 @@ struct IssueResponse {
 
 impl IssueResponse {
     fn from_issue(issue: crate::issue::Issue, linked: Vec<uuid::Uuid>) -> Self {
+        let agent_source = issue.agent_source.as_ref().map(|s| {
+            serde_json::to_value(s).unwrap_or(serde_json::Value::Null)
+        });
         IssueResponse {
             id: issue.id.to_string(),
             title: issue.title,
@@ -614,6 +659,8 @@ impl IssueResponse {
             labels: issue.labels,
             creator: issue.creator,
             resolution: issue.resolution,
+            agent_source,
+            possible_duplicate_of: None,
             linked_workspace_ids: linked.iter().map(|u| u.to_string()).collect(),
             created_at: issue.created_at.to_rfc3339(),
             updated_at: issue.updated_at.to_rfc3339(),
@@ -1675,12 +1722,18 @@ async fn get_blast_radius_handler(
 
 /// `POST /api/issues` — create a new issue.
 ///
+/// When `created_by_agent` is set the request is treated as an agent-initiated
+/// issue and goes through rate-limiting and duplicate-detection guardrails.
+/// If the rate limit is exceeded the handler returns **429 Too Many Requests**
+/// with a `Retry-After` header.  When a similar open issue is detected the
+/// issue is still created but the response includes `possible_duplicate_of`.
+///
 /// Returns 201 Created with the issue metadata.
 async fn create_issue_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateIssueRequest>,
 ) -> Result<(StatusCode, Json<IssueResponse>), ApiError> {
-    use crate::issue::{IssueStore, IssuePriority};
+    use crate::issue::{AgentSource, IssueStore, IssuePriority};
 
     let priority = IssuePriority::from_str(&body.priority).ok_or_else(|| {
         ApiError::bad_request(format!("unknown priority `{}`", body.priority))
@@ -1690,9 +1743,34 @@ async fn create_issue_handler(
     let mut log = crate::event_log::EventLog::open(&state.vai_dir)
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let issue = store
-        .create(body.title, body.description, priority, body.labels, body.creator, &mut log)
-        .map_err(ApiError::from)?;
+    let (issue, possible_duplicate_id) = if let Some(agent_id) = body.created_by_agent {
+        // Agent-initiated path: apply guardrails.
+        let source = body.source.map(|s| AgentSource {
+            source_type: s.source_type,
+            details: s.details,
+        }).unwrap_or_else(|| AgentSource {
+            source_type: "unknown".into(),
+            details: serde_json::Value::Null,
+        });
+        store
+            .create_by_agent(
+                body.title,
+                body.description,
+                priority,
+                body.labels,
+                agent_id,
+                source,
+                body.max_per_hour,
+                &mut log,
+            )
+            .map_err(ApiError::from)?
+    } else {
+        // Human-initiated path: no guardrails.
+        let issue = store
+            .create(body.title, body.description, priority, body.labels, body.creator, &mut log)
+            .map_err(ApiError::from)?;
+        (issue, None)
+    };
 
     let issue_id = issue.id;
     state.broadcast(BroadcastEvent {
@@ -1706,7 +1784,10 @@ async fn create_issue_handler(
         }),
     });
 
-    Ok((StatusCode::CREATED, Json(IssueResponse::from_issue(issue, vec![]))))
+    let mut resp = IssueResponse::from_issue(issue, vec![]);
+    resp.possible_duplicate_of = possible_duplicate_id.map(|id| id.to_string());
+
+    Ok((StatusCode::CREATED, Json(resp)))
 }
 
 /// `GET /api/issues` — list issues with optional filters.
@@ -3728,6 +3809,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Agent-initiated issue creation: guardrails (rate limit + duplicate detection).
+    #[tokio::test]
+    async fn agent_initiated_issues() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        let agent_source = serde_json::json!({
+            "source_type": "test_failure",
+            "details": { "suite": "unit", "test": "auth::login" }
+        });
+
+        // ── Create first agent issue ──────────────────────────────────────────
+        let resp = client
+            .post(format!("http://{addr}/api/issues"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "title": "Auth login unit test failing",
+                "priority": "high",
+                "created_by_agent": "ci-agent",
+                "source": agent_source,
+                "max_per_hour": 2
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(created["creator"], "ci-agent");
+        assert!(created["agent_source"].is_object());
+        assert_eq!(created["agent_source"]["source_type"], "test_failure");
+        assert!(created["possible_duplicate_of"].is_null());
+        let first_id = created["id"].as_str().unwrap().to_string();
+
+        // ── Filter by agent creator ───────────────────────────────────────────
+        let resp = client
+            .get(format!("http://{addr}/api/issues?created_by=ci-agent"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        let by_agent: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(by_agent.as_array().unwrap().len(), 1);
+
+        // ── Duplicate detection: similar title warns ──────────────────────────
+        let resp = client
+            .post(format!("http://{addr}/api/issues"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "title": "Auth login test failing again",
+                "priority": "medium",
+                "created_by_agent": "ci-agent",
+                "source": { "source_type": "test_failure" },
+                "max_per_hour": 20
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let dup_resp: serde_json::Value = resp.json().await.unwrap();
+        // Should report possible duplicate pointing to first issue.
+        assert_eq!(
+            dup_resp["possible_duplicate_of"].as_str().unwrap(),
+            first_id.as_str()
+        );
+
+        // ── Rate limit: exceed max_per_hour = 2 ──────────────────────────────
+        // Already created 2 above; third should be rejected.
+        let resp = client
+            .post(format!("http://{addr}/api/issues"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "title": "Overflow issue",
+                "priority": "low",
+                "created_by_agent": "ci-agent",
+                "source": { "source_type": "test_failure" },
+                "max_per_hour": 2
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 429);
+        assert!(resp.headers().contains_key("retry-after"));
 
         shutdown_tx.send(()).ok();
     }

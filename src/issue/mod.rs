@@ -9,6 +9,7 @@
 //!      → Closed (wontfix / duplicate)
 //! ```
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -36,6 +37,9 @@ pub enum IssueError {
 
     #[error("Issue store not initialized at {0}")]
     NotInitialized(PathBuf),
+
+    #[error("Rate limit exceeded: agent {agent_id} has created {count} issues this hour (max {max})")]
+    RateLimitExceeded { agent_id: String, count: u32, max: u32 },
 }
 
 // ── Issue priority ────────────────────────────────────────────────────────────
@@ -140,6 +144,22 @@ impl IssueResolution {
     }
 }
 
+// ── Agent source metadata ─────────────────────────────────────────────────────
+
+/// Source metadata attached to issues created by an agent.
+///
+/// Describes how and why the agent discovered the issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSource {
+    /// Discovery type, e.g. `"test_failure"`, `"security_vulnerability"`,
+    /// `"code_quality"`, `"performance_regression"`, `"dependency_update"`.
+    pub source_type: String,
+    /// Arbitrary key/value details about the discovery (test suite name,
+    /// severity, affected entity, etc.).
+    #[serde(default)]
+    pub details: serde_json::Value,
+}
+
 // ── Issue data model ──────────────────────────────────────────────────────────
 
 /// A single issue.
@@ -161,6 +181,9 @@ pub struct Issue {
     pub creator: String,
     /// Resolution string (set when status becomes Resolved or Closed).
     pub resolution: Option<String>,
+    /// Source metadata if this issue was created by an agent; `None` for
+    /// human-created issues.
+    pub agent_source: Option<AgentSource>,
     /// When the issue was created.
     pub created_at: DateTime<Utc>,
     /// When the issue was last updated.
@@ -203,16 +226,17 @@ impl IssueStore {
     fn init_schema(&self) -> Result<(), IssueError> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS issues (
-                id          TEXT PRIMARY KEY,
-                title       TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                status      TEXT NOT NULL DEFAULT 'open',
-                priority    TEXT NOT NULL DEFAULT 'medium',
-                labels      TEXT NOT NULL DEFAULT '',
-                creator     TEXT NOT NULL,
-                resolution  TEXT,
-                created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL
+                id           TEXT PRIMARY KEY,
+                title        TEXT NOT NULL,
+                description  TEXT NOT NULL DEFAULT '',
+                status       TEXT NOT NULL DEFAULT 'open',
+                priority     TEXT NOT NULL DEFAULT 'medium',
+                labels       TEXT NOT NULL DEFAULT '',
+                creator      TEXT NOT NULL,
+                resolution   TEXT,
+                agent_source TEXT,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_issues_status   ON issues(status);
             CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority);
@@ -223,8 +247,20 @@ impl IssueStore {
                 workspace_id TEXT NOT NULL,
                 linked_at    TEXT NOT NULL,
                 PRIMARY KEY (issue_id, workspace_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS agent_rate_limits (
+                agent_id    TEXT NOT NULL,
+                hour_bucket TEXT NOT NULL,
+                count       INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_id, hour_bucket)
             );",
         )?;
+        // Migrate existing databases that lack the agent_source column.
+        let _ = self.conn.execute(
+            "ALTER TABLE issues ADD COLUMN agent_source TEXT",
+            [],
+        );
         Ok(())
     }
 
@@ -248,8 +284,8 @@ impl IssueStore {
         let labels_str = labels.join(",");
 
         self.conn.execute(
-            "INSERT INTO issues (id, title, description, status, priority, labels, creator, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO issues (id, title, description, status, priority, labels, creator, agent_source, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id.to_string(),
                 &title,
@@ -257,6 +293,7 @@ impl IssueStore {
                 priority.as_str(),
                 &labels_str,
                 &creator,
+                Option::<String>::None,
                 now.to_rfc3339(),
                 now.to_rfc3339(),
             ],
@@ -278,9 +315,166 @@ impl IssueStore {
             labels,
             creator,
             resolution: None,
+            agent_source: None,
             created_at: now,
             updated_at: now,
         })
+    }
+
+    // ── Agent-initiated issue creation ────────────────────────────────────────
+
+    /// Create an issue on behalf of an agent, with rate-limiting and duplicate detection.
+    ///
+    /// Returns `(issue, possible_duplicate_id)`.  If a similar open issue
+    /// already exists the second element is `Some(id)` — the issue is still
+    /// created, but callers should surface the warning.
+    ///
+    /// Returns [`IssueError::RateLimitExceeded`] when `agent_id` has already
+    /// created `max_per_hour` issues within the current clock hour.
+    pub fn create_by_agent(
+        &self,
+        title: impl Into<String>,
+        description: impl Into<String>,
+        priority: IssuePriority,
+        labels: Vec<String>,
+        agent_id: impl Into<String>,
+        source: AgentSource,
+        max_per_hour: u32,
+        event_log: &mut EventLog,
+    ) -> Result<(Issue, Option<Uuid>), IssueError> {
+        let agent_id = agent_id.into();
+        let title = title.into();
+
+        // ── Rate limit check ──────────────────────────────────────────────────
+        let count = self.increment_agent_rate_limit(&agent_id)?;
+        if count > max_per_hour {
+            // Decrement back so the over-limit request doesn't count.
+            let bucket = current_hour_bucket();
+            let _ = self.conn.execute(
+                "UPDATE agent_rate_limits SET count = count - 1 WHERE agent_id = ?1 AND hour_bucket = ?2",
+                params![&agent_id, &bucket],
+            );
+            return Err(IssueError::RateLimitExceeded {
+                agent_id,
+                count,
+                max: max_per_hour,
+            });
+        }
+
+        // ── Duplicate detection ───────────────────────────────────────────────
+        let possible_duplicate = self.find_similar_open_issue(&title)?;
+
+        // ── Create the issue ──────────────────────────────────────────────────
+        let description = description.into();
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let labels_str = labels.join(",");
+        let source_json = serde_json::to_string(&source).unwrap_or_default();
+
+        self.conn.execute(
+            "INSERT INTO issues (id, title, description, status, priority, labels, creator, agent_source, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id.to_string(),
+                &title,
+                &description,
+                priority.as_str(),
+                &labels_str,
+                &agent_id,
+                &source_json,
+                now.to_rfc3339(),
+                now.to_rfc3339(),
+            ],
+        )?;
+
+        event_log.append(EventKind::IssueCreated {
+            issue_id: id,
+            title: title.clone(),
+            creator: agent_id.clone(),
+            priority: priority.as_str().to_string(),
+        })?;
+
+        let issue = Issue {
+            id,
+            title,
+            description,
+            status: IssueStatus::Open,
+            priority,
+            labels,
+            creator: agent_id,
+            resolution: None,
+            agent_source: Some(source),
+            created_at: now,
+            updated_at: now,
+        };
+        Ok((issue, possible_duplicate))
+    }
+
+    /// Increment the per-agent, per-hour issue creation counter.
+    ///
+    /// Returns the new count after incrementing.
+    fn increment_agent_rate_limit(&self, agent_id: &str) -> Result<u32, IssueError> {
+        let bucket = current_hour_bucket();
+        self.conn.execute(
+            "INSERT INTO agent_rate_limits (agent_id, hour_bucket, count)
+             VALUES (?1, ?2, 1)
+             ON CONFLICT(agent_id, hour_bucket) DO UPDATE SET count = count + 1",
+            params![agent_id, &bucket],
+        )?;
+        let count: u32 = self.conn.query_row(
+            "SELECT count FROM agent_rate_limits WHERE agent_id = ?1 AND hour_bucket = ?2",
+            params![agent_id, &bucket],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Find an open issue whose title is similar to `title` (Jaccard word overlap ≥ 0.5).
+    ///
+    /// Returns the ID of the first match found, or `None`.
+    fn find_similar_open_issue(&self, title: &str) -> Result<Option<Uuid>, IssueError> {
+        let candidates: Vec<(Uuid, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, title FROM issues WHERE status IN ('open', 'in_progress')",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                let t: String = row.get(1)?;
+                Ok((id_str, t))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id_str, t) = row?;
+                if let Ok(id) = Uuid::parse_str(&id_str) {
+                    out.push((id, t));
+                }
+            }
+            out
+        };
+
+        let query_tokens = tokenize_title(title);
+        if query_tokens.is_empty() {
+            return Ok(None);
+        }
+
+        for (id, candidate_title) in candidates {
+            let candidate_tokens = tokenize_title(&candidate_title);
+            if jaccard_similarity(&query_tokens, &candidate_tokens) >= 0.5 {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Return the number of issues an agent has created in the current hour.
+    pub fn agent_issue_count_this_hour(&self, agent_id: &str) -> Result<u32, IssueError> {
+        let bucket = current_hour_bucket();
+        let count: u32 = self.conn.query_row(
+            "SELECT COALESCE(count, 0) FROM agent_rate_limits WHERE agent_id = ?1 AND hour_bucket = ?2",
+            params![agent_id, &bucket],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        Ok(count)
     }
 
     // ── Read ──────────────────────────────────────────────────────────────────
@@ -288,7 +482,7 @@ impl IssueStore {
     /// Fetch a single issue by ID.
     pub fn get(&self, id: Uuid) -> Result<Issue, IssueError> {
         let result = self.conn.query_row(
-            "SELECT id, title, description, status, priority, labels, creator, resolution, created_at, updated_at
+            "SELECT id, title, description, status, priority, labels, creator, resolution, agent_source, created_at, updated_at
              FROM issues WHERE id = ?1",
             params![id.to_string()],
             row_to_issue,
@@ -338,7 +532,7 @@ impl IssueStore {
         };
 
         let sql = format!(
-            "SELECT id, title, description, status, priority, labels, creator, resolution, created_at, updated_at
+            "SELECT id, title, description, status, priority, labels, creator, resolution, agent_source, created_at, updated_at
              FROM issues {} ORDER BY created_at DESC",
             where_clause
         );
@@ -533,6 +727,41 @@ impl IssueStore {
     }
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Return the current UTC hour as a bucket string, e.g. `"2026-03-21T10"`.
+fn current_hour_bucket() -> String {
+    let now = Utc::now();
+    now.format("%Y-%m-%dT%H").to_string()
+}
+
+/// Stop words excluded from title tokenization.
+const STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
+    "has", "have", "in", "is", "it", "its", "of", "on", "or", "that", "the",
+    "this", "to", "was", "will", "with",
+];
+
+/// Tokenize a title into a set of lowercase alphabetic words, excluding stop words.
+fn tokenize_title(title: &str) -> HashSet<String> {
+    title
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+        .filter(|w| !STOP_WORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Compute Jaccard similarity between two token sets.
+fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let intersection = a.intersection(b).count() as f64;
+    let union = a.union(b).count() as f64;
+    if union == 0.0 { 0.0 } else { intersection / union }
+}
+
 // ── Row mapping helper ────────────────────────────────────────────────────────
 
 fn row_to_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
@@ -544,8 +773,9 @@ fn row_to_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
     let labels_str: String = row.get(5)?;
     let creator: String = row.get(6)?;
     let resolution: Option<String> = row.get(7)?;
-    let created_str: String = row.get(8)?;
-    let updated_str: String = row.get(9)?;
+    let agent_source_json: Option<String> = row.get(8)?;
+    let created_str: String = row.get(9)?;
+    let updated_str: String = row.get(10)?;
 
     let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::nil());
     let status = IssueStatus::from_str(&status_str).unwrap_or(IssueStatus::Open);
@@ -555,6 +785,9 @@ fn row_to_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
     } else {
         labels_str.split(',').map(|s| s.to_string()).collect()
     };
+    let agent_source = agent_source_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
     let created_at = DateTime::parse_from_rfc3339(&created_str)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
@@ -571,6 +804,7 @@ fn row_to_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
         labels,
         creator,
         resolution,
+        agent_source,
         created_at,
         updated_at,
     })
@@ -581,7 +815,6 @@ fn row_to_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, IssueStore, EventLog) {
@@ -689,5 +922,131 @@ mod tests {
         store.set_in_progress(issue.id, ws_id, &mut log).unwrap();
         let reopened = store.reopen(issue.id, &mut log).unwrap();
         assert_eq!(reopened.status, IssueStatus::Open);
+    }
+
+    #[test]
+    fn test_create_by_agent_basic() {
+        let (_tmp, store, mut log) = setup();
+        let source = AgentSource {
+            source_type: "test_failure".into(),
+            details: serde_json::json!({ "suite": "unit", "test": "auth::login" }),
+        };
+        let (issue, dup) = store
+            .create_by_agent(
+                "Login test failing",
+                "Auth unit test fails on nil session",
+                IssuePriority::High,
+                vec!["bug".into()],
+                "ci-agent",
+                source,
+                20,
+                &mut log,
+            )
+            .unwrap();
+
+        assert_eq!(issue.creator, "ci-agent");
+        assert!(issue.agent_source.is_some());
+        assert_eq!(issue.agent_source.as_ref().unwrap().source_type, "test_failure");
+        assert!(dup.is_none(), "no duplicate expected for first issue");
+
+        // Fetched from DB should round-trip agent_source.
+        let fetched = store.get(issue.id).unwrap();
+        assert!(fetched.agent_source.is_some());
+    }
+
+    #[test]
+    fn test_rate_limit_exceeded() {
+        let (_tmp, store, mut log) = setup();
+        let make_source = || AgentSource {
+            source_type: "test_failure".into(),
+            details: serde_json::Value::Null,
+        };
+
+        // Fill up to the limit (max_per_hour = 2).
+        for i in 0..2u32 {
+            store
+                .create_by_agent(
+                    format!("Issue {i}"),
+                    "",
+                    IssuePriority::Low,
+                    vec![],
+                    "flood-agent",
+                    make_source(),
+                    2,
+                    &mut log,
+                )
+                .unwrap();
+        }
+
+        // Next one should be rejected.
+        let result = store.create_by_agent(
+            "Issue overflow",
+            "",
+            IssuePriority::Low,
+            vec![],
+            "flood-agent",
+            make_source(),
+            2,
+            &mut log,
+        );
+        assert!(
+            matches!(result, Err(IssueError::RateLimitExceeded { .. })),
+            "expected RateLimitExceeded"
+        );
+
+        // Verify count didn't increase beyond limit.
+        let count = store.agent_issue_count_this_hour("flood-agent").unwrap();
+        assert_eq!(count, 2, "rate-limited request must not increment counter");
+    }
+
+    #[test]
+    fn test_duplicate_detection_warning() {
+        let (_tmp, store, mut log) = setup();
+        let source = || AgentSource {
+            source_type: "test_failure".into(),
+            details: serde_json::Value::Null,
+        };
+
+        // Create first issue.
+        let (first, dup1) = store
+            .create_by_agent(
+                "Auth service login fails",
+                "",
+                IssuePriority::High,
+                vec![],
+                "agent-a",
+                source(),
+                20,
+                &mut log,
+            )
+            .unwrap();
+        assert!(dup1.is_none());
+
+        // Create similar issue — should warn about the first.
+        let (_second, dup2) = store
+            .create_by_agent(
+                "Auth service login failing",
+                "",
+                IssuePriority::Medium,
+                vec![],
+                "agent-b",
+                source(),
+                20,
+                &mut log,
+            )
+            .unwrap();
+        assert_eq!(dup2, Some(first.id), "should detect similar open issue as potential duplicate");
+    }
+
+    #[test]
+    fn test_tokenize_and_similarity() {
+        let a = tokenize_title("Fix login bug in auth service");
+        let b = tokenize_title("Bug fix login auth service module");
+        let sim = jaccard_similarity(&a, &b);
+        assert!(sim >= 0.5, "similar titles should have similarity >= 0.5, got {sim}");
+
+        let c = tokenize_title("Add database migration");
+        let sim2 = jaccard_similarity(&a, &c);
+        assert!(sim2 < 0.5, "dissimilar titles should have similarity < 0.5, got {sim2}");
     }
 }
