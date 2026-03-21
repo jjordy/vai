@@ -20,6 +20,11 @@
 //!   - `GET /api/graph/entities/:id` — entity details and relationships
 //!   - `GET /api/graph/entities/:id/deps` — transitive dependencies (bidirectional)
 //!   - `GET /api/graph/blast-radius` — entities reachable from seeds (`?entities=id1,id2&hops=2`)
+//!   - `POST /api/issues` — create issue
+//!   - `GET /api/issues` — list issues (`?status=`, `?priority=`, `?label=`, `?created_by=`)
+//!   - `GET /api/issues/:id` — issue details with linked workspaces
+//!   - `PATCH /api/issues/:id` — update issue fields
+//!   - `POST /api/issues/:id/close` — close issue with resolution
 //!
 //! ## WebSocket Endpoints
 //!   - `GET /ws/events?key=<api_key>` — real-time event stream
@@ -436,6 +441,16 @@ impl From<version::VersionError> for ApiError {
     }
 }
 
+impl From<crate::issue::IssueError> for ApiError {
+    fn from(e: crate::issue::IssueError) -> Self {
+        match &e {
+            crate::issue::IssueError::NotFound(_) => ApiError::not_found(e.to_string()),
+            crate::issue::IssueError::InvalidTransition { .. } => ApiError::bad_request(e.to_string()),
+            _ => ApiError::internal(e.to_string()),
+        }
+    }
+}
+
 // ── API response types ────────────────────────────────────────────────────────
 
 /// Response body for `GET /api/status`.
@@ -520,6 +535,90 @@ struct RollbackRequest {
     /// If `false` (default) and downstream impacts exist, returns 409.
     #[serde(default)]
     force: bool,
+}
+
+// ── Issue API types ───────────────────────────────────────────────────────────
+
+/// Request body for `POST /api/issues`.
+#[derive(Debug, Deserialize)]
+struct CreateIssueRequest {
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default = "default_priority")]
+    priority: String,
+    #[serde(default)]
+    labels: Vec<String>,
+    /// Human username or agent ID creating this issue.
+    #[serde(default = "default_creator")]
+    creator: String,
+}
+
+fn default_priority() -> String {
+    "medium".to_string()
+}
+
+fn default_creator() -> String {
+    "api".to_string()
+}
+
+/// Request body for `PATCH /api/issues/:id`.
+#[derive(Debug, Deserialize)]
+struct UpdateIssueRequest {
+    title: Option<String>,
+    description: Option<String>,
+    priority: Option<String>,
+    labels: Option<Vec<String>>,
+}
+
+/// Request body for `POST /api/issues/:id/close`.
+#[derive(Debug, Deserialize)]
+struct CloseIssueRequest {
+    /// Resolution: "resolved", "wontfix", or "duplicate".
+    resolution: String,
+}
+
+/// Query parameters for `GET /api/issues`.
+#[derive(Debug, Default, Deserialize)]
+struct ListIssuesQuery {
+    status: Option<String>,
+    priority: Option<String>,
+    label: Option<String>,
+    created_by: Option<String>,
+}
+
+/// Response body for issue endpoints.
+#[derive(Debug, Serialize)]
+struct IssueResponse {
+    id: String,
+    title: String,
+    description: String,
+    status: String,
+    priority: String,
+    labels: Vec<String>,
+    creator: String,
+    resolution: Option<String>,
+    linked_workspace_ids: Vec<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl IssueResponse {
+    fn from_issue(issue: crate::issue::Issue, linked: Vec<uuid::Uuid>) -> Self {
+        IssueResponse {
+            id: issue.id.to_string(),
+            title: issue.title,
+            description: issue.description,
+            status: issue.status.as_str().to_string(),
+            priority: issue.priority.as_str().to_string(),
+            labels: issue.labels,
+            creator: issue.creator,
+            resolution: issue.resolution,
+            linked_workspace_ids: linked.iter().map(|u| u.to_string()).collect(),
+            created_at: issue.created_at.to_rfc3339(),
+            updated_at: issue.updated_at.to_rfc3339(),
+        }
+    }
 }
 
 // ── Route handlers ────────────────────────────────────────────────────────────
@@ -1572,6 +1671,154 @@ async fn get_blast_radius_handler(
     }))
 }
 
+// ── Issue route handlers ──────────────────────────────────────────────────────
+
+/// `POST /api/issues` — create a new issue.
+///
+/// Returns 201 Created with the issue metadata.
+async fn create_issue_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateIssueRequest>,
+) -> Result<(StatusCode, Json<IssueResponse>), ApiError> {
+    use crate::issue::{IssueStore, IssuePriority};
+
+    let priority = IssuePriority::from_str(&body.priority).ok_or_else(|| {
+        ApiError::bad_request(format!("unknown priority `{}`", body.priority))
+    })?;
+
+    let store = IssueStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut log = crate::event_log::EventLog::open(&state.vai_dir)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let issue = store
+        .create(body.title, body.description, priority, body.labels, body.creator, &mut log)
+        .map_err(ApiError::from)?;
+
+    let issue_id = issue.id;
+    state.broadcast(BroadcastEvent {
+        event_type: "IssueCreated".to_string(),
+        event_id: 0,
+        workspace_id: None,
+        timestamp: issue.created_at.to_rfc3339(),
+        data: serde_json::json!({
+            "issue_id": issue_id.to_string(),
+            "title": issue.title.clone(),
+        }),
+    });
+
+    Ok((StatusCode::CREATED, Json(IssueResponse::from_issue(issue, vec![]))))
+}
+
+/// `GET /api/issues` — list issues with optional filters.
+async fn list_issues_handler(
+    State(state): State<Arc<AppState>>,
+    AxumQuery(query): AxumQuery<ListIssuesQuery>,
+) -> Result<Json<Vec<IssueResponse>>, ApiError> {
+    use crate::issue::{IssueStore, IssueFilter, IssueStatus, IssuePriority};
+
+    let status = query.status.as_deref()
+        .map(|s| IssueStatus::from_str(s).ok_or_else(|| ApiError::bad_request(format!("unknown status `{s}`"))))
+        .transpose()?;
+    let priority = query.priority.as_deref()
+        .map(|p| IssuePriority::from_str(p).ok_or_else(|| ApiError::bad_request(format!("unknown priority `{p}`"))))
+        .transpose()?;
+
+    let filter = IssueFilter {
+        status,
+        priority,
+        label: query.label,
+        creator: query.created_by,
+    };
+
+    let store = IssueStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let issues = store.list(&filter).map_err(ApiError::from)?;
+
+    let mut response = Vec::with_capacity(issues.len());
+    for issue in issues {
+        let linked = store.linked_workspaces(issue.id).unwrap_or_default();
+        response.push(IssueResponse::from_issue(issue, linked));
+    }
+    Ok(Json(response))
+}
+
+/// `GET /api/issues/:id` — issue details with linked workspaces.
+///
+/// Returns 404 if the issue does not exist.
+async fn get_issue_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<IssueResponse>, ApiError> {
+    use crate::issue::IssueStore;
+
+    let issue_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
+
+    let store = IssueStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let issue = store.get(issue_id).map_err(ApiError::from)?;
+    let linked = store.linked_workspaces(issue_id).unwrap_or_default();
+
+    Ok(Json(IssueResponse::from_issue(issue, linked)))
+}
+
+/// `PATCH /api/issues/:id` — update mutable fields of an issue.
+///
+/// Returns 404 if the issue does not exist.
+async fn update_issue_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<UpdateIssueRequest>,
+) -> Result<Json<IssueResponse>, ApiError> {
+    use crate::issue::{IssueStore, IssuePriority};
+
+    let issue_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
+
+    let priority = body.priority.as_deref()
+        .map(|p| IssuePriority::from_str(p).ok_or_else(|| ApiError::bad_request(format!("unknown priority `{p}`"))))
+        .transpose()?;
+
+    let store = IssueStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut log = crate::event_log::EventLog::open(&state.vai_dir)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let issue = store
+        .update(issue_id, body.title, body.description, priority, body.labels, &mut log)
+        .map_err(ApiError::from)?;
+
+    let linked = store.linked_workspaces(issue_id).unwrap_or_default();
+    Ok(Json(IssueResponse::from_issue(issue, linked)))
+}
+
+/// `POST /api/issues/:id/close` — close an issue with a resolution.
+///
+/// Returns 404 if the issue does not exist.
+async fn close_issue_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<CloseIssueRequest>,
+) -> Result<Json<IssueResponse>, ApiError> {
+    use crate::issue::{IssueStore, IssueResolution};
+
+    let issue_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
+
+    let resolution = IssueResolution::from_str(&body.resolution).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "unknown resolution `{}`; expected resolved, wontfix, or duplicate",
+            body.resolution
+        ))
+    })?;
+
+    let store = IssueStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut log = crate::event_log::EventLog::open(&state.vai_dir)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let issue = store.close(issue_id, resolution, &mut log).map_err(ApiError::from)?;
+
+    let linked = store.linked_workspaces(issue_id).unwrap_or_default();
+    Ok(Json(IssueResponse::from_issue(issue, linked)))
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -1618,6 +1865,13 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
             "/api/graph/entities/:id/deps",
             get(get_entity_deps_handler),
         )
+        // Issue management endpoints.
+        .route("/api/issues", post(create_issue_handler))
+        .route("/api/issues", get(list_issues_handler))
+        // Static sub-routes must come before :id.
+        .route("/api/issues/:id/close", post(close_issue_handler))
+        .route("/api/issues/:id", get(get_issue_handler))
+        .route("/api/issues/:id", axum::routing::patch(update_issue_handler))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -3301,6 +3555,179 @@ mod tests {
             "v1",
             "server HEAD should advance after submit"
         );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    // ── Issue REST API tests ───────────────────────────────────────────────────
+
+    /// Full CRUD cycle for the issue REST API:
+    /// create → list → get → update → close.
+    #[tokio::test]
+    async fn issue_crud_endpoints() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // ── Create ────────────────────────────────────────────────────────────
+
+        let create_body = serde_json::json!({
+            "title": "Fix login bug",
+            "description": "Auth is broken for new users",
+            "priority": "high",
+            "labels": ["bug", "auth"],
+            "creator": "agent-01"
+        });
+
+        let resp = client
+            .post(format!("http://{addr}/api/issues"))
+            .bearer_auth(&key)
+            .json(&create_body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 201);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(created["title"], "Fix login bug");
+        assert_eq!(created["status"], "open");
+        assert_eq!(created["priority"], "high");
+        assert_eq!(created["creator"], "agent-01");
+        assert!(created["labels"].as_array().unwrap().contains(&serde_json::json!("bug")));
+
+        let issue_id = created["id"].as_str().unwrap().to_string();
+
+        // ── Create a second issue ─────────────────────────────────────────────
+
+        let resp2 = client
+            .post(format!("http://{addr}/api/issues"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "title": "Add rate limiting",
+                "priority": "medium",
+                "creator": "agent-02"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), 201);
+
+        // ── List all ──────────────────────────────────────────────────────────
+
+        let resp = client
+            .get(format!("http://{addr}/api/issues"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let issues: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(issues.as_array().unwrap().len(), 2);
+
+        // ── List with filter ──────────────────────────────────────────────────
+
+        let resp = client
+            .get(format!("http://{addr}/api/issues?priority=high"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let filtered: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(filtered.as_array().unwrap().len(), 1);
+        assert_eq!(filtered[0]["title"], "Fix login bug");
+
+        // Filter by creator.
+        let resp = client
+            .get(format!("http://{addr}/api/issues?created_by=agent-02"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        let by_creator: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(by_creator.as_array().unwrap().len(), 1);
+        assert_eq!(by_creator[0]["title"], "Add rate limiting");
+
+        // ── Get by ID ─────────────────────────────────────────────────────────
+
+        let resp = client
+            .get(format!("http://{addr}/api/issues/{issue_id}"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let fetched: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(fetched["id"], issue_id.as_str());
+        assert_eq!(fetched["title"], "Fix login bug");
+
+        // ── Get non-existent issue → 404 ──────────────────────────────────────
+
+        let fake_id = uuid::Uuid::new_v4();
+        let resp = client
+            .get(format!("http://{addr}/api/issues/{fake_id}"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        // ── Update ────────────────────────────────────────────────────────────
+
+        let resp = client
+            .patch(format!("http://{addr}/api/issues/{issue_id}"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "priority": "critical",
+                "labels": ["bug", "auth", "urgent"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let updated: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(updated["priority"], "critical");
+        assert_eq!(updated["labels"].as_array().unwrap().len(), 3);
+
+        // ── Close ─────────────────────────────────────────────────────────────
+
+        let resp = client
+            .post(format!("http://{addr}/api/issues/{issue_id}/close"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "resolution": "resolved" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let closed: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(closed["status"], "closed");
+        assert_eq!(closed["resolution"], "resolved");
+
+        // ── List with status filter ───────────────────────────────────────────
+
+        let resp = client
+            .get(format!("http://{addr}/api/issues?status=open"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        let open_issues: serde_json::Value = resp.json().await.unwrap();
+        // Only the second issue (rate limiting) remains open.
+        assert_eq!(open_issues.as_array().unwrap().len(), 1);
+        assert_eq!(open_issues[0]["title"], "Add rate limiting");
+
+        // ── Invalid resolution → 400 ──────────────────────────────────────────
+
+        let resp = client
+            .post(format!("http://{addr}/api/issues/{issue_id}/close"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "resolution": "badvalue" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
 
         shutdown_tx.send(()).ok();
     }
