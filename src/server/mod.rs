@@ -2,22 +2,32 @@
 //! multi-agent coordination.
 //!
 //! Entry point: [`start`] — binds a TCP socket and serves the application.
-//! For Phase 2 tracer bullet this module implements:
+//! Current endpoints:
 //!   - `GET /api/status` — server and repository health
+//!   - `POST /api/workspaces` — create a new workspace
+//!   - `GET /api/workspaces` — list active workspaces
+//!   - `GET /api/workspaces/:id` — workspace details
+//!   - `POST /api/workspaces/:id/submit` — submit workspace for merge
+//!   - `DELETE /api/workspaces/:id` — discard a workspace
 //!
-//! Further endpoints (workspaces, graph, versions, WebSocket) will be added
-//! in subsequent issues.
+//! Further endpoints (graph, versions, WebSocket) will be added in subsequent
+//! issues.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::{extract::State, routing::get, Json, Router};
+use axum::extract::{Path as AxumPath, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::net::TcpListener;
 
+use crate::merge;
 use crate::repo;
 use crate::workspace;
 
@@ -81,12 +91,85 @@ impl ServerConfig {
 pub(crate) struct AppState {
     /// Absolute path to the `.vai/` directory.
     vai_dir: PathBuf,
+    /// Absolute path to the repository root (parent of `.vai/`).
+    repo_root: PathBuf,
     /// Monotonic timestamp recorded when the server started.
     started_at: Instant,
     /// Human-readable repository name from `.vai/config.toml`.
     repo_name: String,
     /// vai crate version string.
     vai_version: String,
+}
+
+// ── API error helper ──────────────────────────────────────────────────────────
+
+/// JSON body for error responses.
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    error: String,
+}
+
+/// A handler error that carries an HTTP status code and message.
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: msg.into(),
+        }
+    }
+
+    fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: msg.into(),
+        }
+    }
+
+    fn internal(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: msg.into(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = Json(ErrorBody {
+            error: self.message,
+        });
+        (self.status, body).into_response()
+    }
+}
+
+impl From<workspace::WorkspaceError> for ApiError {
+    fn from(e: workspace::WorkspaceError) -> Self {
+        match &e {
+            workspace::WorkspaceError::NotFound(_) => ApiError::not_found(e.to_string()),
+            workspace::WorkspaceError::NoActiveWorkspace => ApiError::not_found(e.to_string()),
+            _ => ApiError::internal(e.to_string()),
+        }
+    }
+}
+
+impl From<merge::MergeError> for ApiError {
+    fn from(e: merge::MergeError) -> Self {
+        match &e {
+            merge::MergeError::SemanticConflicts { .. } => ApiError::conflict(e.to_string()),
+            merge::MergeError::Workspace(workspace::WorkspaceError::NotFound(_)) => {
+                ApiError::not_found(e.to_string())
+            }
+            merge::MergeError::Workspace(workspace::WorkspaceError::NoActiveWorkspace) => {
+                ApiError::not_found(e.to_string())
+            }
+            _ => ApiError::internal(e.to_string()),
+        }
+    }
 }
 
 // ── API response types ────────────────────────────────────────────────────────
@@ -104,6 +187,57 @@ pub struct StatusResponse {
     pub workspace_count: usize,
     /// vai version string.
     pub vai_version: String,
+}
+
+/// Request body for `POST /api/workspaces`.
+#[derive(Debug, Deserialize)]
+struct CreateWorkspaceRequest {
+    /// Stated agent intent for this workspace.
+    intent: String,
+}
+
+/// Response body for workspace creation and detail endpoints.
+#[derive(Debug, Serialize)]
+struct WorkspaceResponse {
+    id: String,
+    intent: String,
+    status: String,
+    base_version: String,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<workspace::WorkspaceMeta> for WorkspaceResponse {
+    fn from(m: workspace::WorkspaceMeta) -> Self {
+        WorkspaceResponse {
+            id: m.id.to_string(),
+            intent: m.intent,
+            status: m.status.as_str().to_string(),
+            base_version: m.base_version,
+            created_at: m.created_at.to_rfc3339(),
+            updated_at: m.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Response body for `POST /api/workspaces/:id/submit`.
+#[derive(Debug, Serialize)]
+struct SubmitResponse {
+    version: String,
+    files_applied: usize,
+    entities_changed: usize,
+    auto_resolved: u32,
+}
+
+impl From<merge::SubmitResult> for SubmitResponse {
+    fn from(r: merge::SubmitResult) -> Self {
+        SubmitResponse {
+            version: r.version.version_id.clone(),
+            files_applied: r.files_applied,
+            entities_changed: r.entities_changed,
+            auto_resolved: r.auto_resolved,
+        }
+    }
 }
 
 // ── Route handlers ────────────────────────────────────────────────────────────
@@ -124,6 +258,68 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRespon
     })
 }
 
+/// `POST /api/workspaces` — creates a new workspace at the current HEAD.
+///
+/// Returns 201 Created with the workspace metadata.
+async fn create_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateWorkspaceRequest>,
+) -> Result<(StatusCode, Json<WorkspaceResponse>), ApiError> {
+    let head = repo::read_head(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let result = workspace::create(&state.vai_dir, &body.intent, &head)
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(WorkspaceResponse::from(result.workspace))))
+}
+
+/// `GET /api/workspaces` — lists all active (non-discarded, non-merged) workspaces.
+async fn list_workspaces_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<WorkspaceResponse>>, ApiError> {
+    let workspaces = workspace::list(&state.vai_dir).map_err(ApiError::from)?;
+    let response: Vec<WorkspaceResponse> = workspaces.into_iter().map(Into::into).collect();
+    Ok(Json(response))
+}
+
+/// `GET /api/workspaces/:id` — returns details for a single workspace.
+///
+/// Returns 404 if the workspace does not exist.
+async fn get_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<WorkspaceResponse>, ApiError> {
+    let meta = workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
+    Ok(Json(WorkspaceResponse::from(meta)))
+}
+
+/// `POST /api/workspaces/:id/submit` — submits a workspace for merge.
+///
+/// Switches the active workspace to `id`, then runs the merge engine.
+/// Returns 409 Conflict if the merge cannot be auto-resolved.
+/// Returns 404 if the workspace does not exist.
+async fn submit_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<SubmitResponse>, ApiError> {
+    // Verify the workspace exists before switching.
+    workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
+    // Make it the active workspace so merge::submit can find it.
+    workspace::switch(&state.vai_dir, &id).map_err(ApiError::from)?;
+    let result = merge::submit(&state.vai_dir, &state.repo_root).map_err(ApiError::from)?;
+    Ok(Json(SubmitResponse::from(result)))
+}
+
+/// `DELETE /api/workspaces/:id` — discards a workspace.
+///
+/// Returns 404 if the workspace does not exist.
+/// Returns 204 No Content on success.
+async fn discard_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    workspace::discard(&state.vai_dir, &id, None).map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -133,6 +329,11 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRespon
 pub(crate) fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/status", get(status_handler))
+        .route("/api/workspaces", post(create_workspace_handler))
+        .route("/api/workspaces", get(list_workspaces_handler))
+        .route("/api/workspaces/:id", get(get_workspace_handler))
+        .route("/api/workspaces/:id/submit", post(submit_workspace_handler))
+        .route("/api/workspaces/:id", delete(discard_workspace_handler))
         .with_state(state)
 }
 
@@ -148,9 +349,14 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
     let _ = tracing_subscriber::fmt::try_init();
 
     let repo_config = repo::read_config(vai_dir)?;
+    let repo_root = vai_dir
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
 
     let state = Arc::new(AppState {
         vai_dir: vai_dir.to_owned(),
+        repo_root,
         started_at: Instant::now(),
         repo_name: repo_config.name.clone(),
         vai_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -219,32 +425,26 @@ mod tests {
     use super::*;
     use crate::repo;
 
-    /// Start a server on a random port, hit `/api/status`, verify the response.
-    #[tokio::test]
-    async fn status_endpoint_returns_correct_data() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-
-        // Create a small Rust file so the repo has content.
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
-
+    /// Initialise a repo in `root` and return a running test server address.
+    async fn start_test_server(
+        root: &Path,
+    ) -> (SocketAddr, oneshot::Sender<()>, Arc<AppState>) {
         repo::init(root).unwrap();
         let vai_dir = root.join(".vai");
+        let repo_config = repo::read_config(&vai_dir).unwrap();
 
-        // Bind to port 0 so the OS assigns a free port.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let repo_config = repo::read_config(&vai_dir).unwrap();
         let state = Arc::new(AppState {
             vai_dir: vai_dir.clone(),
+            repo_root: root.to_path_buf(),
             started_at: Instant::now(),
             repo_name: repo_config.name.clone(),
             vai_version: env!("CARGO_PKG_VERSION").to_string(),
         });
-        let app = build_app(state);
 
+        let app = build_app(Arc::clone(&state));
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         tokio::spawn(async move {
@@ -259,29 +459,154 @@ mod tests {
         // Give the server a moment to accept connections.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        (addr, shutdown_tx, state)
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_returns_correct_data() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, state) = start_test_server(root).await;
         let client = reqwest::Client::new();
+
         let resp = client
             .get(format!("http://{addr}/api/status"))
             .send()
             .await
             .expect("request failed");
 
-        assert_eq!(resp.status(), 200, "expected HTTP 200");
-
+        assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(
-            body["repo_name"],
-            repo_config.name.as_str(),
-            "repo_name mismatch"
-        );
-        assert_eq!(body["head_version"], "v1", "expected HEAD at v1 after init");
-        assert!(body["uptime_secs"].is_u64(), "uptime_secs should be a number");
-        assert_eq!(body["workspace_count"], 0, "no workspaces expected");
-        assert_eq!(
-            body["vai_version"],
-            env!("CARGO_PKG_VERSION"),
-            "vai_version mismatch"
-        );
+        assert_eq!(body["repo_name"], state.repo_name.as_str());
+        assert_eq!(body["head_version"], "v1");
+        assert!(body["uptime_secs"].is_u64());
+        assert_eq!(body["workspace_count"], 0);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn workspace_crud_endpoints() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // POST /api/workspaces — create
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .json(&serde_json::json!({ "intent": "add hello world feature" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "expected 201 Created");
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let ws_id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["intent"], "add hello world feature");
+        assert_eq!(created["status"], "Created");
+        assert_eq!(created["base_version"], "v1");
+
+        // GET /api/workspaces — list
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let list: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["id"], ws_id.as_str());
+
+        // GET /api/workspaces/:id — details
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces/{ws_id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let detail: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(detail["id"], ws_id.as_str());
+        assert_eq!(detail["intent"], "add hello world feature");
+
+        // GET /api/workspaces/:id — 404 for unknown ID
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces/nonexistent-id"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        // DELETE /api/workspaces/:id — discard
+        let resp = client
+            .delete(format!("http://{addr}/api/workspaces/{ws_id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204, "expected 204 No Content");
+
+        // After discard, workspace should not appear in list
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let list: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 0, "discarded workspace should not appear");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn submit_workspace_creates_new_version() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Create a workspace.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .json(&serde_json::json!({ "intent": "extend hello" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        let ws_id = created["id"].as_str().unwrap().to_string();
+
+        // Write a file into the workspace overlay so there's something to merge.
+        let vai_dir = root.join(".vai");
+        let overlay = vai_dir.join("workspaces").join(&ws_id).join("overlay");
+        fs::create_dir_all(overlay.join("src")).unwrap();
+        fs::write(
+            overlay.join("src/lib.rs"),
+            b"pub fn hello() {}\npub fn world() {}\n",
+        )
+        .unwrap();
+
+        // POST /api/workspaces/:id/submit
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces/{ws_id}/submit"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "expected 200 OK from submit");
+        let result: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(result["version"], "v2", "submit should create v2");
+        assert!(result["files_applied"].as_u64().unwrap() > 0);
 
         shutdown_tx.send(()).ok();
     }
