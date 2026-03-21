@@ -25,6 +25,9 @@
 //!   - `GET /api/issues/:id` — issue details with linked workspaces
 //!   - `PATCH /api/issues/:id` — update issue fields
 //!   - `POST /api/issues/:id/close` — close issue with resolution
+//!   - `GET /api/escalations` — list escalations (`?status=pending|resolved`)
+//!   - `GET /api/escalations/:id` — escalation details
+//!   - `POST /api/escalations/:id/resolve` — resolve an escalation
 //!
 //! ## WebSocket Endpoints
 //!   - `GET /ws/events?key=<api_key>` — real-time event stream
@@ -58,6 +61,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use crate::auth;
 use crate::conflict;
+use crate::escalation::{EscalationSeverity, EscalationStatus, EscalationStore, EscalationType};
 use crate::event_log::{EventKind, EventLog};
 use crate::graph::GraphSnapshot;
 use crate::merge;
@@ -468,6 +472,18 @@ impl From<crate::issue::IssueError> for ApiError {
     }
 }
 
+impl From<crate::escalation::EscalationError> for ApiError {
+    fn from(e: crate::escalation::EscalationError) -> Self {
+        match &e {
+            crate::escalation::EscalationError::NotFound(_) => ApiError::not_found(e.to_string()),
+            crate::escalation::EscalationError::AlreadyResolved(_) => {
+                ApiError::bad_request(e.to_string())
+            }
+            _ => ApiError::internal(e.to_string()),
+        }
+    }
+}
+
 // ── API response types ────────────────────────────────────────────────────────
 
 /// Response body for `GET /api/status`.
@@ -740,7 +756,8 @@ async fn get_workspace_handler(
 /// `POST /api/workspaces/:id/submit` — submits a workspace for merge.
 ///
 /// Switches the active workspace to `id`, then runs the merge engine.
-/// Returns 409 Conflict if the merge cannot be auto-resolved.
+/// Returns 409 Conflict if the merge cannot be auto-resolved; in that case
+/// an escalation is also created automatically.
 /// Returns 404 if the workspace does not exist.
 /// Broadcasts a `WorkspaceSubmitted` event to WebSocket subscribers.
 async fn submit_workspace_handler(
@@ -750,28 +767,81 @@ async fn submit_workspace_handler(
     // Verify the workspace exists before switching.
     let meta = workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
     let workspace_uuid = meta.id;
+    let workspace_intent = meta.intent.clone();
     // Make it the active workspace so merge::submit can find it.
     workspace::switch(&state.vai_dir, &id).map_err(ApiError::from)?;
-    let result = merge::submit(&state.vai_dir, &state.repo_root).map_err(ApiError::from)?;
 
-    // Remove from conflict engine — workspace is no longer active.
-    state.conflict_engine.lock().await.remove_workspace(&workspace_uuid);
+    match merge::submit(&state.vai_dir, &state.repo_root) {
+        Ok(result) => {
+            // Remove from conflict engine — workspace is no longer active.
+            state.conflict_engine.lock().await.remove_workspace(&workspace_uuid);
 
-    // Broadcast the submit/merge event.
-    state.broadcast(BroadcastEvent {
-        event_type: "WorkspaceSubmitted".to_string(),
-        event_id: 0, // event ID not surfaced by merge result; use 0 as sentinel
-        workspace_id: Some(id.clone()),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        data: serde_json::json!({
-            "workspace_id": id,
-            "new_version": result.version.version_id,
-            "files_applied": result.files_applied,
-            "entities_changed": result.entities_changed,
-        }),
-    });
+            // Broadcast the submit/merge event.
+            state.broadcast(BroadcastEvent {
+                event_type: "WorkspaceSubmitted".to_string(),
+                event_id: 0,
+                workspace_id: Some(id.clone()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                data: serde_json::json!({
+                    "workspace_id": id,
+                    "new_version": result.version.version_id,
+                    "files_applied": result.files_applied,
+                    "entities_changed": result.entities_changed,
+                }),
+            });
 
-    Ok(Json(SubmitResponse::from(result)))
+            Ok(Json(SubmitResponse::from(result)))
+        }
+        Err(merge::MergeError::SemanticConflicts { count, ref conflicts }) => {
+            // Auto-create an escalation so humans can review.
+            let affected_entities: Vec<String> = conflicts
+                .iter()
+                .flat_map(|c| c.entity_ids.iter().cloned())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            let summary = format!(
+                "Workspace \"{workspace_intent}\" has {count} unresolvable \
+                 semantic conflict(s) requiring manual resolution"
+            );
+
+            if let Ok(esc_store) = EscalationStore::open(&state.vai_dir) {
+                if let Ok(mut event_log) = EventLog::open(&state.vai_dir) {
+                    if let Ok(escalation) = esc_store.create(
+                        EscalationType::MergeConflict,
+                        EscalationSeverity::High,
+                        summary.clone(),
+                        vec![workspace_intent.clone()],
+                        vec![],
+                        vec![workspace_uuid],
+                        affected_entities,
+                        &mut event_log,
+                    ) {
+                        // Broadcast the escalation creation.
+                        state.broadcast(BroadcastEvent {
+                            event_type: "EscalationCreated".to_string(),
+                            event_id: 0,
+                            workspace_id: Some(id.clone()),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            data: serde_json::json!({
+                                "escalation_id": escalation.id,
+                                "workspace_id": id,
+                                "summary": summary,
+                            }),
+                        });
+                    }
+                }
+            }
+
+            // Return 409 Conflict (same as before).
+            Err(ApiError::conflict(format!(
+                "Semantic merge detected {count} conflict(s) requiring manual resolution; \
+                 an escalation has been created — run `vai escalations list` to view it"
+            )))
+        }
+        Err(e) => Err(ApiError::from(e)),
+    }
 }
 
 /// `DELETE /api/workspaces/:id` — discards a workspace.
@@ -1900,6 +1970,162 @@ async fn close_issue_handler(
     Ok(Json(IssueResponse::from_issue(issue, linked)))
 }
 
+// ── Escalation handlers ───────────────────────────────────────────────────────
+
+/// Response body for a single escalation.
+#[derive(Debug, Serialize)]
+struct EscalationResponse {
+    id: String,
+    escalation_type: String,
+    severity: String,
+    status: String,
+    summary: String,
+    intents: Vec<String>,
+    agents: Vec<String>,
+    workspace_ids: Vec<String>,
+    affected_entities: Vec<String>,
+    resolution_options: Vec<String>,
+    resolution: Option<String>,
+    resolved_by: Option<String>,
+    created_at: String,
+    resolved_at: Option<String>,
+}
+
+impl From<crate::escalation::Escalation> for EscalationResponse {
+    fn from(e: crate::escalation::Escalation) -> Self {
+        EscalationResponse {
+            id: e.id.to_string(),
+            escalation_type: e.escalation_type.as_str().to_string(),
+            severity: e.severity.as_str().to_string(),
+            status: e.status.as_str().to_string(),
+            summary: e.summary,
+            intents: e.intents,
+            agents: e.agents,
+            workspace_ids: e.workspace_ids.iter().map(|u| u.to_string()).collect(),
+            affected_entities: e.affected_entities,
+            resolution_options: e.resolution_options.iter().map(|o| o.as_str().to_string()).collect(),
+            resolution: e.resolution.as_ref().map(|r| r.as_str().to_string()),
+            resolved_by: e.resolved_by,
+            created_at: e.created_at.to_rfc3339(),
+            resolved_at: e.resolved_at.map(|t| t.to_rfc3339()),
+        }
+    }
+}
+
+/// Request body for `POST /api/escalations/:id/resolve`.
+#[derive(Debug, Deserialize)]
+struct ResolveEscalationRequest {
+    /// Resolution option: keep_agent_a, keep_agent_b,
+    /// send_back_to_agent_a, send_back_to_agent_b, pause_both.
+    option: String,
+    /// Identifier of the human or agent resolving this escalation.
+    #[serde(default = "default_resolved_by")]
+    resolved_by: String,
+}
+
+fn default_resolved_by() -> String {
+    "api".to_string()
+}
+
+/// `GET /api/escalations` — list escalations.
+///
+/// Optional `?status=pending|resolved` filter.
+async fn list_escalations_handler(
+    State(state): State<Arc<AppState>>,
+    AxumQuery(params): AxumQuery<ListEscalationsQuery>,
+) -> Result<Json<Vec<EscalationResponse>>, ApiError> {
+    let status_filter = params
+        .status
+        .as_deref()
+        .map(|s| {
+            EscalationStatus::from_str(s)
+                .ok_or_else(|| ApiError::bad_request(format!("unknown status `{s}`")))
+        })
+        .transpose()?;
+
+    let store =
+        EscalationStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let escalations = store
+        .list(status_filter.as_ref())
+        .map_err(ApiError::from)?;
+
+    Ok(Json(
+        escalations.into_iter().map(EscalationResponse::from).collect(),
+    ))
+}
+
+/// Query parameters for `GET /api/escalations`.
+#[derive(Debug, Deserialize)]
+struct ListEscalationsQuery {
+    status: Option<String>,
+}
+
+/// `GET /api/escalations/:id` — details for a single escalation.
+///
+/// Returns 404 if the escalation does not exist.
+async fn get_escalation_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<EscalationResponse>, ApiError> {
+    let esc_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid escalation ID `{id}`")))?;
+
+    let store =
+        EscalationStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let escalation = store.get(esc_id).map_err(ApiError::from)?;
+
+    Ok(Json(EscalationResponse::from(escalation)))
+}
+
+/// `POST /api/escalations/:id/resolve` — resolve an escalation.
+///
+/// Returns 404 if the escalation does not exist.
+/// Returns 400 if the escalation is already resolved or the option is invalid.
+async fn resolve_escalation_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<ResolveEscalationRequest>,
+) -> Result<Json<EscalationResponse>, ApiError> {
+    use crate::escalation::ResolutionOption;
+
+    let esc_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid escalation ID `{id}`")))?;
+
+    let option = ResolutionOption::from_str(&body.option).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "unknown resolution option `{}`; valid options: keep_agent_a, keep_agent_b, \
+             send_back_to_agent_a, send_back_to_agent_b, pause_both",
+            body.option
+        ))
+    })?;
+
+    let store =
+        EscalationStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut log = EventLog::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let escalation = store
+        .resolve(esc_id, option, body.resolved_by, &mut log)
+        .map_err(ApiError::from)?;
+
+    // Broadcast the resolution.
+    state.broadcast(BroadcastEvent {
+        event_type: "EscalationResolved".to_string(),
+        event_id: 0,
+        workspace_id: escalation
+            .workspace_ids
+            .first()
+            .map(|u| u.to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        data: serde_json::json!({
+            "escalation_id": escalation.id,
+            "resolution": escalation.resolution.as_ref().map(|r| r.as_str()),
+            "resolved_by": escalation.resolved_by,
+        }),
+    });
+
+    Ok(Json(EscalationResponse::from(escalation)))
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -1953,6 +2179,11 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/issues/:id/close", post(close_issue_handler))
         .route("/api/issues/:id", get(get_issue_handler))
         .route("/api/issues/:id", axum::routing::patch(update_issue_handler))
+        // Escalation endpoints.
+        .route("/api/escalations", get(list_escalations_handler))
+        // Static sub-routes must come before :id.
+        .route("/api/escalations/:id/resolve", post(resolve_escalation_handler))
+        .route("/api/escalations/:id", get(get_escalation_handler))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,

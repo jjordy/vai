@@ -193,6 +193,20 @@ pub enum EventKind {
         issue_id: Uuid,
         resolution: String,
     },
+    /// An escalation was created requiring human attention.
+    EscalationCreated {
+        escalation_id: Uuid,
+        escalation_type: String,
+        severity: String,
+        workspace_ids: Vec<String>,
+        summary: String,
+    },
+    /// An escalation was resolved by a human operator.
+    EscalationResolved {
+        escalation_id: Uuid,
+        resolution: String,
+        resolved_by: String,
+    },
 }
 
 impl EventKind {
@@ -220,6 +234,8 @@ impl EventKind {
             EventKind::IssueLinkedToWorkspace { .. } => "IssueLinkedToWorkspace",
             EventKind::IssueResolved { .. } => "IssueResolved",
             EventKind::IssueClosed { .. } => "IssueClosed",
+            EventKind::EscalationCreated { .. } => "EscalationCreated",
+            EventKind::EscalationResolved { .. } => "EscalationResolved",
         }
     }
 

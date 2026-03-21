@@ -14,6 +14,7 @@ use crate::clone as remote_clone;
 use crate::diff;
 use crate::event_log::EventLog;
 use crate::graph::{GraphSnapshot, GraphStats};
+use crate::escalation::{EscalationStatus, EscalationStore, ResolutionOption};
 use crate::issue::{IssueFilter, IssueStore, IssuePriority, IssueResolution, IssueStatus};
 use crate::merge;
 use crate::remote_workspace;
@@ -63,6 +64,9 @@ pub enum CliError {
 
     #[error("Issue error: {0}")]
     Issue(#[from] crate::issue::IssueError),
+
+    #[error("Escalation error: {0}")]
+    Escalation(#[from] crate::escalation::EscalationError),
 
     #[error("{0}")]
     Other(String),
@@ -152,6 +156,9 @@ pub enum Commands {
     /// Manage issues.
     #[command(subcommand)]
     Issue(IssueCommands),
+    /// Manage escalations requiring human attention.
+    #[command(subcommand)]
+    Escalations(EscalationCommands),
 }
 
 /// Issue management subcommands.
@@ -213,6 +220,34 @@ pub enum IssueCommands {
         /// Resolution: resolved, wontfix, duplicate.
         #[arg(long)]
         resolution: String,
+    },
+}
+
+/// Escalation management subcommands.
+#[derive(Debug, Subcommand)]
+pub enum EscalationCommands {
+    /// List escalations (default: pending only).
+    List {
+        /// Show all escalations including resolved ones.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show full details of an escalation.
+    Show {
+        /// Escalation ID (full UUID or 8-char prefix).
+        id: String,
+    },
+    /// Resolve an escalation by choosing a resolution option.
+    Resolve {
+        /// Escalation ID (full UUID or 8-char prefix).
+        id: String,
+        /// Resolution option: keep_agent_a, keep_agent_b,
+        /// send_back_to_agent_a, send_back_to_agent_b, pause_both.
+        #[arg(long)]
+        option: String,
+        /// Identifier of the human resolving this escalation.
+        #[arg(long, default_value = "human")]
+        by: String,
     },
 }
 
@@ -873,6 +908,12 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         }
                     };
 
+                    // Query pending escalation count (best-effort).
+                    let pending_escalations = crate::escalation::EscalationStore::open(&vai_dir)
+                        .ok()
+                        .and_then(|s| s.count_pending().ok())
+                        .unwrap_or(0);
+
                     if cli.json {
                         let out = StatusOutput {
                             repo_name: config.name.clone(),
@@ -921,6 +962,14 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         println!();
                         if let Some((open, in_progress)) = issue_counts {
                             println!("Issues: {} open, {} in progress", open, in_progress);
+                        }
+                        if pending_escalations > 0 {
+                            println!(
+                                "{} {} escalation(s) require attention — run {}",
+                                "!".red().bold(),
+                                pending_escalations,
+                                "vai escalations list".bold()
+                            );
                         }
                         println!("Pending conflicts: 0");
                     }
@@ -1332,6 +1381,164 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 }
             }
         }
+        Some(Commands::Escalations(esc_cmd)) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+
+            match esc_cmd {
+                EscalationCommands::List { all } => {
+                    let store = EscalationStore::open(&vai_dir)?;
+                    let status_filter = if all {
+                        None
+                    } else {
+                        Some(EscalationStatus::Pending)
+                    };
+                    let escalations = store.list(status_filter.as_ref())?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&escalations).unwrap());
+                    } else if escalations.is_empty() {
+                        if all {
+                            println!("No escalations.");
+                        } else {
+                            println!("No pending escalations.");
+                        }
+                    } else {
+                        println!(
+                            "{:<10}  {:<10}  {:<8}  {:<30}  {}",
+                            "ID", "TYPE", "SEVERITY", "SUMMARY", "CREATED"
+                        );
+                        println!("{}", "-".repeat(80));
+                        for e in &escalations {
+                            let age = format_age(e.created_at);
+                            let status_marker = if e.is_pending() {
+                                "●".yellow()
+                            } else {
+                                "✓".green()
+                            };
+                            println!(
+                                "{} {:<10}  {:<10}  {:<8}  {:<30}  {}",
+                                status_marker,
+                                &e.id.to_string()[..8],
+                                e.escalation_type.as_str(),
+                                e.severity.as_str(),
+                                truncate(&e.summary, 30),
+                                age,
+                            );
+                        }
+                        let pending = escalations.iter().filter(|e| e.is_pending()).count();
+                        if pending > 0 {
+                            println!();
+                            println!(
+                                "{} escalation(s) need attention. Use {} to resolve.",
+                                pending,
+                                "vai escalations resolve <id> --option <opt>".bold()
+                            );
+                        }
+                    }
+                }
+                EscalationCommands::Show { id } => {
+                    let store = EscalationStore::open(&vai_dir)?;
+                    let e = resolve_escalation(&store, &id)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&e).unwrap());
+                    } else {
+                        let status_color = if e.is_pending() {
+                            e.status.as_str().yellow()
+                        } else {
+                            e.status.as_str().green()
+                        };
+                        println!("{} {}", "Escalation".bold(), e.id.to_string().cyan());
+                        println!("  Type      : {}", e.escalation_type.as_str());
+                        println!("  Severity  : {}", colorize_severity(&e.severity));
+                        println!("  Status    : {}", status_color);
+                        println!("  Created   : {}", e.created_at.format("%Y-%m-%d %H:%M UTC"));
+                        println!();
+                        println!("Summary: {}", e.summary.bold());
+                        if !e.intents.is_empty() {
+                            println!();
+                            println!("Intents involved:");
+                            for (i, intent) in e.intents.iter().enumerate() {
+                                println!("  {}. {}", i + 1, intent);
+                            }
+                        }
+                        if !e.agents.is_empty() {
+                            println!();
+                            println!("Agents: {}", e.agents.join(", "));
+                        }
+                        if !e.workspace_ids.is_empty() {
+                            println!();
+                            println!("Workspaces:");
+                            for ws in &e.workspace_ids {
+                                println!("  {}", ws);
+                            }
+                        }
+                        if !e.affected_entities.is_empty() {
+                            println!();
+                            println!("Affected entities:");
+                            for ent in &e.affected_entities {
+                                println!("  {}", ent);
+                            }
+                        }
+                        if e.is_pending() && !e.resolution_options.is_empty() {
+                            println!();
+                            println!("Resolution options:");
+                            for (i, opt) in e.resolution_options.iter().enumerate() {
+                                println!("  {}. {} ({})", i + 1, opt.label(), opt.as_str());
+                            }
+                            println!();
+                            println!(
+                                "Resolve with: {}",
+                                format!(
+                                    "vai escalations resolve {} --option <option>",
+                                    &e.id.to_string()[..8]
+                                )
+                                .bold()
+                            );
+                        } else if let Some(res) = &e.resolution {
+                            println!();
+                            println!("Resolution : {}", res.label());
+                            if let Some(by) = &e.resolved_by {
+                                println!("Resolved by: {}", by);
+                            }
+                            if let Some(at) = e.resolved_at {
+                                println!("Resolved at: {}", at.format("%Y-%m-%d %H:%M UTC"));
+                            }
+                        }
+                    }
+                }
+                EscalationCommands::Resolve { id, option, by } => {
+                    let opt = ResolutionOption::from_str(&option).ok_or_else(|| {
+                        CliError::Other(format!(
+                            "unknown option `{option}`; valid options: keep_agent_a, \
+                             keep_agent_b, send_back_to_agent_a, send_back_to_agent_b, \
+                             pause_both"
+                        ))
+                    })?;
+                    let store = EscalationStore::open(&vai_dir)?;
+                    let e = resolve_escalation(&store, &id)?;
+                    let mut event_log = EventLog::open(&vai_dir)
+                        .map_err(|e| CliError::Other(format!("cannot open event log: {e}")))?;
+                    let resolved = store.resolve(e.id, opt, by.clone(), &mut event_log)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&resolved).unwrap());
+                    } else {
+                        println!(
+                            "{} Resolved escalation {} — {}",
+                            "✓".green(),
+                            &resolved.id.to_string()[..8].cyan(),
+                            resolved
+                                .resolution
+                                .as_ref()
+                                .map(|r| r.label())
+                                .unwrap_or(""),
+                        );
+                    }
+                }
+            }
+        }
         Some(Commands::Merge(merge_cmd)) => {
             let cwd = std::env::current_dir()
                 .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
@@ -1524,6 +1731,41 @@ fn colorize_priority(priority: &IssuePriority) -> colored::ColoredString {
         IssuePriority::High => priority.as_str().red(),
         IssuePriority::Medium => priority.as_str().yellow(),
         IssuePriority::Low => priority.as_str().normal(),
+    }
+}
+
+/// Resolve an escalation by full UUID or 8-character prefix.
+fn resolve_escalation(
+    store: &EscalationStore,
+    id_str: &str,
+) -> Result<crate::escalation::Escalation, CliError> {
+    // Try full UUID first.
+    if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
+        return store.get(uuid).map_err(CliError::Escalation);
+    }
+    // Fall back to prefix match.
+    let all = store.list(None)?;
+    let matches: Vec<_> = all
+        .into_iter()
+        .filter(|e| e.id.to_string().starts_with(id_str))
+        .collect();
+    match matches.len() {
+        0 => Err(CliError::Other(format!("no escalation with ID prefix `{id_str}`"))),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => Err(CliError::Other(format!(
+            "ambiguous prefix `{id_str}` — matches {} escalations",
+            matches.len()
+        ))),
+    }
+}
+
+/// Colorize an `EscalationSeverity` for terminal output.
+fn colorize_severity(
+    severity: &crate::escalation::EscalationSeverity,
+) -> colored::ColoredString {
+    match severity {
+        crate::escalation::EscalationSeverity::Critical => severity.as_str().red().bold(),
+        crate::escalation::EscalationSeverity::High => severity.as_str().red(),
     }
 }
 
