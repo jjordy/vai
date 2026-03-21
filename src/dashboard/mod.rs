@@ -473,6 +473,88 @@ impl App {
     }
 }
 
+// ── Headless snapshot ─────────────────────────────────────────────────────────
+
+/// A read-only snapshot of all dashboard data, usable without launching the TUI.
+///
+/// Produced by [`snapshot`] for testing and headless inspection.
+#[derive(Debug, Default)]
+pub struct DashboardSnapshot {
+    /// All workspaces (including merged and discarded).
+    pub workspaces: Vec<workspace::WorkspaceMeta>,
+    /// Pending escalations shown in the Conflicts panel.
+    pub pending_escalations: Vec<crate::escalation::Escalation>,
+    /// Count of Open issues.
+    pub open_issues: usize,
+    /// Count of InProgress issues.
+    pub in_progress_issues: usize,
+    /// Count of Resolved issues.
+    pub resolved_issues: usize,
+    /// Count of Closed issues.
+    pub closed_issues: usize,
+    /// Recent versions (last 10, newest first).
+    pub recent_versions: Vec<crate::version::VersionMeta>,
+    /// Semantic graph statistics, if the graph database exists.
+    pub graph_stats: Option<crate::graph::GraphStats>,
+}
+
+/// Returns a [`DashboardSnapshot`] with the same data the TUI panels display,
+/// without starting the interactive terminal UI.
+///
+/// Useful for headless inspection and integration testing.
+pub fn snapshot(vai_dir: &Path) -> Result<DashboardSnapshot, DashboardError> {
+    if !vai_dir.exists() {
+        return Err(DashboardError::NotInitialised);
+    }
+
+    let workspaces = workspace::list_all(vai_dir).unwrap_or_default();
+
+    let pending_escalations = EscalationStore::open(vai_dir)
+        .ok()
+        .and_then(|store| store.list(Some(&EscalationStatus::Pending)).ok())
+        .unwrap_or_default();
+
+    let mut open_issues = 0usize;
+    let mut in_progress_issues = 0usize;
+    let mut resolved_issues = 0usize;
+    let mut closed_issues = 0usize;
+    if let Ok(store) = IssueStore::open(vai_dir) {
+        for issue in store.list(&IssueFilter::default()).unwrap_or_default() {
+            match issue.status {
+                IssueStatus::Open => open_issues += 1,
+                IssueStatus::InProgress => in_progress_issues += 1,
+                IssueStatus::Resolved => resolved_issues += 1,
+                IssueStatus::Closed => closed_issues += 1,
+            }
+        }
+    }
+
+    let recent_versions = version::list_versions(vai_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .take(10)
+        .collect();
+
+    let graph_db = vai_dir.join("graph").join("snapshot.db");
+    let graph_stats = if graph_db.exists() {
+        GraphSnapshot::open(&graph_db).ok().and_then(|snap| snap.stats().ok())
+    } else {
+        None
+    };
+
+    Ok(DashboardSnapshot {
+        workspaces,
+        pending_escalations,
+        open_issues,
+        in_progress_issues,
+        resolved_issues,
+        closed_issues,
+        recent_versions,
+        graph_stats,
+    })
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Launch the TUI dashboard in local mode, polling `.vai/` for changes.
