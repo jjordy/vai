@@ -1,5 +1,9 @@
 /target
 .vai/
+.cargo/
+cargo-home/
+build.sh
+cargo-build.sh
 *.swp
 *.swo
 .DS_Store

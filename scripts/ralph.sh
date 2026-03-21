@@ -25,15 +25,33 @@ MAX_ITERATIONS="${1:-$(jq -r '.defaultIterations // 100' "$SANDCASTLE_DIR/config
 if [ ! -f "$SANDCASTLE_DIR/.env" ]; then
   echo "Error: .sandcastle/.env not found"
   echo "Copy .sandcastle/.env.example to .sandcastle/.env and fill in:"
-  echo "  CLAUDE_CODE_OAUTH_TOKEN  — run: claude config get oauthToken"
-  echo "  GH_TOKEN                 — GitHub PAT with repo scope"
+  echo "  GH_TOKEN — GitHub PAT with repo scope"
+  echo ""
+  echo "CLAUDE_CODE_OAUTH_TOKEN is auto-read from ~/.claude/.credentials.json"
   exit 1
 fi
 
 source "$SANDCASTLE_DIR/.env"
 
-if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] || [ -z "$GH_TOKEN" ]; then
-  echo "Error: CLAUDE_CODE_OAUTH_TOKEN and GH_TOKEN must be set in .sandcastle/.env"
+# Auto-read Claude OAuth token from credentials file, fall back to .env
+CLAUDE_CREDS="$HOME/.claude/.credentials.json"
+if [ -f "$CLAUDE_CREDS" ]; then
+  AUTO_TOKEN=$(jq -r '.oauthToken // empty' "$CLAUDE_CREDS" 2>/dev/null || true)
+  if [ -n "$AUTO_TOKEN" ]; then
+    CLAUDE_CODE_OAUTH_TOKEN="$AUTO_TOKEN"
+    echo "Using Claude OAuth token from ~/.claude/.credentials.json"
+  fi
+fi
+
+if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+  echo "Error: Could not find Claude OAuth token."
+  echo "Either set CLAUDE_CODE_OAUTH_TOKEN in .sandcastle/.env"
+  echo "or ensure ~/.claude/.credentials.json exists (run 'claude' to authenticate)."
+  exit 1
+fi
+
+if [ -z "$GH_TOKEN" ]; then
+  echo "Error: GH_TOKEN must be set in .sandcastle/.env"
   exit 1
 fi
 
@@ -85,10 +103,10 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
   echo "========================================="
   echo ""
 
-  # Fetch open issues inside container
+  # Fetch all open issues
   OPEN_ISSUES=$(docker exec "$CONTAINER_NAME" bash -c "
     cd /home/agent/repo
-    gh issue list --repo '$REPO' --label 'phase-1' --state open --json number,title,body,labels --limit 50
+    gh issue list --repo '$REPO' --state open --json number,title,body,labels --limit 50
   ")
 
   ISSUE_COUNT=$(echo "$OPEN_ISSUES" | jq length)
@@ -127,10 +145,13 @@ $RECENT_COMMITS
   echo "Running Claude Code..."
   echo ""
 
-  docker exec "$CONTAINER_NAME" bash -c "
+  # Write prompt to a file inside the container, then pipe it to claude
+  echo "$FULL_PROMPT" | docker exec -i "$CONTAINER_NAME" tee /tmp/ralph_prompt.md > /dev/null
+
+  docker exec -i "$CONTAINER_NAME" bash -c "
     cd /home/agent/repo
-    echo $(printf '%q' "$FULL_PROMPT") | claude -p \
-      --allowedTools 'Read,Edit,Write,Bash(git commit:*),Bash(cargo:*),Bash(gh issue:*),Glob,Grep'
+    cat /tmp/ralph_prompt.md | claude -p \
+      --allowedTools 'Read,Edit,Write,Bash,Glob,Grep'
   "
 
   CLAUDE_EXIT=$?

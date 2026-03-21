@@ -27,13 +27,14 @@ RUN cargo install cargo-watch
 RUN useradd -m -s /bin/bash agent
 USER agent
 
+# Use agent-owned CARGO_HOME so cargo can write its registry cache
+ENV CARGO_HOME=/home/agent/.cargo
+ENV PATH="/home/agent/.cargo/bin:/home/agent/.local/bin:$PATH"
+
 # Install Claude Code CLI
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
-# Add Claude to PATH
-ENV PATH="/home/agent/.local/bin:$PATH"
-
-# Pre-warm Rust toolchain for agent user
+# Pre-warm Rust toolchain for agent user (installs to /home/agent/.cargo)
 RUN rustup default stable
 
 # Create repos directory
