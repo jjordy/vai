@@ -1017,6 +1017,74 @@ async fn get_workspace_file_handler(
     }))
 }
 
+/// Response for `GET /api/repo/files`.
+#[derive(Debug, Serialize)]
+struct RepoFileListResponse {
+    /// Relative paths of all files in the repository root, sorted.
+    files: Vec<String>,
+    /// Total number of files.
+    count: usize,
+    /// Current HEAD version of the repository.
+    head_version: String,
+}
+
+/// `GET /api/repo/files` — lists every file in the current main codebase.
+///
+/// Returns relative paths suitable for use with `GET /api/files/*path`.
+/// Hidden directories (`.git`, `.vai`) and common build artefacts are excluded.
+async fn list_repo_files_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<RepoFileListResponse>, ApiError> {
+    let head_version = std::fs::read_to_string(state.vai_dir.join("head"))
+        .map_err(|e| ApiError::internal(format!("read head: {e}")))?
+        .trim()
+        .to_string();
+
+    let mut files = Vec::new();
+    collect_repo_files(&state.repo_root, &state.repo_root, &mut files)
+        .map_err(|e| ApiError::internal(format!("list files: {e}")))?;
+    files.sort();
+
+    let count = files.len();
+    Ok(Json(RepoFileListResponse {
+        files,
+        count,
+        head_version,
+    }))
+}
+
+/// Recursively collects relative file paths under `dir`, skipping common
+/// build artefacts and hidden directories (`.vai`, `.git`, `target`, etc.).
+fn collect_repo_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<String>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // Skip hidden/build directories.
+        if name.starts_with('.') || name == "target" || name == "node_modules" {
+            continue;
+        }
+        if path.is_dir() {
+            collect_repo_files(root, &path, out)?;
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
 /// `GET /api/files/*path` — downloads a file from the current main version.
 ///
 /// Returns the file as base64-encoded content. Returns 404 if not found.
@@ -1290,6 +1358,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/workspaces/:id/files", post(upload_workspace_files_handler))
         .route("/api/workspaces/:id/files/*path", get(get_workspace_file_handler))
         .route("/api/workspaces/:id", delete(discard_workspace_handler))
+        .route("/api/repo/files", get(list_repo_files_handler))
         .route("/api/files/*path", get(get_main_file_handler))
         .route("/api/versions", get(list_versions_handler))
         // Static route registered before the dynamic one so that
@@ -2517,6 +2586,97 @@ mod tests {
             resp.status().is_client_error(),
             "missing required param should return 4xx"
         );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    // ── Clone endpoint tests ───────────────────────────────────────────────────
+
+    /// `GET /api/repo/files` returns all files in the repo root.
+    #[tokio::test]
+    async fn list_repo_files_endpoint() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Create a small directory tree.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+        fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        fs::write(root.join("README.md"), b"# test\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("http://{addr}/api/repo/files"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let files = body["files"].as_array().unwrap();
+
+        // Should contain the source files (at minimum the Rust files).
+        let paths: Vec<&str> = files.iter().map(|f| f.as_str().unwrap()).collect();
+        assert!(paths.contains(&"src/lib.rs"), "should list src/lib.rs");
+        assert!(paths.contains(&"src/main.rs"), "should list src/main.rs");
+        assert!(paths.contains(&"README.md"), "should list README.md");
+
+        // head_version should be present.
+        assert!(body["head_version"].is_string(), "should include head_version");
+        assert!(body["count"].is_number(), "should include count");
+        assert_eq!(body["count"].as_u64().unwrap(), files.len() as u64);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Full clone flow: start server → call clone() → verify files on disk and
+    /// `.vai/remote.toml` written correctly.
+    #[tokio::test]
+    async fn clone_downloads_files_and_writes_remote_config() {
+        use crate::clone as remote_clone;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Repo has two source files.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() -> u32 { 42 }\n").unwrap();
+        fs::write(root.join("src/main.rs"), b"fn main() { println!(\"hi\"); }\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+
+        let dest = tmp.path().join("cloned");
+        let vai_url = format!("vai://{addr}/test-repo");
+        let result = remote_clone::clone(&vai_url, &dest, &key)
+            .await
+            .expect("clone should succeed");
+
+        // Files should be present locally.
+        assert!(dest.join("src/lib.rs").exists(), "src/lib.rs should be cloned");
+        assert!(dest.join("src/main.rs").exists(), "src/main.rs should be cloned");
+
+        // File contents should match.
+        let lib_content = fs::read(dest.join("src/lib.rs")).unwrap();
+        assert_eq!(lib_content, b"pub fn hello() -> u32 { 42 }\n");
+
+        // .vai/ structure should exist.
+        assert!(dest.join(".vai").is_dir(), ".vai/ should exist");
+        assert!(dest.join(".vai/config.toml").exists(), "config.toml should exist");
+        assert!(dest.join(".vai/head").exists(), "head should exist");
+        assert!(dest.join(".vai/remote.toml").exists(), "remote.toml should exist");
+
+        // remote.toml should contain the server URL and repo name.
+        let remote = remote_clone::read_remote_config(&dest.join(".vai"))
+            .expect("remote.toml should be readable");
+        assert_eq!(remote.server_url, format!("http://{addr}"));
+        // repo_name comes from the temp dir name — just check it is non-empty.
+        assert!(!remote.repo_name.is_empty(), "repo_name should be set");
+
+        // Result counts should match: src/lib.rs + src/main.rs + vai.toml (from init).
+        assert!(result.files_downloaded >= 2, "should download at least 2 files");
+        assert!(!result.head_version.is_empty());
 
         shutdown_tx.send(()).ok();
     }

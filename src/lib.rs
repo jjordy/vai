@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod cli;
+pub mod clone;
 pub mod diff;
 pub mod event_log;
 pub mod graph;

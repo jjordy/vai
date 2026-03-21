@@ -10,6 +10,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::auth;
+use crate::clone as remote_clone;
 use crate::diff;
 use crate::graph::{GraphSnapshot, GraphStats};
 use crate::merge;
@@ -46,6 +47,9 @@ pub enum CliError {
 
     #[error("Auth error: {0}")]
     Auth(#[from] auth::AuthError),
+
+    #[error("Clone error: {0}")]
+    Clone(#[from] remote_clone::CloneError),
 
     #[error("{0}")]
     Other(String),
@@ -115,6 +119,16 @@ pub enum Commands {
     /// Manage the vai HTTP server.
     #[command(subcommand)]
     Server(ServerCommands),
+    /// Clone a remote vai repository.
+    Clone {
+        /// Remote URL in the form `vai://<host>:<port>/<repo>`.
+        url: String,
+        /// Local directory to clone into (defaults to the repo name).
+        dest: Option<String>,
+        /// API key for authenticating with the remote server.
+        #[arg(long)]
+        key: String,
+    },
 }
 
 /// Workspace subcommands.
@@ -617,6 +631,15 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                             head_version.version_id.bold(),
                             head_version.intent
                         );
+                        // Show remote connection info for cloned repos.
+                        if let Some(remote) = remote_clone::read_remote_config(&vai_dir) {
+                            println!("Remote: {}", remote.server_url.cyan());
+                            println!(
+                                "  Cloned at: {}  (current: {})",
+                                remote.cloned_at_version.dimmed(),
+                                head_version.version_id
+                            );
+                        }
                         println!();
                         print_graph_stats(&graph_stats);
                         println!();
@@ -838,6 +861,31 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         }
                     }
                 }
+            }
+        }
+        Some(Commands::Clone { url, dest, key }) => {
+            // Derive destination directory from repo name if not specified.
+            let dest_path = if let Some(d) = dest {
+                std::path::PathBuf::from(d)
+            } else {
+                // Use the last path component of the URL as the directory name.
+                let name = url
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("vai-repo")
+                    .to_string();
+                std::path::PathBuf::from(name)
+            };
+
+            let result = tokio::runtime::Runtime::new()
+                .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?
+                .block_on(remote_clone::clone(&url, &dest_path, &key))?;
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            } else {
+                remote_clone::print_clone_result(&result);
             }
         }
         Some(Commands::Merge(merge_cmd)) => {
