@@ -18,4 +18,5 @@ pub mod repo;
 pub mod server;
 pub mod sync;
 pub mod version;
+pub mod work_queue;
 pub mod workspace;

@@ -228,6 +228,14 @@ impl ConflictEngine {
         self.scopes.get(workspace_id)
     }
 
+    /// Returns an iterator over all active workspace scope footprints.
+    ///
+    /// Used by the work queue to check predicted issue scopes against
+    /// currently in-flight workspaces.
+    pub fn all_scopes(&self) -> impl Iterator<Item = &WorkspaceScope> {
+        self.scopes.values()
+    }
+
     /// Returns the number of workspaces currently being tracked.
     pub fn tracked_count(&self) -> usize {
         self.scopes.len()

@@ -28,6 +28,8 @@
 //!   - `GET /api/escalations` — list escalations (`?status=pending|resolved`)
 //!   - `GET /api/escalations/:id` — escalation details
 //!   - `POST /api/escalations/:id/resolve` — resolve an escalation
+//!   - `GET /api/work-queue` — ranked list of available and blocked issues
+//!   - `POST /api/work-queue/claim` — atomically claim an issue and create a workspace
 //!
 //! ## WebSocket Endpoints
 //!   - `GET /ws/events?key=<api_key>` — real-time event stream
@@ -67,6 +69,7 @@ use crate::graph::GraphSnapshot;
 use crate::merge;
 use crate::repo;
 use crate::version;
+use crate::work_queue;
 use crate::workspace;
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -2126,6 +2129,75 @@ async fn resolve_escalation_handler(
     Ok(Json(EscalationResponse::from(escalation)))
 }
 
+// ── Work queue API types ──────────────────────────────────────────────────────
+
+/// Request body for `POST /api/work-queue/claim`.
+#[derive(Debug, Deserialize)]
+struct ClaimWorkRequest {
+    /// Issue ID to claim.
+    issue_id: String,
+}
+
+// ── Work queue route handlers ─────────────────────────────────────────────────
+
+/// `GET /api/work-queue` — returns available and blocked work.
+///
+/// Predicts the scope of every open issue via keyword matching against the
+/// semantic graph and checks each against active workspace scopes.
+/// Results are ranked by priority (critical → high → medium → low).
+async fn get_work_queue_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<work_queue::WorkQueue>, ApiError> {
+    let engine = state.conflict_engine.lock().await;
+    let queue = work_queue::compute(&state.vai_dir, &engine)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(queue))
+}
+
+/// `POST /api/work-queue/claim` — atomically claim an issue and create a workspace.
+///
+/// Verifies the issue is still `Open` and uncontested, then creates a workspace
+/// and transitions the issue to `InProgress`.  Returns 409 if the issue is no
+/// longer open or if a conflict has appeared since the queue was last fetched
+/// (caller should refresh the queue and retry with a different issue).
+async fn claim_work_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ClaimWorkRequest>,
+) -> Result<(StatusCode, Json<work_queue::ClaimResult>), ApiError> {
+    let issue_id = body.issue_id.parse::<uuid::Uuid>().map_err(|_| {
+        ApiError::bad_request(format!("invalid issue_id: {}", body.issue_id))
+    })?;
+
+    let engine = state.conflict_engine.lock().await;
+    let result = work_queue::claim(&state.vai_dir, issue_id, &engine).map_err(|e| {
+        use work_queue::WorkQueueError;
+        match &e {
+            WorkQueueError::IssueNotOpen(_) => ApiError::conflict(e.to_string()),
+            WorkQueueError::IssueConflicting(_) => ApiError::conflict(e.to_string()),
+            WorkQueueError::Issue(crate::issue::IssueError::NotFound(_)) => {
+                ApiError::not_found(e.to_string())
+            }
+            _ => ApiError::internal(e.to_string()),
+        }
+    })?;
+
+    // Broadcast workspace creation event.
+    state.broadcast(BroadcastEvent {
+        event_type: "WorkspaceCreated".to_string(),
+        event_id: 0,
+        workspace_id: Some(result.workspace_id.clone()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        data: serde_json::json!({
+            "workspace_id": result.workspace_id,
+            "intent": result.intent,
+            "issue_id": result.issue_id,
+            "claimed_via": "work_queue",
+        }),
+    });
+
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -2184,6 +2256,9 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         // Static sub-routes must come before :id.
         .route("/api/escalations/:id/resolve", post(resolve_escalation_handler))
         .route("/api/escalations/:id", get(get_escalation_handler))
+        // Work queue endpoints.
+        .route("/api/work-queue", get(get_work_queue_handler))
+        .route("/api/work-queue/claim", post(claim_work_handler))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -4128,6 +4203,111 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 429);
         assert!(resp.headers().contains_key("retry-after"));
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Work queue: create issues, verify they appear as available, claim one.
+    #[tokio::test]
+    async fn work_queue_available_and_claim() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Create two open issues.
+        let resp = client
+            .post(format!("http://{addr}/api/issues"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "title": "Fix login bug",
+                "description": "Users cannot log in with OAuth",
+                "priority": "high"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let issue1: serde_json::Value = resp.json().await.unwrap();
+        let issue1_id = issue1["id"].as_str().unwrap().to_string();
+
+        let resp = client
+            .post(format!("http://{addr}/api/issues"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "title": "Add metrics dashboard",
+                "description": "Build a dashboard for system metrics",
+                "priority": "medium"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // ── GET /api/work-queue ────────────────────────────────────────────────
+
+        let resp = client
+            .get(format!("http://{addr}/api/work-queue"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let queue: serde_json::Value = resp.json().await.unwrap();
+        let available = queue["available_work"].as_array().unwrap();
+        // Both issues should be available (no active workspaces).
+        assert_eq!(available.len(), 2);
+        // High priority comes first.
+        assert_eq!(available[0]["issue_id"], issue1_id);
+        assert_eq!(queue["blocked_work"].as_array().unwrap().len(), 0);
+
+        // ── POST /api/work-queue/claim ─────────────────────────────────────────
+
+        let resp = client
+            .post(format!("http://{addr}/api/work-queue/claim"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "issue_id": issue1_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let claim: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(claim["issue_id"], issue1_id);
+        assert!(claim["workspace_id"].as_str().is_some());
+
+        // Claimed issue should now be in_progress.
+        let resp = client
+            .get(format!("http://{addr}/api/issues/{issue1_id}"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        let issue: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(issue["status"], "in_progress");
+
+        // ── Claim a non-existent issue → 404 ──────────────────────────────────
+
+        let resp = client
+            .post(format!("http://{addr}/api/work-queue/claim"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "issue_id": "00000000-0000-0000-0000-000000000000"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        // ── Claim an already in-progress issue → 409 ──────────────────────────
+
+        let resp = client
+            .post(format!("http://{addr}/api/work-queue/claim"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "issue_id": issue1_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
 
         shutdown_tx.send(()).ok();
     }
