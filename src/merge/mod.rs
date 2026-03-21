@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use crate::diff::{self, DiffError};
 use crate::event_log::{ConflictInfo, EventKind, EventLog, EventLogError};
+use crate::merge_patterns::{MergePatternError, MergePatternStore};
 
 /// Re-exported for callers (e.g. CLI) that need to match on severity.
 pub use crate::event_log::ConflictSeverity;
@@ -77,6 +78,9 @@ pub enum MergeError {
 
     #[error("TOML deserialization error: {0}")]
     TomlDe(#[from] toml::de::Error),
+
+    #[error("Merge pattern error: {0}")]
+    MergePattern(#[from] MergePatternError),
 
     #[error("Conflict not found: {0}")]
     ConflictNotFound(String),
@@ -226,7 +230,26 @@ pub fn resolve_conflict(
         resolved_by: "agent".to_string(),
     })?;
 
+    // Record the resolution in the pattern library (best-effort: ignore errors).
+    if let Ok(mut pattern_store) = MergePatternStore::open(vai_dir) {
+        let _ = pattern_store.record_resolution(&record, "manual", false);
+    }
+
     Ok(record)
+}
+
+/// Notifies the merge pattern library that a previously resolved conflict was
+/// rolled back.
+///
+/// Call this after `version::rollback` completes to let the pattern library
+/// adjust success rates and demote patterns that are no longer reliable.
+pub fn record_pattern_rollback(
+    vai_dir: &Path,
+    conflict_id: Uuid,
+) -> Result<(), MergeError> {
+    let mut store = MergePatternStore::open(vai_dir)?;
+    store.record_rollback(conflict_id)?;
+    Ok(())
 }
 
 // ── Private — fast-forward merge ──────────────────────────────────────────────

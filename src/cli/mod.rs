@@ -18,6 +18,7 @@ use crate::scope_inference;
 use crate::escalation::{EscalationStatus, EscalationStore, ResolutionOption};
 use crate::issue::{IssueFilter, IssueStore, IssuePriority, IssueResolution, IssueStatus};
 use crate::merge;
+use crate::merge_patterns::MergePatternStore;
 use crate::remote_workspace;
 use crate::repo;
 use crate::server;
@@ -71,6 +72,9 @@ pub enum CliError {
 
     #[error("Scope inference error: {0}")]
     ScopeInference(#[from] scope_inference::ScopeInferenceError),
+
+    #[error("Merge pattern error: {0}")]
+    MergePattern(#[from] crate::merge_patterns::MergePatternError),
 
     #[error("{0}")]
     Other(String),
@@ -298,6 +302,18 @@ pub enum MergeCommands {
     Resolve {
         /// Conflict ID.
         conflict_id: String,
+    },
+    /// List learned merge conflict patterns with success rates.
+    Patterns,
+    /// Disable auto-resolution for a specific pattern (human override).
+    PatternsDisable {
+        /// Numeric pattern ID (from `vai merge patterns`).
+        pattern_id: i64,
+    },
+    /// Re-enable auto-resolution for a previously disabled pattern.
+    PatternsEnable {
+        /// Numeric pattern ID (from `vai merge patterns`).
+        pattern_id: i64,
     },
 }
 
@@ -1653,6 +1669,86 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                             "{} Conflict {} marked as resolved.",
                             "✓".green().bold(),
                             &record.conflict_id.to_string()[..8].bold()
+                        );
+                    }
+                }
+                MergeCommands::Patterns => {
+                    let store = MergePatternStore::open(&vai_dir)?;
+                    let patterns = store.list_patterns()?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&patterns).unwrap());
+                    } else if patterns.is_empty() {
+                        println!("No merge patterns recorded yet.");
+                        println!("Patterns are built up as conflicts are resolved.");
+                    } else {
+                        println!(
+                            "{} merge pattern(s) in library:",
+                            patterns.len()
+                        );
+                        println!();
+                        for p in &patterns {
+                            let auto_label = if p.auto_resolution_enabled {
+                                "auto".green().bold()
+                            } else if p.disabled_by_human {
+                                "disabled".red()
+                            } else {
+                                "manual".normal()
+                            };
+                            println!(
+                                "  [{}] {} ({})",
+                                p.id.to_string().bold(),
+                                p.description,
+                                auto_label
+                            );
+                            println!(
+                                "       instances: {}  success rate: {:.0}%  {}",
+                                p.instance_count,
+                                p.success_rate() * 100.0,
+                                if p.instance_count <= 10 {
+                                    format!("({} more needed for promotion)", 11 - p.instance_count)
+                                } else {
+                                    String::new()
+                                }
+                            );
+                        }
+                        println!();
+                        println!(
+                            "Disable auto-resolution with: {}",
+                            "vai merge patterns-disable <id>".bold()
+                        );
+                    }
+                }
+                MergeCommands::PatternsDisable { pattern_id } => {
+                    let mut store = MergePatternStore::open(&vai_dir)?;
+                    let pattern = store.disable_pattern(pattern_id)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&pattern).unwrap());
+                    } else {
+                        println!(
+                            "{} Pattern {} ({}) auto-resolution disabled.",
+                            "✓".green().bold(),
+                            pattern.id,
+                            pattern.description
+                        );
+                    }
+                }
+                MergeCommands::PatternsEnable { pattern_id } => {
+                    let mut store = MergePatternStore::open(&vai_dir)?;
+                    let pattern = store.enable_pattern(pattern_id)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&pattern).unwrap());
+                    } else {
+                        let auto_label = if pattern.auto_resolution_enabled {
+                            "now auto-resolving".green()
+                        } else {
+                            "manual (does not yet meet promotion criteria)".normal()
+                        };
+                        println!(
+                            "{} Pattern {} ({}) re-enabled — {}.",
+                            "✓".green().bold(),
+                            pattern.id,
+                            pattern.description,
+                            auto_label
                         );
                     }
                 }
