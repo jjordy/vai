@@ -30,6 +30,11 @@
 //!   - `POST /api/escalations/:id/resolve` — resolve an escalation
 //!   - `GET /api/work-queue` — ranked list of available and blocked issues
 //!   - `POST /api/work-queue/claim` — atomically claim an issue and create a workspace
+//!   - `POST /api/watchers/register` — register a new watcher agent
+//!   - `GET /api/watchers` — list all registered watchers
+//!   - `POST /api/watchers/:id/pause` — pause a watcher
+//!   - `POST /api/watchers/:id/resume` — resume a paused watcher
+//!   - `POST /api/discoveries` — submit a discovery event from a watcher
 //!
 //! ## WebSocket Endpoints
 //!   - `GET /ws/events?key=<api_key>` — real-time event stream
@@ -69,6 +74,7 @@ use crate::graph::GraphSnapshot;
 use crate::merge;
 use crate::repo;
 use crate::version;
+use crate::watcher::{DiscoveryEventKind, IssueCreationPolicy, Watcher, WatcherStatus, WatcherStore, WatchType};
 use crate::work_queue;
 use crate::workspace;
 
@@ -2198,6 +2204,202 @@ async fn claim_work_handler(
     Ok((StatusCode::CREATED, Json(result)))
 }
 
+// ── Watcher handlers ──────────────────────────────────────────────────────────
+
+/// Request body for `POST /api/watchers/register`.
+#[derive(Debug, Deserialize)]
+struct RegisterWatcherRequest {
+    agent_id: String,
+    watch_type: String,
+    description: String,
+    #[serde(default)]
+    issue_creation_policy: IssueCreationPolicy,
+}
+
+/// Response body for watcher endpoints.
+#[derive(Debug, Serialize)]
+struct WatcherResponse {
+    agent_id: String,
+    watch_type: String,
+    description: String,
+    issue_creation_policy: IssueCreationPolicy,
+    status: String,
+    registered_at: String,
+    last_discovery_at: Option<String>,
+    discovery_count: u32,
+}
+
+impl From<Watcher> for WatcherResponse {
+    fn from(w: Watcher) -> Self {
+        WatcherResponse {
+            agent_id: w.agent_id,
+            watch_type: w.watch_type.as_str().to_string(),
+            description: w.description,
+            issue_creation_policy: w.issue_creation_policy,
+            status: w.status.as_str().to_string(),
+            registered_at: w.registered_at.to_rfc3339(),
+            last_discovery_at: w.last_discovery_at.map(|d| d.to_rfc3339()),
+            discovery_count: w.discovery_count,
+        }
+    }
+}
+
+/// `POST /api/watchers/register` — register a new watcher agent.
+async fn register_watcher_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RegisterWatcherRequest>,
+) -> Result<(StatusCode, Json<WatcherResponse>), ApiError> {
+    let store = WatcherStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let now = chrono::Utc::now();
+    let watcher = Watcher {
+        agent_id: body.agent_id,
+        watch_type: WatchType::from_str(&body.watch_type),
+        description: body.description,
+        issue_creation_policy: body.issue_creation_policy,
+        status: WatcherStatus::Active,
+        registered_at: now,
+        last_discovery_at: None,
+        discovery_count: 0,
+    };
+    store.register(&watcher).map_err(|e| {
+        use crate::watcher::WatcherError;
+        match &e {
+            WatcherError::AlreadyExists(_) => ApiError::conflict(e.to_string()),
+            _ => ApiError::internal(e.to_string()),
+        }
+    })?;
+    state.broadcast(BroadcastEvent {
+        event_type: "WatcherRegistered".to_string(),
+        event_id: 0,
+        workspace_id: None,
+        timestamp: now.to_rfc3339(),
+        data: serde_json::json!({ "agent_id": watcher.agent_id }),
+    });
+    Ok((StatusCode::CREATED, Json(watcher.into())))
+}
+
+/// `GET /api/watchers` — list all registered watchers.
+async fn list_watchers_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<WatcherResponse>>, ApiError> {
+    let store = WatcherStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let watchers = store.list().map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(watchers.into_iter().map(Into::into).collect()))
+}
+
+/// `POST /api/watchers/:id/pause` — pause a watcher.
+async fn pause_watcher_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(agent_id): AxumPath<String>,
+) -> Result<Json<WatcherResponse>, ApiError> {
+    let store = WatcherStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    store.pause(&agent_id).map_err(|e| {
+        use crate::watcher::WatcherError;
+        match &e {
+            WatcherError::NotFound(_) => ApiError::not_found(e.to_string()),
+            _ => ApiError::internal(e.to_string()),
+        }
+    })?;
+    let watcher = store.get(&agent_id).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(watcher.into()))
+}
+
+/// `POST /api/watchers/:id/resume` — resume a paused watcher.
+async fn resume_watcher_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(agent_id): AxumPath<String>,
+) -> Result<Json<WatcherResponse>, ApiError> {
+    let store = WatcherStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    store.resume(&agent_id).map_err(|e| {
+        use crate::watcher::WatcherError;
+        match &e {
+            WatcherError::NotFound(_) => ApiError::not_found(e.to_string()),
+            _ => ApiError::internal(e.to_string()),
+        }
+    })?;
+    let watcher = store.get(&agent_id).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(watcher.into()))
+}
+
+/// Request body for `POST /api/discoveries`.
+#[derive(Debug, Deserialize)]
+struct SubmitDiscoveryRequest {
+    /// The watcher agent submitting this event.
+    agent_id: String,
+    /// The discovery event payload.
+    event: DiscoveryEventKind,
+}
+
+/// Response body for `POST /api/discoveries`.
+#[derive(Debug, Serialize)]
+struct DiscoveryOutcomeResponse {
+    record_id: String,
+    agent_id: String,
+    event_type: String,
+    received_at: String,
+    created_issue_id: Option<String>,
+    suppressed: bool,
+    message: String,
+}
+
+/// `POST /api/discoveries` — submit a discovery event from a watcher.
+async fn submit_discovery_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SubmitDiscoveryRequest>,
+) -> Result<(StatusCode, Json<DiscoveryOutcomeResponse>), ApiError> {
+    let watcher_store = WatcherStore::open(&state.vai_dir)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let issue_store = crate::issue::IssueStore::open(&state.vai_dir)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut event_log = EventLog::open(&state.vai_dir)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let event_type = body.event.event_type().to_string();
+    let outcome = watcher_store
+        .submit_discovery(&body.agent_id, body.event, &issue_store, &mut event_log)
+        .map_err(|e| {
+            use crate::watcher::WatcherError;
+            match &e {
+                WatcherError::NotFound(_) => ApiError::not_found(e.to_string()),
+                WatcherError::RateLimitExceeded { .. } => ApiError::rate_limited(e.to_string()),
+                _ => ApiError::internal(e.to_string()),
+            }
+        })?;
+
+    if let Some(issue_id) = outcome.issue_id {
+        state.broadcast(BroadcastEvent {
+            event_type: "IssueCreated".to_string(),
+            event_id: 0,
+            workspace_id: None,
+            timestamp: outcome.record.received_at.to_rfc3339(),
+            data: serde_json::json!({
+                "issue_id": issue_id.to_string(),
+                "source": "watcher_discovery",
+                "watcher_agent_id": &body.agent_id,
+            }),
+        });
+    }
+
+    let status = if outcome.suppressed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+
+    Ok((
+        status,
+        Json(DiscoveryOutcomeResponse {
+            record_id: outcome.record.id.to_string(),
+            agent_id: outcome.record.agent_id,
+            event_type,
+            received_at: outcome.record.received_at.to_rfc3339(),
+            created_issue_id: outcome.record.created_issue_id.map(|id| id.to_string()),
+            suppressed: outcome.suppressed,
+            message: outcome.message,
+        }),
+    ))
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -2259,6 +2461,12 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         // Work queue endpoints.
         .route("/api/work-queue", get(get_work_queue_handler))
         .route("/api/work-queue/claim", post(claim_work_handler))
+        // Watcher registration and discovery endpoints.
+        .route("/api/watchers/register", post(register_watcher_handler))
+        .route("/api/watchers", get(list_watchers_handler))
+        .route("/api/watchers/:id/pause", post(pause_watcher_handler))
+        .route("/api/watchers/:id/resume", post(resume_watcher_handler))
+        .route("/api/discoveries", post(submit_discovery_handler))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
