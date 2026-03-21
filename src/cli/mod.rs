@@ -706,7 +706,79 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
             );
         }
         Some(Commands::Merge(merge_cmd)) => {
-            eprintln!("Command not yet implemented: merge {merge_cmd:?}");
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+
+            match merge_cmd {
+                MergeCommands::Status => {
+                    let conflicts = merge::list_conflicts(&vai_dir)?;
+                    let pending: Vec<_> = conflicts.iter().filter(|c| !c.resolved).collect();
+                    let resolved_count = conflicts.len() - pending.len();
+
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&conflicts).unwrap());
+                    } else if conflicts.is_empty() {
+                        println!("No merge conflicts.");
+                    } else {
+                        println!(
+                            "{} conflict(s): {} pending, {} resolved",
+                            conflicts.len(),
+                            pending.len(),
+                            resolved_count
+                        );
+                        println!();
+                        for c in &conflicts {
+                            let status_label = if c.resolved {
+                                "resolved".green()
+                            } else {
+                                "pending".yellow()
+                            };
+                            let severity_label = match c.severity {
+                                merge::ConflictSeverity::Low => "low".normal(),
+                                merge::ConflictSeverity::Medium => "medium".yellow(),
+                                merge::ConflictSeverity::High => "high".red(),
+                            };
+                            println!(
+                                "  {} [{}] [{}]",
+                                c.conflict_id.to_string()[..8].bold(),
+                                severity_label,
+                                status_label
+                            );
+                            println!("    File : {}", c.file_path);
+                            println!("    Level: {}", c.merge_level);
+                            println!("    Desc : {}", c.description);
+                            if !c.entity_ids.is_empty() {
+                                println!(
+                                    "    Entities: {}",
+                                    c.entity_ids.join(", ")
+                                );
+                            }
+                            println!();
+                        }
+                        if !pending.is_empty() {
+                            println!(
+                                "Resolve with: {}",
+                                "vai merge resolve <conflict-id>".bold()
+                            );
+                        }
+                    }
+                }
+                MergeCommands::Resolve { conflict_id } => {
+                    let record = merge::resolve_conflict(&vai_dir, &conflict_id)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&record).unwrap());
+                    } else {
+                        println!(
+                            "{} Conflict {} marked as resolved.",
+                            "✓".green().bold(),
+                            &record.conflict_id.to_string()[..8].bold()
+                        );
+                    }
+                }
+            }
         }
     }
     Ok(())
