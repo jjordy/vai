@@ -167,6 +167,8 @@ pub enum Commands {
     /// Manage escalations requiring human attention.
     #[command(subcommand)]
     Escalations(EscalationCommands),
+    /// Launch the TUI dashboard for real-time agent oversight (local mode).
+    Dashboard,
 }
 
 /// Issue management subcommands.
@@ -1753,6 +1755,15 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     }
                 }
             }
+        }
+        Some(Commands::Dashboard) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+            crate::dashboard::run(&vai_dir)
+                .map_err(|e| CliError::Other(e.to_string()))?;
         }
     }
     Ok(())

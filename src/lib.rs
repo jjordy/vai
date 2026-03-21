@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod cli;
 pub mod clone;
+pub mod dashboard;
 pub mod escalation;
 pub mod conflict;
 pub mod diff;
