@@ -1,0 +1,30 @@
+[package]
+name = "vai"
+version = "0.1.0"
+edition = "2021"
+description = "A version control system built for AI agents"
+license = "MIT"
+
+[[bin]]
+name = "vai"
+path = "src/main.rs"
+
+[lib]
+name = "vai"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+colored = "2"
+indicatif = "0.17"
+
+[dev-dependencies]
+tempfile = "3"
