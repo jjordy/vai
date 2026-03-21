@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::graph::{Entity, GraphError, GraphSnapshot};
+use crate::scope_history::{ScopeHistoryError, ScopeHistoryStore};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -41,6 +42,9 @@ use crate::graph::{Entity, GraphError, GraphSnapshot};
 pub enum ScopeInferenceError {
     #[error("Graph error: {0}")]
     Graph(#[from] GraphError),
+
+    #[error("Scope history error: {0}")]
+    History(#[from] ScopeHistoryError),
 }
 
 // ── Confidence levels ─────────────────────────────────────────────────────────
@@ -81,6 +85,17 @@ pub struct ScopedEntity {
     pub reason: String,
 }
 
+/// A single historical record that influenced the scope prediction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryInfluence {
+    /// The past intent text.
+    pub past_intent: String,
+    /// Entity IDs from the past intent that were added or boosted.
+    pub entity_ids: Vec<String>,
+    /// Number of query terms that overlapped with this past intent.
+    pub term_overlap: usize,
+}
+
 /// The result of a scope inference operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScopeInference {
@@ -90,6 +105,9 @@ pub struct ScopeInference {
     pub terms: Vec<String>,
     /// The predicted set of affected entities, sorted by confidence (descending).
     pub predicted_scope: Vec<ScopedEntity>,
+    /// Historical records that influenced this prediction (only present when
+    /// [`infer_with_history`] is used).
+    pub history_influences: Vec<HistoryInfluence>,
     /// Wall-clock timestamp of the inference.
     pub inferred_at: DateTime<Utc>,
 }
@@ -243,8 +261,105 @@ pub fn infer(
         intent: intent.to_string(),
         terms,
         predicted_scope,
+        history_influences: Vec::new(),
         inferred_at: Utc::now(),
     })
+}
+
+/// Infers scope like [`infer`], then boosts entity confidence using historical
+/// data from `history`.
+///
+/// Entities that appear frequently in past intents with similar terms are
+/// upgraded one confidence level (LOW → MEDIUM, MEDIUM → HIGH) and appear with
+/// an additional `"historical match"` reason suffix.  Entities not yet in the
+/// graph-based prediction but present in history are added at `LOW` confidence.
+///
+/// The `history_influences` field of the returned [`ScopeInference`] is
+/// populated with the specific past records that contributed to the prediction.
+pub fn infer_with_history(
+    snapshot: &GraphSnapshot,
+    history: &ScopeHistoryStore,
+    intent: &str,
+    max_hops: usize,
+) -> Result<ScopeInference, ScopeInferenceError> {
+    let mut result = infer(snapshot, intent, max_hops)?;
+
+    // Compute per-entity historical weights keyed by entity ID.
+    let weights = history.compute_entity_weights(&result.terms)?;
+    if weights.is_empty() {
+        return Ok(result);
+    }
+
+    let weight_map: HashMap<String, f64> = weights
+        .iter()
+        .map(|w| (w.entity_id.clone(), w.weight))
+        .collect();
+
+    // Boost entities already in predicted scope.
+    for scoped in &mut result.predicted_scope {
+        if let Some(&w) = weight_map.get(&scoped.entity.id) {
+            if w > 0.0 {
+                let boosted = match scoped.confidence {
+                    ConfidenceLevel::Low => ConfidenceLevel::Medium,
+                    ConfidenceLevel::Medium => ConfidenceLevel::High,
+                    ConfidenceLevel::High => ConfidenceLevel::High,
+                };
+                if boosted > scoped.confidence {
+                    scoped.confidence = boosted;
+                    scoped.reason = format!("{} + historical match (weight {w:.2})", scoped.reason);
+                }
+            }
+        }
+    }
+
+    // Add historically relevant entities not yet in scope (at LOW confidence).
+    let existing_ids: std::collections::HashSet<String> =
+        result.predicted_scope.iter().map(|s| s.entity.id.clone()).collect();
+
+    let new_ids: Vec<String> = weight_map
+        .keys()
+        .filter(|id| !existing_ids.contains(*id))
+        .cloned()
+        .collect();
+
+    if !new_ids.is_empty() {
+        let new_entities = snapshot.get_entities_by_ids(&new_ids)?;
+        for entity in new_entities {
+            let w = weight_map[&entity.id];
+            result.predicted_scope.push(ScopedEntity {
+                reason: format!("historical match (weight {w:.2})"),
+                entity,
+                confidence: ConfidenceLevel::Low,
+            });
+        }
+    }
+
+    // Re-sort: HIGH first, MEDIUM, LOW.
+    result.predicted_scope.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+
+    // Populate history_influences from the raw records.
+    let all_records = history.list_recent(10_000)?;
+    for record in &all_records {
+        let overlap = record
+            .terms
+            .iter()
+            .filter(|t| result.terms.contains(t))
+            .count();
+        if overlap == 0 || record.actual_entity_ids.is_empty() {
+            continue;
+        }
+        result.history_influences.push(HistoryInfluence {
+            past_intent: record.intent_text.clone(),
+            entity_ids: record.actual_entity_ids.clone(),
+            term_overlap: overlap,
+        });
+    }
+    // Most influential records first.
+    result
+        .history_influences
+        .sort_by(|a, b| b.term_overlap.cmp(&a.term_overlap));
+
+    Ok(result)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

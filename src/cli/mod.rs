@@ -15,6 +15,7 @@ use crate::diff;
 use crate::event_log::EventLog;
 use crate::graph::{GraphSnapshot, GraphStats};
 use crate::scope_inference;
+use crate::scope_history::ScopeHistoryStore;
 use crate::escalation::{EscalationStatus, EscalationStore, ResolutionOption};
 use crate::issue::{IssueFilter, IssueStore, IssuePriority, IssueResolution, IssueStatus};
 use crate::merge;
@@ -75,6 +76,9 @@ pub enum CliError {
 
     #[error("Merge pattern error: {0}")]
     MergePattern(#[from] crate::merge_patterns::MergePatternError),
+
+    #[error("Scope history error: {0}")]
+    ScopeHistory(#[from] crate::scope_history::ScopeHistoryError),
 
     #[error("{0}")]
     Other(String),
@@ -371,6 +375,15 @@ pub enum GraphCommands {
         /// Number of relationship hops to traverse from direct matches (default: 2).
         #[arg(long, default_value_t = 2)]
         hops: usize,
+        /// Weight predictions using historical intent data.
+        #[arg(long)]
+        history: bool,
+    },
+    /// Show scope prediction accuracy over the last N completed intents.
+    Accuracy {
+        /// Number of past intents to evaluate (default: 20).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
 }
 
@@ -433,8 +446,14 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         }
                     }
                 }
-                GraphCommands::Infer { intent, hops } => {
-                    let result = scope_inference::infer(&snapshot, &intent, hops)?;
+                GraphCommands::Infer { intent, hops, history } => {
+                    let history_path = root.join(".vai").join("graph").join("history.db");
+                    let result = if history {
+                        let hist = ScopeHistoryStore::open(&history_path)?;
+                        scope_inference::infer_with_history(&snapshot, &hist, &intent, hops)?
+                    } else {
+                        scope_inference::infer(&snapshot, &intent, hops)?
+                    };
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&result).unwrap());
                     } else {
@@ -462,6 +481,37 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                                     println!("         ↳ {}", scoped.reason);
                                 }
                             }
+                        }
+                        if history && !result.history_influences.is_empty() {
+                            println!("\n  {}", "Historical influences:".bold());
+                            for inf in &result.history_influences {
+                                println!(
+                                    "    ({} term overlap) \"{}\"  → {} entities",
+                                    inf.term_overlap,
+                                    inf.past_intent,
+                                    inf.entity_ids.len(),
+                                );
+                            }
+                        }
+                    }
+                }
+                GraphCommands::Accuracy { limit } => {
+                    let history_path = root.join(".vai").join("graph").join("history.db");
+                    let hist = ScopeHistoryStore::open(&history_path)?;
+                    let metrics = hist.accuracy(limit)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&metrics).unwrap());
+                    } else {
+                        println!("{}", "Scope prediction accuracy".bold());
+                        println!("  Intents evaluated : {}", metrics.sample_count);
+                        if metrics.sample_count == 0 {
+                            println!("  No data yet — submit some workspaces to build history.");
+                        } else {
+                            println!("  Avg recall        : {:.1}%  (target ≥ 70%)",
+                                metrics.avg_recall * 100.0);
+                            println!("  Avg precision     : {:.1}%  (target ≥ 70%)",
+                                metrics.avg_precision * 100.0);
+                            println!("  F1 score          : {:.3}", metrics.f1_score);
                         }
                     }
                 }
@@ -715,8 +765,23 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         // Capture linked issue before submit (workspace meta still accessible after).
                         let active_ws_meta = workspace::active(&vai_dir)?;
                         let linked_issue_id = active_ws_meta.issue_id;
+                        let intent_text = active_ws_meta.intent.clone();
+                        let workspace_id = active_ws_meta.id.to_string();
 
                         let result = merge::submit(&vai_dir, &root)?;
+
+                        // Record intent → actual entities in history store.
+                        let history_path = vai_dir.join("graph").join("history.db");
+                        if let Ok(hist) = ScopeHistoryStore::open(&history_path) {
+                            let terms = scope_inference::extract_terms(&intent_text);
+                            let _ = hist.record(
+                                &intent_text,
+                                &terms,
+                                &[], // predicted IDs not tracked at submit time
+                                &result.entity_ids,
+                                Some(&workspace_id),
+                            );
+                        }
 
                         // If linked to an issue, resolve it now that the workspace merged.
                         if let Some(issue_id) = linked_issue_id {

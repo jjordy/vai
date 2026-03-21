@@ -17,6 +17,7 @@ pub mod merge;
 pub mod merge_patterns;
 pub mod remote_workspace;
 pub mod repo;
+pub mod scope_history;
 pub mod scope_inference;
 pub mod server;
 pub mod sync;

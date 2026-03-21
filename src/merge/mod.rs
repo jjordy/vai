@@ -135,6 +135,8 @@ pub struct SubmitResult {
     pub entities_changed: usize,
     /// Number of conflicts that were auto-resolved during a semantic merge.
     pub auto_resolved: u32,
+    /// Stable IDs of all entities touched by this workspace.
+    pub entity_ids: Vec<String>,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -295,11 +297,18 @@ fn fast_forward_merge(
 
     advance_head_and_close_workspace(vai_dir, &new_version_id, ws_meta)?;
 
+    let entity_ids: Vec<String> = workspace_diff
+        .entity_changes
+        .iter()
+        .map(|ec| ec.entity_id.clone())
+        .collect();
+
     Ok(SubmitResult {
         version: version_meta,
         files_applied,
-        entities_changed: workspace_diff.entity_changes.len(),
+        entities_changed: entity_ids.len(),
         auto_resolved: 0,
+        entity_ids,
     })
 }
 
@@ -419,11 +428,18 @@ fn semantic_merge(
 
     advance_head_and_close_workspace(vai_dir, &new_version_id, ws_meta)?;
 
+    let entity_ids: Vec<String> = workspace_diff
+        .entity_changes
+        .iter()
+        .map(|ec| ec.entity_id.clone())
+        .collect();
+
     Ok(SubmitResult {
         version: version_meta,
         files_applied,
-        entities_changed: workspace_diff.entity_changes.len(),
+        entities_changed: entity_ids.len(),
         auto_resolved,
+        entity_ids,
     })
 }
 
