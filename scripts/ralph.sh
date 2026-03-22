@@ -36,7 +36,7 @@ source "$SANDCASTLE_DIR/.env"
 # Auto-read Claude OAuth token from credentials file, fall back to .env
 CLAUDE_CREDS="$HOME/.claude/.credentials.json"
 if [ -f "$CLAUDE_CREDS" ]; then
-  AUTO_TOKEN=$(jq -r '.oauthToken // empty' "$CLAUDE_CREDS" 2>/dev/null || true)
+  AUTO_TOKEN=$(jq -r '(.claudeAiOauth.accessToken // .oauthToken) // empty' "$CLAUDE_CREDS" 2>/dev/null || true)
   if [ -n "$AUTO_TOKEN" ]; then
     CLAUDE_CODE_OAUTH_TOKEN="$AUTO_TOKEN"
     echo "Using Claude OAuth token from ~/.claude/.credentials.json"
