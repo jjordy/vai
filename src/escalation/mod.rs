@@ -473,7 +473,12 @@ impl EscalationStore {
 /// Generate the default resolution options for an escalation.
 ///
 /// Options depend on the escalation type and the number of workspaces involved.
-fn default_resolution_options(
+/// Returns the default set of resolution options for a given escalation type
+/// and workspace configuration.
+///
+/// Used both internally and by storage-trait callers that need to pre-compute
+/// options before calling [`crate::storage::EscalationStore::create_escalation`].
+pub fn default_resolution_options(
     escalation_type: &EscalationType,
     workspace_ids: &[Uuid],
 ) -> Vec<ResolutionOption> {

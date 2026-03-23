@@ -161,7 +161,7 @@ impl IssueStore for SqliteStorage {
     ) -> Result<Issue, StorageError> {
         let store = self.open_issue_store()?;
         let mut log = self.open_event_log()?;
-        store
+        let mut created = store
             .create(
                 issue.title,
                 issue.description,
@@ -170,7 +170,22 @@ impl IssueStore for SqliteStorage {
                 issue.creator,
                 &mut log,
             )
-            .map_err(|e| StorageError::Database(e.to_string()))
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        // If agent_source metadata was provided, persist it now.
+        // The legacy `create()` method doesn't accept this parameter, so we
+        // apply it as a follow-up UPDATE and attach it to the returned value.
+        if let Some(ref src) = issue.agent_source {
+            let src_str = src.to_string();
+            store
+                .set_agent_source(created.id, &src_str)
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+
+            // Attach the parsed agent_source to the returned issue.
+            created.agent_source = serde_json::from_value(src.clone()).ok();
+        }
+
+        Ok(created)
     }
 
     async fn get_issue(

@@ -108,7 +108,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use crate::auth;
 use crate::conflict;
-use crate::escalation::{EscalationSeverity, EscalationStatus, EscalationStore, EscalationType};
+use crate::escalation::EscalationStatus;
 use crate::event_log::{EventKind, EventLog};
 use crate::graph::GraphSnapshot;
 use crate::merge;
@@ -386,7 +386,7 @@ pub struct AgentIdentity {
 
 // ── Per-request repository context ────────────────────────────────────────────
 
-/// Resolved repository paths for the current request.
+/// Resolved repository paths and storage backend for the current request.
 ///
 /// In single-repo (legacy) mode this mirrors [`AppState::vai_dir`] and
 /// [`AppState::repo_root`].  In multi-repo mode it is resolved from the
@@ -398,6 +398,45 @@ struct RepoCtx {
     vai_dir: PathBuf,
     /// Absolute path to the repository root (parent of `.vai/`).
     repo_root: PathBuf,
+    /// Stable identifier for this repository, used to scope storage trait calls.
+    ///
+    /// Read from `.vai/config.toml` at request time. In SQLite mode the value
+    /// is ignored by all trait implementations; in Postgres mode it is used to
+    /// scope every query to the correct tenant.
+    repo_id: uuid::Uuid,
+    /// Per-repository storage backend.
+    ///
+    /// In single-repo mode this is a clone of [`AppState::storage`].
+    /// In multi-repo SQLite mode each repo gets its own `Local` backend rooted
+    /// at its own `.vai/` directory.  In multi-repo Postgres mode the shared
+    /// `Server` backend is used (scoped by `repo_id`).
+    storage: crate::storage::StorageBackend,
+}
+
+/// Reads the `repo_id` from `.vai/config.toml`, returning `Uuid::nil()` on
+/// failure (safe for SQLite mode which ignores the value).
+fn repo_id_from_vai_dir(vai_dir: &Path) -> uuid::Uuid {
+    crate::repo::read_config(vai_dir)
+        .map(|c| c.repo_id)
+        .unwrap_or_else(|_| uuid::Uuid::nil())
+}
+
+/// Constructs the per-repo storage backend given the resolved `.vai/` directory
+/// and the server-level backend.
+///
+/// - SQLite (`Local`) backends are re-rooted at `vai_dir` so multi-repo
+///   configurations get isolated SQLite files per repository.
+/// - Postgres (`Server`) backends are shared and use `repo_id` for tenant
+///   scoping, so the server backend is returned as-is.
+fn repo_storage(
+    state_storage: &crate::storage::StorageBackend,
+    vai_dir: &Path,
+) -> crate::storage::StorageBackend {
+    use crate::storage::StorageBackend;
+    match state_storage {
+        StorageBackend::Local(_) => StorageBackend::local(vai_dir),
+        StorageBackend::Server(_) => state_storage.clone(),
+    }
 }
 
 #[axum::async_trait]
@@ -413,9 +452,14 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for RepoCtx {
             return Ok(ctx.clone());
         }
         // Fall back to the single-repo paths stored in AppState.
+        let vai_dir = state.vai_dir.clone();
+        let repo_id = repo_id_from_vai_dir(&vai_dir);
+        let storage = state.storage.clone();
         Ok(RepoCtx {
-            vai_dir: state.vai_dir.clone(),
+            vai_dir,
             repo_root: state.repo_root.clone(),
+            repo_id,
+            storage,
         })
     }
 }
@@ -527,9 +571,14 @@ async fn repo_resolve_middleware(
         }
     };
 
+    let vai_dir = entry.path.join(".vai");
+    let repo_id = repo_id_from_vai_dir(&vai_dir);
+    let storage = repo_storage(&state.storage, &vai_dir);
     let ctx = RepoCtx {
-        vai_dir: entry.path.join(".vai"),
+        vai_dir,
         repo_root: entry.path.clone(),
+        repo_id,
+        storage,
     };
     request.extensions_mut().insert(ctx);
     next.run(request).await
@@ -661,6 +710,19 @@ impl From<crate::escalation::EscalationError> for ApiError {
         match &e {
             crate::escalation::EscalationError::NotFound(_) => ApiError::not_found(e.to_string()),
             crate::escalation::EscalationError::AlreadyResolved(_) => {
+                ApiError::bad_request(e.to_string())
+            }
+            _ => ApiError::internal(e.to_string()),
+        }
+    }
+}
+
+impl From<crate::storage::StorageError> for ApiError {
+    fn from(e: crate::storage::StorageError) -> Self {
+        match &e {
+            crate::storage::StorageError::NotFound(_) => ApiError::not_found(e.to_string()),
+            crate::storage::StorageError::Conflict(_) => ApiError::conflict(e.to_string()),
+            crate::storage::StorageError::InvalidTransition(_) => {
                 ApiError::bad_request(e.to_string())
             }
             _ => ApiError::internal(e.to_string()),
@@ -901,19 +963,26 @@ async fn status_handler(
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
 ) -> Json<StatusResponse> {
-    use crate::issue::IssueStore;
+    use crate::issue::{IssueFilter, IssueStatus};
 
     let head = repo::read_head(&ctx.vai_dir).unwrap_or_else(|_| "unknown".to_string());
     let workspace_count = workspace::list(&ctx.vai_dir)
         .map(|w| w.len())
         .unwrap_or(0);
 
-    let issue_count = IssueStore::open(&ctx.vai_dir)
-        .and_then(|s| s.count_open())
+    let issue_count = ctx.storage.issues()
+        .list_issues(&ctx.repo_id, &IssueFilter {
+            status: Some(IssueStatus::Open),
+            ..Default::default()
+        })
+        .await
+        .map(|v| v.len())
         .unwrap_or(0);
 
-    let escalation_count = EscalationStore::open(&ctx.vai_dir)
-        .and_then(|s| s.count_pending())
+    let escalation_count = ctx.storage.escalations()
+        .list_escalations(&ctx.repo_id, true)
+        .await
+        .map(|v| v.len())
         .unwrap_or(0);
 
     let entity_count = open_graph(&ctx.vai_dir)
@@ -1069,31 +1138,39 @@ async fn submit_workspace_handler(
                  semantic conflict(s) requiring manual resolution"
             );
 
-            if let Ok(esc_store) = EscalationStore::open(&ctx.vai_dir) {
-                if let Ok(mut event_log) = EventLog::open(&ctx.vai_dir) {
-                    if let Ok(escalation) = esc_store.create(
-                        EscalationType::MergeConflict,
-                        EscalationSeverity::High,
-                        summary.clone(),
-                        vec![workspace_intent.clone()],
-                        vec![],
-                        vec![workspace_uuid],
-                        affected_entities,
-                        &mut event_log,
-                    ) {
-                        // Broadcast the escalation creation.
-                        state.broadcast(BroadcastEvent {
-                            event_type: "EscalationCreated".to_string(),
-                            event_id: 0,
-                            workspace_id: Some(id.clone()),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                            data: serde_json::json!({
-                                "escalation_id": escalation.id,
-                                "workspace_id": id,
-                                "summary": summary,
-                            }),
-                        });
-                    }
+            {
+                use crate::escalation::{EscalationSeverity, EscalationType};
+                use crate::storage::NewEscalation;
+                let resolution_options = crate::escalation::default_resolution_options(
+                    &EscalationType::MergeConflict,
+                    &[workspace_uuid],
+                );
+                let new_esc = NewEscalation {
+                    escalation_type: EscalationType::MergeConflict,
+                    severity: EscalationSeverity::High,
+                    summary: summary.clone(),
+                    intents: vec![workspace_intent.clone()],
+                    agents: vec![],
+                    workspace_ids: vec![workspace_uuid],
+                    affected_entities,
+                    resolution_options,
+                };
+                if let Ok(escalation) = ctx.storage.escalations()
+                    .create_escalation(&ctx.repo_id, new_esc)
+                    .await
+                {
+                    // Broadcast the escalation creation.
+                    state.broadcast(BroadcastEvent {
+                        event_type: "EscalationCreated".to_string(),
+                        event_id: 0,
+                        workspace_id: Some(id.clone()),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        data: serde_json::json!({
+                            "escalation_id": escalation.id,
+                            "workspace_id": id,
+                            "summary": summary,
+                        }),
+                    });
                 }
             }
 
@@ -2057,6 +2134,25 @@ async fn get_blast_radius_handler(
 
 // ── Issue route handlers ──────────────────────────────────────────────────────
 
+/// Returns the IDs of workspaces linked to `issue_id` via their `issue_id` field.
+///
+/// Uses the storage trait so the lookup works for both SQLite and Postgres.
+/// Falls back to an empty list on error so callers never fail on this auxiliary query.
+async fn linked_workspace_ids(
+    ctx: &RepoCtx,
+    issue_id: uuid::Uuid,
+) -> Vec<uuid::Uuid> {
+    ctx.storage
+        .workspaces()
+        .list_workspaces(&ctx.repo_id, true)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|ws| ws.issue_id == Some(issue_id))
+        .map(|ws| ws.id)
+        .collect()
+}
+
 /// `POST /api/issues` — create a new issue.
 ///
 /// When `created_by_agent` is set the request is treated as an agent-initiated
@@ -2071,45 +2167,75 @@ async fn create_issue_handler(
     ctx: RepoCtx,
     Json(body): Json<CreateIssueRequest>,
 ) -> Result<(StatusCode, Json<IssueResponse>), ApiError> {
+    use crate::issue::{AgentSource, IssueFilter, IssuePriority};
+    use crate::storage::NewIssue;
+
     let _lock = state.repo_lock.lock().await;
-    use crate::issue::{AgentSource, IssueStore, IssuePriority};
 
     let priority = IssuePriority::from_str(&body.priority).ok_or_else(|| {
         ApiError::bad_request(format!("unknown priority `{}`", body.priority))
     })?;
 
-    let store = IssueStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut log = crate::event_log::EventLog::open(&ctx.vai_dir)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let issues = ctx.storage.issues();
 
-    let (issue, possible_duplicate_id) = if let Some(agent_id) = body.created_by_agent {
-        // Agent-initiated path: apply guardrails.
-        let source = body.source.map(|s| AgentSource {
-            source_type: s.source_type,
-            details: s.details,
-        }).unwrap_or_else(|| AgentSource {
-            source_type: "unknown".into(),
-            details: serde_json::Value::Null,
-        });
-        store
-            .create_by_agent(
-                body.title,
-                body.description,
-                priority,
-                body.labels,
-                agent_id,
-                source,
-                body.max_per_hour,
-                &mut log,
-            )
-            .map_err(ApiError::from)?
-    } else {
-        // Human-initiated path: no guardrails.
-        let issue = store
-            .create(body.title, body.description, priority, body.labels, body.creator, &mut log)
-            .map_err(ApiError::from)?;
-        (issue, None)
+    let (creator, agent_source, possible_duplicate_id) =
+        if let Some(ref agent_id) = body.created_by_agent {
+            // Agent-initiated path: apply rate-limiting and duplicate-detection.
+            let all_issues = issues
+                .list_issues(&ctx.repo_id, &IssueFilter::default())
+                .await
+                .map_err(ApiError::from)?;
+
+            // Rate-limiting: count issues created by this agent in the last hour.
+            let one_hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
+            let agent_count = all_issues
+                .iter()
+                .filter(|i| {
+                    i.creator == *agent_id
+                        && i.created_at > one_hour_ago
+                })
+                .count() as u32;
+
+            if agent_count >= body.max_per_hour {
+                return Err(ApiError::rate_limited(format!(
+                    "agent `{agent_id}` has created {agent_count} issues in the last hour \
+                     (limit: {})",
+                    body.max_per_hour
+                )));
+            }
+
+            // Duplicate detection: Jaccard similarity on open-issue titles.
+            let dup_id = crate::issue::find_similar_open_issue(&all_issues, &body.title);
+
+            let source = body.source.as_ref().map(|s| AgentSource {
+                source_type: s.source_type.clone(),
+                details: s.details.clone(),
+            }).unwrap_or_else(|| AgentSource {
+                source_type: "unknown".into(),
+                details: serde_json::Value::Null,
+            });
+
+            (agent_id.clone(), Some(source), dup_id)
+        } else {
+            // Human-initiated path: no guardrails.
+            (body.creator.clone(), None, None)
+        };
+
+    let new_issue = NewIssue {
+        title: body.title.clone(),
+        description: body.description.clone(),
+        priority,
+        labels: body.labels.clone(),
+        creator,
+        agent_source: agent_source.map(|s| {
+            serde_json::to_value(s).unwrap_or(serde_json::Value::Null)
+        }),
     };
+
+    let issue = issues
+        .create_issue(&ctx.repo_id, new_issue)
+        .await
+        .map_err(ApiError::from)?;
 
     let issue_id = issue.id;
     state.broadcast(BroadcastEvent {
@@ -2134,7 +2260,7 @@ async fn list_issues_handler(
     ctx: RepoCtx,
     AxumQuery(query): AxumQuery<ListIssuesQuery>,
 ) -> Result<Json<Vec<IssueResponse>>, ApiError> {
-    use crate::issue::{IssueStore, IssueFilter, IssueStatus, IssuePriority};
+    use crate::issue::{IssueFilter, IssueStatus, IssuePriority};
 
     let status = query.status.as_deref()
         .map(|s| IssueStatus::from_str(s).ok_or_else(|| ApiError::bad_request(format!("unknown status `{s}`"))))
@@ -2150,14 +2276,29 @@ async fn list_issues_handler(
         creator: query.created_by,
     };
 
-    let store = IssueStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let issues = store.list(&filter).map_err(ApiError::from)?;
+    let issues = ctx.storage.issues()
+        .list_issues(&ctx.repo_id, &filter)
+        .await
+        .map_err(ApiError::from)?;
 
-    let mut response = Vec::with_capacity(issues.len());
-    for issue in issues {
-        let linked = store.linked_workspaces(issue.id).unwrap_or_default();
-        response.push(IssueResponse::from_issue(issue, linked));
-    }
+    // Fetch all workspaces once to compute linked workspace IDs per issue.
+    let all_workspaces = ctx.storage.workspaces()
+        .list_workspaces(&ctx.repo_id, true)
+        .await
+        .unwrap_or_default();
+
+    let response = issues
+        .into_iter()
+        .map(|issue| {
+            let linked: Vec<uuid::Uuid> = all_workspaces
+                .iter()
+                .filter(|ws| ws.issue_id == Some(issue.id))
+                .map(|ws| ws.id)
+                .collect();
+            IssueResponse::from_issue(issue, linked)
+        })
+        .collect();
+
     Ok(Json(response))
 }
 
@@ -2168,14 +2309,15 @@ async fn get_issue_handler(
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<IssueResponse>, ApiError> {
-    use crate::issue::IssueStore;
-
     let issue_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
 
-    let store = IssueStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let issue = store.get(issue_id).map_err(ApiError::from)?;
-    let linked = store.linked_workspaces(issue_id).unwrap_or_default();
+    let issue = ctx.storage.issues()
+        .get_issue(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    let linked = linked_workspace_ids(&ctx, issue_id).await;
 
     Ok(Json(IssueResponse::from_issue(issue, linked)))
 }
@@ -2189,8 +2331,10 @@ async fn update_issue_handler(
     AxumPath(id): AxumPath<String>,
     Json(body): Json<UpdateIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
+    use crate::issue::IssuePriority;
+    use crate::storage::IssueUpdate;
+
     let _lock = state.repo_lock.lock().await;
-    use crate::issue::{IssueStore, IssuePriority};
 
     let issue_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
@@ -2199,15 +2343,20 @@ async fn update_issue_handler(
         .map(|p| IssuePriority::from_str(p).ok_or_else(|| ApiError::bad_request(format!("unknown priority `{p}`"))))
         .transpose()?;
 
-    let store = IssueStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut log = crate::event_log::EventLog::open(&ctx.vai_dir)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let update = IssueUpdate {
+        title: body.title,
+        description: body.description,
+        priority,
+        labels: body.labels,
+        ..Default::default()
+    };
 
-    let issue = store
-        .update(issue_id, body.title, body.description, priority, body.labels, &mut log)
+    let issue = ctx.storage.issues()
+        .update_issue(&ctx.repo_id, &issue_id, update)
+        .await
         .map_err(ApiError::from)?;
 
-    let linked = store.linked_workspaces(issue_id).unwrap_or_default();
+    let linked = linked_workspace_ids(&ctx, issue_id).await;
     Ok(Json(IssueResponse::from_issue(issue, linked)))
 }
 
@@ -2221,18 +2370,16 @@ async fn close_issue_handler(
     Json(body): Json<CloseIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
     let _lock = state.repo_lock.lock().await;
-    use crate::issue::IssueStore;
 
     let issue_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
 
-    let store = IssueStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut log = crate::event_log::EventLog::open(&ctx.vai_dir)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let issue = ctx.storage.issues()
+        .close_issue(&ctx.repo_id, &issue_id, &body.resolution)
+        .await
+        .map_err(ApiError::from)?;
 
-    let issue = store.close(issue_id, &body.resolution, &mut log).map_err(ApiError::from)?;
-
-    let linked = store.linked_workspaces(issue_id).unwrap_or_default();
+    let linked = linked_workspace_ids(&ctx, issue_id).await;
     Ok(Json(IssueResponse::from_issue(issue, linked)))
 }
 
@@ -2309,11 +2456,19 @@ async fn list_escalations_handler(
         })
         .transpose()?;
 
-    let store =
-        EscalationStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let escalations = store
-        .list(status_filter.as_ref())
+    let pending_only = matches!(status_filter, Some(EscalationStatus::Pending));
+    let escalations = ctx.storage.escalations()
+        .list_escalations(&ctx.repo_id, pending_only)
+        .await
         .map_err(ApiError::from)?;
+
+    // If a specific status other than Pending was requested (e.g. Resolved),
+    // filter client-side since the trait only supports pending_only.
+    let escalations = if let Some(ref sf) = status_filter {
+        escalations.into_iter().filter(|e| &e.status == sf).collect()
+    } else {
+        escalations
+    };
 
     Ok(Json(
         escalations.into_iter().map(EscalationResponse::from).collect(),
@@ -2336,9 +2491,10 @@ async fn get_escalation_handler(
     let esc_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request(format!("invalid escalation ID `{id}`")))?;
 
-    let store =
-        EscalationStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let escalation = store.get(esc_id).map_err(ApiError::from)?;
+    let escalation = ctx.storage.escalations()
+        .get_escalation(&ctx.repo_id, &esc_id)
+        .await
+        .map_err(ApiError::from)?;
 
     Ok(Json(EscalationResponse::from(escalation)))
 }
@@ -2366,12 +2522,9 @@ async fn resolve_escalation_handler(
         ))
     })?;
 
-    let store =
-        EscalationStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut log = EventLog::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-
-    let escalation = store
-        .resolve(esc_id, option, body.resolved_by, &mut log)
+    let escalation = ctx.storage.escalations()
+        .resolve_escalation(&ctx.repo_id, &esc_id, option, &body.resolved_by)
+        .await
         .map_err(ApiError::from)?;
 
     // Broadcast the resolution.

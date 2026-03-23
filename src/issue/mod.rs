@@ -478,6 +478,22 @@ impl IssueStore {
     }
 
     /// Count the total number of open issues (status = `open`).
+    /// Update the `agent_source` JSON column for an existing issue.
+    ///
+    /// Used by storage trait implementations that create issues via [`Self::create`]
+    /// and then need to attach agent discovery metadata in a separate step.
+    pub fn set_agent_source(
+        &self,
+        id: Uuid,
+        source_json: &str,
+    ) -> Result<(), IssueError> {
+        self.conn.execute(
+            "UPDATE issues SET agent_source = ?1 WHERE id = ?2",
+            params![source_json, id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn count_open(&self) -> Result<usize, IssueError> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM issues WHERE status = 'open'",
@@ -755,6 +771,29 @@ const STOP_WORDS: &[&str] = &[
 ];
 
 /// Tokenize a title into a set of lowercase alphabetic words, excluding stop words.
+/// Find an open issue in `issues` whose title is similar to `title`
+/// (Jaccard word overlap ≥ 0.5).
+///
+/// Returns the ID of the first match found, or `None`.  Used by server
+/// handlers that have fetched all open issues via the storage trait rather
+/// than through the SQLite-specific `IssueStore` method.
+pub fn find_similar_open_issue(issues: &[Issue], title: &str) -> Option<Uuid> {
+    let query_tokens = tokenize_title(title);
+    if query_tokens.is_empty() {
+        return None;
+    }
+    for issue in issues {
+        if issue.status != IssueStatus::Open && issue.status != IssueStatus::InProgress {
+            continue;
+        }
+        let candidate_tokens = tokenize_title(&issue.title);
+        if jaccard_similarity(&query_tokens, &candidate_tokens) >= 0.5 {
+            return Some(issue.id);
+        }
+    }
+    None
+}
+
 fn tokenize_title(title: &str) -> HashSet<String> {
     title
         .split(|c: char| !c.is_alphanumeric())
