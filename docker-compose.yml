@@ -1,0 +1,75 @@
+# vai local development environment
+#
+# Provides Postgres (primary database) and MinIO (S3-compatible object store)
+# for testing the hosted server backend without a cloud account.
+#
+# Usage:
+#   docker compose up -d        # start in background
+#   docker compose down         # stop and remove containers
+#   docker compose down -v      # stop and delete persistent volumes
+#
+# Default connection strings (see .env.example for env var names):
+#   Postgres: postgres://vai:vai@localhost:5432/vai
+#   MinIO S3: http://localhost:9000  (key: vaidev / secret: vaidevpass123)
+#   MinIO console: http://localhost:9001
+
+services:
+
+  # ── Postgres ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vai
+      POSTGRES_PASSWORD: vai
+      POSTGRES_DB: vai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vai -d vai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── MinIO (S3-compatible object store) ──────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: vaidev
+      MINIO_ROOT_PASSWORD: vaidevpass123
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── MinIO bucket initialisation ─────────────────────────────────────────────
+  # Creates the default vai bucket on first startup so the server can write
+  # objects immediately without manual setup.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 vaidev vaidevpass123 &&
+        mc mb --ignore-existing local/vai-dev &&
+        echo 'bucket vai-dev ready'
+      "
+    restart: "no"
+
+volumes:
+  postgres_data:
+  minio_data:

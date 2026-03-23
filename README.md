@@ -148,6 +148,41 @@ vai is in active development. Phase 1 (foundation) and Phase 2 (coordination) ar
 - [ ] Automatic scope inference (Phase 4)
 - [ ] TUI dashboard (Phase 4)
 
+## Local Development Setup (Postgres + MinIO)
+
+The hosted server backend requires Postgres and an S3-compatible object store.
+A `docker-compose.yml` at the repository root starts both with a single command.
+
+```bash
+# Start Postgres and MinIO in the background
+docker compose up -d
+
+# Verify both containers are healthy
+docker compose ps
+```
+
+Default connection details:
+
+| Service | URL / address | Credentials |
+|---------|--------------|-------------|
+| Postgres | `localhost:5432` db `vai` | user `vai` / password `vai` |
+| MinIO S3 API | `http://localhost:9000` | key `vaidev` / secret `vaidevpass123` |
+| MinIO console | `http://localhost:9001` | key `vaidev` / secret `vaidevpass123` |
+
+Set `DATABASE_URL` before starting the server in Postgres mode:
+
+```bash
+export DATABASE_URL=postgres://vai:vai@localhost:5432/vai
+vai server start
+```
+
+Stop and clean up:
+
+```bash
+docker compose down        # stop containers, keep volumes
+docker compose down -v     # stop containers AND delete all data
+```
+
 ## Development
 
 vai is written in Rust and structured for AI-assisted development (vertical slices, clean API boundaries).
