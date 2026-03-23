@@ -208,6 +208,7 @@ pub async fn clone(url: &str, dest: &Path, api_key: &str) -> Result<CloneResult,
         name: status.repo_name.clone(),
         created_at: Utc::now(),
         vai_version: env!("CARGO_PKG_VERSION").to_string(),
+        remote: None,
     };
     fs::write(
         vai_dir.join("config.toml"),

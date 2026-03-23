@@ -45,6 +45,18 @@ pub enum RepoError {
 
 // ── On-disk config types ──────────────────────────────────────────────────────
 
+/// Remote server configuration stored in `.vai/config.toml` under `[remote]`.
+///
+/// When present, CLI commands proxy to this server instead of operating on the
+/// local `.vai/` directory directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteServerConfig {
+    /// Base HTTP URL of the remote vai server, e.g. `https://vai.example.com`.
+    pub url: String,
+    /// API key for authenticating requests to the server.
+    pub api_key: String,
+}
+
 /// Contents of `.vai/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
@@ -56,6 +68,9 @@ pub struct RepoConfig {
     pub created_at: DateTime<Utc>,
     /// vai version that created this repository.
     pub vai_version: String,
+    /// Optional remote server configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteServerConfig>,
 }
 
 /// Contents of `vai.toml` at the project root.
@@ -145,6 +160,7 @@ pub fn init(root: &Path) -> Result<InitResult, RepoError> {
         name: repo_name,
         created_at: Utc::now(),
         vai_version: env!("CARGO_PKG_VERSION").to_string(),
+        remote: None,
     };
     fs::write(
         vai_dir.join("config.toml"),
@@ -296,6 +312,12 @@ pub fn read_head(vai_dir: &Path) -> Result<String, RepoError> {
 pub fn read_config(vai_dir: &Path) -> Result<RepoConfig, RepoError> {
     let raw = fs::read_to_string(vai_dir.join("config.toml"))?;
     Ok(toml::from_str(&raw)?)
+}
+
+/// Writes the repository configuration to `.vai/config.toml`.
+pub fn write_config(vai_dir: &Path, config: &RepoConfig) -> Result<(), RepoError> {
+    fs::write(vai_dir.join("config.toml"), toml::to_string_pretty(config)?)?;
+    Ok(())
 }
 
 // ── Source file collection ─────────────────────────────────────────────────────

@@ -191,6 +191,9 @@ pub enum Commands {
         #[arg(long)]
         key: Option<String>,
     },
+    /// Manage the remote server configuration.
+    #[command(subcommand)]
+    Remote(RemoteCommands),
 }
 
 /// Issue management subcommands.
@@ -395,6 +398,23 @@ pub enum KeysCommands {
         /// Name of the key to revoke.
         name: String,
     },
+}
+
+/// Remote server configuration subcommands.
+#[derive(Debug, Subcommand)]
+pub enum RemoteCommands {
+    /// Set the remote server URL and API key.
+    Add {
+        /// Base URL of the remote vai server (e.g. `https://vai.example.com`).
+        url: String,
+        /// API key for authenticating requests.
+        #[arg(long)]
+        key: String,
+    },
+    /// Remove the remote server configuration.
+    Remove,
+    /// Show current remote config and test connectivity.
+    Status,
 }
 
 /// Graph subcommands.
@@ -1978,6 +1998,80 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
             } else {
                 crate::dashboard::run(&vai_dir)
                     .map_err(|e| CliError::Other(e.to_string()))?;
+            }
+        }
+        Some(Commands::Remote(remote_cmd)) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+            match remote_cmd {
+                RemoteCommands::Add { url, key } => {
+                    let mut config = repo::read_config(&vai_dir)?;
+                    config.remote = Some(repo::RemoteServerConfig { url: url.clone(), api_key: key });
+                    repo::write_config(&vai_dir, &config)?;
+                    if cli.json {
+                        println!("{}", serde_json::json!({"status": "ok", "url": url}));
+                    } else {
+                        println!("Remote set to {}", url.cyan());
+                    }
+                }
+                RemoteCommands::Remove => {
+                    let mut config = repo::read_config(&vai_dir)?;
+                    if config.remote.is_none() {
+                        return Err(CliError::Other("no remote configured".to_string()));
+                    }
+                    config.remote = None;
+                    repo::write_config(&vai_dir, &config)?;
+                    if cli.json {
+                        println!("{}", serde_json::json!({"status": "ok"}));
+                    } else {
+                        println!("Remote configuration removed.");
+                    }
+                }
+                RemoteCommands::Status => {
+                    let config = repo::read_config(&vai_dir)?;
+                    match &config.remote {
+                        None => {
+                            if cli.json {
+                                println!("{}", serde_json::json!({"configured": false}));
+                            } else {
+                                println!("No remote configured.");
+                                println!("Run `vai remote add <url> --key <api-key>` to set one.");
+                            }
+                        }
+                        Some(remote) => {
+                            // Test connectivity by pinging /api/status.
+                            let status_url = format!("{}/api/status", remote.url.trim_end_matches('/'));
+                            let rt = tokio::runtime::Runtime::new()
+                                .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?;
+                            let reachable = rt.block_on(async {
+                                reqwest::Client::new()
+                                    .get(&status_url)
+                                    .bearer_auth(&remote.api_key)
+                                    .send()
+                                    .await
+                                    .map(|r| r.status().is_success())
+                                    .unwrap_or(false)
+                            });
+                            if cli.json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "configured": true,
+                                        "url": remote.url,
+                                        "reachable": reachable,
+                                    })
+                                );
+                            } else if reachable {
+                                println!("Remote: {} {}", remote.url.cyan(), "(reachable)".green());
+                            } else {
+                                println!("Remote: {} {}", remote.url.cyan(), "(unreachable)".red());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
