@@ -490,6 +490,46 @@ fn collect_recursive(dir: &Path, ignore: &[String], files: &mut Vec<PathBuf>) {
     }
 }
 
+/// Collects all files under `root` for migration, respecting vai.toml ignore patterns.
+///
+/// Unlike [`collect_source_files`], this returns every regular file regardless of
+/// extension — suitable for a full project upload via `vai remote migrate` (PRD 12.3).
+pub fn list_migration_files(root: &Path) -> Vec<PathBuf> {
+    let vai_toml_path = root.join("vai.toml");
+    let vai_toml: VaiToml = if vai_toml_path.exists() {
+        let raw = fs::read_to_string(&vai_toml_path).unwrap_or_default();
+        toml::from_str(&raw).unwrap_or_default()
+    } else {
+        VaiToml::default()
+    };
+    let mut files = Vec::new();
+    collect_all_recursive(root, &vai_toml.ignore, &mut files);
+    files
+}
+
+/// Recursively collects all regular files under `dir`, respecting ignore patterns.
+fn collect_all_recursive(dir: &Path, ignore: &[String], files: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if path_should_ignore(&name, ignore) {
+            continue;
+        }
+        if path.is_dir() {
+            collect_all_recursive(&path, ignore, files);
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+}
+
 /// Returns `true` if a file or directory `name` matches any ignore pattern.
 fn path_should_ignore(name: &str, ignore: &[String]) -> bool {
     for pattern in ignore {

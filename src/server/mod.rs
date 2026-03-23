@@ -37,6 +37,8 @@
 //!   - `POST /api/watchers/:id/pause` — pause a watcher
 //!   - `POST /api/watchers/:id/resume` — resume a paused watcher
 //!   - `POST /api/discoveries` — submit a discovery event from a watcher
+//!   - `POST /api/files` — upload source files into repo root (migration, PRD 12.3)
+//!   - `POST /api/graph/refresh` — rebuild semantic graph from source files (PRD 12.4)
 //!   - `POST /api/migrate` — bulk migration from local SQLite (single-repo mode)
 //!   - `GET /api/migration-stats` — counts of migrated data for post-migration verification
 //!   - `POST /api/repos/:repo/migrate` — bulk migration from local SQLite (multi-repo mode)
@@ -71,6 +73,7 @@
 //!   - `POST /api/repos/:repo/workspaces/:id/files` — upload files into workspace overlay
 //!   - `GET /api/repos/:repo/workspaces/:id/files/*path` — download file from workspace
 //!   - `GET /api/repos/:repo/files` — list files in repo root
+//!   - `POST /api/repos/:repo/files` — upload source files into repo root (migration, PRD 12.3)
 //!   - `GET /api/repos/:repo/files/*path` — download file from main version
 //!   - `GET /api/repos/:repo/versions` — list version history
 //!   - `GET /api/repos/:repo/versions/:id` — version details
@@ -79,6 +82,7 @@
 //!   - `GET /api/repos/:repo/graph/entities/:id` — entity details
 //!   - `GET /api/repos/:repo/graph/entities/:id/deps` — transitive deps
 //!   - `GET /api/repos/:repo/graph/blast-radius` — blast-radius query
+//!   - `POST /api/repos/:repo/graph/refresh` — rebuild semantic graph (PRD 12.4)
 //!   - `POST /api/repos/:repo/issues` — create issue
 //!   - `GET /api/repos/:repo/issues` — list issues
 //!   - `GET /api/repos/:repo/issues/:id` — issue details
@@ -2335,6 +2339,114 @@ fn collect_repo_files(
     Ok(())
 }
 
+// ── Source file upload (migration) ───────────────────────────────────────────
+
+/// `POST /api/files` — uploads source files into the repository root.
+///
+/// Used by `vai remote migrate` (PRD 12.3) to copy the local project directory
+/// to the server after the metadata migration completes.  Files are written
+/// directly to `repo_root`.  Call `POST /api/graph/refresh` afterwards to
+/// rebuild the semantic graph from the uploaded files.
+///
+/// Accepts the same `{"files":[{"path":"…","content_base64":"…"}]}` format as
+/// the workspace overlay upload endpoint.
+async fn upload_source_files_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
+    Json(body): Json<UploadFilesRequest>,
+) -> Result<(StatusCode, Json<UploadFilesResponse>), ApiError> {
+    require_repo_permission(
+        &ctx.storage,
+        &identity,
+        &ctx.repo_id,
+        crate::storage::RepoRole::Write,
+    )
+    .await?;
+    let _lock = state.repo_lock.lock().await;
+
+    let mut uploaded_paths: Vec<String> = Vec::new();
+
+    for entry in &body.files {
+        let content = BASE64
+            .decode(&entry.content_base64)
+            .map_err(|e| {
+                ApiError::bad_request(format!(
+                    "base64 decode error for '{}': {e}",
+                    entry.path
+                ))
+            })?;
+
+        if content.len() > MAX_FILE_SIZE_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "file '{}' exceeds 10 MiB limit ({} bytes)",
+                entry.path,
+                content.len()
+            )));
+        }
+
+        let rel = sanitize_path(&entry.path)
+            .ok_or_else(|| ApiError::bad_request(format!("invalid path: '{}'", entry.path)))?;
+
+        let dest = ctx.repo_root.join(&rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ApiError::internal(format!("create dirs: {e}")))?;
+        }
+        std::fs::write(&dest, &content)
+            .map_err(|e| ApiError::internal(format!("write source file: {e}")))?;
+
+        uploaded_paths.push(rel.to_string_lossy().replace('\\', "/"));
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(UploadFilesResponse {
+            uploaded: uploaded_paths.len(),
+            paths: uploaded_paths,
+        }),
+    ))
+}
+
+/// Response body for `POST /api/graph/refresh`.
+#[derive(Debug, Serialize)]
+struct ServerGraphRefreshResponse {
+    /// Number of source files scanned during the rebuild.
+    files_scanned: usize,
+    /// Total entities in the graph after refresh.
+    entities: usize,
+    /// Total relationships in the graph after refresh.
+    relationships: usize,
+}
+
+/// `POST /api/graph/refresh` — rebuilds the semantic graph from source files.
+///
+/// Should be called after `POST /api/files` completes to ensure the graph
+/// reflects the uploaded source files (PRD 12.4).
+async fn server_graph_refresh_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
+) -> Result<Json<ServerGraphRefreshResponse>, ApiError> {
+    require_repo_permission(
+        &ctx.storage,
+        &identity,
+        &ctx.repo_id,
+        crate::storage::RepoRole::Write,
+    )
+    .await?;
+    let _lock = state.repo_lock.lock().await;
+
+    let result = crate::repo::refresh_graph(&ctx.repo_root)
+        .map_err(|e| ApiError::internal(format!("graph refresh failed: {e}")))?;
+
+    Ok(Json(ServerGraphRefreshResponse {
+        files_scanned: result.files_scanned,
+        entities: result.graph_stats.entity_count,
+        relationships: result.graph_stats.relationship_count,
+    }))
+}
+
 /// `GET /api/files/*path` — downloads a file from the current main version.
 ///
 /// Returns the file as base64-encoded content. Returns 404 if not found.
@@ -4380,7 +4492,9 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/workspaces/:id/files/*path", get(get_workspace_file_handler))
         .route("/api/workspaces/:id", delete(discard_workspace_handler))
         .route("/api/repo/files", get(list_repo_files_handler))
+        .route("/api/files", post(upload_source_files_handler))
         .route("/api/files/*path", get(get_main_file_handler))
+        .route("/api/graph/refresh", post(server_graph_refresh_handler))
         .route("/api/versions", get(list_versions_handler))
         // Static route registered before the dynamic one so that
         // POST /api/versions/rollback is never captured by :id.
@@ -4477,6 +4591,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/workspaces/:id/files/*path", get(get_workspace_file_handler))
         .route("/workspaces/:id", delete(discard_workspace_handler))
         .route("/files", get(list_repo_files_handler))
+        .route("/files", post(upload_source_files_handler))
         .route("/files/*path", get(get_main_file_handler))
         .route("/versions", get(list_versions_handler))
         .route("/versions/rollback", post(rollback_handler))
@@ -4485,6 +4600,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/graph/blast-radius", get(get_blast_radius_handler))
         .route("/graph/entities/:id", get(get_graph_entity_handler))
         .route("/graph/entities/:id/deps", get(get_entity_deps_handler))
+        .route("/graph/refresh", post(server_graph_refresh_handler))
         .route("/issues", post(create_issue_handler))
         .route("/issues", get(list_issues_handler))
         .route("/issues/:id/close", post(close_issue_handler))

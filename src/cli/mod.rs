@@ -3,6 +3,7 @@
 //! Uses `clap` derive API to define all vai subcommands.
 //! Each command handler lives in its own submodule.
 
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -2594,6 +2595,138 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         }
                     })
                     .map_err(|e| CliError::Other(format!("migration failed: {e}")))?;
+
+                    // ── Source file upload (PRD 12.3) ──────────────────────────
+                    let source_files = repo::list_migration_files(&root);
+                    let total_files = source_files.len();
+
+                    if !cli.json && total_files > 0 {
+                        println!("Uploading {} source files…", total_files);
+                    }
+
+                    // Serializable types for the batch upload request/response.
+                    #[derive(serde::Serialize)]
+                    struct FileEntry {
+                        path: String,
+                        content_base64: String,
+                    }
+                    #[derive(serde::Serialize)]
+                    struct FileBatch {
+                        files: Vec<FileEntry>,
+                    }
+                    #[derive(serde::Deserialize)]
+                    struct FileBatchResponse {
+                        uploaded: usize,
+                    }
+
+                    const BATCH_SIZE: usize = 50;
+                    let mut files_uploaded = 0usize;
+                    let files_endpoint = format!("/api/repos/{repo_name}/files");
+
+                    for chunk in source_files.chunks(BATCH_SIZE) {
+                        let entries: Vec<FileEntry> = chunk
+                            .iter()
+                            .filter_map(|path| {
+                                let content = std::fs::read(path).ok()?;
+                                let rel = path
+                                    .strip_prefix(&root)
+                                    .ok()?
+                                    .to_string_lossy()
+                                    .replace('\\', "/");
+                                let encoded =
+                                    base64::engine::general_purpose::STANDARD.encode(&content);
+                                Some(FileEntry {
+                                    path: rel,
+                                    content_base64: encoded,
+                                })
+                            })
+                            .collect();
+
+                        if entries.is_empty() {
+                            continue;
+                        }
+
+                        let batch = FileBatch { files: entries };
+
+                        let resp: FileBatchResponse = rt
+                            .block_on(async {
+                                match client
+                                    .post::<_, FileBatchResponse>(&files_endpoint, &batch)
+                                    .await
+                                {
+                                    Ok(r) => Ok(r),
+                                    Err(crate::remote_client::RemoteClientError::HttpError {
+                                        status: 404,
+                                        ..
+                                    }) => {
+                                        client
+                                            .post::<_, FileBatchResponse>("/api/files", &batch)
+                                            .await
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            })
+                            .map_err(|e| {
+                                CliError::Other(format!("source file upload failed: {e}"))
+                            })?;
+
+                        files_uploaded += resp.uploaded;
+                        if !cli.json {
+                            println!(
+                                "  Uploaded {}/{} files…",
+                                files_uploaded, total_files
+                            );
+                        }
+                    }
+
+                    // ── Graph rebuild (PRD 12.4) ────────────────────────────────
+                    if files_uploaded > 0 {
+                        if !cli.json {
+                            println!("Triggering server-side graph rebuild…");
+                        }
+
+                        #[derive(serde::Deserialize)]
+                        struct GraphRefreshResp {
+                            files_scanned: usize,
+                        }
+
+                        let graph_endpoint =
+                            format!("/api/repos/{repo_name}/graph/refresh");
+                        let refresh: GraphRefreshResp = rt
+                            .block_on(async {
+                                match client
+                                    .post::<_, GraphRefreshResp>(
+                                        &graph_endpoint,
+                                        &serde_json::json!({}),
+                                    )
+                                    .await
+                                {
+                                    Ok(r) => Ok(r),
+                                    Err(crate::remote_client::RemoteClientError::HttpError {
+                                        status: 404,
+                                        ..
+                                    }) => {
+                                        client
+                                            .post::<_, GraphRefreshResp>(
+                                                "/api/graph/refresh",
+                                                &serde_json::json!({}),
+                                            )
+                                            .await
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            })
+                            .map_err(|e| {
+                                CliError::Other(format!("graph refresh failed: {e}"))
+                            })?;
+
+                        if !cli.json {
+                            println!(
+                                "  Graph rebuilt — {} files scanned.",
+                                refresh.files_scanned
+                            );
+                        }
+                    }
 
                     // Write the migration marker (TOML, includes counts for verification).
                     let marker = crate::migration::MigrationMarker {
