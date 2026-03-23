@@ -2016,12 +2016,14 @@ fn print_graph_stats(stats: &GraphStats) {
     println!("  {} relationships", stats.relationship_count);
 }
 
-/// Truncates a string to `max` characters, appending `…` if needed.
+/// Truncates a string to `max` *characters*, appending `…` if needed.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let char_count = s.chars().count();
+    if char_count <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max - 1])
+        let truncated: String = s.chars().take(max - 1).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -2142,6 +2144,7 @@ fn colorize_severity(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use super::truncate;
     use tempfile::TempDir;
 
     use crate::{graph::GraphSnapshot, repo, version, workspace};
@@ -2196,6 +2199,23 @@ mod tests {
         let active_id = workspace::active_id(&vai_dir);
         assert!(active_id.is_some());
         assert_eq!(active_id.unwrap(), ws_list[0].id.to_string());
+    }
+
+    /// `truncate` must not panic on multi-byte unicode characters.
+    #[test]
+    fn truncate_unicode_safe() {
+        // ASCII: no truncation needed
+        assert_eq!(truncate("hello", 10), "hello");
+        // ASCII: truncation
+        assert_eq!(truncate("hello world", 8), "hello w…");
+        // Em-dash is 3 bytes — byte-slicing at byte 29 would panic
+        let em = "title with em\u{2014}dash right here!";
+        let result = truncate(em, 20);
+        assert_eq!(result.chars().count(), 20);
+        assert!(result.ends_with('…'));
+        // String shorter than max: returned as-is
+        let short = "café";
+        assert_eq!(truncate(short, 10), short);
     }
 
     /// `read_config` should fail gracefully on a non-repo directory.
