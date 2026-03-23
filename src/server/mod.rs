@@ -4,7 +4,9 @@
 //! Entry point: [`start`] — binds a TCP socket and serves the application.
 //!
 //! ## REST Endpoints
+//!   - `GET /health` — liveness probe, returns 200 OK (unauthenticated)
 //!   - `GET /api/status` — server and repository health (unauthenticated)
+//!   - `GET /api/server/stats` — uptime, version, workspace count (unauthenticated)
 //!   - `POST /api/workspaces` — create a new workspace
 //!   - `GET /api/workspaces` — list active workspaces
 //!   - `GET /api/workspaces/:id` — workspace details
@@ -39,8 +41,9 @@
 //! ## WebSocket Endpoints
 //!   - `GET /ws/events?key=<api_key>` — real-time event stream
 //!
-//! All REST endpoints except `GET /api/status` require
-//! `Authorization: Bearer <key>`. WebSocket auth uses the `key` query param.
+//! All REST endpoints except `GET /health`, `GET /api/status`, and
+//! `GET /api/server/stats` require `Authorization: Bearer <key>`.
+//! WebSocket auth uses the `key` query param.
 //! Keys are managed with `vai server keys`.
 
 use std::collections::VecDeque;
@@ -520,6 +523,24 @@ pub struct StatusResponse {
     pub entity_count: usize,
 }
 
+/// Response body for `GET /health`.
+#[derive(Debug, Serialize)]
+pub struct HealthResponse {
+    /// Always `"ok"` when the server is healthy.
+    pub status: &'static str,
+}
+
+/// Response body for `GET /api/server/stats`.
+#[derive(Debug, Serialize)]
+pub struct ServerStatsResponse {
+    /// Number of seconds the server has been running.
+    pub uptime_secs: u64,
+    /// vai version string (from `Cargo.toml`).
+    pub vai_version: String,
+    /// Number of active workspaces in the current repository.
+    pub workspace_count: usize,
+}
+
 /// Request body for `POST /api/workspaces`.
 #[derive(Debug, Deserialize)]
 struct CreateWorkspaceRequest {
@@ -738,6 +759,30 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRespon
         issue_count,
         escalation_count,
         entity_count,
+    })
+}
+
+/// `GET /health` — simple liveness probe for load balancers.
+///
+/// Returns `200 OK` with `{ "status": "ok" }`. No authentication required.
+async fn health_handler() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "ok" })
+}
+
+/// `GET /api/server/stats` — server-level operational statistics.
+///
+/// Returns uptime, vai version, and workspace count. No authentication required.
+async fn server_stats_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<ServerStatsResponse> {
+    let workspace_count = workspace::list(&state.vai_dir)
+        .map(|w| w.len())
+        .unwrap_or(0);
+
+    Json(ServerStatsResponse {
+        uptime_secs: state.started_at.elapsed().as_secs(),
+        vai_version: state.vai_version.clone(),
+        workspace_count,
     })
 }
 
@@ -2451,7 +2496,9 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
 
     // Unauthenticated routes (REST + WebSocket).
     let public = Router::new()
+        .route("/health", get(health_handler))
         .route("/api/status", get(status_handler))
+        .route("/api/server/stats", get(server_stats_handler))
         .route("/ws/events", get(ws_events_handler));
 
     // Routes requiring `Authorization: Bearer <key>`.
@@ -2738,6 +2785,51 @@ mod tests {
         assert_eq!(body["repo_name"], state.repo_name.as_str());
         assert_eq!(body["head_version"], "v1");
         assert!(body["uptime_secs"].is_u64());
+        assert_eq!(body["workspace_count"], 0);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_returns_ok() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "ok");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn server_stats_endpoint_returns_data() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // stats is unauthenticated
+        let resp = client
+            .get(format!("http://{addr}/api/server/stats"))
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["uptime_secs"].is_u64());
+        assert!(body["vai_version"].is_string());
         assert_eq!(body["workspace_count"], 0);
 
         shutdown_tx.send(()).ok();
