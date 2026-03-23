@@ -442,6 +442,12 @@ pub enum RemoteCommands {
     Remove,
     /// Show current remote config and test connectivity.
     Status,
+    /// Migrate all local data to the configured remote server.
+    ///
+    /// Reads all local SQLite data (events, issues, versions, escalations),
+    /// streams it to the remote server, and writes a `.vai/migrated_at` marker
+    /// on success.  All subsequent CLI commands will proxy to the remote.
+    Migrate,
 }
 
 /// Graph subcommands.
@@ -2428,6 +2434,99 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                                 println!("Remote: {} {}", remote.url.cyan(), "(unreachable)".red());
                             }
                         }
+                    }
+                }
+                RemoteCommands::Migrate => {
+                    let config = repo::read_config(&vai_dir)?;
+                    let remote = config.remote.as_ref().ok_or_else(|| {
+                        CliError::Other(
+                            "no remote configured; run `vai remote add <url> --key <key>` first"
+                                .to_string(),
+                        )
+                    })?;
+
+                    if !cli.json {
+                        println!("Gathering local data…");
+                    }
+
+                    let payload = crate::migration::gather_local_data(&vai_dir)
+                        .map_err(|e| CliError::Other(format!("failed to read local data: {e}")))?;
+
+                    let event_count = payload.events.len();
+                    let issue_count = payload.issues.len();
+                    let version_count = payload.versions.len();
+                    let esc_count = payload.escalations.len();
+
+                    if !cli.json {
+                        println!(
+                            "Migrating {} events, {} issues, {} versions, {} escalations…",
+                            event_count, issue_count, version_count, esc_count
+                        );
+                    }
+
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?;
+                    let client = crate::remote_client::RemoteClient::new(remote)
+                        .map_err(|e| CliError::Other(format!("API key error: {e}")))?;
+
+                    // Try repo-scoped endpoint first; fall back to single-repo.
+                    let repo_name = &config.name;
+                    let endpoint = format!("/api/repos/{repo_name}/migrate");
+
+                    let summary: crate::migration::MigrationSummary = rt.block_on(async {
+                        // Try the repo-scoped endpoint.
+                        match client
+                            .post::<_, crate::migration::MigrationSummary>(&endpoint, &payload)
+                            .await
+                        {
+                            Ok(s) => Ok(s),
+                            Err(crate::remote_client::RemoteClientError::HttpError {
+                                status: 404, ..
+                            }) => {
+                                // Fall back to the single-repo endpoint.
+                                client
+                                    .post::<_, crate::migration::MigrationSummary>(
+                                        "/api/migrate",
+                                        &payload,
+                                    )
+                                    .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    })
+                    .map_err(|e| CliError::Other(format!("migration failed: {e}")))?;
+
+                    // Write the migration marker.
+                    let marker_path = vai_dir.join("migrated_at");
+                    let marker = format!(
+                        "migrated_at = {}\nremote_url = {}\n",
+                        summary.migrated_at.to_rfc3339(),
+                        remote.url
+                    );
+                    std::fs::write(&marker_path, &marker)
+                        .map_err(|e| CliError::Other(format!("failed to write migrated_at: {e}")))?;
+
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+                    } else {
+                        println!("Migration complete.");
+                        println!(
+                            "  Events:      {}",
+                            summary.events_migrated
+                        );
+                        println!("  Issues:      {}", summary.issues_migrated);
+                        println!("  Versions:    {}", summary.versions_migrated);
+                        println!("  Escalations: {}", summary.escalations_migrated);
+                        if let Some(ref head) = summary.head_version {
+                            println!("  HEAD:        {}", head);
+                        }
+                        println!(
+                            "\nAll future commands will proxy to {}",
+                            remote.url.cyan()
+                        );
+                        println!(
+                            "Local .vai/ kept as backup (remove with `vai remote remove` to revert)."
+                        );
                     }
                 }
             }

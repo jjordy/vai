@@ -37,6 +37,8 @@
 //!   - `POST /api/watchers/:id/pause` — pause a watcher
 //!   - `POST /api/watchers/:id/resume` — resume a paused watcher
 //!   - `POST /api/discoveries` — submit a discovery event from a watcher
+//!   - `POST /api/migrate` — bulk migration from local SQLite (single-repo mode)
+//!   - `POST /api/repos/:repo/migrate` — bulk migration from local SQLite (multi-repo mode)
 //!   - `POST /api/repos` — register and initialise a new repository (multi-repo mode)
 //!   - `GET /api/repos` — list all registered repositories with basic stats
 //!   - `POST /api/users` — create a new user account
@@ -4048,6 +4050,215 @@ async fn revoke_key_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Migration handler (PRD 12.2) ──────────────────────────────────────────────
+
+/// Bulk migration endpoint: `POST /api/migrate` (single-repo) and
+/// `POST /api/repos/:repo/migrate` (multi-repo).
+///
+/// Accepts a [`MigrationPayload`] containing events, issues, versions, and
+/// escalations from a local SQLite repository and inserts everything into
+/// Postgres in a single transaction.  Rejects the request if the repository
+/// already contains events (prevents accidental double-migration).
+///
+/// Only available when the server is running in Postgres mode.
+async fn migrate_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
+    Json(payload): Json<crate::migration::MigrationPayload>,
+) -> Result<(StatusCode, Json<crate::migration::MigrationSummary>), ApiError> {
+    use crate::migration::MigrationSummary;
+    use crate::storage::StorageBackend;
+
+    require_repo_permission(
+        &ctx.storage,
+        &identity,
+        &ctx.repo_id,
+        crate::storage::RepoRole::Write,
+    )
+    .await?;
+
+    let pg = match &ctx.storage {
+        StorageBackend::Server(pg) => pg.clone(),
+        StorageBackend::Local(_) => {
+            return Err(ApiError::bad_request(
+                "migration endpoint requires a Postgres-backed server; \
+                 this server is running in local SQLite mode",
+            ));
+        }
+    };
+
+    let repo_id = ctx.repo_id;
+    let pool = pg.pool();
+
+    // Guard: reject if the repo already has events.
+    let existing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE repo_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::internal(format!("failed to count existing events: {e}")))?;
+
+    if existing > 0 {
+        return Err(ApiError::conflict(format!(
+            "repository {repo_id} already has {existing} events; \
+             migration rejected to prevent data duplication"
+        )));
+    }
+
+    let _lock = state.repo_lock.lock().await;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to begin transaction: {e}")))?;
+
+    // ── Insert events ──────────────────────────────────────────────────────────
+    for event in &payload.events {
+        let event_type = event.kind.event_type();
+        let workspace_id = event.kind.workspace_id();
+        let payload_val = serde_json::to_value(&event.kind)
+            .map_err(|e| ApiError::internal(format!("failed to serialize event: {e}")))?;
+
+        sqlx::query(
+            r#"INSERT INTO events (repo_id, event_type, workspace_id, payload, created_at)
+               VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(repo_id)
+        .bind(&event_type)
+        .bind(workspace_id)
+        .bind(&payload_val)
+        .bind(event.timestamp)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to insert event: {e}")))?;
+    }
+
+    // ── Insert issues ──────────────────────────────────────────────────────────
+    for issue in &payload.issues {
+        let priority = issue.priority.as_str().to_string();
+        let status = issue.status.as_str().to_string();
+        let agent_source = issue
+            .agent_source
+            .as_ref()
+            .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null));
+
+        sqlx::query(
+            r#"INSERT INTO issues
+                   (id, repo_id, title, body, status, priority, labels,
+                    creator, agent_source, resolution, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+               ON CONFLICT (id) DO NOTHING"#,
+        )
+        .bind(issue.id)
+        .bind(repo_id)
+        .bind(&issue.title)
+        .bind(&issue.description)
+        .bind(&status)
+        .bind(&priority)
+        .bind(&issue.labels)
+        .bind(&issue.creator)
+        .bind(&agent_source)
+        .bind(&issue.resolution)
+        .bind(issue.created_at)
+        .bind(issue.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to insert issue: {e}")))?;
+    }
+
+    // ── Insert versions ────────────────────────────────────────────────────────
+    for version in &payload.versions {
+        let merge_event_id = version.merge_event_id.map(|x| x as i64);
+        let version_uuid = uuid::Uuid::new_v4();
+
+        sqlx::query(
+            r#"INSERT INTO versions
+                   (id, repo_id, version_id, parent_version_id, intent,
+                    created_by, merge_event_id, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (repo_id, version_id) DO NOTHING"#,
+        )
+        .bind(version_uuid)
+        .bind(repo_id)
+        .bind(&version.version_id)
+        .bind(&version.parent_version_id)
+        .bind(&version.intent)
+        .bind(&version.created_by)
+        .bind(merge_event_id)
+        .bind(version.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to insert version: {e}")))?;
+    }
+
+    // ── Insert escalations ─────────────────────────────────────────────────────
+    for esc in &payload.escalations {
+        let esc_type = esc.escalation_type.as_str().to_string();
+        let severity = esc.severity.as_str().to_string();
+        let resolved = esc.status != crate::escalation::EscalationStatus::Pending;
+        let resolution = esc.resolution.as_ref().map(|r| r.as_str().to_string());
+        let resolution_options = serde_json::to_value(&esc.resolution_options)
+            .map_err(|e| ApiError::internal(format!("failed to serialize resolution options: {e}")))?;
+
+        sqlx::query(
+            r#"INSERT INTO escalations
+                   (id, repo_id, escalation_type, severity, summary,
+                    intents, agents, workspace_ids, affected_entities,
+                    resolution_options, resolved, resolution, resolved_by,
+                    resolved_at, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+               ON CONFLICT (id) DO NOTHING"#,
+        )
+        .bind(esc.id)
+        .bind(repo_id)
+        .bind(&esc_type)
+        .bind(&severity)
+        .bind(&esc.summary)
+        .bind(&esc.intents)
+        .bind(&esc.agents)
+        .bind(&esc.workspace_ids)
+        .bind(&esc.affected_entities)
+        .bind(&resolution_options)
+        .bind(resolved)
+        .bind(&resolution)
+        .bind(&esc.resolved_by)
+        .bind(esc.resolved_at)
+        .bind(esc.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to insert escalation: {e}")))?;
+    }
+
+    // ── Set HEAD version ───────────────────────────────────────────────────────
+    if let Some(ref head) = payload.head_version {
+        sqlx::query(
+            r#"INSERT INTO version_head (repo_id, version_id) VALUES ($1, $2)
+               ON CONFLICT (repo_id) DO UPDATE SET version_id = EXCLUDED.version_id"#,
+        )
+        .bind(repo_id)
+        .bind(head)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to set HEAD: {e}")))?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to commit migration transaction: {e}")))?;
+
+    let summary = MigrationSummary {
+        events_migrated: payload.events.len(),
+        issues_migrated: payload.issues.len(),
+        versions_migrated: payload.versions.len(),
+        escalations_migrated: payload.escalations.len(),
+        head_version: payload.head_version,
+        migrated_at: chrono::Utc::now(),
+    };
+    Ok((StatusCode::OK, Json(summary)))
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -4117,6 +4328,8 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/watchers/:id/pause", post(pause_watcher_handler))
         .route("/api/watchers/:id/resume", post(resume_watcher_handler))
         .route("/api/discoveries", post(submit_discovery_handler))
+        // Migration endpoint (PRD 12.2) — single-repo mode.
+        .route("/api/migrate", post(migrate_handler))
         // Multi-repo management endpoints.
         .route("/api/repos", post(create_repo_handler))
         .route("/api/repos", get(list_repos_handler))
@@ -4199,6 +4412,8 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/watchers/:id/resume", post(resume_watcher_handler))
         .route("/discoveries", post(submit_discovery_handler))
         .route("/ws/events", get(ws_events_handler))
+        // Migration endpoint (PRD 12.2) — multi-repo mode.
+        .route("/migrate", post(migrate_handler))
         // Apply repo resolution first (outermost = runs last).
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
