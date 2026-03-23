@@ -40,6 +40,41 @@
 //!   - `POST /api/repos` — register and initialise a new repository (multi-repo mode)
 //!   - `GET /api/repos` — list all registered repositories with basic stats
 //!
+//! ## Multi-Repo Endpoints (`/api/repos/:repo/`)
+//!   - `GET /api/repos/:repo/status` — per-repo health (same fields as `/api/status`)
+//!   - `POST /api/repos/:repo/workspaces` — create workspace in the named repo
+//!   - `GET /api/repos/:repo/workspaces` — list workspaces in the named repo
+//!   - `GET /api/repos/:repo/workspaces/:id` — workspace details
+//!   - `POST /api/repos/:repo/workspaces/:id/submit` — submit workspace for merge
+//!   - `DELETE /api/repos/:repo/workspaces/:id` — discard workspace
+//!   - `POST /api/repos/:repo/workspaces/:id/files` — upload files into workspace overlay
+//!   - `GET /api/repos/:repo/workspaces/:id/files/*path` — download file from workspace
+//!   - `GET /api/repos/:repo/files` — list files in repo root
+//!   - `GET /api/repos/:repo/files/*path` — download file from main version
+//!   - `GET /api/repos/:repo/versions` — list version history
+//!   - `GET /api/repos/:repo/versions/:id` — version details
+//!   - `POST /api/repos/:repo/versions/rollback` — rollback to prior version
+//!   - `GET /api/repos/:repo/graph/entities` — list graph entities
+//!   - `GET /api/repos/:repo/graph/entities/:id` — entity details
+//!   - `GET /api/repos/:repo/graph/entities/:id/deps` — transitive deps
+//!   - `GET /api/repos/:repo/graph/blast-radius` — blast-radius query
+//!   - `POST /api/repos/:repo/issues` — create issue
+//!   - `GET /api/repos/:repo/issues` — list issues
+//!   - `GET /api/repos/:repo/issues/:id` — issue details
+//!   - `PATCH /api/repos/:repo/issues/:id` — update issue
+//!   - `POST /api/repos/:repo/issues/:id/close` — close issue
+//!   - `GET /api/repos/:repo/escalations` — list escalations
+//!   - `GET /api/repos/:repo/escalations/:id` — escalation details
+//!   - `POST /api/repos/:repo/escalations/:id/resolve` — resolve escalation
+//!   - `GET /api/repos/:repo/work-queue` — ranked work items
+//!   - `POST /api/repos/:repo/work-queue/claim` — claim issue + create workspace
+//!   - `POST /api/repos/:repo/watchers/register` — register watcher
+//!   - `GET /api/repos/:repo/watchers` — list watchers
+//!   - `POST /api/repos/:repo/watchers/:id/pause` — pause watcher
+//!   - `POST /api/repos/:repo/watchers/:id/resume` — resume watcher
+//!   - `POST /api/repos/:repo/discoveries` — submit discovery event
+//!   - `WS /api/repos/:repo/ws/events` — per-repo WebSocket event stream
+//!
 //! ## WebSocket Endpoints
 //!   - `GET /ws/events?key=<api_key>` — real-time event stream
 //!
@@ -336,6 +371,42 @@ pub struct AgentIdentity {
     pub name: String,
 }
 
+// ── Per-request repository context ────────────────────────────────────────────
+
+/// Resolved repository paths for the current request.
+///
+/// In single-repo (legacy) mode this mirrors [`AppState::vai_dir`] and
+/// [`AppState::repo_root`].  In multi-repo mode it is resolved from the
+/// `/:repo` path segment by [`repo_resolve_middleware`] and injected into
+/// request extensions before any handler runs.
+#[derive(Debug, Clone)]
+struct RepoCtx {
+    /// Absolute path to the repository's `.vai/` directory.
+    vai_dir: PathBuf,
+    /// Absolute path to the repository root (parent of `.vai/`).
+    repo_root: PathBuf,
+}
+
+#[axum::async_trait]
+impl axum::extract::FromRequestParts<Arc<AppState>> for RepoCtx {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        // Prefer context injected by repo_resolve_middleware (multi-repo mode).
+        if let Some(ctx) = parts.extensions.get::<RepoCtx>() {
+            return Ok(ctx.clone());
+        }
+        // Fall back to the single-repo paths stored in AppState.
+        Ok(RepoCtx {
+            vai_dir: state.vai_dir.clone(),
+            repo_root: state.repo_root.clone(),
+        })
+    }
+}
+
 // ── Authentication middleware ─────────────────────────────────────────────────
 
 /// Axum middleware that enforces `Authorization: Bearer <key>` on every request.
@@ -375,6 +446,80 @@ async fn auth_middleware(
         Ok(None) => ApiError::unauthorized("invalid or revoked API key").into_response(),
         Err(e) => ApiError::internal(format!("auth error: {e}")).into_response(),
     }
+}
+
+// ── Multi-repo resolve middleware ─────────────────────────────────────────────
+
+/// Middleware for `/api/repos/:repo/` routes.
+///
+/// Extracts the `:repo` path parameter, looks the name up in the server
+/// registry, and injects a [`RepoCtx`] into request extensions so that every
+/// downstream handler operates on the correct per-repo paths.
+///
+/// Returns **400** when the server is not in multi-repo mode and **404** when
+/// the named repository has not been registered.
+async fn repo_resolve_middleware(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    use axum::extract::FromRequestParts as _;
+
+    // Split the request so we can call the path extractor.
+    let (mut parts, body) = request.into_parts();
+    let path_result = AxumPath::<std::collections::HashMap<String, String>>::from_request_parts(
+        &mut parts,
+        &state,
+    )
+    .await;
+    request = Request::from_parts(parts, body);
+
+    let params = match path_result {
+        Ok(AxumPath(p)) => p,
+        Err(_) => {
+            return ApiError::bad_request("could not extract path parameters").into_response()
+        }
+    };
+
+    let repo_name = match params.get("repo") {
+        Some(n) => n.clone(),
+        None => return ApiError::bad_request("missing `:repo` path segment").into_response(),
+    };
+
+    let storage_root = match state.storage_root.as_ref() {
+        Some(sr) => sr.clone(),
+        None => {
+            return ApiError::bad_request(
+                "server is not in multi-repo mode; set storage_root in ~/.vai/server.toml",
+            )
+            .into_response()
+        }
+    };
+
+    let registry = match RepoRegistry::load(&storage_root) {
+        Ok(r) => r,
+        Err(e) => {
+            return ApiError::internal(format!("failed to load repo registry: {e}"))
+                .into_response()
+        }
+    };
+
+    let entry = match registry.repos.iter().find(|r| r.name == repo_name) {
+        Some(e) => e.clone(),
+        None => {
+            return ApiError::not_found(format!(
+                "repository `{repo_name}` is not registered on this server"
+            ))
+            .into_response()
+        }
+    };
+
+    let ctx = RepoCtx {
+        vai_dir: entry.path.join(".vai"),
+        repo_root: entry.path.clone(),
+    };
+    request.extensions_mut().insert(ctx);
+    next.run(request).await
 }
 
 // ── API error helper ──────────────────────────────────────────────────────────
@@ -739,29 +884,37 @@ impl IssueResponse {
 /// `GET /api/status` — returns live repository and server health info.
 ///
 /// This is the only unauthenticated REST endpoint.
-async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
+async fn status_handler(
+    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
+) -> Json<StatusResponse> {
     use crate::issue::IssueStore;
 
-    let head = repo::read_head(&state.vai_dir).unwrap_or_else(|_| "unknown".to_string());
-    let workspace_count = workspace::list(&state.vai_dir)
+    let head = repo::read_head(&ctx.vai_dir).unwrap_or_else(|_| "unknown".to_string());
+    let workspace_count = workspace::list(&ctx.vai_dir)
         .map(|w| w.len())
         .unwrap_or(0);
 
-    let issue_count = IssueStore::open(&state.vai_dir)
+    let issue_count = IssueStore::open(&ctx.vai_dir)
         .and_then(|s| s.count_open())
         .unwrap_or(0);
 
-    let escalation_count = EscalationStore::open(&state.vai_dir)
+    let escalation_count = EscalationStore::open(&ctx.vai_dir)
         .and_then(|s| s.count_pending())
         .unwrap_or(0);
 
-    let entity_count = open_graph(&state.vai_dir)
+    let entity_count = open_graph(&ctx.vai_dir)
         .and_then(|g| g.stats().map_err(|e| ApiError::internal(e.to_string())))
         .map(|s| s.entity_count)
         .unwrap_or(0);
 
+    // Derive repo name from config if available; fall back to the path stem.
+    let repo_name = repo::read_config(&ctx.vai_dir)
+        .map(|c| c.name)
+        .unwrap_or_else(|_| state.repo_name.clone());
+
     Json(StatusResponse {
-        repo_name: state.repo_name.clone(),
+        repo_name,
         head_version: head,
         uptime_secs: state.started_at.elapsed().as_secs(),
         workspace_count,
@@ -784,8 +937,9 @@ async fn health_handler() -> Json<HealthResponse> {
 /// Returns uptime, vai version, and workspace count. No authentication required.
 async fn server_stats_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
 ) -> Json<ServerStatsResponse> {
-    let workspace_count = workspace::list(&state.vai_dir)
+    let workspace_count = workspace::list(&ctx.vai_dir)
         .map(|w| w.len())
         .unwrap_or(0);
 
@@ -802,11 +956,12 @@ async fn server_stats_handler(
 /// Broadcasts a `WorkspaceCreated` event to WebSocket subscribers.
 async fn create_workspace_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     Json(body): Json<CreateWorkspaceRequest>,
 ) -> Result<(StatusCode, Json<WorkspaceResponse>), ApiError> {
     let _lock = state.repo_lock.lock().await;
-    let head = repo::read_head(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let result = workspace::create(&state.vai_dir, &body.intent, &head)
+    let head = repo::read_head(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let result = workspace::create(&ctx.vai_dir, &body.intent, &head)
         .map_err(ApiError::from)?;
 
     // Broadcast the workspace creation event to all WebSocket subscribers.
@@ -828,9 +983,9 @@ async fn create_workspace_handler(
 
 /// `GET /api/workspaces` — lists all active (non-discarded, non-merged) workspaces.
 async fn list_workspaces_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
 ) -> Result<Json<Vec<WorkspaceResponse>>, ApiError> {
-    let workspaces = workspace::list(&state.vai_dir).map_err(ApiError::from)?;
+    let workspaces = workspace::list(&ctx.vai_dir).map_err(ApiError::from)?;
     let response: Vec<WorkspaceResponse> = workspaces.into_iter().map(Into::into).collect();
     Ok(Json(response))
 }
@@ -839,10 +994,10 @@ async fn list_workspaces_handler(
 ///
 /// Returns 404 if the workspace does not exist.
 async fn get_workspace_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<WorkspaceResponse>, ApiError> {
-    let meta = workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
+    let meta = workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
     Ok(Json(WorkspaceResponse::from(meta)))
 }
 
@@ -855,17 +1010,18 @@ async fn get_workspace_handler(
 /// Broadcasts a `WorkspaceSubmitted` event to WebSocket subscribers.
 async fn submit_workspace_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<SubmitResponse>, ApiError> {
     let _lock = state.repo_lock.lock().await;
     // Verify the workspace exists before switching.
-    let meta = workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
+    let meta = workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
     let workspace_uuid = meta.id;
     let workspace_intent = meta.intent.clone();
     // Make it the active workspace so merge::submit can find it.
-    workspace::switch(&state.vai_dir, &id).map_err(ApiError::from)?;
+    workspace::switch(&ctx.vai_dir, &id).map_err(ApiError::from)?;
 
-    match merge::submit(&state.vai_dir, &state.repo_root) {
+    match merge::submit(&ctx.vai_dir, &ctx.repo_root) {
         Ok(result) => {
             // Remove from conflict engine — workspace is no longer active.
             state.conflict_engine.lock().await.remove_workspace(&workspace_uuid);
@@ -900,8 +1056,8 @@ async fn submit_workspace_handler(
                  semantic conflict(s) requiring manual resolution"
             );
 
-            if let Ok(esc_store) = EscalationStore::open(&state.vai_dir) {
-                if let Ok(mut event_log) = EventLog::open(&state.vai_dir) {
+            if let Ok(esc_store) = EscalationStore::open(&ctx.vai_dir) {
+                if let Ok(mut event_log) = EventLog::open(&ctx.vai_dir) {
                     if let Ok(escalation) = esc_store.create(
                         EscalationType::MergeConflict,
                         EscalationSeverity::High,
@@ -945,14 +1101,15 @@ async fn submit_workspace_handler(
 /// Broadcasts a `WorkspaceDiscarded` event to WebSocket subscribers.
 async fn discard_workspace_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
     let _lock = state.repo_lock.lock().await;
     // Resolve UUID before discarding so we can remove it from the conflict engine.
-    let ws_uuid = workspace::get(&state.vai_dir, &id)
+    let ws_uuid = workspace::get(&ctx.vai_dir, &id)
         .map(|m| m.id)
         .ok();
-    workspace::discard(&state.vai_dir, &id, None).map_err(ApiError::from)?;
+    workspace::discard(&ctx.vai_dir, &id, None).map_err(ApiError::from)?;
 
     // Remove from conflict engine — workspace is no longer active.
     if let Some(uuid) = ws_uuid {
@@ -977,11 +1134,11 @@ async fn discard_workspace_handler(
 /// recent versions (the list is already oldest-first, so we truncate from
 /// the end after reversing).
 async fn list_versions_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumQuery(params): AxumQuery<ListVersionsQuery>,
 ) -> Result<Json<Vec<version::VersionMeta>>, ApiError> {
     let mut versions =
-        version::list_versions(&state.vai_dir).map_err(ApiError::from)?;
+        version::list_versions(&ctx.vai_dir).map_err(ApiError::from)?;
     if let Some(limit) = params.limit {
         // Keep the N most-recent: the list is oldest-first, so drop from the front.
         let len = versions.len();
@@ -997,11 +1154,11 @@ async fn list_versions_handler(
 ///
 /// Returns 404 if the version does not exist.
 async fn get_version_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<version::VersionChanges>, ApiError> {
     let changes =
-        version::get_version_changes(&state.vai_dir, &id).map_err(ApiError::from)?;
+        version::get_version_changes(&ctx.vai_dir, &id).map_err(ApiError::from)?;
     Ok(Json(changes))
 }
 
@@ -1015,11 +1172,11 @@ async fn get_version_handler(
 ///
 /// If `force` is `true`, the rollback proceeds regardless of downstream impact.
 async fn rollback_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     Json(body): Json<RollbackRequest>,
 ) -> Response {
     // Compute impact analysis before attempting the rollback.
-    let impact = match version::analyze_rollback_impact(&state.vai_dir, &body.version) {
+    let impact = match version::analyze_rollback_impact(&ctx.vai_dir, &body.version) {
         Ok(i) => i,
         Err(e) => return ApiError::from(e).into_response(),
     };
@@ -1035,7 +1192,7 @@ async fn rollback_handler(
             .into_response();
     }
 
-    match version::rollback(&state.vai_dir, &state.repo_root, &body.version, None) {
+    match version::rollback(&ctx.vai_dir, &ctx.repo_root, &body.version, None) {
         Ok(result) => Json(result).into_response(),
         Err(e) => ApiError::from(e).into_response(),
     }
@@ -1380,13 +1537,14 @@ fn sha256_hex(data: &[u8]) -> String {
 /// - Broadcasts a `FilesUploaded` WebSocket event on success.
 async fn upload_workspace_files_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<UploadFilesRequest>,
 ) -> Result<(StatusCode, Json<UploadFilesResponse>), ApiError> {
     let _lock = state.repo_lock.lock().await;
-    let mut meta = workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
-    let overlay = workspace::overlay_dir(&state.vai_dir, &id);
-    let log_dir = state.vai_dir.join("event_log");
+    let mut meta = workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
+    let overlay = workspace::overlay_dir(&ctx.vai_dir, &id);
+    let log_dir = ctx.vai_dir.join("event_log");
     let workspace_uuid = meta.id;
 
     let mut uploaded_paths: Vec<String> = Vec::new();
@@ -1459,7 +1617,7 @@ async fn upload_workspace_files_handler(
     if meta.status == workspace::WorkspaceStatus::Created && !uploaded_paths.is_empty() {
         meta.status = workspace::WorkspaceStatus::Active;
         meta.updated_at = chrono::Utc::now();
-        workspace::update_meta(&state.vai_dir, &meta)
+        workspace::update_meta(&ctx.vai_dir, &meta)
             .map_err(|e| ApiError::internal(format!("update workspace meta: {e}")))?;
     }
 
@@ -1475,7 +1633,7 @@ async fn upload_workspace_files_handler(
     // Run conflict overlap detection and notify affected workspaces.
     {
         let mut engine = state.conflict_engine.lock().await;
-        match engine.update_scope(workspace_uuid, &meta.intent, &uploaded_paths, &state.vai_dir) {
+        match engine.update_scope(workspace_uuid, &meta.intent, &uploaded_paths, &ctx.vai_dir) {
             Ok(overlaps) => {
                 for overlap in overlaps {
                     let ts = chrono::Utc::now().to_rfc3339();
@@ -1539,23 +1697,23 @@ async fn upload_workspace_files_handler(
 /// repository (repo root) is used as a fallback. Returns 404 if the file
 /// exists in neither location. Response includes `found_in: "overlay"|"base"`.
 async fn get_workspace_file_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath((id, path)): AxumPath<(String, String)>,
 ) -> Result<Json<FileDownloadResponse>, ApiError> {
     // Verify workspace exists.
-    workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
+    workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
 
     let rel = sanitize_path(&path)
         .ok_or_else(|| ApiError::bad_request(format!("invalid path: '{path}'")))?;
 
     // Try overlay first.
-    let overlay_path = workspace::overlay_dir(&state.vai_dir, &id).join(&rel);
+    let overlay_path = workspace::overlay_dir(&ctx.vai_dir, &id).join(&rel);
     let (content, found_in) = if overlay_path.exists() {
         let bytes = std::fs::read(&overlay_path)
             .map_err(|e| ApiError::internal(format!("read overlay file: {e}")))?;
         (bytes, "overlay".to_string())
     } else {
-        let base_path = state.repo_root.join(&rel);
+        let base_path = ctx.repo_root.join(&rel);
         if !base_path.exists() {
             return Err(ApiError::not_found(format!("file not found: '{path}'")));
         }
@@ -1589,15 +1747,15 @@ struct RepoFileListResponse {
 /// Returns relative paths suitable for use with `GET /api/files/*path`.
 /// Hidden directories (`.git`, `.vai`) and common build artefacts are excluded.
 async fn list_repo_files_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
 ) -> Result<Json<RepoFileListResponse>, ApiError> {
-    let head_version = std::fs::read_to_string(state.vai_dir.join("head"))
+    let head_version = std::fs::read_to_string(ctx.vai_dir.join("head"))
         .map_err(|e| ApiError::internal(format!("read head: {e}")))?
         .trim()
         .to_string();
 
     let mut files = Vec::new();
-    collect_repo_files(&state.repo_root, &state.repo_root, &mut files)
+    collect_repo_files(&ctx.repo_root, &ctx.repo_root, &mut files)
         .map_err(|e| ApiError::internal(format!("list files: {e}")))?;
     files.sort();
 
@@ -1645,13 +1803,13 @@ fn collect_repo_files(
 ///
 /// Returns the file as base64-encoded content. Returns 404 if not found.
 async fn get_main_file_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(path): AxumPath<String>,
 ) -> Result<Json<FileDownloadResponse>, ApiError> {
     let rel = sanitize_path(&path)
         .ok_or_else(|| ApiError::bad_request(format!("invalid path: '{path}'")))?;
 
-    let file_path = state.repo_root.join(&rel);
+    let file_path = ctx.repo_root.join(&rel);
     if !file_path.exists() {
         return Err(ApiError::not_found(format!("file not found: '{path}'")));
     }
@@ -1781,10 +1939,10 @@ fn open_graph(vai_dir: &std::path::Path) -> Result<GraphSnapshot, ApiError> {
 ///
 /// Query params: `kind`, `file`, `name` (all optional, combined with AND).
 async fn list_graph_entities_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumQuery(filter): AxumQuery<GraphEntityFilter>,
 ) -> Result<Json<Vec<EntitySummary>>, ApiError> {
-    let graph = open_graph(&state.vai_dir)?;
+    let graph = open_graph(&ctx.vai_dir)?;
     let entities = graph
         .filter_entities(
             filter.kind.as_deref(),
@@ -1797,10 +1955,10 @@ async fn list_graph_entities_handler(
 
 /// `GET /api/graph/entities/:id` — entity details and its relationships.
 async fn get_graph_entity_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<EntityDetailResponse>, ApiError> {
-    let graph = open_graph(&state.vai_dir)?;
+    let graph = open_graph(&ctx.vai_dir)?;
     let entity = graph
         .get_entity_by_id(&id)
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -1817,10 +1975,10 @@ async fn get_graph_entity_handler(
 /// `GET /api/graph/entities/:id/deps` — all entities transitively reachable
 /// from this entity following any relationship direction.
 async fn get_entity_deps_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<EntityDepsResponse>, ApiError> {
-    let graph = open_graph(&state.vai_dir)?;
+    let graph = open_graph(&ctx.vai_dir)?;
     // Verify the entity exists before traversal.
     graph
         .get_entity_by_id(&id)
@@ -1852,7 +2010,7 @@ async fn get_entity_deps_handler(
 /// - `entities` — comma-separated entity IDs
 /// - `hops` — max traversal depth (default: 2)
 async fn get_blast_radius_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumQuery(query): AxumQuery<BlastRadiusQuery>,
 ) -> Result<Json<BlastRadiusResponse>, ApiError> {
     let seed_ids: Vec<String> = query
@@ -1869,7 +2027,7 @@ async fn get_blast_radius_handler(
     }
 
     let hops = query.hops;
-    let graph = open_graph(&state.vai_dir)?;
+    let graph = open_graph(&ctx.vai_dir)?;
 
     let seed_refs: Vec<&str> = seed_ids.iter().map(String::as_str).collect();
     let (entities, relationships) = graph
@@ -1897,6 +2055,7 @@ async fn get_blast_radius_handler(
 /// Returns 201 Created with the issue metadata.
 async fn create_issue_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     Json(body): Json<CreateIssueRequest>,
 ) -> Result<(StatusCode, Json<IssueResponse>), ApiError> {
     let _lock = state.repo_lock.lock().await;
@@ -1906,8 +2065,8 @@ async fn create_issue_handler(
         ApiError::bad_request(format!("unknown priority `{}`", body.priority))
     })?;
 
-    let store = IssueStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut log = crate::event_log::EventLog::open(&state.vai_dir)
+    let store = IssueStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut log = crate::event_log::EventLog::open(&ctx.vai_dir)
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let (issue, possible_duplicate_id) = if let Some(agent_id) = body.created_by_agent {
@@ -1959,7 +2118,7 @@ async fn create_issue_handler(
 
 /// `GET /api/issues` — list issues with optional filters.
 async fn list_issues_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumQuery(query): AxumQuery<ListIssuesQuery>,
 ) -> Result<Json<Vec<IssueResponse>>, ApiError> {
     use crate::issue::{IssueStore, IssueFilter, IssueStatus, IssuePriority};
@@ -1978,7 +2137,7 @@ async fn list_issues_handler(
         creator: query.created_by,
     };
 
-    let store = IssueStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let store = IssueStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let issues = store.list(&filter).map_err(ApiError::from)?;
 
     let mut response = Vec::with_capacity(issues.len());
@@ -1993,7 +2152,7 @@ async fn list_issues_handler(
 ///
 /// Returns 404 if the issue does not exist.
 async fn get_issue_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<IssueResponse>, ApiError> {
     use crate::issue::IssueStore;
@@ -2001,7 +2160,7 @@ async fn get_issue_handler(
     let issue_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
 
-    let store = IssueStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let store = IssueStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let issue = store.get(issue_id).map_err(ApiError::from)?;
     let linked = store.linked_workspaces(issue_id).unwrap_or_default();
 
@@ -2013,6 +2172,7 @@ async fn get_issue_handler(
 /// Returns 404 if the issue does not exist.
 async fn update_issue_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<UpdateIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
@@ -2026,8 +2186,8 @@ async fn update_issue_handler(
         .map(|p| IssuePriority::from_str(p).ok_or_else(|| ApiError::bad_request(format!("unknown priority `{p}`"))))
         .transpose()?;
 
-    let store = IssueStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut log = crate::event_log::EventLog::open(&state.vai_dir)
+    let store = IssueStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut log = crate::event_log::EventLog::open(&ctx.vai_dir)
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let issue = store
@@ -2043,6 +2203,7 @@ async fn update_issue_handler(
 /// Returns 404 if the issue does not exist.
 async fn close_issue_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<CloseIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
@@ -2052,8 +2213,8 @@ async fn close_issue_handler(
     let issue_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
 
-    let store = IssueStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut log = crate::event_log::EventLog::open(&state.vai_dir)
+    let store = IssueStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut log = crate::event_log::EventLog::open(&ctx.vai_dir)
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let issue = store.close(issue_id, &body.resolution, &mut log).map_err(ApiError::from)?;
@@ -2123,7 +2284,7 @@ fn default_resolved_by() -> String {
 ///
 /// Optional `?status=pending|resolved` filter.
 async fn list_escalations_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumQuery(params): AxumQuery<ListEscalationsQuery>,
 ) -> Result<Json<Vec<EscalationResponse>>, ApiError> {
     let status_filter = params
@@ -2136,7 +2297,7 @@ async fn list_escalations_handler(
         .transpose()?;
 
     let store =
-        EscalationStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+        EscalationStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let escalations = store
         .list(status_filter.as_ref())
         .map_err(ApiError::from)?;
@@ -2156,14 +2317,14 @@ struct ListEscalationsQuery {
 ///
 /// Returns 404 if the escalation does not exist.
 async fn get_escalation_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<EscalationResponse>, ApiError> {
     let esc_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request(format!("invalid escalation ID `{id}`")))?;
 
     let store =
-        EscalationStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+        EscalationStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let escalation = store.get(esc_id).map_err(ApiError::from)?;
 
     Ok(Json(EscalationResponse::from(escalation)))
@@ -2175,6 +2336,7 @@ async fn get_escalation_handler(
 /// Returns 400 if the escalation is already resolved or the option is invalid.
 async fn resolve_escalation_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<ResolveEscalationRequest>,
 ) -> Result<Json<EscalationResponse>, ApiError> {
@@ -2192,8 +2354,8 @@ async fn resolve_escalation_handler(
     })?;
 
     let store =
-        EscalationStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut log = EventLog::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+        EscalationStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut log = EventLog::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
 
     let escalation = store
         .resolve(esc_id, option, body.resolved_by, &mut log)
@@ -2236,9 +2398,10 @@ struct ClaimWorkRequest {
 /// Results are ranked by priority (critical → high → medium → low).
 async fn get_work_queue_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
 ) -> Result<Json<work_queue::WorkQueue>, ApiError> {
     let engine = state.conflict_engine.lock().await;
-    let queue = work_queue::compute(&state.vai_dir, &engine)
+    let queue = work_queue::compute(&ctx.vai_dir, &engine)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(queue))
 }
@@ -2251,6 +2414,7 @@ async fn get_work_queue_handler(
 /// (caller should refresh the queue and retry with a different issue).
 async fn claim_work_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     Json(body): Json<ClaimWorkRequest>,
 ) -> Result<(StatusCode, Json<work_queue::ClaimResult>), ApiError> {
     let _lock = state.repo_lock.lock().await;
@@ -2259,7 +2423,7 @@ async fn claim_work_handler(
     })?;
 
     let engine = state.conflict_engine.lock().await;
-    let result = work_queue::claim(&state.vai_dir, issue_id, &engine).map_err(|e| {
+    let result = work_queue::claim(&ctx.vai_dir, issue_id, &engine).map_err(|e| {
         use work_queue::WorkQueueError;
         match &e {
             WorkQueueError::IssueNotOpen(_) => ApiError::conflict(e.to_string()),
@@ -2331,10 +2495,11 @@ impl From<Watcher> for WatcherResponse {
 /// `POST /api/watchers/register` — register a new watcher agent.
 async fn register_watcher_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     Json(body): Json<RegisterWatcherRequest>,
 ) -> Result<(StatusCode, Json<WatcherResponse>), ApiError> {
     let _lock = state.repo_lock.lock().await;
-    let store = WatcherStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let store = WatcherStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let now = chrono::Utc::now();
     let watcher = Watcher {
         agent_id: body.agent_id,
@@ -2365,9 +2530,9 @@ async fn register_watcher_handler(
 
 /// `GET /api/watchers` — list all registered watchers.
 async fn list_watchers_handler(
-    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
 ) -> Result<Json<Vec<WatcherResponse>>, ApiError> {
-    let store = WatcherStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let store = WatcherStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let watchers = store.list().map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(watchers.into_iter().map(Into::into).collect()))
 }
@@ -2375,10 +2540,11 @@ async fn list_watchers_handler(
 /// `POST /api/watchers/:id/pause` — pause a watcher.
 async fn pause_watcher_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(agent_id): AxumPath<String>,
 ) -> Result<Json<WatcherResponse>, ApiError> {
     let _lock = state.repo_lock.lock().await;
-    let store = WatcherStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let store = WatcherStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     store.pause(&agent_id).map_err(|e| {
         use crate::watcher::WatcherError;
         match &e {
@@ -2393,10 +2559,11 @@ async fn pause_watcher_handler(
 /// `POST /api/watchers/:id/resume` — resume a paused watcher.
 async fn resume_watcher_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumPath(agent_id): AxumPath<String>,
 ) -> Result<Json<WatcherResponse>, ApiError> {
     let _lock = state.repo_lock.lock().await;
-    let store = WatcherStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    let store = WatcherStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     store.resume(&agent_id).map_err(|e| {
         use crate::watcher::WatcherError;
         match &e {
@@ -2432,14 +2599,15 @@ struct DiscoveryOutcomeResponse {
 /// `POST /api/discoveries` — submit a discovery event from a watcher.
 async fn submit_discovery_handler(
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     Json(body): Json<SubmitDiscoveryRequest>,
 ) -> Result<(StatusCode, Json<DiscoveryOutcomeResponse>), ApiError> {
     let _lock = state.repo_lock.lock().await;
-    let watcher_store = WatcherStore::open(&state.vai_dir)
+    let watcher_store = WatcherStore::open(&ctx.vai_dir)
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    let issue_store = crate::issue::IssueStore::open(&state.vai_dir)
+    let issue_store = crate::issue::IssueStore::open(&ctx.vai_dir)
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut event_log = EventLog::open(&state.vai_dir)
+    let mut event_log = EventLog::open(&ctx.vai_dir)
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let event_type = body.event.event_type().to_string();
@@ -2740,6 +2908,56 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
             auth_middleware,
         ));
 
+    // Per-repo routes: `/api/repos/:repo/<resource>` mirrors the legacy routes
+    // but resolves `vai_dir`/`repo_root` from the registry via
+    // `repo_resolve_middleware`.  All the same handlers are reused — the
+    // `RepoCtx` extractor picks up the per-repo paths from request extensions.
+    let repo_scoped = Router::new()
+        .route("/status", get(status_handler))
+        .route("/workspaces", post(create_workspace_handler))
+        .route("/workspaces", get(list_workspaces_handler))
+        .route("/workspaces/:id", get(get_workspace_handler))
+        .route("/workspaces/:id/submit", post(submit_workspace_handler))
+        .route("/workspaces/:id/files", post(upload_workspace_files_handler))
+        .route("/workspaces/:id/files/*path", get(get_workspace_file_handler))
+        .route("/workspaces/:id", delete(discard_workspace_handler))
+        .route("/files", get(list_repo_files_handler))
+        .route("/files/*path", get(get_main_file_handler))
+        .route("/versions", get(list_versions_handler))
+        .route("/versions/rollback", post(rollback_handler))
+        .route("/versions/:id", get(get_version_handler))
+        .route("/graph/entities", get(list_graph_entities_handler))
+        .route("/graph/blast-radius", get(get_blast_radius_handler))
+        .route("/graph/entities/:id", get(get_graph_entity_handler))
+        .route("/graph/entities/:id/deps", get(get_entity_deps_handler))
+        .route("/issues", post(create_issue_handler))
+        .route("/issues", get(list_issues_handler))
+        .route("/issues/:id/close", post(close_issue_handler))
+        .route("/issues/:id", get(get_issue_handler))
+        .route("/issues/:id", axum::routing::patch(update_issue_handler))
+        .route("/escalations", get(list_escalations_handler))
+        .route("/escalations/:id/resolve", post(resolve_escalation_handler))
+        .route("/escalations/:id", get(get_escalation_handler))
+        .route("/work-queue", get(get_work_queue_handler))
+        .route("/work-queue/claim", post(claim_work_handler))
+        .route("/watchers/register", post(register_watcher_handler))
+        .route("/watchers", get(list_watchers_handler))
+        .route("/watchers/:id/pause", post(pause_watcher_handler))
+        .route("/watchers/:id/resume", post(resume_watcher_handler))
+        .route("/discoveries", post(submit_discovery_handler))
+        .route("/ws/events", get(ws_events_handler))
+        // Apply repo resolution first (outermost = runs last).
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            repo_resolve_middleware,
+        ))
+        // Auth runs before repo resolution so unauthenticated requests are
+        // rejected cheaply before the registry lookup.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth_middleware,
+        ));
+
     let cors = tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
@@ -2748,7 +2966,11 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
             axum::http::header::AUTHORIZATION,
         ]);
 
-    public.merge(protected).layer(cors).with_state(state)
+    public
+        .merge(protected)
+        .nest("/api/repos/:repo", repo_scoped)
+        .layer(cors)
+        .with_state(state)
 }
 
 // ── Test helper ───────────────────────────────────────────────────────────────
@@ -5075,6 +5297,223 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 400);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    // ── /api/repos/:repo/* routing tests ─────────────────────────────────────
+
+    /// Register a repo, then hit `/api/repos/:repo/status` to verify routing.
+    #[tokio::test]
+    async fn repo_scoped_status_route() {
+        let tmp = TempDir::new().unwrap();
+        let storage_tmp = TempDir::new().unwrap();
+        fs::create_dir_all(storage_tmp.path()).unwrap();
+
+        let (addr, shutdown_tx, key) =
+            start_test_server_multi_repo(tmp.path(), storage_tmp.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+
+        // Register a repo.
+        let resp = client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "name": "my-project" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // Hit the repo-scoped status endpoint.
+        let resp = client
+            .get(format!("http://{addr}/api/repos/my-project/status"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // The registered repo is initialised with `vai init` so it has a head version.
+        assert_eq!(body["head_version"], "v1");
+        assert_eq!(body["workspace_count"], 0);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Accessing a repo-scoped route for an unregistered repo returns 404.
+    #[tokio::test]
+    async fn repo_scoped_route_unknown_repo_returns_404() {
+        let tmp = TempDir::new().unwrap();
+        let storage_tmp = TempDir::new().unwrap();
+        fs::create_dir_all(storage_tmp.path()).unwrap();
+
+        let (addr, shutdown_tx, key) =
+            start_test_server_multi_repo(tmp.path(), storage_tmp.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("http://{addr}/api/repos/does-not-exist/status"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Create a workspace via `/api/repos/:repo/workspaces` and list it back.
+    #[tokio::test]
+    async fn repo_scoped_workspace_create_and_list() {
+        let tmp = TempDir::new().unwrap();
+        let storage_tmp = TempDir::new().unwrap();
+        fs::create_dir_all(storage_tmp.path()).unwrap();
+
+        let (addr, shutdown_tx, key) =
+            start_test_server_multi_repo(tmp.path(), storage_tmp.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+
+        // Register a repo.
+        let resp = client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "name": "alpha" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // Create a workspace in that repo via the scoped route.
+        let resp = client
+            .post(format!("http://{addr}/api/repos/alpha/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "test feature" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let ws: serde_json::Value = resp.json().await.unwrap();
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        // List workspaces — should contain the one we created.
+        let resp = client
+            .get(format!("http://{addr}/api/repos/alpha/workspaces"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let list: serde_json::Value = resp.json().await.unwrap();
+        let workspaces = list.as_array().unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0]["id"], ws_id);
+
+        // The legacy single-repo routes should NOT see this workspace
+        // (it lives under the storage_root repo, not the server's own .vai/).
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let legacy: serde_json::Value = resp.json().await.unwrap();
+        assert!(legacy.as_array().unwrap().is_empty());
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Repo-scoped routes require auth — missing key returns 401.
+    #[tokio::test]
+    async fn repo_scoped_route_requires_auth() {
+        let tmp = TempDir::new().unwrap();
+        let storage_tmp = TempDir::new().unwrap();
+        fs::create_dir_all(storage_tmp.path()).unwrap();
+
+        let (addr, shutdown_tx, key) =
+            start_test_server_multi_repo(tmp.path(), storage_tmp.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+
+        // Register a repo first (with auth).
+        client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "name": "secure-repo" }))
+            .send()
+            .await
+            .unwrap();
+
+        // Access without token → 401.
+        let resp = client
+            .get(format!("http://{addr}/api/repos/secure-repo/workspaces"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Issues created via a repo-scoped route are isolated to that repo.
+    #[tokio::test]
+    async fn repo_scoped_issues_are_isolated() {
+        let tmp = TempDir::new().unwrap();
+        let storage_tmp = TempDir::new().unwrap();
+        fs::create_dir_all(storage_tmp.path()).unwrap();
+
+        let (addr, shutdown_tx, key) =
+            start_test_server_multi_repo(tmp.path(), storage_tmp.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+
+        // Register two repos.
+        for name in ["repo-a", "repo-b"] {
+            let resp = client
+                .post(format!("http://{addr}/api/repos"))
+                .bearer_auth(&key)
+                .json(&serde_json::json!({ "name": name }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 201);
+        }
+
+        // Create an issue in repo-a.
+        let resp = client
+            .post(format!("http://{addr}/api/repos/repo-a/issues"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "title": "Issue in A",
+                "description": "",
+                "priority": "medium",
+                "labels": []
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // repo-b should have no issues.
+        let resp = client
+            .get(format!("http://{addr}/api/repos/repo-b/issues"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let b_issues: serde_json::Value = resp.json().await.unwrap();
+        assert!(b_issues.as_array().unwrap().is_empty());
+
+        // repo-a should have exactly one issue.
+        let resp = client
+            .get(format!("http://{addr}/api/repos/repo-a/issues"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let a_issues: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(a_issues.as_array().unwrap().len(), 1);
+        assert_eq!(a_issues[0]["title"], "Issue in A");
 
         shutdown_tx.send(()).ok();
     }
