@@ -37,6 +37,8 @@
 //!   - `POST /api/watchers/:id/pause` — pause a watcher
 //!   - `POST /api/watchers/:id/resume` — resume a paused watcher
 //!   - `POST /api/discoveries` — submit a discovery event from a watcher
+//!   - `POST /api/repos` — register and initialise a new repository (multi-repo mode)
+//!   - `GET /api/repos` — list all registered repositories with basic stats
 //!
 //! ## WebSocket Endpoints
 //!   - `GET /ws/events?key=<api_key>` — real-time event stream
@@ -295,6 +297,8 @@ pub(crate) struct AppState {
     /// issue create/update, etc.) to prevent data races on the event log and
     /// `.vai/` directory.
     repo_lock: Arc<Mutex<()>>,
+    /// Root directory for multi-repo storage. `None` means single-repo (legacy) mode.
+    storage_root: Option<PathBuf>,
 }
 
 impl AppState {
@@ -2484,6 +2488,181 @@ async fn submit_discovery_handler(
     ))
 }
 
+// ── Repository registry ───────────────────────────────────────────────────────
+
+/// A single registered repository entry in the multi-repo registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoRegistryEntry {
+    /// Short identifier used in API paths (e.g. `"my-project"`).
+    pub name: String,
+    /// Absolute path to the repository root (parent of `.vai/`).
+    pub path: PathBuf,
+    /// When this repo was registered with the server.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Persistent registry of all repos managed by this server instance.
+///
+/// Stored as JSON at `{storage_root}/registry.json`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RepoRegistry {
+    repos: Vec<RepoRegistryEntry>,
+}
+
+impl RepoRegistry {
+    /// Loads the registry from `{storage_root}/registry.json`, creating an
+    /// empty registry if the file does not yet exist.
+    fn load(storage_root: &Path) -> Result<Self, std::io::Error> {
+        let path = storage_root.join("registry.json");
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        serde_json::from_str(&raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// Saves the registry to `{storage_root}/registry.json`.
+    fn save(&self, storage_root: &Path) -> Result<(), std::io::Error> {
+        let path = storage_root.join("registry.json");
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    /// Returns `true` if a repo with the given name is already registered.
+    fn contains(&self, name: &str) -> bool {
+        self.repos.iter().any(|r| r.name == name)
+    }
+}
+
+// ── Request / response types for /api/repos ───────────────────────────────────
+
+/// Request body for `POST /api/repos`.
+#[derive(Debug, Deserialize)]
+struct CreateRepoRequest {
+    /// Short name for the new repository (alphanumeric, hyphens, underscores).
+    name: String,
+}
+
+/// Response body for repo list and creation endpoints.
+#[derive(Debug, Serialize)]
+struct RepoResponse {
+    /// Short name of the repository.
+    name: String,
+    /// Absolute filesystem path to the repository root.
+    path: String,
+    /// ISO-8601 timestamp when the repo was registered.
+    created_at: String,
+    /// Current HEAD version string (e.g. `"v1"`).
+    head_version: String,
+    /// Number of active workspaces.
+    workspace_count: usize,
+}
+
+impl RepoResponse {
+    fn from_entry(entry: &RepoRegistryEntry) -> Self {
+        let vai_dir = entry.path.join(".vai");
+        let head_version = repo::read_head(&vai_dir).unwrap_or_else(|_| "unknown".to_string());
+        let workspace_count = workspace::list(&vai_dir).map(|w| w.len()).unwrap_or(0);
+        RepoResponse {
+            name: entry.name.clone(),
+            path: entry.path.display().to_string(),
+            created_at: entry.created_at.to_rfc3339(),
+            head_version,
+            workspace_count,
+        }
+    }
+}
+
+// ── Repository management handlers ────────────────────────────────────────────
+
+/// `POST /api/repos` — registers and initialises a new repository.
+///
+/// Creates `{storage_root}/{name}/`, runs `vai init`, and records the repo in
+/// the server registry. Returns 400 if multi-repo mode is not enabled (i.e.
+/// `storage_root` is not set) or if the name is already taken.
+async fn create_repo_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateRepoRequest>,
+) -> Result<(StatusCode, Json<RepoResponse>), ApiError> {
+    let storage_root = state.storage_root.as_ref().ok_or_else(|| {
+        ApiError::bad_request(
+            "server is not in multi-repo mode; set storage_root in ~/.vai/server.toml",
+        )
+    })?;
+
+    // Validate the repo name: alphanumeric, hyphens, underscores only.
+    if body.name.is_empty()
+        || !body
+            .name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ApiError::bad_request(
+            "repo name must be non-empty and contain only alphanumeric characters, hyphens, and underscores",
+        ));
+    }
+
+    let _lock = state.repo_lock.lock().await;
+
+    // Load registry and check for duplicates.
+    let mut registry = RepoRegistry::load(storage_root).map_err(|e| ApiError::internal(e.to_string()))?;
+    if registry.contains(&body.name) {
+        return Err(ApiError::conflict(format!(
+            "repository '{}' is already registered",
+            body.name
+        )));
+    }
+
+    // Create the directory and initialise the vai repo.
+    let repo_root = storage_root.join(&body.name);
+    std::fs::create_dir_all(&repo_root).map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // repo::init is synchronous and may do significant I/O; run on the
+    // blocking thread pool so we don't stall the async executor.
+    let repo_root_clone = repo_root.clone();
+    tokio::task::spawn_blocking(move || repo::init(&repo_root_clone))
+        .await
+        .map_err(|e| ApiError::internal(format!("task join error: {e}")))?
+        .map_err(|e| ApiError::internal(format!("vai init failed: {e}")))?;
+
+    let entry = RepoRegistryEntry {
+        name: body.name.clone(),
+        path: repo_root,
+        created_at: chrono::Utc::now(),
+    };
+
+    // Persist the updated registry.
+    registry.repos.push(entry.clone());
+    registry.save(storage_root).map_err(|e| ApiError::internal(e.to_string()))?;
+
+    tracing::info!(name = %entry.name, path = %entry.path.display(), "repo registered");
+
+    Ok((StatusCode::CREATED, Json(RepoResponse::from_entry(&entry))))
+}
+
+/// `GET /api/repos` — lists all registered repositories with basic stats.
+///
+/// Returns an empty array if no repos are registered or if storage_root is not
+/// set.
+async fn list_repos_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<RepoResponse>>, ApiError> {
+    let storage_root = match state.storage_root.as_ref() {
+        Some(sr) => sr,
+        None => return Ok(Json(vec![])),
+    };
+
+    let registry = RepoRegistry::load(storage_root).map_err(|e| ApiError::internal(e.to_string()))?;
+    let responses: Vec<RepoResponse> = registry
+        .repos
+        .iter()
+        .map(RepoResponse::from_entry)
+        .collect();
+
+    Ok(Json(responses))
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -2553,6 +2732,9 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/watchers/:id/pause", post(pause_watcher_handler))
         .route("/api/watchers/:id/resume", post(resume_watcher_handler))
         .route("/api/discoveries", post(submit_discovery_handler))
+        // Multi-repo management endpoints.
+        .route("/api/repos", post(create_repo_handler))
+        .route("/api/repos", get(list_repos_handler))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -2602,6 +2784,7 @@ pub async fn start_for_testing(
         event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
         conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
         repo_lock: Arc::new(Mutex::new(())),
+        storage_root: None,
     });
 
     let app = build_app(state);
@@ -2654,6 +2837,7 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
         event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
         conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
         repo_lock: Arc::new(Mutex::new(())),
+        storage_root: config.storage_root.clone(),
     });
 
     let app = build_app(state);
@@ -2773,6 +2957,7 @@ mod tests {
             event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
             conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
             repo_lock: Arc::new(Mutex::new(())),
+            storage_root: None,
         });
 
         let app = build_app(Arc::clone(&state));
@@ -4703,6 +4888,193 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 409);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    // ── /api/repos endpoint tests ─────────────────────────────────────────────
+
+    /// Helper: start a test server with a storage_root configured.
+    async fn start_test_server_multi_repo(
+        root: &Path,
+        storage_root: PathBuf,
+    ) -> (SocketAddr, oneshot::Sender<()>, String) {
+        repo::init(root).unwrap();
+        let vai_dir = root.join(".vai");
+        let repo_config = repo::read_config(&vai_dir).unwrap();
+        let (_, key) = auth::create(&vai_dir, "test-agent").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let state = Arc::new(AppState {
+            vai_dir: vai_dir.clone(),
+            repo_root: root.to_path_buf(),
+            started_at: Instant::now(),
+            repo_name: repo_config.name.clone(),
+            vai_version: env!("CARGO_PKG_VERSION").to_string(),
+            event_tx,
+            event_seq: Arc::new(AtomicU64::new(0)),
+            event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
+            conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
+            repo_lock: Arc::new(Mutex::new(())),
+            storage_root: Some(storage_root),
+        });
+
+        let app = build_app(Arc::clone(&state));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async { shutdown_rx.await.ok(); })
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (addr, shutdown_tx, key)
+    }
+
+    #[tokio::test]
+    async fn list_repos_empty_when_no_storage_root() {
+        let tmp = TempDir::new().unwrap();
+        let (addr, shutdown_tx, _state, key) = start_test_server(tmp.path()).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let list: serde_json::Value = resp.json().await.unwrap();
+        assert!(list.as_array().unwrap().is_empty());
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn create_repo_rejected_without_storage_root() {
+        let tmp = TempDir::new().unwrap();
+        let (addr, shutdown_tx, _state, key) = start_test_server(tmp.path()).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "name": "my-project" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn create_and_list_repos() {
+        let tmp = TempDir::new().unwrap();
+        let storage_tmp = TempDir::new().unwrap();
+        fs::create_dir_all(storage_tmp.path()).unwrap();
+
+        let (addr, shutdown_tx, key) =
+            start_test_server_multi_repo(tmp.path(), storage_tmp.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+
+        // Create a repo.
+        let resp = client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "name": "my-project" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(created["name"], "my-project");
+        assert_eq!(created["head_version"], "v1");
+        assert_eq!(created["workspace_count"], 0);
+
+        // Verify the directory was created and initialized.
+        let repo_root = storage_tmp.path().join("my-project");
+        assert!(repo_root.join(".vai").is_dir(), ".vai/ not created");
+
+        // List repos — should contain the one we created.
+        let resp = client
+            .get(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let list: serde_json::Value = resp.json().await.unwrap();
+        let repos = list.as_array().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["name"], "my-project");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn create_repo_duplicate_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let storage_tmp = TempDir::new().unwrap();
+
+        let (addr, shutdown_tx, key) =
+            start_test_server_multi_repo(tmp.path(), storage_tmp.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+
+        // First create — OK.
+        let resp = client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "name": "alpha" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // Second create with same name — conflict.
+        let resp = client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "name": "alpha" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn create_repo_invalid_name_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let storage_tmp = TempDir::new().unwrap();
+
+        let (addr, shutdown_tx, key) =
+            start_test_server_multi_repo(tmp.path(), storage_tmp.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+
+        // Name with path traversal characters.
+        let resp = client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "name": "../evil" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+
+        // Empty name.
+        let resp = client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "name": "" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
 
         shutdown_tx.send(()).ok();
     }
