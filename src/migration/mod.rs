@@ -145,12 +145,91 @@ pub fn gather_local_data(vai_dir: &Path) -> Result<MigrationPayload, MigrationEr
     })
 }
 
+// ── Migration marker ──────────────────────────────────────────────────────────
+
+/// Parsed contents of the `.vai/migrated_at` marker file.
+///
+/// Written by `vai remote migrate` after a successful migration so that
+/// `vai remote status` can show verification info without re-querying all
+/// local data from scratch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationMarker {
+    /// UTC timestamp when migration completed (RFC 3339).
+    pub migrated_at: DateTime<Utc>,
+    /// URL of the remote server that received the migration.
+    pub remote_url: String,
+    /// Number of events migrated.
+    pub events_migrated: usize,
+    /// Number of issues migrated.
+    pub issues_migrated: usize,
+    /// Number of versions migrated.
+    pub versions_migrated: usize,
+    /// Number of escalations migrated.
+    pub escalations_migrated: usize,
+    /// HEAD version at the time of migration, if any.
+    pub head_version: Option<String>,
+}
+
+impl MigrationMarker {
+    /// Writes this marker to `<vai_dir>/migrated_at` in TOML format.
+    pub fn write(&self, vai_dir: &Path) -> Result<(), MigrationError> {
+        let path = vai_dir.join("migrated_at");
+        let content = toml::to_string(self)
+            .map_err(|e| MigrationError::Io(format!("failed to serialise migration marker: {e}")))?;
+        std::fs::write(&path, content)
+            .map_err(|e| MigrationError::Io(format!("failed to write migrated_at: {e}")))?;
+        Ok(())
+    }
+
+    /// Reads and parses `.vai/migrated_at`, returning `None` if the file does
+    /// not exist or cannot be parsed.
+    pub fn read(vai_dir: &Path) -> Option<Self> {
+        let path = vai_dir.join("migrated_at");
+        let content = std::fs::read_to_string(&path).ok()?;
+        toml::from_str(&content).ok()
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn migration_marker_roundtrips() {
+        let dir = TempDir::new().unwrap();
+        let vai_dir = dir.path().join(".vai");
+        std::fs::create_dir_all(&vai_dir).unwrap();
+
+        let marker = MigrationMarker {
+            migrated_at: Utc::now(),
+            remote_url: "https://vai.example.com".to_string(),
+            events_migrated: 42,
+            issues_migrated: 5,
+            versions_migrated: 3,
+            escalations_migrated: 1,
+            head_version: Some("v7".to_string()),
+        };
+        marker.write(&vai_dir).unwrap();
+
+        let back = MigrationMarker::read(&vai_dir).expect("marker should be readable");
+        assert_eq!(back.remote_url, "https://vai.example.com");
+        assert_eq!(back.events_migrated, 42);
+        assert_eq!(back.issues_migrated, 5);
+        assert_eq!(back.versions_migrated, 3);
+        assert_eq!(back.escalations_migrated, 1);
+        assert_eq!(back.head_version, Some("v7".to_string()));
+    }
+
+    #[test]
+    fn migration_marker_read_missing_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let vai_dir = dir.path().join(".vai");
+        std::fs::create_dir_all(&vai_dir).unwrap();
+        assert!(MigrationMarker::read(&vai_dir).is_none());
+    }
 
     #[test]
     fn gather_empty_repo() {

@@ -38,7 +38,9 @@
 //!   - `POST /api/watchers/:id/resume` — resume a paused watcher
 //!   - `POST /api/discoveries` — submit a discovery event from a watcher
 //!   - `POST /api/migrate` — bulk migration from local SQLite (single-repo mode)
+//!   - `GET /api/migration-stats` — counts of migrated data for post-migration verification
 //!   - `POST /api/repos/:repo/migrate` — bulk migration from local SQLite (multi-repo mode)
+//!   - `GET /api/repos/:repo/migration-stats` — per-repo migration stats
 //!   - `POST /api/repos` — register and initialise a new repository (multi-repo mode)
 //!   - `GET /api/repos` — list all registered repositories with basic stats
 //!   - `POST /api/users` — create a new user account
@@ -4259,6 +4261,92 @@ async fn migrate_handler(
     Ok((StatusCode::OK, Json(summary)))
 }
 
+// ── Migration stats ───────────────────────────────────────────────────────────
+
+/// Response body for `GET /api/migration-stats` and `GET /api/repos/:repo/migration-stats`.
+///
+/// Returns counts of all data in the repository, useful for post-migration verification.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MigrationStatsResponse {
+    /// Total number of events in the repository.
+    pub events: i64,
+    /// Total number of issues in the repository (all statuses).
+    pub issues: i64,
+    /// Total number of versions in the repository.
+    pub versions: i64,
+    /// Total number of escalations in the repository.
+    pub escalations: i64,
+    /// Current HEAD version identifier, if any.
+    pub head_version: Option<String>,
+}
+
+/// `GET /api/migration-stats` and `GET /api/repos/:repo/migration-stats`
+///
+/// Returns counts of events, issues, versions, and escalations for the repository.
+/// Requires Postgres backend.  Used by `vai remote status` to verify a migration
+/// transferred all data correctly.
+async fn migration_stats_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+) -> Result<Json<MigrationStatsResponse>, ApiError> {
+    use crate::storage::StorageBackend;
+
+    require_repo_permission(
+        &ctx.storage,
+        &identity,
+        &ctx.repo_id,
+        crate::storage::RepoRole::Read,
+    )
+    .await?;
+
+    let pg = match &ctx.storage {
+        StorageBackend::Server(pg) => pg.clone(),
+        StorageBackend::Local(_) => {
+            return Err(ApiError::bad_request(
+                "migration-stats endpoint requires a Postgres-backed server; \
+                 this server is running in local SQLite mode",
+            ));
+        }
+    };
+
+    let pool = pg.pool();
+
+    let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE repo_id = $1")
+        .bind(ctx.repo_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to count events: {e}")))?;
+
+    let issues: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM issues WHERE repo_id = $1")
+        .bind(ctx.repo_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to count issues: {e}")))?;
+
+    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM versions WHERE repo_id = $1")
+        .bind(ctx.repo_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to count versions: {e}")))?;
+
+    let escalations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM escalations WHERE repo_id = $1")
+            .bind(ctx.repo_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to count escalations: {e}")))?;
+
+    let head_version = repo::read_head(&ctx.vai_dir).ok();
+
+    Ok(Json(MigrationStatsResponse {
+        events,
+        issues,
+        versions,
+        escalations,
+        head_version,
+    }))
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -4328,8 +4416,9 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/watchers/:id/pause", post(pause_watcher_handler))
         .route("/api/watchers/:id/resume", post(resume_watcher_handler))
         .route("/api/discoveries", post(submit_discovery_handler))
-        // Migration endpoint (PRD 12.2) — single-repo mode.
+        // Migration endpoints (PRD 12.2, 12.5) — single-repo mode.
         .route("/api/migrate", post(migrate_handler))
+        .route("/api/migration-stats", get(migration_stats_handler))
         // Multi-repo management endpoints.
         .route("/api/repos", post(create_repo_handler))
         .route("/api/repos", get(list_repos_handler))
@@ -4412,8 +4501,9 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/watchers/:id/resume", post(resume_watcher_handler))
         .route("/discoveries", post(submit_discovery_handler))
         .route("/ws/events", get(ws_events_handler))
-        // Migration endpoint (PRD 12.2) — multi-repo mode.
+        // Migration endpoints (PRD 12.2, 12.5) — multi-repo mode.
         .route("/migrate", post(migrate_handler))
+        .route("/migration-stats", get(migration_stats_handler))
         // Apply repo resolution first (outermost = runs last).
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),

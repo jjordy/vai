@@ -2398,6 +2398,8 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 }
                 RemoteCommands::Status => {
                     let config = repo::read_config(&vai_dir)?;
+                    // Check for a migration marker written by `vai remote migrate`.
+                    let marker = crate::migration::MigrationMarker::read(&vai_dir);
                     match &config.remote {
                         None => {
                             if cli.json {
@@ -2408,30 +2410,127 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                             }
                         }
                         Some(remote) => {
-                            // Test connectivity by pinging /api/status.
                             let rt = tokio::runtime::Runtime::new()
                                 .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?;
-                            let client = crate::remote_client::RemoteClient::new(&remote)
+                            let client = crate::remote_client::RemoteClient::new(remote)
                                 .map_err(|e| CliError::Other(format!("API key error: {e}")))?;
+
+                            // Ping connectivity.
                             let reachable = rt.block_on(async {
                                 client
                                     .get::<serde_json::Value>("/api/status")
                                     .await
                                     .is_ok()
                             });
-                            if cli.json {
-                                println!(
-                                    "{}",
-                                    serde_json::json!({
-                                        "configured": true,
-                                        "url": remote.url,
-                                        "reachable": reachable,
-                                    })
-                                );
-                            } else if reachable {
-                                println!("Remote: {} {}", remote.url.cyan(), "(reachable)".green());
+
+                            // If migrated, fetch remote stats for verification.
+                            let repo_name = &config.name;
+                            let stats: Option<crate::server::MigrationStatsResponse> = if marker.is_some() {
+                                rt.block_on(async {
+                                    let repo_endpoint =
+                                        format!("/api/repos/{repo_name}/migration-stats");
+                                    match client
+                                        .get::<crate::server::MigrationStatsResponse>(
+                                            &repo_endpoint,
+                                        )
+                                        .await
+                                    {
+                                        Ok(s) => Some(s),
+                                        Err(_) => {
+                                            // Fall back to single-repo endpoint.
+                                            client
+                                                .get::<crate::server::MigrationStatsResponse>(
+                                                    "/api/migration-stats",
+                                                )
+                                                .await
+                                                .ok()
+                                        }
+                                    }
+                                })
                             } else {
-                                println!("Remote: {} {}", remote.url.cyan(), "(unreachable)".red());
+                                None
+                            };
+
+                            if cli.json {
+                                let mut obj = serde_json::json!({
+                                    "configured": true,
+                                    "url": remote.url,
+                                    "reachable": reachable,
+                                });
+                                if let Some(ref m) = marker {
+                                    obj["migrated_at"] = serde_json::json!(m.migrated_at.to_rfc3339());
+                                    obj["migration"] = serde_json::json!({
+                                        "events_migrated": m.events_migrated,
+                                        "issues_migrated": m.issues_migrated,
+                                        "versions_migrated": m.versions_migrated,
+                                        "escalations_migrated": m.escalations_migrated,
+                                        "head_version": m.head_version,
+                                    });
+                                }
+                                if let Some(ref s) = stats {
+                                    obj["remote_counts"] = serde_json::json!({
+                                        "events": s.events,
+                                        "issues": s.issues,
+                                        "versions": s.versions,
+                                        "escalations": s.escalations,
+                                        "head_version": s.head_version,
+                                    });
+                                }
+                                println!("{}", obj);
+                            } else {
+                                if reachable {
+                                    println!("Remote: {} {}", remote.url.cyan(), "(reachable)".green());
+                                } else {
+                                    println!("Remote: {} {}", remote.url.cyan(), "(unreachable)".red());
+                                }
+                                if let Some(ref m) = marker {
+                                    println!();
+                                    println!(
+                                        "Migrated: {}",
+                                        m.migrated_at.format("%Y-%m-%d %H:%M:%S UTC")
+                                    );
+                                    println!("Data transferred:");
+                                    println!("  Events:      {}", m.events_migrated);
+                                    println!("  Issues:      {}", m.issues_migrated);
+                                    println!("  Versions:    {}", m.versions_migrated);
+                                    println!("  Escalations: {}", m.escalations_migrated);
+                                    if let Some(ref head) = m.head_version {
+                                        println!("  HEAD:        {}", head);
+                                    }
+
+                                    if let Some(ref s) = stats {
+                                        println!();
+                                        println!("Verification (remote counts):");
+                                        let ev_ok = s.events == m.events_migrated as i64;
+                                        let is_ok = s.issues == m.issues_migrated as i64;
+                                        let ve_ok = s.versions == m.versions_migrated as i64;
+                                        let es_ok = s.escalations == m.escalations_migrated as i64;
+                                        let tick = |ok: bool| {
+                                            if ok { "OK".green().to_string() } else { "MISMATCH".red().to_string() }
+                                        };
+                                        println!(
+                                            "  Events:      {} (expected {}) [{}]",
+                                            s.events, m.events_migrated, tick(ev_ok)
+                                        );
+                                        println!(
+                                            "  Issues:      {} (expected {}) [{}]",
+                                            s.issues, m.issues_migrated, tick(is_ok)
+                                        );
+                                        println!(
+                                            "  Versions:    {} (expected {}) [{}]",
+                                            s.versions, m.versions_migrated, tick(ve_ok)
+                                        );
+                                        println!(
+                                            "  Escalations: {} (expected {}) [{}]",
+                                            s.escalations, m.escalations_migrated, tick(es_ok)
+                                        );
+                                        if ev_ok && is_ok && ve_ok && es_ok {
+                                            println!("\nMigration verified successfully.");
+                                        } else {
+                                            println!("\nWarning: some counts do not match.");
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2496,14 +2595,18 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     })
                     .map_err(|e| CliError::Other(format!("migration failed: {e}")))?;
 
-                    // Write the migration marker.
-                    let marker_path = vai_dir.join("migrated_at");
-                    let marker = format!(
-                        "migrated_at = {}\nremote_url = {}\n",
-                        summary.migrated_at.to_rfc3339(),
-                        remote.url
-                    );
-                    std::fs::write(&marker_path, &marker)
+                    // Write the migration marker (TOML, includes counts for verification).
+                    let marker = crate::migration::MigrationMarker {
+                        migrated_at: summary.migrated_at,
+                        remote_url: remote.url.clone(),
+                        events_migrated: summary.events_migrated,
+                        issues_migrated: summary.issues_migrated,
+                        versions_migrated: summary.versions_migrated,
+                        escalations_migrated: summary.escalations_migrated,
+                        head_version: summary.head_version.clone(),
+                    };
+                    marker
+                        .write(&vai_dir)
                         .map_err(|e| CliError::Other(format!("failed to write migrated_at: {e}")))?;
 
                     if cli.json {
