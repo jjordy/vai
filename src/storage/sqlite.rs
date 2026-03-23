@@ -629,7 +629,11 @@ impl AuthStore for SqliteStorage {
         &self,
         _repo_id: Option<&Uuid>,
         name: &str,
+        _user_id: Option<&Uuid>,
+        _role_override: Option<&str>,
     ) -> Result<(ApiKey, String), StorageError> {
+        // SQLite (local) mode has no user/RBAC concept; user_id and role_override
+        // are ignored. Keys are stored in the local keys.db.
         auth::create(&self.vai_dir, name).map_err(|e| match e {
             auth::AuthError::Duplicate(n) => StorageError::Conflict(format!("key name '{n}' already exists")),
             other => StorageError::Database(other.to_string()),
@@ -648,6 +652,11 @@ impl AuthStore for SqliteStorage {
     ) -> Result<Vec<ApiKey>, StorageError> {
         auth::list(&self.vai_dir)
             .map_err(|e| StorageError::Database(e.to_string()))
+    }
+
+    async fn list_keys_by_user(&self, _user_id: &Uuid) -> Result<Vec<ApiKey>, StorageError> {
+        // SQLite (local) mode has no user concept; return all keys.
+        auth::list(&self.vai_dir).map_err(|e| StorageError::Database(e.to_string()))
     }
 
     async fn revoke_key(&self, id: &str) -> Result<(), StorageError> {
@@ -1134,7 +1143,7 @@ mod tests {
     async fn auth_store_create_and_validate() {
         let (_tmp, storage, repo_id) = setup();
 
-        let (key_meta, plaintext) = storage.create_key(Some(&repo_id), "test-key").await.unwrap();
+        let (key_meta, plaintext) = storage.create_key(Some(&repo_id), "test-key", None, None).await.unwrap();
         assert_eq!(key_meta.name, "test-key");
 
         let validated = storage.validate_key(&plaintext).await.unwrap();

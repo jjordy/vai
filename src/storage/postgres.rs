@@ -1099,6 +1099,8 @@ impl AuthStore for PostgresStorage {
         &self,
         repo_id: Option<&Uuid>,
         name: &str,
+        user_id: Option<&Uuid>,
+        role_override: Option<&str>,
     ) -> Result<(ApiKey, String), StorageError> {
         let id = Uuid::new_v4().to_string();
         let token = random_token(64);
@@ -1107,8 +1109,8 @@ impl AuthStore for PostgresStorage {
 
         sqlx::query(
             r#"
-            INSERT INTO api_keys (id, repo_id, name, key_hash, key_prefix)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO api_keys (id, repo_id, name, key_hash, key_prefix, user_id, role_override)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
         )
         .bind(&id)
@@ -1116,6 +1118,8 @@ impl AuthStore for PostgresStorage {
         .bind(name)
         .bind(&key_hash)
         .bind(&key_prefix)
+        .bind(user_id)
+        .bind(role_override)
         .execute(&self.pool)
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -1127,8 +1131,8 @@ impl AuthStore for PostgresStorage {
             last_used_at: None,
             created_at: Utc::now(),
             revoked: false,
-            user_id: None,
-            role_override: None,
+            user_id: user_id.copied(),
+            role_override: role_override.map(|s| s.to_string()),
         };
 
         Ok((key, token))
@@ -1180,6 +1184,20 @@ impl AuthStore for PostgresStorage {
             .fetch_all(&self.pool)
             .await,
         }
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        rows.into_iter().map(row_to_api_key).collect()
+    }
+
+    async fn list_keys_by_user(&self, user_id: &Uuid) -> Result<Vec<ApiKey>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT id, name, key_prefix, last_used_at, created_at, revoked, \
+                    user_id, role_override \
+             FROM api_keys WHERE user_id = $1 AND revoked = false ORDER BY created_at",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
 
         rows.into_iter().map(row_to_api_key).collect()

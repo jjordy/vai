@@ -438,10 +438,14 @@ pub trait AuthStore: Send + Sync {
     ///
     /// Returns the key metadata and the plaintext secret (shown only once).
     /// `repo_id` is `None` for server-level keys.
+    /// `user_id` associates the key with a user account (RBAC server mode).
+    /// `role_override` caps the key's effective permissions at the given role.
     async fn create_key(
         &self,
         repo_id: Option<&Uuid>,
         name: &str,
+        user_id: Option<&Uuid>,
+        role_override: Option<&str>,
     ) -> Result<(ApiKey, String), StorageError>;
 
     /// Validates a plaintext API token and returns the associated key metadata.
@@ -454,6 +458,11 @@ pub trait AuthStore: Send + Sync {
         &self,
         repo_id: Option<&Uuid>,
     ) -> Result<Vec<ApiKey>, StorageError>;
+
+    /// Lists all non-revoked keys belonging to a specific user.
+    ///
+    /// In SQLite (local) mode this returns all keys (no user concept exists).
+    async fn list_keys_by_user(&self, user_id: &Uuid) -> Result<Vec<ApiKey>, StorageError>;
 
     /// Revokes a key by its record ID. Revoked keys are rejected by `validate_key`.
     async fn revoke_key(&self, id: &str) -> Result<(), StorageError>;

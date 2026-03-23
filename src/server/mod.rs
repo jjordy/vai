@@ -53,6 +53,9 @@
 //!   - `GET /api/orgs/:org/repos/:repo/collaborators` — list repo collaborators
 //!   - `PATCH /api/orgs/:org/repos/:repo/collaborators/:user` — change collaborator role
 //!   - `DELETE /api/orgs/:org/repos/:repo/collaborators/:user` — remove a collaborator
+//!   - `POST /api/keys` — create an API key (scoped to repo + role)
+//!   - `GET /api/keys` — list the authenticated user's keys
+//!   - `DELETE /api/keys/:id` — revoke a key by its record UUID
 //!
 //! ## Multi-Repo Endpoints (`/api/repos/:repo/`)
 //!   - `GET /api/repos/:repo/status` — per-repo health (same fields as `/api/status`)
@@ -3605,6 +3608,184 @@ async fn remove_collaborator_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── API key management (PRD 10.3) ─────────────────────────────────────────────
+
+/// Request body for `POST /api/keys`.
+#[derive(Debug, Deserialize)]
+struct CreateKeyRequest {
+    /// Human-readable name for this key.
+    name: String,
+    /// Repository UUID to scope this key to. `None` for server-level keys.
+    repo_id: Option<uuid::Uuid>,
+    /// Optional role cap. When set, the key's effective permissions are the
+    /// lesser of the creator's role and this value.
+    /// Accepted values: `"owner"`, `"admin"`, `"write"`, `"read"`.
+    role_override: Option<String>,
+}
+
+/// Response body for key creation.
+#[derive(Debug, Serialize)]
+struct CreateKeyResponse {
+    /// Key metadata (same shape as `ApiKeyResponse`).
+    key: ApiKeyResponse,
+    /// The plaintext token — shown only once.
+    token: String,
+}
+
+/// Response body for key list/get endpoints.
+#[derive(Debug, Serialize)]
+struct ApiKeyResponse {
+    id: String,
+    name: String,
+    key_prefix: String,
+    created_at: String,
+    last_used_at: Option<String>,
+    user_id: Option<String>,
+    role_override: Option<String>,
+}
+
+impl From<crate::auth::ApiKey> for ApiKeyResponse {
+    fn from(k: crate::auth::ApiKey) -> Self {
+        ApiKeyResponse {
+            id: k.id,
+            name: k.name,
+            key_prefix: k.key_prefix,
+            created_at: k.created_at.to_rfc3339(),
+            last_used_at: k.last_used_at.map(|t| t.to_rfc3339()),
+            user_id: k.user_id.map(|u| u.to_string()),
+            role_override: k.role_override,
+        }
+    }
+}
+
+/// `POST /api/keys` — creates a new API key scoped to the authenticated user.
+///
+/// The key's effective permissions are the lesser of the creator's own role and
+/// the requested `role_override`. A user cannot create a key with more
+/// permissions than they currently have.
+async fn create_key_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateKeyRequest>,
+) -> Result<(StatusCode, Json<CreateKeyResponse>), ApiError> {
+    // Admin keys can create keys without a user_id association.
+    // User-linked keys require a user_id on the identity.
+    let user_id = if identity.is_admin {
+        None
+    } else {
+        match identity.user_id {
+            Some(uid) => Some(uid),
+            None => {
+                return Err(ApiError::forbidden(
+                    "this key is not associated with a user; cannot create scoped keys",
+                ));
+            }
+        }
+    };
+
+    // Validate role_override: must be a recognised role string.
+    let role_override = match &body.role_override {
+        Some(r) => {
+            let parsed = crate::storage::RepoRole::from_str(r);
+            // Ensure the creator is not escalating beyond their own permissions.
+            if !identity.is_admin {
+                if let Some(repo_id) = &body.repo_id {
+                    let effective = require_repo_permission(
+                        &state.storage,
+                        &identity,
+                        repo_id,
+                        crate::storage::RepoRole::Read,
+                    )
+                    .await?;
+                    if parsed.rank() > effective.rank() {
+                        return Err(ApiError::bad_request(
+                            "role_override cannot exceed your own effective role on this repo",
+                        ));
+                    }
+                }
+            }
+            Some(parsed.as_str().to_string())
+        }
+        None => None,
+    };
+
+    let auth = state.storage.auth();
+    let (key_meta, token) = auth
+        .create_key(
+            body.repo_id.as_ref(),
+            &body.name,
+            user_id.as_ref(),
+            role_override.as_deref(),
+        )
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateKeyResponse {
+            key: ApiKeyResponse::from(key_meta),
+            token,
+        }),
+    ))
+}
+
+/// `GET /api/keys` — lists all active keys belonging to the authenticated user.
+///
+/// Admin keys see all server-level keys; user keys see only keys owned by
+/// that user.
+async fn list_keys_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<ApiKeyResponse>>, ApiError> {
+    let auth = state.storage.auth();
+
+    let keys = if identity.is_admin {
+        auth.list_keys(None).await.map_err(ApiError::from)?
+    } else {
+        match identity.user_id {
+            Some(uid) => auth.list_keys_by_user(&uid).await.map_err(ApiError::from)?,
+            None => {
+                return Err(ApiError::forbidden(
+                    "this key is not associated with a user; cannot list keys",
+                ));
+            }
+        }
+    };
+
+    Ok(Json(keys.into_iter().map(ApiKeyResponse::from).collect()))
+}
+
+/// `DELETE /api/keys/:id` — revokes a key by its record UUID.
+///
+/// Users can only revoke their own keys; admin can revoke any key.
+async fn revoke_key_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    State(state): State<Arc<AppState>>,
+    AxumPath(key_id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let auth = state.storage.auth();
+
+    // Non-admin users may only revoke their own keys. Verify ownership by
+    // checking that the key is in their key list before revoking.
+    if !identity.is_admin {
+        let user_id = match identity.user_id {
+            Some(uid) => uid,
+            None => {
+                return Err(ApiError::forbidden(
+                    "this key is not associated with a user; cannot revoke keys",
+                ));
+            }
+        };
+        let user_keys = auth.list_keys_by_user(&user_id).await.map_err(ApiError::from)?;
+        if !user_keys.iter().any(|k| k.id == key_id) {
+            return Err(ApiError::forbidden("you do not own this API key"));
+        }
+    }
+
+    auth.revoke_key(&key_id).await.map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -3692,6 +3873,10 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
             axum::routing::patch(update_org_member_handler),
         )
         .route("/api/orgs/:org/members/:user", delete(remove_org_member_handler))
+        // API key management endpoints (PRD 10.3).
+        .route("/api/keys", post(create_key_handler))
+        .route("/api/keys", get(list_keys_handler))
+        .route("/api/keys/:id", delete(revoke_key_handler))
         // Repository collaborator endpoints (PRD 10.3).
         .route(
             "/api/orgs/:org/repos/:repo/collaborators",

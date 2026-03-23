@@ -629,7 +629,7 @@ async fn test_auth_store() {
 
     // create repo-scoped key
     let (key_meta, plaintext) = storage
-        .create_key(Some(&repo_id), "ci-bot")
+        .create_key(Some(&repo_id), "ci-bot", None, None)
         .await
         .expect("create_key failed");
     assert_eq!(key_meta.name, "ci-bot");
@@ -652,7 +652,7 @@ async fn test_auth_store() {
 
     // create server-level key (repo_id=None)
     let (server_key, server_plaintext) = storage
-        .create_key(None, "admin")
+        .create_key(None, "admin", None, None)
         .await
         .expect("create server key failed");
     assert_eq!(server_key.name, "admin");
