@@ -238,19 +238,22 @@ pub enum IssueCommands {
         /// New priority level.
         #[arg(long)]
         priority: Option<String>,
-        /// Add a label (can be repeated).
+        /// Add a label (can be repeated, or use comma-separated values).
         #[arg(long)]
         label: Vec<String>,
         /// New title.
         #[arg(long)]
         title: Option<String>,
+        /// New body / description text (Markdown supported).
+        #[arg(long)]
+        body: Option<String>,
     },
     /// Close an issue with a resolution.
     Close {
         /// Issue ID.
         id: String,
-        /// Resolution: resolved, wontfix, duplicate.
-        #[arg(long)]
+        /// Resolution: resolved, wontfix, duplicate (default: resolved).
+        #[arg(long, default_value = "resolved")]
         resolution: String,
     },
 }
@@ -273,10 +276,10 @@ pub enum EscalationCommands {
     Resolve {
         /// Escalation ID (full UUID or 8-char prefix).
         id: String,
-        /// Resolution option: keep_agent_a, keep_agent_b,
+        /// Resolution: keep_agent_a, keep_agent_b,
         /// send_back_to_agent_a, send_back_to_agent_b, pause_both.
         #[arg(long)]
-        option: String,
+        resolution: String,
         /// Identifier of the human resolving this escalation.
         #[arg(long, default_value = "human")]
         by: String,
@@ -1519,7 +1522,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         }
                     }
                 }
-                IssueCommands::Update { id, priority, label, title } => {
+                IssueCommands::Update { id, priority, label, title, body } => {
                     let prio = if let Some(p) = priority {
                         Some(IssuePriority::from_str(&p)
                             .ok_or_else(|| CliError::Other(format!("unknown priority: {p}")))?)
@@ -1534,7 +1537,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     let updated = store.update(
                         resolved.id,
                         title,
-                        None,
+                        body,
                         prio,
                         new_labels,
                         &mut event_log,
@@ -1699,10 +1702,10 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         }
                     }
                 }
-                EscalationCommands::Resolve { id, option, by } => {
-                    let opt = ResolutionOption::from_str(&option).ok_or_else(|| {
+                EscalationCommands::Resolve { id, resolution, by } => {
+                    let opt = ResolutionOption::from_str(&resolution).ok_or_else(|| {
                         CliError::Other(format!(
-                            "unknown option `{option}`; valid options: keep_agent_a, \
+                            "unknown resolution `{resolution}`; valid values: keep_agent_a, \
                              keep_agent_b, send_back_to_agent_a, send_back_to_agent_b, \
                              pause_both"
                         ))
