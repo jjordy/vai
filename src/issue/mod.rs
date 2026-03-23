@@ -477,6 +477,16 @@ impl IssueStore {
         Ok(count)
     }
 
+    /// Count the total number of open issues (status = `open`).
+    pub fn count_open(&self) -> Result<usize, IssueError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM issues WHERE status = 'open'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     // ── Read ──────────────────────────────────────────────────────────────────
 
     /// Fetch a single issue by ID.

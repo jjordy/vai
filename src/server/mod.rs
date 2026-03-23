@@ -512,6 +512,12 @@ pub struct StatusResponse {
     pub workspace_count: usize,
     /// vai version string.
     pub vai_version: String,
+    /// Total number of open issues.
+    pub issue_count: usize,
+    /// Number of pending escalations.
+    pub escalation_count: usize,
+    /// Total number of entities in the semantic graph.
+    pub entity_count: usize,
 }
 
 /// Request body for `POST /api/workspaces`.
@@ -703,9 +709,24 @@ impl IssueResponse {
 ///
 /// This is the only unauthenticated REST endpoint.
 async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
+    use crate::issue::IssueStore;
+
     let head = repo::read_head(&state.vai_dir).unwrap_or_else(|_| "unknown".to_string());
     let workspace_count = workspace::list(&state.vai_dir)
         .map(|w| w.len())
+        .unwrap_or(0);
+
+    let issue_count = IssueStore::open(&state.vai_dir)
+        .and_then(|s| s.count_open())
+        .unwrap_or(0);
+
+    let escalation_count = EscalationStore::open(&state.vai_dir)
+        .and_then(|s| s.count_pending())
+        .unwrap_or(0);
+
+    let entity_count = open_graph(&state.vai_dir)
+        .and_then(|g| g.stats().map_err(|e| ApiError::internal(e.to_string())))
+        .map(|s| s.entity_count)
         .unwrap_or(0);
 
     Json(StatusResponse {
@@ -714,6 +735,9 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRespon
         uptime_secs: state.started_at.elapsed().as_secs(),
         workspace_count,
         vai_version: state.vai_version.clone(),
+        issue_count,
+        escalation_count,
+        entity_count,
     })
 }
 
