@@ -85,6 +85,9 @@ pub enum CliError {
     #[error("Work queue error: {0}")]
     WorkQueue(#[from] crate::work_queue::WorkQueueError),
 
+    #[error("Remote client error: {0}")]
+    Remote(#[from] crate::remote_client::RemoteClientError),
+
     #[error("{0}")]
     Other(String),
 }
@@ -100,6 +103,13 @@ pub struct Cli {
     /// Suppress non-essential output.
     #[arg(long, short = 'q', global = true)]
     pub quiet: bool,
+
+    /// Force local operation, ignoring any configured remote.
+    ///
+    /// When set, all commands read and write the local `.vai/` directory even
+    /// if a `[remote]` section is present in the config.
+    #[arg(long, global = true)]
+    pub local: bool,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -659,6 +669,36 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     }
                 }
                 WorkspaceCommands::List => {
+                    // Proxy to remote if configured.
+                    if let Some(client) = try_remote(&vai_dir, cli.local)? {
+                        let rt = make_rt()?;
+                        let workspaces: serde_json::Value = rt.block_on(client.get("/api/workspaces"))?;
+                        if cli.json {
+                            println!("{}", serde_json::to_string_pretty(&workspaces).unwrap());
+                        } else {
+                            let arr = workspaces.as_array().cloned().unwrap_or_default();
+                            if arr.is_empty() {
+                                println!("No active workspaces.");
+                            } else {
+                                println!("{:<38}  {:<8}  {:<30}  Created", "ID", "Status", "Intent");
+                                println!("{}", "-".repeat(100));
+                                for ws in &arr {
+                                    let age = ws["created_at"].as_str()
+                                        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                                        .map(format_age)
+                                        .unwrap_or_else(|| "?".to_string());
+                                    println!(
+                                        " {:<38}  {:<8}  {:<30}  {}",
+                                        ws["id"].as_str().unwrap_or(""),
+                                        ws["status"].as_str().unwrap_or(""),
+                                        truncate(ws["intent"].as_str().unwrap_or(""), 30),
+                                        age,
+                                    );
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
                     let workspaces = workspace::list(&vai_dir)?;
                     let active_id = workspace::active_id(&vai_dir);
                     if cli.json {
@@ -1064,6 +1104,31 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 Some(root) => {
                     let vai_dir = root.join(".vai");
 
+                    // ── Remote dispatch (skip when --others or --local) ───
+                    if !others && !cli.local {
+                        if let Some(client) = try_remote(&vai_dir, cli.local)? {
+                            let rt = make_rt()?;
+                            let status: serde_json::Value = rt.block_on(client.get("/api/status"))?;
+                            if cli.json {
+                                println!("{}", serde_json::to_string_pretty(&status).unwrap());
+                            } else {
+                                let repo_name = status["repo_name"].as_str().unwrap_or("?");
+                                let head = status["head_version"].as_str().unwrap_or("?");
+                                let ws_count = status["workspace_count"].as_u64().unwrap_or(0);
+                                let issue_count = status["issue_count"].as_u64().unwrap_or(0);
+                                let entity_count = status["entity_count"].as_u64().unwrap_or(0);
+                                let uptime = status["uptime_secs"].as_u64().unwrap_or(0);
+                                println!("{} repository: {}", "vai".bold(), repo_name.bold());
+                                println!("Current version: {}", head.bold());
+                                println!("Active workspaces: {ws_count}");
+                                println!("Open issues: {issue_count}");
+                                println!("Graph entities: {entity_count}");
+                                println!("Server uptime: {}s", uptime);
+                            }
+                            return Ok(());
+                        }
+                    }
+
                     // ── --others: list remote workspaces ──────────────────
                     if others {
                         let remote = remote_clone::read_remote_config(&vai_dir)
@@ -1433,6 +1498,157 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
             let vai_dir = root.join(".vai");
 
+            // ── Remote dispatch ────────────────────────────────────────────────
+            if let Some(client) = try_remote(&vai_dir, cli.local)? {
+                let rt = make_rt()?;
+                match issue_cmd {
+                    IssueCommands::List { status, priority, label, created_by } => {
+                        let mut params: Vec<String> = vec![];
+                        if let Some(s) = status { params.push(format!("status={s}")); }
+                        if let Some(p) = priority { params.push(format!("priority={p}")); }
+                        if let Some(l) = label { params.push(format!("label={l}")); }
+                        if let Some(c) = created_by { params.push(format!("created_by={c}")); }
+                        let path = if params.is_empty() {
+                            "/api/issues".to_string()
+                        } else {
+                            format!("/api/issues?{}", params.join("&"))
+                        };
+                        let issues: serde_json::Value = rt.block_on(client.get(&path))?;
+                        if cli.json {
+                            println!("{}", serde_json::to_string_pretty(&issues).unwrap());
+                        } else {
+                            let arr = issues.as_array().cloned().unwrap_or_default();
+                            if arr.is_empty() {
+                                println!("No issues found.");
+                            } else {
+                                println!("{:<10}  {:<11}  {:<8}  {:<30}  {}", "ID", "STATUS", "PRIORITY", "TITLE", "CREATED");
+                                println!("{}", "-".repeat(85));
+                                for issue in &arr {
+                                    let id_short = json_id_short(issue, "id");
+                                    let age = issue["created_at"].as_str()
+                                        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                                        .map(format_age)
+                                        .unwrap_or_else(|| "?".to_string());
+                                    println!(
+                                        "{:<10}  {:<11}  {:<8}  {:<30}  {}",
+                                        id_short,
+                                        issue["status"].as_str().unwrap_or("?"),
+                                        issue["priority"].as_str().unwrap_or("?"),
+                                        truncate(issue["title"].as_str().unwrap_or(""), 30),
+                                        age,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    IssueCommands::Create { title, body, priority, label } => {
+                        let labels: Vec<String> = label.iter()
+                            .flat_map(|s| s.split(','))
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        let req = serde_json::json!({
+                            "title": title,
+                            "description": body,
+                            "priority": priority,
+                            "labels": labels,
+                        });
+                        let issue: serde_json::Value = rt.block_on(client.post("/api/issues", &req))?;
+                        if cli.json {
+                            println!("{}", serde_json::to_string_pretty(&issue).unwrap());
+                        } else {
+                            println!("{} Created issue {}", "✓".green(), json_id_short(&issue, "id").cyan());
+                            println!("  Title    : {}", issue["title"].as_str().unwrap_or(""));
+                            println!("  Status   : {}", issue["status"].as_str().unwrap_or(""));
+                            println!("  Priority : {}", issue["priority"].as_str().unwrap_or(""));
+                        }
+                    }
+                    IssueCommands::Show { id } => {
+                        let path = format!("/api/issues/{id}");
+                        let issue: serde_json::Value = rt.block_on(client.get(&path))?;
+                        if cli.json {
+                            println!("{}", serde_json::to_string_pretty(&issue).unwrap());
+                        } else {
+                            println!("{} {}", "Issue".bold(), issue["id"].as_str().unwrap_or("").cyan());
+                            println!("  Title       : {}", issue["title"].as_str().unwrap_or("").bold());
+                            println!("  Status      : {}", issue["status"].as_str().unwrap_or(""));
+                            println!("  Priority    : {}", issue["priority"].as_str().unwrap_or(""));
+                            let labels: Vec<&str> = issue["labels"].as_array()
+                                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                                .unwrap_or_default();
+                            if !labels.is_empty() {
+                                println!("  Labels      : {}", labels.join(", "));
+                            }
+                            println!("  Creator     : {}", issue["creator"].as_str().unwrap_or(""));
+                            if let Some(res) = issue["resolution"].as_str() {
+                                println!("  Resolution  : {res}");
+                            }
+                            println!("  Created     : {}", issue["created_at"].as_str().unwrap_or(""));
+                            println!("  Updated     : {}", issue["updated_at"].as_str().unwrap_or(""));
+                            let desc = issue["description"].as_str().unwrap_or("");
+                            if !desc.is_empty() {
+                                println!();
+                                println!("{desc}");
+                            }
+                            let ws_ids: Vec<&str> = issue["linked_workspace_ids"].as_array()
+                                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                                .unwrap_or_default();
+                            if !ws_ids.is_empty() {
+                                println!();
+                                println!("Linked workspaces:");
+                                for ws_id in ws_ids {
+                                    println!("  {ws_id}");
+                                }
+                            }
+                        }
+                    }
+                    IssueCommands::Update { id, priority, label, title, body } => {
+                        let new_labels: Option<Vec<String>> = if label.is_empty() {
+                            None
+                        } else {
+                            Some(label.iter()
+                                .flat_map(|s| s.split(','))
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect())
+                        };
+                        let req = serde_json::json!({
+                            "priority": priority,
+                            "title": title,
+                            "description": body,
+                            "labels": new_labels,
+                        });
+                        let path = format!("/api/issues/{id}");
+                        let issue: serde_json::Value = rt.block_on(client.patch(&path, &req))?;
+                        if cli.json {
+                            println!("{}", serde_json::to_string_pretty(&issue).unwrap());
+                        } else {
+                            println!("{} Updated issue {}", "✓".green(), json_id_short(&issue, "id").cyan());
+                            println!("  Title    : {}", issue["title"].as_str().unwrap_or(""));
+                            println!("  Status   : {}", issue["status"].as_str().unwrap_or(""));
+                            println!("  Priority : {}", issue["priority"].as_str().unwrap_or(""));
+                        }
+                    }
+                    IssueCommands::Close { id, resolution } => {
+                        let req = serde_json::json!({ "resolution": resolution });
+                        let path = format!("/api/issues/{id}/close");
+                        let issue: serde_json::Value = rt.block_on(client.post(&path, &req))?;
+                        if cli.json {
+                            println!("{}", serde_json::to_string_pretty(&issue).unwrap());
+                        } else {
+                            println!(
+                                "{} Closed issue {} ({})",
+                                "✓".green(),
+                                json_id_short(&issue, "id").cyan(),
+                                issue["resolution"].as_str().unwrap_or(""),
+                            );
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            // ── Local dispatch ─────────────────────────────────────────────────
+
             match issue_cmd {
                 IssueCommands::Create { title, body, priority, label } => {
                     let prio = IssuePriority::from_str(&priority)
@@ -1762,6 +1978,79 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
             let root = repo::find_root(&cwd)
                 .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
             let vai_dir = root.join(".vai");
+
+            // ── Remote dispatch ────────────────────────────────────────────────
+            if let Some(client) = try_remote(&vai_dir, cli.local)? {
+                let rt = make_rt()?;
+                match wq_cmd {
+                    WorkQueueCommands::List => {
+                        let queue: serde_json::Value = rt.block_on(client.get("/api/work-queue"))?;
+                        if cli.json {
+                            println!("{}", serde_json::to_string_pretty(&queue).unwrap());
+                        } else {
+                            let available = queue["available_work"].as_array().cloned().unwrap_or_default();
+                            let blocked = queue["blocked_work"].as_array().cloned().unwrap_or_default();
+                            if available.is_empty() && blocked.is_empty() {
+                                println!("No open issues in the work queue.");
+                            } else {
+                                if !available.is_empty() {
+                                    println!("{}", "Available work:".green().bold());
+                                    println!("  {:<10}  {:<8}  {}", "ISSUE", "PRIORITY", "TITLE");
+                                    println!("  {}", "-".repeat(60));
+                                    for item in &available {
+                                        let id = item["issue_id"].as_str().unwrap_or("?");
+                                        let id_short = if id.len() >= 8 { &id[..8] } else { id };
+                                        println!(
+                                            "  {:<10}  {:<8}  {}",
+                                            id_short,
+                                            item["priority"].as_str().unwrap_or(""),
+                                            item["title"].as_str().unwrap_or(""),
+                                        );
+                                    }
+                                }
+                                if !blocked.is_empty() {
+                                    if !available.is_empty() { println!(); }
+                                    println!("{}", "Blocked work:".yellow().bold());
+                                    println!("  {:<10}  {:<8}  {}", "ISSUE", "PRIORITY", "TITLE");
+                                    println!("  {}", "-".repeat(60));
+                                    for item in &blocked {
+                                        let id = item["issue_id"].as_str().unwrap_or("?");
+                                        let id_short = if id.len() >= 8 { &id[..8] } else { id };
+                                        println!(
+                                            "  {:<10}  {:<8}  {}",
+                                            id_short,
+                                            item["priority"].as_str().unwrap_or(""),
+                                            item["title"].as_str().unwrap_or(""),
+                                        );
+                                        println!("    {}", item["reason"].as_str().unwrap_or("").dimmed());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    WorkQueueCommands::Claim { issue_id } => {
+                        let req = serde_json::json!({ "issue_id": issue_id });
+                        let result: serde_json::Value = rt.block_on(client.post("/api/work-queue/claim", &req))?;
+                        if cli.json {
+                            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                        } else {
+                            let issue_id_short = json_id_short(&result, "issue_id");
+                            let ws_id_short = json_id_short(&result, "workspace_id");
+                            println!(
+                                "{} Claimed issue {} → workspace {}",
+                                "✓".green(),
+                                issue_id_short.cyan(),
+                                ws_id_short.cyan(),
+                            );
+                            if let Some(intent) = result["intent"].as_str() {
+                                println!("  Intent : {intent}");
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
             // For local CLI, create an empty conflict engine — workspace scope
             // tracking is a server-side concern when multiple agents run concurrently.
             let engine = conflict::ConflictEngine::new();
@@ -2243,6 +2532,39 @@ fn colorize_severity(
         crate::escalation::EscalationSeverity::Critical => severity.as_str().red().bold(),
         crate::escalation::EscalationSeverity::High => severity.as_str().red(),
     }
+}
+
+// ── Remote helpers ─────────────────────────────────────────────────────────────
+
+/// Returns a `RemoteClient` if a remote server is configured and `--local` was
+/// not passed.  Returns `None` if local-only mode should be used.
+fn try_remote(
+    vai_dir: &std::path::Path,
+    local: bool,
+) -> Result<Option<crate::remote_client::RemoteClient>, CliError> {
+    if local {
+        return Ok(None);
+    }
+    let config = repo::read_config(vai_dir)?;
+    match config.remote {
+        Some(remote_cfg) => {
+            let client = crate::remote_client::RemoteClient::new(&remote_cfg)?;
+            Ok(Some(client))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Creates a single-threaded blocking Tokio runtime for async remote calls.
+fn make_rt() -> Result<tokio::runtime::Runtime, CliError> {
+    tokio::runtime::Runtime::new()
+        .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))
+}
+
+/// Extracts the 8-character prefix from a UUID string field in a JSON value.
+fn json_id_short(val: &serde_json::Value, field: &str) -> String {
+    let id = val[field].as_str().unwrap_or("????????");
+    if id.len() >= 8 { id[..8].to_string() } else { id.to_string() }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
