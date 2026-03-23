@@ -201,13 +201,13 @@ pub enum IssueCommands {
         /// Short summary of the issue.
         #[arg(long)]
         title: String,
-        /// Full description (optional).
+        /// Full description / body text (optional, Markdown supported).
         #[arg(long, default_value = "")]
-        description: String,
+        body: String,
         /// Priority level: critical, high, medium, low.
         #[arg(long, default_value = "medium")]
         priority: String,
-        /// Comma-separated labels (optional).
+        /// Label to apply (can be repeated, or use comma-separated values).
         #[arg(long)]
         label: Vec<String>,
     },
@@ -1405,17 +1405,24 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
             let vai_dir = root.join(".vai");
 
             match issue_cmd {
-                IssueCommands::Create { title, description, priority, label } => {
+                IssueCommands::Create { title, body, priority, label } => {
                     let prio = IssuePriority::from_str(&priority)
                         .ok_or_else(|| CliError::Other(format!("unknown priority: {priority}")))?;
+                    // Expand comma-separated label values (e.g. --label "a,b" or --label a --label b).
+                    let labels: Vec<String> = label
+                        .iter()
+                        .flat_map(|s| s.split(','))
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
                     let store = IssueStore::open(&vai_dir)?;
                     let mut event_log = EventLog::open(&vai_dir)
                         .map_err(|e| CliError::Other(format!("cannot open event log: {e}")))?;
                     let issue = store.create(
                         title,
-                        description,
+                        body,
                         prio,
-                        label,
+                        labels,
                         whoami(),
                         &mut event_log,
                     )?;
