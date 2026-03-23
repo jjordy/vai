@@ -1072,7 +1072,15 @@ fn parse_version_num(version: &str) -> usize {
 
 // ── Private — shared helpers ───────────────────────────────────────────────────
 
-/// Updates the semantic graph for all `.rs` files in `workspace_diff`.
+/// Returns true if the path has a file extension supported by the semantic graph engine.
+fn is_supported_source_file(path: &str) -> bool {
+    matches!(
+        path.rsplit('.').next().unwrap_or(""),
+        "rs" | "ts" | "tsx" | "js" | "jsx"
+    )
+}
+
+/// Updates the semantic graph for all supported source files in `workspace_diff`.
 fn update_graph_for_diff(
     vai_dir: &Path,
     repo_root: &Path,
@@ -1081,7 +1089,7 @@ fn update_graph_for_diff(
     let snapshot_path = vai_dir.join("graph").join("snapshot.db");
     let snapshot = GraphSnapshot::open(&snapshot_path)?;
     for fd in &workspace_diff.file_diffs {
-        if fd.path.ends_with(".rs") {
+        if is_supported_source_file(&fd.path) {
             let abs_path = repo_root.join(&fd.path);
             if let Ok(content) = fs::read(&abs_path) {
                 let _ = snapshot.update_file(&fd.path, &content);
