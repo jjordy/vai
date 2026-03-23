@@ -1,4 +1,4 @@
-//! End-to-end integration test for the Phase 1 single-agent workflow.
+//! End-to-end integration test for the single-agent workspace and graph workflow.
 //!
 //! Exercises the full lifecycle:
 //! `vai init` → workspace create → diff → submit → log → show → rollback
@@ -237,7 +237,7 @@ fn test_rollback_creates_new_version() {
 
 /// Full lifecycle: init → workspace → diff → submit v2 → submit v3 → rollback v2 → v4.
 #[test]
-fn test_full_phase1_lifecycle() {
+fn test_full_workspace_and_graph_lifecycle() {
     let (_tmp, root, vai_dir) = setup_repo();
 
     // 1. Init

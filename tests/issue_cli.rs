@@ -1,4 +1,4 @@
-//! Integration test for the Phase 3 issue CLI lifecycle.
+//! Integration test for the issue CLI lifecycle.
 //!
 //! Exercises: create → list → show → update → close
 

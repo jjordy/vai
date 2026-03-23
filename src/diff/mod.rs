@@ -469,8 +469,22 @@ fn new_fn() -> u32 {
         let diff = compute(&vai_dir, &root).unwrap();
 
         assert_eq!(diff.file_diffs.len(), 1);
-        assert_eq!(diff.file_diffs[0].path, "src/new.rs");
-        assert_eq!(diff.file_diffs[0].change_type, FileChangeType::Added);
+        let fd = &diff.file_diffs[0];
+        assert_eq!(fd.path, "src/new.rs");
+        assert_eq!(fd.change_type, FileChangeType::Added);
+        assert!(!fd.content_hash.is_empty(), "content_hash should be populated for added files");
+
+        // Entity-level: should detect `foo` as added.
+        assert!(
+            !diff.entity_changes.is_empty(),
+            "entity changes should be detected for the new file"
+        );
+        assert!(
+            diff.entity_changes.iter().any(|c| c.qualified_name == "foo"
+                && c.change_type == EntityChangeType::Added),
+            "foo should be detected as an added entity, got: {:?}",
+            diff.entity_changes.iter().map(|c| (&c.qualified_name, &c.change_type)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -506,10 +520,12 @@ fn new_fn() -> u32 {
             .iter()
             .filter(|c| c.change_type == EntityChangeType::Added)
             .collect();
-        assert!(
-            added.iter().any(|c| c.qualified_name.contains("new_fn")),
-            "expected new_fn to be detected as added"
+        assert_eq!(added.len(), 1, "exactly one entity should be added (new_fn)");
+        assert_eq!(
+            added[0].qualified_name, "new_fn",
+            "the added entity should be new_fn"
         );
+        assert_eq!(added[0].file_path, "src/lib.rs");
     }
 
     #[test]
@@ -529,10 +545,12 @@ fn new_fn() -> u32 {
             .iter()
             .filter(|c| c.change_type == EntityChangeType::Modified)
             .collect();
-        assert!(
-            modified.iter().any(|c| c.qualified_name.contains("hello")),
-            "expected hello to be detected as modified"
+        assert_eq!(modified.len(), 1, "exactly one entity should be modified (hello)");
+        assert_eq!(
+            modified[0].qualified_name, "hello",
+            "the modified entity should be hello"
         );
+        assert_eq!(modified[0].file_path, "src/lib.rs");
     }
 
     #[test]
@@ -557,10 +575,12 @@ fn remove_me() {}
             .iter()
             .filter(|c| c.change_type == EntityChangeType::Removed)
             .collect();
-        assert!(
-            removed.iter().any(|c| c.qualified_name.contains("remove_me")),
-            "expected remove_me to be detected as removed"
+        assert_eq!(removed.len(), 1, "exactly one entity should be removed (remove_me)");
+        assert_eq!(
+            removed[0].qualified_name, "remove_me",
+            "the removed entity should be remove_me"
         );
+        assert_eq!(removed[0].file_path, "src/lib.rs");
     }
 
     #[test]

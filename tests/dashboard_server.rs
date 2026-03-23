@@ -53,6 +53,11 @@ fn test_parse_server_url() {
 fn test_parse_server_url_invalid() {
     let err = dashboard::parse_server_url("http://localhost:7865", "k");
     assert!(err.is_err());
+    let msg = err.unwrap_err().to_string();
+    assert!(
+        msg.contains("vai://"),
+        "error should mention expected vai:// scheme, got: {msg}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -127,12 +132,17 @@ async fn test_dashboard_server_receives_workspace_created_event() {
 
     // ── Dashboard snapshot shows the new workspace ────────────────────────────
     let snap = dashboard::snapshot(&vai_dir).expect("snapshot");
-    assert!(
-        snap.workspaces
-            .iter()
-            .any(|w| w.intent.contains("dashboard server test workspace")),
-        "snapshot should include the new workspace"
+    let matching: Vec<_> = snap.workspaces
+        .iter()
+        .filter(|w| w.intent.contains("dashboard server test workspace"))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "snapshot should include exactly one workspace with the test intent, found {}",
+        matching.len()
     );
+    assert_eq!(matching[0].status, vai::workspace::WorkspaceStatus::Created);
 
     // ── Shutdown ──────────────────────────────────────────────────────────────
     let _ = shutdown_tx.send(());
@@ -155,10 +165,14 @@ async fn test_dashboard_snapshot_after_workspace_create() {
         workspace::create(&vai_dir, "local snapshot test", &head).expect("create workspace");
 
     let snap = dashboard::snapshot(&vai_dir).expect("snapshot");
-    assert!(
-        snap.workspaces
-            .iter()
-            .any(|w| w.id == result.workspace.id),
-        "snapshot should list the new workspace"
+    assert_eq!(
+        snap.workspaces.len(),
+        1,
+        "snapshot should list exactly one workspace"
     );
+    assert_eq!(
+        snap.workspaces[0].id, result.workspace.id,
+        "snapshot workspace ID should match the created workspace"
+    );
+    assert_eq!(snap.workspaces[0].intent, "local snapshot test");
 }

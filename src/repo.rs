@@ -217,6 +217,59 @@ pub fn init(root: &Path) -> Result<InitResult, RepoError> {
     })
 }
 
+/// Result of a graph refresh operation.
+#[derive(Debug, Serialize)]
+pub struct RefreshResult {
+    /// Number of source files scanned.
+    pub files_scanned: usize,
+    /// Graph statistics after the refresh.
+    pub graph_stats: GraphStats,
+}
+
+/// Re-scans all source files and rebuilds the semantic graph.
+///
+/// Reads ignore patterns from `vai.toml`, collects all matching source files,
+/// and re-parses them into the graph snapshot. Existing graph data is replaced.
+pub fn refresh_graph(root: &Path) -> Result<RefreshResult, RepoError> {
+    let vai_dir = root.join(".vai");
+    if !vai_dir.exists() {
+        return Err(RepoError::NotARepo);
+    }
+
+    // Read ignore patterns from vai.toml.
+    let vai_toml_path = root.join("vai.toml");
+    let vai_toml: VaiToml = if vai_toml_path.exists() {
+        let raw = fs::read_to_string(&vai_toml_path)?;
+        toml::from_str(&raw)?
+    } else {
+        VaiToml::default()
+    };
+
+    let source_files = collect_source_files(root, &vai_toml.ignore);
+    let snapshot_path = vai_dir.join("graph").join("snapshot.db");
+    let snapshot = GraphSnapshot::open(&snapshot_path)?;
+
+    let mut files_scanned = 0usize;
+    for file_path in &source_files {
+        let rel = file_path
+            .strip_prefix(root)
+            .unwrap_or(file_path)
+            .to_string_lossy()
+            .into_owned();
+        if let Ok(source) = fs::read(file_path) {
+            let _ = snapshot.update_file(&rel, &source);
+            files_scanned += 1;
+        }
+    }
+
+    let graph_stats = snapshot.stats()?;
+
+    Ok(RefreshResult {
+        files_scanned,
+        graph_stats,
+    })
+}
+
 /// Walks up the directory tree from `start` to find the root of a vai repository.
 ///
 /// Returns the path containing `.vai/`, or `None` if not found.

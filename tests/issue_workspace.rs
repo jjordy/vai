@@ -1,4 +1,4 @@
-//! Integration test for issue-workspace linking (Phase 3 PRD 3.1).
+//! Integration test for issue-workspace linking.
 //!
 //! Exercises: create issue → create workspace linked to issue → submit →
 //! verify issue resolved. Also tests workspace discard → issue reopen.
@@ -105,6 +105,11 @@ fn test_workspace_submit_resolves_issue() {
     ws_meta.issue_id = Some(issue.id);
     workspace::update_meta(&vai_dir, &ws_meta).unwrap();
     assert_eq!(store.get(issue.id).unwrap().status, IssueStatus::InProgress);
+
+    // Add a file to the workspace overlay so submit has something to merge.
+    let overlay = workspace::overlay_dir(&vai_dir, &ws_meta.id.to_string());
+    std::fs::create_dir_all(overlay.join("src")).unwrap();
+    std::fs::write(overlay.join("src/feature_x.rs"), "pub fn feature_x() {}\n").unwrap();
 
     // Submit workspace (local merge).
     let submit_result = merge::submit(&vai_dir, &root).unwrap();

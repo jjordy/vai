@@ -1,4 +1,4 @@
-//! End-to-end integration test for the Phase 3 issue-driven workflow.
+//! End-to-end integration test for the issue-driven workflow.
 //!
 //! Exercises the full issue lifecycle:
 //! init repo → create 5 issues (human + agent) → query work queue →
@@ -75,12 +75,12 @@ fn setup() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     (tmp, root, vai_dir)
 }
 
-// ── Full Phase 3 E2E test ─────────────────────────────────────────────────────
+// ── Full E2E test ────────────────────────────────────────────────────────────
 
-/// Full Phase 3 lifecycle: issue creation → work queue → claim → conflict →
+/// Full lifecycle: issue creation → work queue → claim → conflict →
 /// submit → escalation → resolution → audit trail.
 #[test]
-fn test_phase3_full_lifecycle() {
+fn test_full_issue_lifecycle() {
     let start = std::time::Instant::now();
 
     let (_tmp, root, vai_dir) = setup();
@@ -386,7 +386,7 @@ fn test_phase3_full_lifecycle() {
     let elapsed = start.elapsed();
     assert!(
         elapsed.as_secs() < 60,
-        "Phase 3 E2E test must complete in under 60 seconds (took {elapsed:?})"
+        "issue lifecycle E2E test must complete in under 60 seconds (took {elapsed:?})"
     );
 }
 

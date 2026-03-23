@@ -373,6 +373,8 @@ pub enum KeysCommands {
 pub enum GraphCommands {
     /// Display graph statistics.
     Show,
+    /// Re-scan all source files and rebuild the semantic graph.
+    Refresh,
     /// Search for entities by name.
     Query {
         /// Entity name to search for.
@@ -435,6 +437,24 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         }
                         println!("  Relationships : {}", stats.relationship_count);
                         println!("  Files         : {}", stats.file_count);
+                    }
+                }
+                GraphCommands::Refresh => {
+                    let result = repo::refresh_graph(&root)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        println!(
+                            "{} Graph refreshed — {} files scanned",
+                            "✓".green().bold(),
+                            result.files_scanned
+                        );
+                        println!("  Entities      : {}", result.graph_stats.entity_count);
+                        for (kind, count) in &result.graph_stats.by_kind {
+                            println!("    {kind:<15} {count}");
+                        }
+                        println!("  Relationships : {}", result.graph_stats.relationship_count);
+                        println!("  Files         : {}", result.graph_stats.file_count);
                     }
                 }
                 GraphCommands::Query { name } => {

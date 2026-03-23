@@ -1,6 +1,6 @@
-//! End-to-end integration test for the full Phase 4 intelligent workflow.
+//! End-to-end integration test for the intelligent workflow.
 //!
-//! Exercises all Phase 4 capabilities in sequence:
+//! Exercises scope inference, merge patterns, and dashboard capabilities in sequence:
 //! 1.  Init repo with sample Rust code, start embedded server.
 //! 2.  Create workspace with intent — verify scope inference suggests relevant entities.
 //! 3.  Complete workspace — verify predicted vs. actual scope recorded in history.
@@ -62,10 +62,10 @@ fn setup() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     (tmp, root, vai_dir)
 }
 
-// ── Full Phase 4 E2E test ─────────────────────────────────────────────────────
+// ── Full E2E test ────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_phase4_full_intelligent_workflow() {
+async fn test_full_intelligent_workflow() {
     let start = std::time::Instant::now();
 
     // ── Step 1: Init repo and start embedded server ───────────────────────────
@@ -341,6 +341,6 @@ async fn test_phase4_full_intelligent_workflow() {
     let elapsed = start.elapsed();
     assert!(
         elapsed.as_secs() < 90,
-        "Phase 4 E2E test must complete in under 90 seconds (took {elapsed:?})"
+        "intelligent workflow E2E test must complete in under 90 seconds (took {elapsed:?})"
     );
 }

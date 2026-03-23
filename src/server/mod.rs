@@ -282,6 +282,10 @@ pub(crate) struct AppState {
     event_buffer: Arc<StdMutex<EventBuffer>>,
     /// Conflict engine — tracks workspace scopes and detects overlaps.
     conflict_engine: Arc<Mutex<conflict::ConflictEngine>>,
+    /// Serializes filesystem-mutating operations (workspace create/submit/discard,
+    /// issue create/update, etc.) to prevent data races on the event log and
+    /// `.vai/` directory.
+    repo_lock: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -721,6 +725,7 @@ async fn create_workspace_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateWorkspaceRequest>,
 ) -> Result<(StatusCode, Json<WorkspaceResponse>), ApiError> {
+    let _lock = state.repo_lock.lock().await;
     let head = repo::read_head(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let result = workspace::create(&state.vai_dir, &body.intent, &head)
         .map_err(ApiError::from)?;
@@ -773,6 +778,7 @@ async fn submit_workspace_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<SubmitResponse>, ApiError> {
+    let _lock = state.repo_lock.lock().await;
     // Verify the workspace exists before switching.
     let meta = workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
     let workspace_uuid = meta.id;
@@ -862,6 +868,7 @@ async fn discard_workspace_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
+    let _lock = state.repo_lock.lock().await;
     // Resolve UUID before discarding so we can remove it from the conflict engine.
     let ws_uuid = workspace::get(&state.vai_dir, &id)
         .map(|m| m.id)
@@ -1297,6 +1304,7 @@ async fn upload_workspace_files_handler(
     AxumPath(id): AxumPath<String>,
     Json(body): Json<UploadFilesRequest>,
 ) -> Result<(StatusCode, Json<UploadFilesResponse>), ApiError> {
+    let _lock = state.repo_lock.lock().await;
     let mut meta = workspace::get(&state.vai_dir, &id).map_err(ApiError::from)?;
     let overlay = workspace::overlay_dir(&state.vai_dir, &id);
     let log_dir = state.vai_dir.join("event_log");
@@ -1812,6 +1820,7 @@ async fn create_issue_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateIssueRequest>,
 ) -> Result<(StatusCode, Json<IssueResponse>), ApiError> {
+    let _lock = state.repo_lock.lock().await;
     use crate::issue::{AgentSource, IssueStore, IssuePriority};
 
     let priority = IssuePriority::from_str(&body.priority).ok_or_else(|| {
@@ -1928,6 +1937,7 @@ async fn update_issue_handler(
     AxumPath(id): AxumPath<String>,
     Json(body): Json<UpdateIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
+    let _lock = state.repo_lock.lock().await;
     use crate::issue::{IssueStore, IssuePriority};
 
     let issue_id = uuid::Uuid::parse_str(&id)
@@ -1957,6 +1967,7 @@ async fn close_issue_handler(
     AxumPath(id): AxumPath<String>,
     Json(body): Json<CloseIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
+    let _lock = state.repo_lock.lock().await;
     use crate::issue::{IssueStore, IssueResolution};
 
     let issue_id = uuid::Uuid::parse_str(&id)
@@ -2170,6 +2181,7 @@ async fn claim_work_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ClaimWorkRequest>,
 ) -> Result<(StatusCode, Json<work_queue::ClaimResult>), ApiError> {
+    let _lock = state.repo_lock.lock().await;
     let issue_id = body.issue_id.parse::<uuid::Uuid>().map_err(|_| {
         ApiError::bad_request(format!("invalid issue_id: {}", body.issue_id))
     })?;
@@ -2249,6 +2261,7 @@ async fn register_watcher_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RegisterWatcherRequest>,
 ) -> Result<(StatusCode, Json<WatcherResponse>), ApiError> {
+    let _lock = state.repo_lock.lock().await;
     let store = WatcherStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let now = chrono::Utc::now();
     let watcher = Watcher {
@@ -2292,6 +2305,7 @@ async fn pause_watcher_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(agent_id): AxumPath<String>,
 ) -> Result<Json<WatcherResponse>, ApiError> {
+    let _lock = state.repo_lock.lock().await;
     let store = WatcherStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     store.pause(&agent_id).map_err(|e| {
         use crate::watcher::WatcherError;
@@ -2309,6 +2323,7 @@ async fn resume_watcher_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(agent_id): AxumPath<String>,
 ) -> Result<Json<WatcherResponse>, ApiError> {
+    let _lock = state.repo_lock.lock().await;
     let store = WatcherStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     store.resume(&agent_id).map_err(|e| {
         use crate::watcher::WatcherError;
@@ -2347,6 +2362,7 @@ async fn submit_discovery_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SubmitDiscoveryRequest>,
 ) -> Result<(StatusCode, Json<DiscoveryOutcomeResponse>), ApiError> {
+    let _lock = state.repo_lock.lock().await;
     let watcher_store = WatcherStore::open(&state.vai_dir)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let issue_store = crate::issue::IssueStore::open(&state.vai_dir)
@@ -2472,7 +2488,12 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
             auth_middleware,
         ));
 
-    public.merge(protected).with_state(state)
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
+
+    public.merge(protected).layer(cors).with_state(state)
 }
 
 // ── Test helper ───────────────────────────────────────────────────────────────
@@ -2507,6 +2528,7 @@ pub async fn start_for_testing(
         event_seq: Arc::new(AtomicU64::new(0)),
         event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
         conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
+        repo_lock: Arc::new(Mutex::new(())),
     });
 
     let app = build_app(state);
@@ -2558,6 +2580,7 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
         event_seq: Arc::new(AtomicU64::new(0)),
         event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
         conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
+        repo_lock: Arc::new(Mutex::new(())),
     });
 
     let app = build_app(state);
@@ -2651,6 +2674,7 @@ mod tests {
             event_seq: Arc::new(AtomicU64::new(0)),
             event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
             conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
+            repo_lock: Arc::new(Mutex::new(())),
         });
 
         let app = build_app(Arc::clone(&state));

@@ -96,6 +96,9 @@ pub enum MergeError {
         count: usize,
         conflicts: Vec<ConflictRecord>,
     },
+
+    #[error("workspace has no changes to submit")]
+    EmptyWorkspace,
 }
 
 // ── Conflict persistence ───────────────────────────────────────────────────────
@@ -150,8 +153,11 @@ pub struct SubmitResult {
 pub fn submit(vai_dir: &Path, repo_root: &Path) -> Result<SubmitResult, MergeError> {
     let ws_meta = workspace::active(vai_dir)?;
 
-    // 1. Compute diff and record file/entity events.
+    // 1. Compute diff and reject if empty.
     let workspace_diff = diff::compute(vai_dir, repo_root)?;
+    if workspace_diff.is_empty() {
+        return Err(MergeError::EmptyWorkspace);
+    }
     diff::record_events(vai_dir, &workspace_diff)?;
 
     // 2. Record WorkspaceSubmitted.
@@ -1277,15 +1283,17 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_overlay_fast_forward() {
+    fn test_empty_overlay_returns_error() {
         let (_dir, root) = setup_repo(&[("src/lib.rs", BASE_RS)]);
         let vai_dir = root.join(".vai");
 
         workspace::create(&vai_dir, "no-op", "v1").unwrap();
 
-        let result = submit(&vai_dir, &root).unwrap();
-        assert_eq!(result.files_applied, 0);
-        assert_eq!(result.version.version_id, "v2");
+        let result = submit(&vai_dir, &root);
+        assert!(
+            matches!(result, Err(MergeError::EmptyWorkspace)),
+            "submitting an empty workspace should return EmptyWorkspace error"
+        );
     }
 
     // ── Three-level semantic merge tests ────────────────────────────────────

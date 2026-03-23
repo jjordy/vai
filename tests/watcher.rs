@@ -1,4 +1,4 @@
-//! Integration test for the Phase 4 watcher agent registration and discovery pipeline.
+//! Integration test for the watcher agent registration and discovery pipeline.
 //!
 //! Exercises:
 //! 1. Register a watcher via `POST /api/watchers/register`.
@@ -84,6 +84,12 @@ async fn test_watcher_registration_and_discovery_pipeline() {
     let watchers: Vec<serde_json::Value> = list_res.json().await.unwrap();
     assert_eq!(watchers.len(), 1);
     assert_eq!(watchers[0]["agent_id"], "ci-watcher");
+    assert_eq!(watchers[0]["watch_type"], "test_suite");
+    assert_eq!(watchers[0]["status"], "active");
+    assert!(
+        watchers[0]["description"].as_str().unwrap().contains("nightly CI"),
+        "watcher description should match"
+    );
 
     // Duplicate registration should fail.
     let dup_res = client

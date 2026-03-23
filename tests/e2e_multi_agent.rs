@@ -1,4 +1,4 @@
-//! End-to-end integration test for the Phase 2 multi-agent coordination workflow.
+//! End-to-end integration test for the multi-agent coordination workflow.
 //!
 //! Exercises the full multi-agent lifecycle:
 //! `vai init` → server start → two agents create workspaces → overlap detected
@@ -79,7 +79,7 @@ fn setup_server_repo() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
 
 // ── Multi-agent coordination test ────────────────────────────────────────────
 
-/// Full Phase 2 multi-agent workflow:
+/// Full multi-agent coordination workflow:
 ///
 /// 1. `vai init` on a repo with sample Rust files.
 /// 2. Create API keys for two agents (A and B).
@@ -96,7 +96,7 @@ fn setup_server_repo() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
 /// 12. Verify version history contains all three versions (v1, v2, v3).
 /// 13. Verify the event log audit trail via the `/api/versions` endpoint.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_phase2_multi_agent_coordination() {
+async fn test_multi_agent_coordination() {
     // ── 1. Server repo setup ─────────────────────────────────────────────────
     let (_tmp, _root, vai_dir) = setup_server_repo();
 
@@ -318,9 +318,14 @@ async fn test_phase2_multi_agent_coordination() {
         .unwrap();
     assert_eq!(v2_resp.status(), 200);
     let v2_detail: serde_json::Value = v2_resp.json().await.unwrap();
+    let v2_files = v2_detail["file_changes"].as_array()
+        .expect("v2 should have file_changes array");
     assert!(
-        !v2_detail["file_changes"].as_array().unwrap_or(&vec![]).is_empty(),
-        "v2 should record file changes in the audit trail"
+        v2_files.iter().any(|f| {
+            let path = f["path"].as_str().unwrap_or("");
+            path.contains("auth.rs")
+        }),
+        "v2 file changes should include auth.rs, got: {v2_files:?}"
     );
 
     let v3_resp = client
@@ -331,9 +336,14 @@ async fn test_phase2_multi_agent_coordination() {
         .unwrap();
     assert_eq!(v3_resp.status(), 200);
     let v3_detail: serde_json::Value = v3_resp.json().await.unwrap();
+    let v3_files = v3_detail["file_changes"].as_array()
+        .expect("v3 should have file_changes array");
     assert!(
-        !v3_detail["file_changes"].as_array().unwrap_or(&vec![]).is_empty(),
-        "v3 should record file changes in the audit trail"
+        v3_files.iter().any(|f| {
+            let path = f["path"].as_str().unwrap_or("");
+            path.contains("auth.rs")
+        }),
+        "v3 file changes should include auth.rs, got: {v3_files:?}"
     );
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
@@ -419,14 +429,14 @@ async fn test_event_buffer_replay_on_reconnect() {
     .unwrap();
 
     // The replayed stream should contain the event created during the disconnect.
-    let got_replay = timeout(Duration::from_secs(5), async {
+    let replayed_event = timeout(Duration::from_secs(5), async {
         loop {
             if let Some(Ok(Message::Text(msg))) = ws2.next().await {
                 let v: serde_json::Value = serde_json::from_str(&msg).unwrap_or_default();
                 if v["type"].as_str() == Some("WorkspaceCreated") {
                     let replayed_id = v["event_id"].as_u64().unwrap_or(0);
                     if replayed_id > event_id {
-                        return true;
+                        return v;
                     }
                 }
             }
@@ -435,7 +445,20 @@ async fn test_event_buffer_replay_on_reconnect() {
     .await
     .expect("timed out waiting for replayed event");
 
-    assert!(got_replay, "should receive replayed event after reconnect");
+    assert_eq!(
+        replayed_event["type"].as_str(),
+        Some("WorkspaceCreated"),
+        "replayed event should be WorkspaceCreated"
+    );
+    let replayed_id = replayed_event["event_id"].as_u64().unwrap();
+    assert!(
+        replayed_id > event_id,
+        "replayed event ID ({replayed_id}) should be greater than the last seen event ID ({event_id})"
+    );
+    assert!(
+        replayed_event["data"]["intent"].as_str().unwrap().contains("second workspace"),
+        "replayed event should contain the intent from the second workspace"
+    );
 
     ws2.close(None).await.ok();
     shutdown_tx.send(()).ok();
