@@ -125,6 +125,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use crate::auth;
 use crate::conflict;
+use crate::storage::EventStore as _;
 use crate::escalation::EscalationStatus;
 use crate::event_log::{EventKind, EventLog};
 use crate::graph::GraphSnapshot;
@@ -1481,6 +1482,7 @@ struct WsQueryParams {
 async fn ws_events_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
     AxumQuery(params): AxumQuery<WsQueryParams>,
 ) -> Response {
     let key_str = match params.key {
@@ -1512,12 +1514,26 @@ async fn ws_events_handler(
         }
     };
 
-    let event_rx = state.event_tx.subscribe();
-    let event_buffer = Arc::clone(&state.event_buffer);
     let last_event_id = params.last_event_id;
-    ws.on_upgrade(move |socket| {
-        handle_ws_connection(socket, event_rx, agent_name, event_buffer, last_event_id)
-    })
+
+    // In server mode (Postgres), use LISTEN/NOTIFY-driven delivery.
+    // In local mode (SQLite), fall back to the in-memory broadcast channel.
+    match ctx.storage {
+        crate::storage::StorageBackend::Server(ref pg) => {
+            let pg = Arc::clone(pg);
+            let repo_id = ctx.repo_id;
+            ws.on_upgrade(move |socket| {
+                handle_ws_connection_pg(socket, pg, repo_id, agent_name, last_event_id)
+            })
+        }
+        crate::storage::StorageBackend::Local(_) => {
+            let event_rx = state.event_tx.subscribe();
+            let event_buffer = Arc::clone(&state.event_buffer);
+            ws.on_upgrade(move |socket| {
+                handle_ws_connection(socket, event_rx, agent_name, event_buffer, last_event_id)
+            })
+        }
+    }
 }
 
 /// Returns `true` if `event` passes all non-empty dimensions of `filter`.
@@ -1715,6 +1731,219 @@ async fn handle_ws_connection(
             Err(broadcast::error::RecvError::Closed) => break,
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(skipped = n, "WebSocket client lagged behind event stream");
+            }
+        }
+    }
+
+    recv_task.abort();
+}
+
+/// Converts a storage [`crate::event_log::Event`] into the [`BroadcastEvent`]
+/// wire format delivered to WebSocket clients.
+fn event_to_broadcast(event: crate::event_log::Event) -> BroadcastEvent {
+    let workspace_id = event.kind.workspace_id().map(|id| id.to_string());
+    let event_type = event.kind.event_type().to_string();
+    let data = serde_json::to_value(&event.kind).unwrap_or(serde_json::Value::Null);
+    BroadcastEvent {
+        event_type,
+        event_id: event.id,
+        workspace_id,
+        timestamp: event.timestamp.to_rfc3339(),
+        data,
+    }
+}
+
+/// Manages a WebSocket connection backed by Postgres LISTEN/NOTIFY.
+///
+/// This is the server-mode counterpart to [`handle_ws_connection`]. Instead of
+/// reading from an in-memory broadcast channel it:
+///
+/// 1. Creates a [`sqlx::postgres::PgListener`] on the `vai_events` channel.
+/// 2. When the client sends a `subscribe` message and a `last_event_id` was
+///    provided on connect, queries the database for missed events and delivers
+///    them before switching to live delivery.
+/// 3. On each `NOTIFY vai_events, '<repo_id>:<event_id>'`, queries all events
+///    since the last delivered ID for the subscribed repo, applies the client's
+///    subscription filter, and sends matching events.
+async fn handle_ws_connection_pg(
+    socket: WebSocket,
+    pg: Arc<crate::storage::postgres::PostgresStorage>,
+    repo_id: uuid::Uuid,
+    agent_name: String,
+    last_event_id: Option<u64>,
+) {
+    let (ws_tx, ws_rx) = socket.split();
+    let ws_tx = Arc::new(Mutex::new(ws_tx));
+
+    // Shared subscription filter — `None` until the client sends Subscribe.
+    let filter: Arc<Mutex<Option<SubscriptionFilter>>> = Arc::new(Mutex::new(None));
+    let filter_for_recv = Arc::clone(&filter);
+    let ws_tx_for_recv = Arc::clone(&ws_tx);
+
+    // Tracks the highest event ID we have delivered to this client.
+    // Initialised to `last_event_id` so live NOTIFY delivery picks up from
+    // where the client left off even if it sends no last_event_id (value 0
+    // means "from the beginning").
+    let last_delivered_id = Arc::new(AtomicU64::new(last_event_id.unwrap_or(0)));
+    let last_delivered_for_recv = Arc::clone(&last_delivered_id);
+
+    // Whether the missed-event replay has already been triggered.
+    let replay_done = Arc::new(std::sync::atomic::AtomicBool::new(last_event_id.is_none()));
+    let replay_done_for_recv = Arc::clone(&replay_done);
+
+    let pg_for_recv = Arc::clone(&pg);
+
+    // Spawn a task that reads incoming client messages (subscription updates).
+    let recv_task = tokio::spawn(async move {
+        let mut ws_rx = ws_rx;
+        while let Some(msg) = ws_rx.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    match serde_json::from_str::<ClientMessage>(&text) {
+                        Ok(ClientMessage::Subscribe { subscribe }) => {
+                            tracing::debug!(
+                                agent = %agent_name,
+                                event_types = ?subscribe.event_types,
+                                "WebSocket subscription updated (Postgres mode)"
+                            );
+
+                            // On the first subscribe message of a reconnection,
+                            // replay any events the client missed.
+                            if !replay_done_for_recv.swap(true, Ordering::Relaxed) {
+                                if let Some(last_id) = last_event_id {
+                                    match pg_for_recv
+                                        .query_since_id(&repo_id, last_id as i64)
+                                        .await
+                                    {
+                                        Ok(events) => {
+                                            let mut sender = ws_tx_for_recv.lock().await;
+                                            let mut max_id = last_id;
+                                            for event in events {
+                                                let bc = event_to_broadcast(event);
+                                                if filter_matches(&subscribe, &bc) {
+                                                    match serde_json::to_string(&bc) {
+                                                        Ok(json) => {
+                                                            if sender
+                                                                .send(Message::Text(json))
+                                                                .await
+                                                                .is_err()
+                                                            {
+                                                                return;
+                                                            }
+                                                        }
+                                                        Err(e) => tracing::error!(
+                                                            "replay serialize error: {e}"
+                                                        ),
+                                                    }
+                                                }
+                                                if bc.event_id > max_id {
+                                                    max_id = bc.event_id;
+                                                }
+                                            }
+                                            // Advance the cursor past replayed events.
+                                            last_delivered_for_recv
+                                                .fetch_max(max_id, Ordering::Relaxed);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("replay query failed: {e}");
+                                        }
+                                    }
+                                }
+                            }
+
+                            *filter_for_recv.lock().await = Some(subscribe);
+                        }
+                        Err(e) => {
+                            let err_msg =
+                                serde_json::json!({ "error": format!("{e}") }).to_string();
+                            let _ = ws_tx_for_recv
+                                .lock()
+                                .await
+                                .send(Message::Text(err_msg))
+                                .await;
+                        }
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    // Create a Postgres listener on the `vai_events` channel.
+    let mut listener = match pg.create_listener().await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("failed to create PgListener: {e}");
+            recv_task.abort();
+            return;
+        }
+    };
+    if let Err(e) = listener.listen("vai_events").await {
+        tracing::error!("failed to listen on vai_events: {e}");
+        recv_task.abort();
+        return;
+    }
+
+    // Forward events to the client whenever a NOTIFY arrives for this repo.
+    loop {
+        let notification = match listener.recv().await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!("PgListener recv error: {e}");
+                break;
+            }
+        };
+
+        // Payload format: "<repo_id>:<event_id>" — lightweight pointer only.
+        let payload = notification.payload();
+        let Some((repo_str, _)) = payload.split_once(':') else {
+            continue;
+        };
+        let Ok(notif_repo) = repo_str.parse::<uuid::Uuid>() else {
+            continue;
+        };
+        // Only handle NOTIFYs for the repo this client is subscribed to.
+        if notif_repo != repo_id {
+            continue;
+        }
+
+        // Gate delivery: client must have sent a subscribe message first.
+        let current_filter = {
+            let guard = filter.lock().await;
+            guard.clone()
+        };
+        let Some(ref sub) = current_filter else {
+            continue;
+        };
+
+        // Query all events since the last one we delivered.
+        let since = last_delivered_id.load(Ordering::Relaxed) as i64;
+        let events = match pg.query_since_id(&repo_id, since).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("query_since_id failed: {e}");
+                continue;
+            }
+        };
+
+        for event in events {
+            let bc = event_to_broadcast(event);
+            // Advance cursor regardless of filter so we never re-deliver.
+            last_delivered_id.fetch_max(bc.event_id, Ordering::Relaxed);
+
+            if filter_matches(sub, &bc) {
+                let json = match serde_json::to_string(&bc) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("serialize event failed: {e}");
+                        continue;
+                    }
+                };
+                if ws_tx.lock().await.send(Message::Text(json)).await.is_err() {
+                    recv_task.abort();
+                    return;
+                }
             }
         }
     }

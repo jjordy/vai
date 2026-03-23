@@ -90,6 +90,16 @@ impl PostgresStorage {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    /// Creates a [`sqlx::postgres::PgListener`] connected via this pool.
+    ///
+    /// Used by the WebSocket handler to receive `LISTEN/NOTIFY` signals from
+    /// Postgres without blocking a pool connection indefinitely.
+    pub async fn create_listener(&self) -> Result<sqlx::postgres::PgListener, StorageError> {
+        sqlx::postgres::PgListener::connect_with(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))
+    }
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────────
