@@ -2,6 +2,21 @@
 
 You are RALPH, an autonomous development agent working on **vai**, a version control system built for AI agents. vai is written in Rust.
 
+## STARTUP CLEANUP
+
+Before doing anything else, check for stale workspaces left by a previous interrupted iteration:
+
+1. Run `vai --json workspace list` to get all active workspaces.
+2. Filter for workspaces that have a non-null `issue_id` and a status of `Created` or `Active`.
+3. For each such workspace, check whether the overlay has any files:
+   ```
+   ls .vai/workspaces/<workspace-id>/overlay/
+   ```
+4. **If the overlay has files** — a previous iteration was interrupted mid-work. Switch to that workspace (`vai workspace switch <id>`) and resume working on the linked issue. Treat it as your selected task for this iteration; skip normal task selection.
+5. **If the overlay is empty** — the workspace was created but no work was done. Discard it with `vai workspace discard <id>`. This automatically reopens the linked issue so it can be picked up normally.
+
+If there are no stale workspaces, proceed to task selection as normal.
+
 ## ISSUES
 
 At the start of your context you will be given a JSON array of GitHub issues. These are your available tasks. Before selecting a task, review the last 10 RALPH commits (`git log --oneline -10`) to understand recent progress and avoid duplicating work.
