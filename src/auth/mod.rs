@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors from the auth module.
@@ -46,6 +47,13 @@ pub struct ApiKey {
     pub last_used_at: Option<DateTime<Utc>>,
     /// Whether this key has been revoked.
     pub revoked: bool,
+    /// The user this key belongs to. `None` for legacy server-level keys or
+    /// keys created before RBAC was introduced.
+    pub user_id: Option<Uuid>,
+    /// Optional role cap. When set, the key's effective permissions are the
+    /// lesser of the user's computed role and this override. `None` means
+    /// "inherit the user's full effective role".
+    pub role_override: Option<String>,
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -133,6 +141,8 @@ pub fn create(vai_dir: &Path, name: &str) -> Result<(ApiKey, String), AuthError>
         created_at: now,
         last_used_at: None,
         revoked: false,
+        user_id: None,
+        role_override: None,
     };
 
     Ok((key, plaintext))
@@ -157,6 +167,8 @@ pub fn list(vai_dir: &Path) -> Result<Vec<ApiKey>, AuthError> {
                 created_at: parse_ts(row.get::<_, String>(3)?),
                 last_used_at: last_used_str.map(parse_ts),
                 revoked: row.get::<_, i64>(5)? != 0,
+                user_id: None,
+                role_override: None,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -202,6 +214,8 @@ pub fn validate(vai_dir: &Path, plaintext: &str) -> Result<Option<ApiKey>, AuthE
                 created_at: parse_ts(row.get::<_, String>(3)?),
                 last_used_at: last_used_str.map(parse_ts),
                 revoked: row.get::<_, i64>(5)? != 0,
+                user_id: None,
+                role_override: None,
             })
         },
     );

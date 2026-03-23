@@ -407,6 +407,13 @@ pub struct AgentIdentity {
     /// Admin requests bypass per-repo permission checks and have full access
     /// to all endpoints including org/user management.
     pub is_admin: bool,
+    /// The user this API key belongs to. `None` for legacy or admin keys.
+    pub user_id: Option<uuid::Uuid>,
+    /// Optional role cap from the key's `role_override` column.
+    ///
+    /// When present, the key's effective permissions are the lesser of the
+    /// user's computed role and this override value.
+    pub role_override: Option<String>,
 }
 
 // ── Per-request repository context ────────────────────────────────────────────
@@ -523,21 +530,29 @@ async fn auth_middleware(
             key_id: "admin".to_string(),
             name: "admin".to_string(),
             is_admin: true,
+            user_id: None,
+            role_override: None,
         });
         return next.run(request).await;
     }
 
-    match auth::validate(&state.vai_dir, &key_str) {
-        Ok(Some(api_key)) => {
+    // Validate via the storage backend so that both SQLite (local) and
+    // Postgres (server) key stores are supported.
+    match state.storage.auth().validate_key(&key_str).await {
+        Ok(api_key) => {
             tracing::debug!(agent = %api_key.name, "authenticated request");
             request.extensions_mut().insert(AgentIdentity {
                 key_id: api_key.id,
                 name: api_key.name,
                 is_admin: false,
+                user_id: api_key.user_id,
+                role_override: api_key.role_override,
             });
             next.run(request).await
         }
-        Ok(None) => ApiError::unauthorized("invalid or revoked API key").into_response(),
+        Err(crate::storage::StorageError::NotFound(_)) => {
+            ApiError::unauthorized("invalid or revoked API key").into_response()
+        }
         Err(e) => ApiError::internal(format!("auth error: {e}")).into_response(),
     }
 }
@@ -677,6 +692,13 @@ impl ApiError {
             message: msg.into(),
         }
     }
+
+    fn forbidden(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -765,6 +787,69 @@ impl From<crate::storage::StorageError> for ApiError {
             _ => ApiError::internal(e.to_string()),
         }
     }
+}
+
+// ── RBAC helpers ─────────────────────────────────────────────────────────────
+
+/// Checks that the authenticated user has at least `required` on `repo_id`.
+///
+/// Returns the effective [`RepoRole`] on success, or a `403 Forbidden`
+/// response on failure.  Admin keys always pass with `Owner` access.
+///
+/// Call this from handlers that need to enforce per-repo permissions:
+///
+/// ```ignore
+/// let role = require_repo_permission(&state, &identity, &repo_id, RepoRole::Write).await?;
+/// ```
+async fn require_repo_permission(
+    state: &AppState,
+    identity: &AgentIdentity,
+    repo_id: &uuid::Uuid,
+    required: crate::storage::RepoRole,
+) -> Result<crate::storage::RepoRole, Response> {
+    use crate::storage::RepoRole;
+
+    if identity.is_admin {
+        return Ok(RepoRole::Owner);
+    }
+
+    let user_id = match &identity.user_id {
+        Some(uid) => uid,
+        None => {
+            return Err(
+                ApiError::forbidden("this key is not associated with a user; cannot check repo permissions")
+                    .into_response(),
+            );
+        }
+    };
+
+    let resolved = state
+        .storage
+        .orgs()
+        .resolve_repo_role(user_id, repo_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("permission check failed: {e}")).into_response())?;
+
+    let effective = match resolved {
+        None => {
+            return Err(ApiError::forbidden("access denied").into_response());
+        }
+        Some(r) => r,
+    };
+
+    // Apply key-level role cap if present.
+    let effective = if let Some(cap_str) = &identity.role_override {
+        let cap = RepoRole::from_str(cap_str);
+        if effective.rank() > cap.rank() { cap } else { effective }
+    } else {
+        effective
+    };
+
+    if effective.rank() < required.rank() {
+        return Err(ApiError::forbidden("insufficient permissions").into_response());
+    }
+
+    Ok(effective)
 }
 
 // ── API response types ────────────────────────────────────────────────────────
@@ -1368,19 +1453,31 @@ async fn ws_events_handler(
         }
     };
 
-    match auth::validate(&state.vai_dir, &key_str) {
-        Ok(Some(api_key)) => {
-            tracing::debug!(agent = %api_key.name, "WebSocket connection authenticated");
-            let event_rx = state.event_tx.subscribe();
-            let event_buffer = Arc::clone(&state.event_buffer);
-            let last_event_id = params.last_event_id;
-            ws.on_upgrade(move |socket| {
-                handle_ws_connection(socket, event_rx, api_key.name, event_buffer, last_event_id)
-            })
+    // Admin key takes priority — allow it as a WebSocket credential.
+    let agent_name = if key_str == state.admin_key {
+        "admin".to_string()
+    } else {
+        // Validate via storage backend (handles both SQLite and Postgres).
+        match state.storage.auth().validate_key(&key_str).await {
+            Ok(api_key) => {
+                tracing::debug!(agent = %api_key.name, "WebSocket connection authenticated");
+                api_key.name
+            }
+            Err(crate::storage::StorageError::NotFound(_)) => {
+                return ApiError::unauthorized("invalid or revoked API key").into_response();
+            }
+            Err(e) => {
+                return ApiError::internal(format!("auth error: {e}")).into_response();
+            }
         }
-        Ok(None) => ApiError::unauthorized("invalid or revoked API key").into_response(),
-        Err(e) => ApiError::internal(format!("auth error: {e}")).into_response(),
-    }
+    };
+
+    let event_rx = state.event_tx.subscribe();
+    let event_buffer = Arc::clone(&state.event_buffer);
+    let last_event_id = params.last_event_id;
+    ws.on_upgrade(move |socket| {
+        handle_ws_connection(socket, event_rx, agent_name, event_buffer, last_event_id)
+    })
 }
 
 /// Returns `true` if `event` passes all non-empty dimensions of `filter`.

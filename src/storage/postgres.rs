@@ -1127,6 +1127,8 @@ impl AuthStore for PostgresStorage {
             last_used_at: None,
             created_at: Utc::now(),
             revoked: false,
+            user_id: None,
+            role_override: None,
         };
 
         Ok((key, token))
@@ -1136,7 +1138,8 @@ impl AuthStore for PostgresStorage {
         let key_hash = hash_token(token);
 
         let row = sqlx::query(
-            "SELECT id, name, key_prefix, last_used_at, created_at, revoked \
+            "SELECT id, name, key_prefix, last_used_at, created_at, revoked, \
+                    user_id, role_override \
              FROM api_keys WHERE key_hash = $1 AND revoked = false",
         )
         .bind(&key_hash)
@@ -1162,14 +1165,16 @@ impl AuthStore for PostgresStorage {
     async fn list_keys(&self, repo_id: Option<&Uuid>) -> Result<Vec<ApiKey>, StorageError> {
         let rows = match repo_id {
             Some(rid) => sqlx::query(
-                "SELECT id, name, key_prefix, last_used_at, created_at, revoked \
+                "SELECT id, name, key_prefix, last_used_at, created_at, revoked, \
+                        user_id, role_override \
                  FROM api_keys WHERE repo_id = $1 AND revoked = false ORDER BY created_at",
             )
             .bind(rid)
             .fetch_all(&self.pool)
             .await,
             None => sqlx::query(
-                "SELECT id, name, key_prefix, last_used_at, created_at, revoked \
+                "SELECT id, name, key_prefix, last_used_at, created_at, revoked, \
+                        user_id, role_override \
                  FROM api_keys WHERE repo_id IS NULL AND revoked = false ORDER BY created_at",
             )
             .fetch_all(&self.pool)
@@ -1199,6 +1204,8 @@ fn row_to_api_key(row: sqlx::postgres::PgRow) -> Result<ApiKey, StorageError> {
         last_used_at: row.get("last_used_at"),
         created_at: row.get("created_at"),
         revoked: row.get("revoked"),
+        user_id: row.get("user_id"),
+        role_override: row.get("role_override"),
     })
 }
 
