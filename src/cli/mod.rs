@@ -18,7 +18,7 @@ use crate::graph::{GraphSnapshot, GraphStats};
 use crate::scope_inference;
 use crate::scope_history::ScopeHistoryStore;
 use crate::escalation::{EscalationStatus, EscalationStore, ResolutionOption};
-use crate::issue::{IssueFilter, IssueStore, IssuePriority, IssueResolution, IssueStatus};
+use crate::issue::{IssueFilter, IssueStore, IssuePriority, IssueStatus};
 use crate::merge;
 use crate::merge_patterns::MergePatternStore;
 use crate::remote_workspace;
@@ -1554,13 +1554,11 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     }
                 }
                 IssueCommands::Close { id, resolution } => {
-                    let res = IssueResolution::from_str(&resolution)
-                        .ok_or_else(|| CliError::Other(format!("unknown resolution: {resolution}. Use: resolved, wontfix, duplicate")))?;
                     let store = IssueStore::open(&vai_dir)?;
                     let mut event_log = EventLog::open(&vai_dir)
                         .map_err(|e| CliError::Other(format!("cannot open event log: {e}")))?;
                     let resolved_issue = resolve_issue(&store, &id)?;
-                    let closed = store.close(resolved_issue.id, res, &mut event_log)?;
+                    let closed = store.close(resolved_issue.id, &resolution, &mut event_log)?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&closed).unwrap());
                     } else {

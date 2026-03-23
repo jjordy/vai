@@ -685,24 +685,26 @@ impl IssueStore {
         self.get(id)
     }
 
-    /// Close an issue with a resolution (can come from any state).
+    /// Close an issue with a resolution string (can come from any state).
+    ///
+    /// `resolution` can be any string; common values are `"resolved"`, `"wontfix"`, and
+    /// `"duplicate"`, but free-form text (e.g. `"resolved in v5"`) is also accepted.
     pub fn close(
         &self,
         id: Uuid,
-        resolution: IssueResolution,
+        resolution: &str,
         event_log: &mut EventLog,
     ) -> Result<Issue, IssueError> {
         // Verify it exists (returns NotFound if not).
         self.get(id)?;
         let now = Utc::now();
-        let res_str = resolution.as_str();
         self.conn.execute(
             "UPDATE issues SET status='closed', resolution=?2, updated_at=?3 WHERE id=?1",
-            params![id.to_string(), res_str, now.to_rfc3339()],
+            params![id.to_string(), resolution, now.to_rfc3339()],
         )?;
         event_log.append(EventKind::IssueClosed {
             issue_id: id,
-            resolution: res_str.to_string(),
+            resolution: resolution.to_string(),
         })?;
         self.get(id)
     }
@@ -899,7 +901,7 @@ mod tests {
             .create("Won't do", "", IssuePriority::Low, vec![], "alice", &mut log)
             .unwrap();
 
-        let closed = store.close(issue.id, IssueResolution::WontFix, &mut log).unwrap();
+        let closed = store.close(issue.id, "wontfix", &mut log).unwrap();
         assert_eq!(closed.status, IssueStatus::Closed);
         assert_eq!(closed.resolution.as_deref(), Some("wontfix"));
     }

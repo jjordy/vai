@@ -4,7 +4,7 @@
 
 use tempfile::TempDir;
 use vai::event_log::EventLog;
-use vai::issue::{IssueFilter, IssuePriority, IssueResolution, IssueStatus, IssueStore};
+use vai::issue::{IssueFilter, IssuePriority, IssueStatus, IssueStore};
 use vai::repo;
 
 /// Set up a temp repo and return (TempDir, vai_dir).
@@ -77,7 +77,7 @@ fn test_issue_full_lifecycle() {
     assert_eq!(fetched.priority, IssuePriority::Critical);
 
     // Close issue 2 as wontfix.
-    let closed = store.close(i2.id, IssueResolution::WontFix, &mut log).unwrap();
+    let closed = store.close(i2.id, "wontfix", &mut log).unwrap();
     assert_eq!(closed.status, IssueStatus::Closed);
     assert_eq!(closed.resolution.as_deref(), Some("wontfix"));
 

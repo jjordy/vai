@@ -1968,23 +1968,16 @@ async fn close_issue_handler(
     Json(body): Json<CloseIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
     let _lock = state.repo_lock.lock().await;
-    use crate::issue::{IssueStore, IssueResolution};
+    use crate::issue::IssueStore;
 
     let issue_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
-
-    let resolution = IssueResolution::from_str(&body.resolution).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "unknown resolution `{}`; expected resolved, wontfix, or duplicate",
-            body.resolution
-        ))
-    })?;
 
     let store = IssueStore::open(&state.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let mut log = crate::event_log::EventLog::open(&state.vai_dir)
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let issue = store.close(issue_id, resolution, &mut log).map_err(ApiError::from)?;
+    let issue = store.close(issue_id, &body.resolution, &mut log).map_err(ApiError::from)?;
 
     let linked = store.linked_workspaces(issue_id).unwrap_or_default();
     Ok(Json(IssueResponse::from_issue(issue, linked)))
@@ -2491,7 +2484,10 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
     let cors = tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any);
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ]);
 
     public.merge(protected).layer(cors).with_state(state)
 }
@@ -4337,16 +4333,36 @@ mod tests {
         assert_eq!(open_issues.as_array().unwrap().len(), 1);
         assert_eq!(open_issues[0]["title"], "Add rate limiting");
 
-        // ── Invalid resolution → 400 ──────────────────────────────────────────
+        // ── Free-text resolution is accepted (any string allowed) ────────────────
 
+        // Re-open by creating a fresh issue and closing it with a free-text resolution.
         let resp = client
-            .post(format!("http://{addr}/api/issues/{issue_id}/close"))
+            .post(format!("http://{addr}/api/issues"))
             .bearer_auth(&key)
-            .json(&serde_json::json!({ "resolution": "badvalue" }))
+            .json(&serde_json::json!({
+                "title": "Temp issue for free-text resolution test",
+                "body": "",
+                "priority": "low",
+                "labels": [],
+                "created_by": "test"
+            }))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 400);
+        assert_eq!(resp.status(), 201);
+        let temp_issue: serde_json::Value = resp.json().await.unwrap();
+        let temp_id = temp_issue["id"].as_str().unwrap();
+
+        let resp = client
+            .post(format!("http://{addr}/api/issues/{temp_id}/close"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "resolution": "resolved in v5" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let closed_temp: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(closed_temp["resolution"], "resolved in v5");
 
         shutdown_tx.send(()).ok();
     }
