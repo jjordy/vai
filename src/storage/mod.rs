@@ -20,6 +20,7 @@
 
 pub mod filesystem;
 pub mod postgres;
+pub mod s3;
 pub mod sqlite;
 
 use std::path::PathBuf;
@@ -901,7 +902,16 @@ pub enum StorageBackend {
     /// Local CLI mode — SQLite + filesystem under a `.vai/` directory.
     Local(Arc<sqlite::SqliteStorage>),
     /// Hosted server mode — Postgres with multi-tenant `repo_id` scoping.
+    ///
+    /// File storage falls back to [`postgres::PostgresStorage`]'s stub
+    /// `FileStore` impl (returns errors).  Use [`StorageBackend::ServerWithS3`]
+    /// for a real file store.
     Server(Arc<postgres::PostgresStorage>),
+    /// Hosted server mode with an S3-compatible file store.
+    ///
+    /// All database traits delegate to the Postgres backend; [`FileStore`]
+    /// delegates to the S3 backend.
+    ServerWithS3(Arc<postgres::PostgresStorage>, Arc<s3::S3FileStore>),
 }
 
 impl StorageBackend {
@@ -921,11 +931,31 @@ impl StorageBackend {
         Ok(StorageBackend::Server(Arc::new(storage)))
     }
 
+    /// Connects to Postgres and an S3-compatible store, returning a server-mode
+    /// backend with a functional [`FileStore`].
+    ///
+    /// The Postgres pool is shared between the database backend and the S3 file
+    /// index.  Run migrations (including `20260323000003_file_index.sql`) via
+    /// [`postgres::PostgresStorage::migrate`] before serving requests.
+    pub async fn server_with_s3(
+        database_url: &str,
+        max_connections: u32,
+        s3_config: s3::S3Config,
+    ) -> Result<Self, StorageError> {
+        let pg = postgres::PostgresStorage::connect(database_url, max_connections).await?;
+        let pg = Arc::new(pg);
+        let file_store =
+            s3::S3FileStore::connect(s3_config, pg.pool().clone()).await?;
+        Ok(StorageBackend::ServerWithS3(pg, Arc::new(file_store)))
+    }
+
     /// Returns the event log store.
     pub fn events(&self) -> Arc<dyn EventStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn EventStore>,
-            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn EventStore>,
+            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
+                Arc::clone(s) as Arc<dyn EventStore>
+            }
         }
     }
 
@@ -933,7 +963,9 @@ impl StorageBackend {
     pub fn issues(&self) -> Arc<dyn IssueStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn IssueStore>,
-            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn IssueStore>,
+            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
+                Arc::clone(s) as Arc<dyn IssueStore>
+            }
         }
     }
 
@@ -941,7 +973,9 @@ impl StorageBackend {
     pub fn escalations(&self) -> Arc<dyn EscalationStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn EscalationStore>,
-            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn EscalationStore>,
+            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
+                Arc::clone(s) as Arc<dyn EscalationStore>
+            }
         }
     }
 
@@ -949,7 +983,9 @@ impl StorageBackend {
     pub fn graph(&self) -> Arc<dyn GraphStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn GraphStore>,
-            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn GraphStore>,
+            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
+                Arc::clone(s) as Arc<dyn GraphStore>
+            }
         }
     }
 
@@ -957,7 +993,9 @@ impl StorageBackend {
     pub fn versions(&self) -> Arc<dyn VersionStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn VersionStore>,
-            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn VersionStore>,
+            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
+                Arc::clone(s) as Arc<dyn VersionStore>
+            }
         }
     }
 
@@ -965,7 +1003,9 @@ impl StorageBackend {
     pub fn workspaces(&self) -> Arc<dyn WorkspaceStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn WorkspaceStore>,
-            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn WorkspaceStore>,
+            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
+                Arc::clone(s) as Arc<dyn WorkspaceStore>
+            }
         }
     }
 
@@ -973,29 +1013,35 @@ impl StorageBackend {
     pub fn auth(&self) -> Arc<dyn AuthStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn AuthStore>,
-            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn AuthStore>,
+            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
+                Arc::clone(s) as Arc<dyn AuthStore>
+            }
         }
     }
 
     /// Returns the organization and RBAC store.
     ///
-    /// Only meaningful for the `Server` backend — the local SQLite backend
+    /// Only meaningful for Postgres-backed variants — the local SQLite backend
     /// returns a stub that errors on use (RBAC is not supported in local mode).
     pub fn orgs(&self) -> Arc<dyn OrgStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn OrgStore>,
-            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn OrgStore>,
+            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
+                Arc::clone(s) as Arc<dyn OrgStore>
+            }
         }
     }
 
     /// Returns the file content store.
     ///
-    /// For the `Server` backend the underlying Postgres implementation returns
-    /// an error on use — a real S3-backed [`FileStore`] is tracked in issue #76.
+    /// - [`StorageBackend::Local`]: filesystem-backed store under `.vai/`.
+    /// - [`StorageBackend::Server`]: stub that returns errors (use `ServerWithS3`).
+    /// - [`StorageBackend::ServerWithS3`]: S3-backed store with Postgres index.
     pub fn files(&self) -> Arc<dyn FileStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn FileStore>,
             StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn FileStore>,
+            StorageBackend::ServerWithS3(_, f) => Arc::clone(f) as Arc<dyn FileStore>,
         }
     }
 }

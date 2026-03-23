@@ -479,7 +479,7 @@ fn repo_storage(
     use crate::storage::StorageBackend;
     match state_storage {
         StorageBackend::Local(_) => StorageBackend::local(vai_dir),
-        StorageBackend::Server(_) => state_storage.clone(),
+        StorageBackend::Server(_) | StorageBackend::ServerWithS3(_, _) => state_storage.clone(),
     }
 }
 
@@ -1527,7 +1527,8 @@ async fn ws_events_handler(
     // In server mode (Postgres), use LISTEN/NOTIFY-driven delivery.
     // In local mode (SQLite), fall back to the in-memory broadcast channel.
     match ctx.storage {
-        crate::storage::StorageBackend::Server(ref pg) => {
+        crate::storage::StorageBackend::Server(ref pg)
+        | crate::storage::StorageBackend::ServerWithS3(ref pg, _) => {
             let pg = Arc::clone(pg);
             let repo_id = ctx.repo_id;
             ws.on_upgrade(move |socket| {
@@ -4193,7 +4194,7 @@ async fn migrate_handler(
     .await?;
 
     let pg = match &ctx.storage {
-        StorageBackend::Server(pg) => pg.clone(),
+        StorageBackend::Server(pg) | StorageBackend::ServerWithS3(pg, _) => pg.clone(),
         StorageBackend::Local(_) => {
             return Err(ApiError::bad_request(
                 "migration endpoint requires a Postgres-backed server; \
@@ -4412,7 +4413,7 @@ async fn migration_stats_handler(
     .await?;
 
     let pg = match &ctx.storage {
-        StorageBackend::Server(pg) => pg.clone(),
+        StorageBackend::Server(pg) | StorageBackend::ServerWithS3(pg, _) => pg.clone(),
         StorageBackend::Local(_) => {
             return Err(ApiError::bad_request(
                 "migration-stats endpoint requires a Postgres-backed server; \
@@ -4736,7 +4737,8 @@ pub async fn start_for_testing_pg(
         .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
 
     let pg = match &storage {
-        crate::storage::StorageBackend::Server(pg) => pg.clone(),
+        crate::storage::StorageBackend::Server(pg)
+        | crate::storage::StorageBackend::ServerWithS3(pg, _) => pg.clone(),
         _ => unreachable!(),
     };
 
