@@ -459,6 +459,234 @@ pub trait AuthStore: Send + Sync {
     async fn revoke_key(&self, id: &str) -> Result<(), StorageError>;
 }
 
+// ── RBAC types ────────────────────────────────────────────────────────────────
+
+/// Role a user holds within an organization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrgRole {
+    /// Full control over the org, including billing and deletion.
+    Owner,
+    /// Manage members, create repos, resolve escalations.
+    Admin,
+    /// Basic org membership; access determined per repo.
+    Member,
+}
+
+impl OrgRole {
+    /// Parses a stored role string, defaulting to `Member` on unknown values.
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "owner" => OrgRole::Owner,
+            "admin" => OrgRole::Admin,
+            _ => OrgRole::Member,
+        }
+    }
+
+    /// Returns the canonical lowercase string stored in the database.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OrgRole::Owner => "owner",
+            OrgRole::Admin => "admin",
+            OrgRole::Member => "member",
+        }
+    }
+}
+
+/// Role a user holds on a specific repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoRole {
+    /// Full control including deletion and collaborator management.
+    Owner,
+    /// Manage collaborators, workspaces, issues, and escalations.
+    Admin,
+    /// Create and submit workspaces; create and close issues.
+    Write,
+    /// Read-only access to all repo data.
+    Read,
+}
+
+impl RepoRole {
+    /// Parses a stored role string, defaulting to `Read` on unknown values.
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "owner" => RepoRole::Owner,
+            "admin" => RepoRole::Admin,
+            "write" => RepoRole::Write,
+            _ => RepoRole::Read,
+        }
+    }
+
+    /// Returns the canonical lowercase string stored in the database.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RepoRole::Owner => "owner",
+            RepoRole::Admin => "admin",
+            RepoRole::Write => "write",
+            RepoRole::Read => "read",
+        }
+    }
+}
+
+/// An organization that owns repositories and has members.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Organization {
+    /// Stable UUID.
+    pub id: Uuid,
+    /// Human-readable display name.
+    pub name: String,
+    /// URL-safe unique identifier, e.g. `"acme-corp"`.
+    pub slug: String,
+    /// When the organization was created.
+    pub created_at: DateTime<Utc>,
+}
+
+/// A user in the vai system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    /// Stable UUID.
+    pub id: Uuid,
+    /// Unique email address.
+    pub email: String,
+    /// Display name.
+    pub name: String,
+    /// When the user account was created.
+    pub created_at: DateTime<Utc>,
+}
+
+/// A user's membership record in an organization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgMember {
+    /// Organization this membership belongs to.
+    pub org_id: Uuid,
+    /// The member user.
+    pub user_id: Uuid,
+    /// Role within the organization.
+    pub role: OrgRole,
+    /// When the membership was created.
+    pub created_at: DateTime<Utc>,
+}
+
+/// A user's collaborator record on a specific repository.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoCollaborator {
+    /// Repository this record belongs to.
+    pub repo_id: Uuid,
+    /// The collaborator user.
+    pub user_id: Uuid,
+    /// Role on the repository.
+    pub role: RepoRole,
+    /// When the collaborator was added.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Input for creating a new organization.
+#[derive(Debug, Clone)]
+pub struct NewOrg {
+    /// Human-readable display name.
+    pub name: String,
+    /// URL-safe unique slug.
+    pub slug: String,
+}
+
+/// Input for creating a new user.
+#[derive(Debug, Clone)]
+pub struct NewUser {
+    /// Unique email address.
+    pub email: String,
+    /// Display name.
+    pub name: String,
+}
+
+// ── OrgStore ──────────────────────────────────────────────────────────────────
+
+/// Storage for organizations, users, org memberships, and repo collaborators.
+///
+/// This is the foundation of the RBAC system. Permission resolution logic
+/// (PRD 10.1) queries these tables to compute a user's effective role.
+#[async_trait]
+pub trait OrgStore: Send + Sync {
+    // ── Organizations ──────────────────────────────────────────────────────────
+
+    /// Creates a new organization.
+    async fn create_org(&self, org: NewOrg) -> Result<Organization, StorageError>;
+
+    /// Fetches an organization by its UUID.
+    async fn get_org(&self, org_id: &Uuid) -> Result<Organization, StorageError>;
+
+    /// Fetches an organization by its URL slug.
+    async fn get_org_by_slug(&self, slug: &str) -> Result<Organization, StorageError>;
+
+    /// Lists all organizations (used by server-level admin only).
+    async fn list_orgs(&self) -> Result<Vec<Organization>, StorageError>;
+
+    /// Permanently deletes an organization and all its repos (cascade).
+    async fn delete_org(&self, org_id: &Uuid) -> Result<(), StorageError>;
+
+    // ── Users ─────────────────────────────────────────────────────────────────
+
+    /// Creates a new user.
+    async fn create_user(&self, user: NewUser) -> Result<User, StorageError>;
+
+    /// Fetches a user by UUID.
+    async fn get_user(&self, user_id: &Uuid) -> Result<User, StorageError>;
+
+    /// Fetches a user by email address.
+    async fn get_user_by_email(&self, email: &str) -> Result<User, StorageError>;
+
+    // ── Org membership ────────────────────────────────────────────────────────
+
+    /// Adds a user as a member of an organization with the given role.
+    async fn add_org_member(
+        &self,
+        org_id: &Uuid,
+        user_id: &Uuid,
+        role: OrgRole,
+    ) -> Result<OrgMember, StorageError>;
+
+    /// Changes an existing member's role within the organization.
+    async fn update_org_member(
+        &self,
+        org_id: &Uuid,
+        user_id: &Uuid,
+        role: OrgRole,
+    ) -> Result<OrgMember, StorageError>;
+
+    /// Removes a user from an organization.
+    async fn remove_org_member(&self, org_id: &Uuid, user_id: &Uuid) -> Result<(), StorageError>;
+
+    /// Lists all members of an organization.
+    async fn list_org_members(&self, org_id: &Uuid) -> Result<Vec<OrgMember>, StorageError>;
+
+    // ── Repo collaborators ────────────────────────────────────────────────────
+
+    /// Grants a user a role on a specific repository.
+    async fn add_collaborator(
+        &self,
+        repo_id: &Uuid,
+        user_id: &Uuid,
+        role: RepoRole,
+    ) -> Result<RepoCollaborator, StorageError>;
+
+    /// Changes an existing collaborator's role on a repository.
+    async fn update_collaborator(
+        &self,
+        repo_id: &Uuid,
+        user_id: &Uuid,
+        role: RepoRole,
+    ) -> Result<RepoCollaborator, StorageError>;
+
+    /// Removes a collaborator from a repository.
+    async fn remove_collaborator(&self, repo_id: &Uuid, user_id: &Uuid) -> Result<(), StorageError>;
+
+    /// Lists all collaborators on a repository.
+    async fn list_collaborators(
+        &self,
+        repo_id: &Uuid,
+    ) -> Result<Vec<RepoCollaborator>, StorageError>;
+}
+
 // ── FileStore ─────────────────────────────────────────────────────────────────
 
 /// Content storage for source files and workspace overlays.
@@ -603,6 +831,17 @@ impl StorageBackend {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn AuthStore>,
             StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn AuthStore>,
+        }
+    }
+
+    /// Returns the organization and RBAC store.
+    ///
+    /// Only meaningful for the `Server` backend — the local SQLite backend
+    /// returns a stub that errors on use (RBAC is not supported in local mode).
+    pub fn orgs(&self) -> Arc<dyn OrgStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn OrgStore>,
+            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn OrgStore>,
         }
     }
 

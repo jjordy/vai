@@ -28,7 +28,8 @@ use crate::workspace;
 
 use super::{
     AuthStore, EscalationStore, EventStore, FileMetadata, FileStore, GraphStore, IssueStore,
-    IssueUpdate, NewEscalation, NewIssue, NewVersion, NewWorkspace, StorageError, VersionStore,
+    IssueUpdate, NewEscalation, NewIssue, NewOrg, NewUser, NewVersion, NewWorkspace, OrgMember,
+    OrgRole, OrgStore, Organization, RepoCollaborator, RepoRole, StorageError, User, VersionStore,
     WorkspaceStore, WorkspaceUpdate,
 };
 use crate::auth::ApiKey;
@@ -798,6 +799,119 @@ fn collect_files(
         }
     }
     Ok(())
+}
+
+// ── OrgStore ──────────────────────────────────────────────────────────────────
+//
+// RBAC is not supported in local CLI mode — organizations and multi-user
+// permission management require a hosted Postgres backend.  These stubs return
+// a clear error so that accidental usage is surfaced immediately.
+
+fn org_store_unsupported() -> StorageError {
+    StorageError::InvalidTransition(
+        "OrgStore is not supported in local CLI mode; use the hosted server backend".to_string(),
+    )
+}
+
+#[async_trait]
+impl OrgStore for SqliteStorage {
+    async fn create_org(&self, _org: NewOrg) -> Result<Organization, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn get_org(&self, _org_id: &Uuid) -> Result<Organization, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn get_org_by_slug(&self, _slug: &str) -> Result<Organization, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn list_orgs(&self) -> Result<Vec<Organization>, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn delete_org(&self, _org_id: &Uuid) -> Result<(), StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn create_user(&self, _user: NewUser) -> Result<User, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn get_user(&self, _user_id: &Uuid) -> Result<User, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn get_user_by_email(&self, _email: &str) -> Result<User, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn add_org_member(
+        &self,
+        _org_id: &Uuid,
+        _user_id: &Uuid,
+        _role: OrgRole,
+    ) -> Result<OrgMember, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn update_org_member(
+        &self,
+        _org_id: &Uuid,
+        _user_id: &Uuid,
+        _role: OrgRole,
+    ) -> Result<OrgMember, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn remove_org_member(
+        &self,
+        _org_id: &Uuid,
+        _user_id: &Uuid,
+    ) -> Result<(), StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn list_org_members(
+        &self,
+        _org_id: &Uuid,
+    ) -> Result<Vec<OrgMember>, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn add_collaborator(
+        &self,
+        _repo_id: &Uuid,
+        _user_id: &Uuid,
+        _role: RepoRole,
+    ) -> Result<RepoCollaborator, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn update_collaborator(
+        &self,
+        _repo_id: &Uuid,
+        _user_id: &Uuid,
+        _role: RepoRole,
+    ) -> Result<RepoCollaborator, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn remove_collaborator(
+        &self,
+        _repo_id: &Uuid,
+        _user_id: &Uuid,
+    ) -> Result<(), StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn list_collaborators(
+        &self,
+        _repo_id: &Uuid,
+    ) -> Result<Vec<RepoCollaborator>, StorageError> {
+        Err(org_store_unsupported())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

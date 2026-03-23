@@ -40,7 +40,8 @@ use crate::workspace::{WorkspaceMeta, WorkspaceStatus};
 
 use super::{
     AuthStore, EscalationStore, EventStore, FileMetadata, FileStore, GraphStore, IssueStore,
-    IssueUpdate, NewEscalation, NewIssue, NewVersion, NewWorkspace, StorageError, VersionStore,
+    IssueUpdate, NewEscalation, NewIssue, NewOrg, NewUser, NewVersion, NewWorkspace, OrgMember,
+    OrgRole, OrgStore, Organization, RepoCollaborator, RepoRole, StorageError, User, VersionStore,
     WorkspaceStore, WorkspaceUpdate,
 };
 
@@ -1250,5 +1251,393 @@ impl FileStore for PostgresStorage {
         Err(StorageError::Io(
             "PostgresStorage does not implement FileStore; use S3FileStore".to_string(),
         ))
+    }
+}
+
+// ── OrgStore ──────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl OrgStore for PostgresStorage {
+    // ── Organizations ──────────────────────────────────────────────────────────
+
+    async fn create_org(&self, org: NewOrg) -> Result<Organization, StorageError> {
+        let row = sqlx::query(
+            "INSERT INTO organizations (name, slug)
+             VALUES ($1, $2)
+             RETURNING id, name, slug, created_at",
+        )
+        .bind(&org.name)
+        .bind(&org.slug)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e {
+                if db_err.constraint().is_some() {
+                    return StorageError::Conflict(format!("slug '{}' already exists", org.slug));
+                }
+            }
+            StorageError::Database(e.to_string())
+        })?;
+
+        Ok(Organization {
+            id: row.get("id"),
+            name: row.get("name"),
+            slug: row.get("slug"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn get_org(&self, org_id: &Uuid) -> Result<Organization, StorageError> {
+        let row = sqlx::query(
+            "SELECT id, name, slug, created_at FROM organizations WHERE id = $1",
+        )
+        .bind(org_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .ok_or_else(|| StorageError::NotFound(format!("org {org_id}")))?;
+
+        Ok(Organization {
+            id: row.get("id"),
+            name: row.get("name"),
+            slug: row.get("slug"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn get_org_by_slug(&self, slug: &str) -> Result<Organization, StorageError> {
+        let row = sqlx::query(
+            "SELECT id, name, slug, created_at FROM organizations WHERE slug = $1",
+        )
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .ok_or_else(|| StorageError::NotFound(format!("org with slug '{slug}'")))?;
+
+        Ok(Organization {
+            id: row.get("id"),
+            name: row.get("name"),
+            slug: row.get("slug"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn list_orgs(&self) -> Result<Vec<Organization>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT id, name, slug, created_at FROM organizations ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| Organization {
+                id: row.get("id"),
+                name: row.get("name"),
+                slug: row.get("slug"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    async fn delete_org(&self, org_id: &Uuid) -> Result<(), StorageError> {
+        let result = sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(StorageError::NotFound(format!("org {org_id}")));
+        }
+        Ok(())
+    }
+
+    // ── Users ─────────────────────────────────────────────────────────────────
+
+    async fn create_user(&self, user: NewUser) -> Result<User, StorageError> {
+        let row = sqlx::query(
+            "INSERT INTO users (email, name)
+             VALUES ($1, $2)
+             RETURNING id, email, name, created_at",
+        )
+        .bind(&user.email)
+        .bind(&user.name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e {
+                if db_err.constraint().is_some() {
+                    return StorageError::Conflict(format!(
+                        "email '{}' already exists",
+                        user.email
+                    ));
+                }
+            }
+            StorageError::Database(e.to_string())
+        })?;
+
+        Ok(User {
+            id: row.get("id"),
+            email: row.get("email"),
+            name: row.get("name"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn get_user(&self, user_id: &Uuid) -> Result<User, StorageError> {
+        let row =
+            sqlx::query("SELECT id, email, name, created_at FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| StorageError::Database(e.to_string()))?
+                .ok_or_else(|| StorageError::NotFound(format!("user {user_id}")))?;
+
+        Ok(User {
+            id: row.get("id"),
+            email: row.get("email"),
+            name: row.get("name"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn get_user_by_email(&self, email: &str) -> Result<User, StorageError> {
+        let row =
+            sqlx::query("SELECT id, email, name, created_at FROM users WHERE email = $1")
+                .bind(email)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| StorageError::Database(e.to_string()))?
+                .ok_or_else(|| StorageError::NotFound(format!("user with email '{email}'")))?;
+
+        Ok(User {
+            id: row.get("id"),
+            email: row.get("email"),
+            name: row.get("name"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    // ── Org membership ────────────────────────────────────────────────────────
+
+    async fn add_org_member(
+        &self,
+        org_id: &Uuid,
+        user_id: &Uuid,
+        role: OrgRole,
+    ) -> Result<OrgMember, StorageError> {
+        let row = sqlx::query(
+            "INSERT INTO org_members (org_id, user_id, role)
+             VALUES ($1, $2, $3)
+             RETURNING org_id, user_id, role, created_at",
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .bind(role.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e {
+                if db_err.constraint().is_some() {
+                    return StorageError::Conflict(format!(
+                        "user {user_id} is already a member of org {org_id}"
+                    ));
+                }
+            }
+            StorageError::Database(e.to_string())
+        })?;
+
+        Ok(OrgMember {
+            org_id: row.get("org_id"),
+            user_id: row.get("user_id"),
+            role: OrgRole::from_str(row.get("role")),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn update_org_member(
+        &self,
+        org_id: &Uuid,
+        user_id: &Uuid,
+        role: OrgRole,
+    ) -> Result<OrgMember, StorageError> {
+        let row = sqlx::query(
+            "UPDATE org_members SET role = $3
+             WHERE org_id = $1 AND user_id = $2
+             RETURNING org_id, user_id, role, created_at",
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .bind(role.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .ok_or_else(|| {
+            StorageError::NotFound(format!("membership for user {user_id} in org {org_id}"))
+        })?;
+
+        Ok(OrgMember {
+            org_id: row.get("org_id"),
+            user_id: row.get("user_id"),
+            role: OrgRole::from_str(row.get("role")),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn remove_org_member(&self, org_id: &Uuid, user_id: &Uuid) -> Result<(), StorageError> {
+        let result =
+            sqlx::query("DELETE FROM org_members WHERE org_id = $1 AND user_id = $2")
+                .bind(org_id)
+                .bind(user_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(StorageError::NotFound(format!(
+                "membership for user {user_id} in org {org_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn list_org_members(&self, org_id: &Uuid) -> Result<Vec<OrgMember>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT org_id, user_id, role, created_at
+             FROM org_members WHERE org_id = $1
+             ORDER BY created_at",
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| OrgMember {
+                org_id: row.get("org_id"),
+                user_id: row.get("user_id"),
+                role: OrgRole::from_str(row.get("role")),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    // ── Repo collaborators ────────────────────────────────────────────────────
+
+    async fn add_collaborator(
+        &self,
+        repo_id: &Uuid,
+        user_id: &Uuid,
+        role: RepoRole,
+    ) -> Result<RepoCollaborator, StorageError> {
+        let row = sqlx::query(
+            "INSERT INTO repo_collaborators (repo_id, user_id, role)
+             VALUES ($1, $2, $3)
+             RETURNING repo_id, user_id, role, created_at",
+        )
+        .bind(repo_id)
+        .bind(user_id)
+        .bind(role.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e {
+                if db_err.constraint().is_some() {
+                    return StorageError::Conflict(format!(
+                        "user {user_id} is already a collaborator on repo {repo_id}"
+                    ));
+                }
+            }
+            StorageError::Database(e.to_string())
+        })?;
+
+        Ok(RepoCollaborator {
+            repo_id: row.get("repo_id"),
+            user_id: row.get("user_id"),
+            role: RepoRole::from_str(row.get("role")),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn update_collaborator(
+        &self,
+        repo_id: &Uuid,
+        user_id: &Uuid,
+        role: RepoRole,
+    ) -> Result<RepoCollaborator, StorageError> {
+        let row = sqlx::query(
+            "UPDATE repo_collaborators SET role = $3
+             WHERE repo_id = $1 AND user_id = $2
+             RETURNING repo_id, user_id, role, created_at",
+        )
+        .bind(repo_id)
+        .bind(user_id)
+        .bind(role.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .ok_or_else(|| {
+            StorageError::NotFound(format!(
+                "collaborator {user_id} on repo {repo_id}"
+            ))
+        })?;
+
+        Ok(RepoCollaborator {
+            repo_id: row.get("repo_id"),
+            user_id: row.get("user_id"),
+            role: RepoRole::from_str(row.get("role")),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn remove_collaborator(
+        &self,
+        repo_id: &Uuid,
+        user_id: &Uuid,
+    ) -> Result<(), StorageError> {
+        let result = sqlx::query(
+            "DELETE FROM repo_collaborators WHERE repo_id = $1 AND user_id = $2",
+        )
+        .bind(repo_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(StorageError::NotFound(format!(
+                "collaborator {user_id} on repo {repo_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn list_collaborators(
+        &self,
+        repo_id: &Uuid,
+    ) -> Result<Vec<RepoCollaborator>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT repo_id, user_id, role, created_at
+             FROM repo_collaborators WHERE repo_id = $1
+             ORDER BY created_at",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| RepoCollaborator {
+                repo_id: row.get("repo_id"),
+                user_id: row.get("user_id"),
+                role: RepoRole::from_str(row.get("role")),
+                created_at: row.get("created_at"),
+            })
+            .collect())
     }
 }
