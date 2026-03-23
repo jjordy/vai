@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::auth;
 use crate::clone as remote_clone;
+use crate::conflict;
 use crate::diff;
 use crate::event_log::EventLog;
 use crate::graph::{GraphSnapshot, GraphStats};
@@ -26,6 +27,7 @@ use crate::server;
 use crate::sync as remote_sync;
 use crate::version::VersionMeta;
 use crate::version;
+use crate::work_queue;
 use crate::workspace;
 use crate::workspace::WorkspaceMeta;
 
@@ -79,6 +81,9 @@ pub enum CliError {
 
     #[error("Scope history error: {0}")]
     ScopeHistory(#[from] crate::scope_history::ScopeHistoryError),
+
+    #[error("Work queue error: {0}")]
+    WorkQueue(#[from] crate::work_queue::WorkQueueError),
 
     #[error("{0}")]
     Other(String),
@@ -171,6 +176,9 @@ pub enum Commands {
     /// Manage escalations requiring human attention.
     #[command(subcommand)]
     Escalations(EscalationCommands),
+    /// Inspect and claim work from the prioritized work queue.
+    #[command(subcommand)]
+    WorkQueue(WorkQueueCommands),
     /// Launch the TUI dashboard for real-time agent oversight.
     ///
     /// Without `--server`, polls the local `.vai/` directory.
@@ -272,6 +280,24 @@ pub enum EscalationCommands {
         /// Identifier of the human resolving this escalation.
         #[arg(long, default_value = "human")]
         by: String,
+    },
+}
+
+/// Work queue subcommands.
+#[derive(Debug, Subcommand)]
+pub enum WorkQueueCommands {
+    /// List available and blocked work ranked by priority.
+    ///
+    /// Predicts which entities each open issue will touch and checks for
+    /// overlap with active workspace scopes.
+    List,
+    /// Atomically claim an issue: mark it in-progress and create a workspace.
+    ///
+    /// Re-checks for conflicts at claim time; returns an error if the issue
+    /// is no longer open or now conflicts with an active workspace.
+    Claim {
+        /// Issue ID (full UUID or 8-char prefix).
+        issue_id: String,
     },
 }
 
@@ -1691,6 +1717,86 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                                 .as_ref()
                                 .map(|r| r.label())
                                 .unwrap_or(""),
+                        );
+                    }
+                }
+            }
+        }
+        Some(Commands::WorkQueue(wq_cmd)) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+            // For local CLI, create an empty conflict engine — workspace scope
+            // tracking is a server-side concern when multiple agents run concurrently.
+            let engine = conflict::ConflictEngine::new();
+
+            match wq_cmd {
+                WorkQueueCommands::List => {
+                    let queue = work_queue::compute(&vai_dir, &engine)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&queue).unwrap());
+                    } else if queue.available_work.is_empty() && queue.blocked_work.is_empty() {
+                        println!("No open issues in the work queue.");
+                    } else {
+                        if !queue.available_work.is_empty() {
+                            println!("{}", "Available work:".green().bold());
+                            println!(
+                                "  {:<10}  {:<8}  {}",
+                                "ISSUE", "PRIORITY", "TITLE"
+                            );
+                            println!("  {}", "-".repeat(60));
+                            for item in &queue.available_work {
+                                println!(
+                                    "  {:<10}  {:<8}  {}",
+                                    &item.issue_id[..8],
+                                    item.priority,
+                                    item.title,
+                                );
+                            }
+                        }
+                        if !queue.blocked_work.is_empty() {
+                            if !queue.available_work.is_empty() {
+                                println!();
+                            }
+                            println!("{}", "Blocked work:".yellow().bold());
+                            println!(
+                                "  {:<10}  {:<8}  {}",
+                                "ISSUE", "PRIORITY", "TITLE"
+                            );
+                            println!("  {}", "-".repeat(60));
+                            for item in &queue.blocked_work {
+                                println!(
+                                    "  {:<10}  {:<8}  {}",
+                                    &item.issue_id[..8],
+                                    item.priority,
+                                    item.title,
+                                );
+                                println!("    {}", item.reason.dimmed());
+                            }
+                        }
+                    }
+                }
+                WorkQueueCommands::Claim { issue_id } => {
+                    // Resolve prefix → full UUID via the issue store.
+                    let issue_store = IssueStore::open(&vai_dir)?;
+                    let issue = resolve_issue(&issue_store, &issue_id)?;
+                    let result = work_queue::claim(&vai_dir, issue.id, &engine)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        println!(
+                            "{} Claimed issue {} → workspace {}",
+                            "✓".green(),
+                            result.issue_id[..8].cyan(),
+                            result.workspace_id[..8].cyan(),
+                        );
+                        println!("  Intent : {}", result.intent);
+                        println!(
+                            "  Scope  : {} entities across {} file(s)",
+                            result.predicted_scope.blast_radius,
+                            result.predicted_scope.files.len(),
                         );
                     }
                 }
