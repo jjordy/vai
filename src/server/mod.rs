@@ -357,6 +357,12 @@ pub(crate) struct AppState {
     /// Handlers should prefer this over direct `vai_dir`-based module calls when
     /// the required operation is covered by a storage trait.
     pub(crate) storage: crate::storage::StorageBackend,
+    /// Bootstrap admin key (plaintext).
+    ///
+    /// Set via the `VAI_ADMIN_KEY` environment variable or generated on first
+    /// startup and printed to stdout.  A request bearing this key bypasses
+    /// normal API-key validation and receives full server-admin access.
+    admin_key: String,
 }
 
 impl AppState {
@@ -392,6 +398,11 @@ pub struct AgentIdentity {
     pub key_id: String,
     /// Human-readable key name.
     pub name: String,
+    /// Whether this request was authenticated with the bootstrap admin key.
+    ///
+    /// Admin requests bypass per-repo permission checks and have full access
+    /// to all endpoints including org/user management.
+    pub is_admin: bool,
 }
 
 // ── Per-request repository context ────────────────────────────────────────────
@@ -501,12 +512,24 @@ async fn auth_middleware(
         }
     };
 
+    // Bootstrap admin key check — takes priority over per-repo API keys.
+    if key_str == state.admin_key {
+        tracing::debug!("authenticated request via bootstrap admin key");
+        request.extensions_mut().insert(AgentIdentity {
+            key_id: "admin".to_string(),
+            name: "admin".to_string(),
+            is_admin: true,
+        });
+        return next.run(request).await;
+    }
+
     match auth::validate(&state.vai_dir, &key_str) {
         Ok(Some(api_key)) => {
             tracing::debug!(agent = %api_key.name, "authenticated request");
             request.extensions_mut().insert(AgentIdentity {
                 key_id: api_key.id,
                 name: api_key.name,
+                is_admin: false,
             });
             next.run(request).await
         }
@@ -3451,6 +3474,8 @@ pub async fn start_for_testing(
         repo_lock: Arc::new(Mutex::new(())),
         storage_root: None,
         storage: crate::storage::StorageBackend::local(vai_dir),
+        // Tests use a fixed admin key so they can exercise admin-only endpoints.
+        admin_key: "vai_admin_test".to_string(),
     });
 
     let app = build_app(state);
@@ -3471,6 +3496,33 @@ pub async fn start_for_testing(
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     Ok((addr, shutdown_tx))
+}
+
+// ── Bootstrap admin key ───────────────────────────────────────────────────────
+
+/// Returns the bootstrap admin key to use for this server instance.
+///
+/// Resolution order:
+/// 1. `VAI_ADMIN_KEY` environment variable — use the provided value as-is.
+/// 2. Not set — generate a fresh `vai_admin_<uuid>` key, print it to stdout
+///    (so the operator can copy it), and return it.
+fn resolve_admin_key() -> String {
+    if let Ok(key) = std::env::var("VAI_ADMIN_KEY") {
+        if !key.is_empty() {
+            return key;
+        }
+    }
+    let generated = format!("vai_admin_{}", uuid::Uuid::new_v4().simple());
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════╗");
+    println!("║              VAI BOOTSTRAP ADMIN KEY (shown once)               ║");
+    println!("╠══════════════════════════════════════════════════════════════════╣");
+    println!("║  {}  ║", generated);
+    println!("╠══════════════════════════════════════════════════════════════════╣");
+    println!("║  Set VAI_ADMIN_KEY=<key> to reuse this key across restarts.     ║");
+    println!("╚══════════════════════════════════════════════════════════════════╝");
+    println!();
+    generated
 }
 
 // ── Public start function ─────────────────────────────────────────────────────
@@ -3511,6 +3563,8 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
         None => crate::storage::StorageBackend::local(vai_dir),
     };
 
+    let admin_key = resolve_admin_key();
+
     let state = Arc::new(AppState {
         vai_dir: vai_dir.to_owned(),
         repo_root,
@@ -3524,6 +3578,7 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
         repo_lock: Arc::new(Mutex::new(())),
         storage_root: config.storage_root.clone(),
         storage,
+        admin_key,
     });
 
     let app = build_app(state);
@@ -3645,6 +3700,7 @@ mod tests {
             repo_lock: Arc::new(Mutex::new(())),
             storage_root: None,
             storage: crate::storage::StorageBackend::local(&vai_dir),
+            admin_key: "vai_admin_test".to_string(),
         });
 
         let app = build_app(Arc::clone(&state));
@@ -5608,6 +5664,7 @@ mod tests {
             repo_lock: Arc::new(Mutex::new(())),
             storage_root: Some(storage_root),
             storage: crate::storage::StorageBackend::local(&vai_dir),
+            admin_key: "vai_admin_test".to_string(),
         });
 
         let app = build_app(Arc::clone(&state));
