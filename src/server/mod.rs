@@ -4706,6 +4706,93 @@ pub async fn start_for_testing(
     Ok((addr, shutdown_tx))
 }
 
+/// Variant of [`start_for_testing`] that uses a Postgres storage backend.
+///
+/// Connects to `database_url`, runs schema migrations, inserts the repo row
+/// derived from `vai_dir/config.toml`, then binds to a random port and
+/// returns `(addr, shutdown_tx, repo_id)`.
+///
+/// The test admin key is `"vai_admin_test"`, identical to the SQLite variant.
+///
+/// # Cleanup
+///
+/// After the test, delete the repo row with:
+/// `DELETE FROM repos WHERE id = $1` — all child rows cascade automatically.
+pub async fn start_for_testing_pg(
+    vai_dir: &Path,
+    database_url: &str,
+) -> Result<(SocketAddr, tokio::sync::oneshot::Sender<()>, uuid::Uuid), ServerError> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let repo_config = repo::read_config(vai_dir)?;
+    let repo_root = vai_dir
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+
+    // Connect to Postgres and run schema migrations.
+    let storage = crate::storage::StorageBackend::server(database_url, 5)
+        .await
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    let pg = match &storage {
+        crate::storage::StorageBackend::Server(pg) => pg.clone(),
+        _ => unreachable!(),
+    };
+
+    let migrations_path = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+    pg.migrate(migrations_path)
+        .await
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    // Insert the repo row so FK constraints on events/issues/versions are satisfied.
+    let repo_id = repo_config.repo_id;
+    sqlx::query("INSERT INTO repos (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
+        .bind(repo_id)
+        .bind(&repo_config.name)
+        .execute(pg.pool())
+        .await
+        .map_err(|e| {
+            ServerError::Io(std::io::Error::other(format!("failed to insert repo: {e}")))
+        })?;
+
+    let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
+    let state = Arc::new(AppState {
+        vai_dir: vai_dir.to_owned(),
+        repo_root,
+        started_at: Instant::now(),
+        repo_name: repo_config.name,
+        vai_version: env!("CARGO_PKG_VERSION").to_string(),
+        event_tx,
+        event_seq: Arc::new(AtomicU64::new(0)),
+        event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
+        conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
+        repo_lock: Arc::new(Mutex::new(())),
+        storage_root: None,
+        storage,
+        admin_key: "vai_admin_test".to_string(),
+    });
+
+    let app = build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                shutdown_rx.await.ok();
+            })
+            .await
+            .ok();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    Ok((addr, shutdown_tx, repo_id))
+}
+
 // ── Bootstrap admin key ───────────────────────────────────────────────────────
 
 /// Returns the bootstrap admin key to use for this server instance.
