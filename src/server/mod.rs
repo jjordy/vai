@@ -125,7 +125,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use crate::auth;
 use crate::conflict;
-use crate::storage::EventStore as _;
+use crate::storage::{EventFilter, EventStore as _};
 use crate::escalation::EscalationStatus;
 use crate::event_log::{EventKind, EventLog};
 use crate::graph::GraphSnapshot;
@@ -1536,6 +1536,25 @@ async fn ws_events_handler(
     }
 }
 
+/// Converts a WebSocket [`SubscriptionFilter`] into a storage [`EventFilter`]
+/// so filter conditions can be pushed to the database layer.
+///
+/// Workspace IDs that cannot be parsed as UUIDs are silently dropped — they
+/// cannot match any stored row.
+fn subscription_to_event_filter(sub: &SubscriptionFilter) -> EventFilter {
+    let workspace_ids = sub
+        .workspaces
+        .iter()
+        .filter_map(|s| s.parse::<uuid::Uuid>().ok())
+        .collect();
+    EventFilter {
+        event_types: sub.event_types.clone(),
+        workspace_ids,
+        entity_ids: sub.entities.clone(),
+        paths: sub.paths.clone(),
+    }
+}
+
 /// Returns `true` if `event` passes all non-empty dimensions of `filter`.
 fn filter_matches(filter: &SubscriptionFilter, event: &BroadcastEvent) -> bool {
     // Event-type filter.
@@ -1808,11 +1827,17 @@ async fn handle_ws_connection_pg(
                             );
 
                             // On the first subscribe message of a reconnection,
-                            // replay any events the client missed.
+                            // replay any events the client missed — applying the
+                            // subscription filter in the database query.
                             if !replay_done_for_recv.swap(true, Ordering::Relaxed) {
                                 if let Some(last_id) = last_event_id {
+                                    let ev_filter = subscription_to_event_filter(&subscribe);
                                     match pg_for_recv
-                                        .query_since_id(&repo_id, last_id as i64)
+                                        .query_since_id_filtered(
+                                            &repo_id,
+                                            last_id as i64,
+                                            &ev_filter,
+                                        )
                                         .await
                                     {
                                         Ok(events) => {
@@ -1820,24 +1845,22 @@ async fn handle_ws_connection_pg(
                                             let mut max_id = last_id;
                                             for event in events {
                                                 let bc = event_to_broadcast(event);
-                                                if filter_matches(&subscribe, &bc) {
-                                                    match serde_json::to_string(&bc) {
-                                                        Ok(json) => {
-                                                            if sender
-                                                                .send(Message::Text(json))
-                                                                .await
-                                                                .is_err()
-                                                            {
-                                                                return;
-                                                            }
-                                                        }
-                                                        Err(e) => tracing::error!(
-                                                            "replay serialize error: {e}"
-                                                        ),
-                                                    }
-                                                }
                                                 if bc.event_id > max_id {
                                                     max_id = bc.event_id;
+                                                }
+                                                match serde_json::to_string(&bc) {
+                                                    Ok(json) => {
+                                                        if sender
+                                                            .send(Message::Text(json))
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            return;
+                                                        }
+                                                    }
+                                                    Err(e) => tracing::error!(
+                                                        "replay serialize error: {e}"
+                                                    ),
                                                 }
                                             }
                                             // Advance the cursor past replayed events.
@@ -1897,10 +1920,13 @@ async fn handle_ws_connection_pg(
 
         // Payload format: "<repo_id>:<event_id>" — lightweight pointer only.
         let payload = notification.payload();
-        let Some((repo_str, _)) = payload.split_once(':') else {
+        let Some((repo_str, event_id_str)) = payload.split_once(':') else {
             continue;
         };
         let Ok(notif_repo) = repo_str.parse::<uuid::Uuid>() else {
+            continue;
+        };
+        let Ok(notif_event_id) = event_id_str.parse::<i64>() else {
             continue;
         };
         // Only handle NOTIFYs for the repo this client is subscribed to.
@@ -1917,35 +1943,42 @@ async fn handle_ws_connection_pg(
             continue;
         };
 
-        // Query all events since the last one we delivered.
+        // Build a storage-level filter from the subscription so Postgres can
+        // apply it in the query rather than loading all events into memory.
+        let ev_filter = subscription_to_event_filter(sub);
+
+        // Query only matching events since the last delivered ID.
         let since = last_delivered_id.load(Ordering::Relaxed) as i64;
-        let events = match pg.query_since_id(&repo_id, since).await {
+        let events = match pg.query_since_id_filtered(&repo_id, since, &ev_filter).await {
             Ok(e) => e,
             Err(e) => {
-                tracing::error!("query_since_id failed: {e}");
+                tracing::error!("query_since_id_filtered failed: {e}");
+                // Still advance cursor so a transient error doesn't replay
+                // non-matching events on the next NOTIFY.
+                last_delivered_id.fetch_max(notif_event_id as u64, Ordering::Relaxed);
                 continue;
             }
         };
 
         for event in events {
             let bc = event_to_broadcast(event);
-            // Advance cursor regardless of filter so we never re-deliver.
-            last_delivered_id.fetch_max(bc.event_id, Ordering::Relaxed);
-
-            if filter_matches(sub, &bc) {
-                let json = match serde_json::to_string(&bc) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("serialize event failed: {e}");
-                        continue;
-                    }
-                };
-                if ws_tx.lock().await.send(Message::Text(json)).await.is_err() {
-                    recv_task.abort();
-                    return;
+            let json = match serde_json::to_string(&bc) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("serialize event failed: {e}");
+                    continue;
                 }
+            };
+            if ws_tx.lock().await.send(Message::Text(json)).await.is_err() {
+                recv_task.abort();
+                return;
             }
         }
+
+        // Advance cursor to the notified event ID so subsequent NOTIFYs don't
+        // re-scan events that were already considered (even if they didn't match
+        // the filter).
+        last_delivered_id.fetch_max(notif_event_id as u64, Ordering::Relaxed);
     }
 
     recv_task.abort();

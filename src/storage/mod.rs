@@ -169,6 +169,71 @@ pub struct FileMetadata {
 
 // ── EventStore ────────────────────────────────────────────────────────────────
 
+/// Subscription filter used to narrow event queries to only the events a
+/// client cares about.
+///
+/// All non-empty fields are ANDed together; within each field the values are
+/// ORed (i.e. "event type is A or B, AND workspace is W1 or W2").
+/// An empty `Vec` for any field means "no restriction on that dimension".
+#[derive(Debug, Clone, Default)]
+pub struct EventFilter {
+    /// If non-empty, only return events whose `event_type` is one of these.
+    pub event_types: Vec<String>,
+    /// If non-empty, only return events whose `workspace_id` is one of these.
+    pub workspace_ids: Vec<Uuid>,
+    /// If non-empty, only return events whose serialised payload contains at
+    /// least one of these strings (used for entity-ID filtering).
+    pub entity_ids: Vec<String>,
+    /// If non-empty, only return events whose serialised payload contains at
+    /// least one of these path strings.
+    pub paths: Vec<String>,
+}
+
+impl EventFilter {
+    /// Returns `true` when every dimension is unconstrained (no filtering).
+    pub fn is_empty(&self) -> bool {
+        self.event_types.is_empty()
+            && self.workspace_ids.is_empty()
+            && self.entity_ids.is_empty()
+            && self.paths.is_empty()
+    }
+
+    /// Returns `true` if `event` satisfies all active filter dimensions.
+    pub fn matches(&self, event: &Event) -> bool {
+        if !self.event_types.is_empty()
+            && !self
+                .event_types
+                .iter()
+                .any(|t| t == event.kind.event_type())
+        {
+            return false;
+        }
+
+        if !self.workspace_ids.is_empty() {
+            match event.kind.workspace_id() {
+                Some(ws) if self.workspace_ids.contains(&ws) => {}
+                _ => return false,
+            }
+        }
+
+        if !self.entity_ids.is_empty() {
+            let data = serde_json::to_string(&event.kind).unwrap_or_default();
+            if !self.entity_ids.iter().any(|eid| data.contains(eid.as_str())) {
+                return false;
+            }
+        }
+
+        if !self.paths.is_empty() {
+            let data = serde_json::to_string(&event.kind).unwrap_or_default();
+            if !self.paths.iter().any(|p| data.contains(p.as_str())) {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
 /// Append-only event log storage.
 ///
 /// The event log is vai's source of truth. Every action in the system is
@@ -208,6 +273,25 @@ pub trait EventStore: Send + Sync {
         repo_id: &Uuid,
         last_id: i64,
     ) -> Result<Vec<Event>, StorageError>;
+
+    /// Returns events with ID greater than `last_id` that match `filter`.
+    ///
+    /// Implementations should push the filter conditions to the storage layer
+    /// rather than loading all events and filtering in memory.  The default
+    /// implementation falls back to [`query_since_id`] + in-memory filtering
+    /// for backends that do not support server-side filtering.
+    async fn query_since_id_filtered(
+        &self,
+        repo_id: &Uuid,
+        last_id: i64,
+        filter: &EventFilter,
+    ) -> Result<Vec<Event>, StorageError> {
+        if filter.is_empty() {
+            return self.query_since_id(repo_id, last_id).await;
+        }
+        let events = self.query_since_id(repo_id, last_id).await?;
+        Ok(events.into_iter().filter(|e| filter.matches(e)).collect())
+    }
 
     /// Returns the total number of events for the repo.
     async fn count(&self, repo_id: &Uuid) -> Result<u64, StorageError>;

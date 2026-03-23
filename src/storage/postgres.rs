@@ -39,10 +39,10 @@ use crate::version::VersionMeta;
 use crate::workspace::{WorkspaceMeta, WorkspaceStatus};
 
 use super::{
-    AuthStore, EscalationStore, EventStore, FileMetadata, FileStore, GraphStore, IssueStore,
-    IssueUpdate, NewEscalation, NewIssue, NewOrg, NewUser, NewVersion, NewWorkspace, OrgMember,
-    OrgRole, OrgStore, Organization, RepoCollaborator, RepoRole, StorageError, User, VersionStore,
-    WorkspaceStore, WorkspaceUpdate,
+    AuthStore, EscalationStore, EventFilter, EventStore, FileMetadata, FileStore, GraphStore,
+    IssueStore, IssueUpdate, NewEscalation, NewIssue, NewOrg, NewUser, NewVersion, NewWorkspace,
+    OrgMember, OrgRole, OrgStore, Organization, RepoCollaborator, RepoRole, StorageError, User,
+    VersionStore, WorkspaceStore, WorkspaceUpdate,
 };
 
 // ── PostgresStorage ───────────────────────────────────────────────────────────
@@ -247,6 +247,79 @@ impl EventStore for PostgresStorage {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        rows_to_events(rows)
+    }
+
+    /// Server-side filtered query — pushes all active filter dimensions to
+    /// Postgres so only matching rows are transferred over the wire.
+    ///
+    /// Dimensions applied in SQL:
+    /// - `event_types` → `event_type = ANY($n)`
+    /// - `workspace_ids` → `workspace_id = ANY($n)`
+    /// - `entity_ids` / `paths` → `payload::text LIKE '%…%'` OR-chain
+    async fn query_since_id_filtered(
+        &self,
+        repo_id: &Uuid,
+        last_id: i64,
+        filter: &EventFilter,
+    ) -> Result<Vec<Event>, StorageError> {
+        if filter.is_empty() {
+            return self.query_since_id(repo_id, last_id).await;
+        }
+
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, payload, created_at FROM events WHERE repo_id = ",
+        );
+        qb.push_bind(repo_id);
+        qb.push(" AND id > ");
+        qb.push_bind(last_id);
+
+        if !filter.event_types.is_empty() {
+            qb.push(" AND event_type = ANY(");
+            qb.push_bind(filter.event_types.clone());
+            qb.push(")");
+        }
+
+        if !filter.workspace_ids.is_empty() {
+            qb.push(" AND workspace_id = ANY(");
+            qb.push_bind(filter.workspace_ids.clone());
+            qb.push(")");
+        }
+
+        // Entity IDs: at least one must appear (substring) in the payload.
+        if !filter.entity_ids.is_empty() {
+            qb.push(" AND (");
+            for (i, eid) in filter.entity_ids.iter().enumerate() {
+                if i > 0 {
+                    qb.push(" OR ");
+                }
+                qb.push("payload::text LIKE ");
+                qb.push_bind(format!("%{eid}%"));
+            }
+            qb.push(")");
+        }
+
+        // Paths: at least one must appear (substring) in the payload.
+        if !filter.paths.is_empty() {
+            qb.push(" AND (");
+            for (i, path) in filter.paths.iter().enumerate() {
+                if i > 0 {
+                    qb.push(" OR ");
+                }
+                qb.push("payload::text LIKE ");
+                qb.push_bind(format!("%{path}%"));
+            }
+            qb.push(")");
+        }
+
+        qb.push(" ORDER BY id");
+
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
 
         rows_to_events(rows)
     }
