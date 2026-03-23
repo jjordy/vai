@@ -677,6 +677,18 @@ pub trait OrgStore: Send + Sync {
     /// Lists all members of an organization.
     async fn list_org_members(&self, org_id: &Uuid) -> Result<Vec<OrgMember>, StorageError>;
 
+    // ── Org-scoped repo lookup ────────────────────────────────────────────────
+
+    /// Resolves a repository's UUID from its org and name.
+    ///
+    /// Used by collaborator endpoints that address repos as
+    /// `/api/orgs/:org/repos/:repo/collaborators`.
+    async fn get_repo_id_in_org(
+        &self,
+        org_id: &Uuid,
+        repo_name: &str,
+    ) -> Result<Uuid, StorageError>;
+
     // ── Repo collaborators ────────────────────────────────────────────────────
 
     /// Grants a user a role on a specific repository.

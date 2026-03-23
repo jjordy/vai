@@ -1526,6 +1526,29 @@ impl OrgStore for PostgresStorage {
             .collect())
     }
 
+    // ── Org-scoped repo lookup ────────────────────────────────────────────────
+
+    async fn get_repo_id_in_org(
+        &self,
+        org_id: &Uuid,
+        repo_name: &str,
+    ) -> Result<Uuid, StorageError> {
+        let row = sqlx::query("SELECT id FROM repos WHERE org_id = $1 AND name = $2")
+            .bind(org_id)
+            .bind(repo_name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        match row {
+            Some(r) => Ok(r.get::<Uuid, _>("id")),
+            None => Err(StorageError::NotFound(format!(
+                "repo '{}' not found in org",
+                repo_name
+            ))),
+        }
+    }
+
     // ── Repo collaborators ────────────────────────────────────────────────────
 
     async fn add_collaborator(

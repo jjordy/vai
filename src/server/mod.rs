@@ -49,6 +49,10 @@
 //!   - `GET /api/orgs/:org/members` — list members of an organization
 //!   - `PATCH /api/orgs/:org/members/:user` — update a member's role
 //!   - `DELETE /api/orgs/:org/members/:user` — remove a member from an organization
+//!   - `POST /api/orgs/:org/repos/:repo/collaborators` — add a collaborator to a repo
+//!   - `GET /api/orgs/:org/repos/:repo/collaborators` — list repo collaborators
+//!   - `PATCH /api/orgs/:org/repos/:repo/collaborators/:user` — change collaborator role
+//!   - `DELETE /api/orgs/:org/repos/:repo/collaborators/:user` — remove a collaborator
 //!
 //! ## Multi-Repo Endpoints (`/api/repos/:repo/`)
 //!   - `GET /api/repos/:repo/status` — per-repo health (same fields as `/api/status`)
@@ -3282,6 +3286,110 @@ async fn remove_org_member_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Repo collaborator handlers (PRD 10.3) ─────────────────────────────────────
+
+/// Request body for `POST /api/orgs/:org/repos/:repo/collaborators`.
+#[derive(Debug, Deserialize)]
+struct AddCollaboratorRequest {
+    /// User UUID to add as a collaborator.
+    user_id: uuid::Uuid,
+    /// Role on the repository: `"owner"`, `"admin"`, `"write"`, or `"read"`.
+    role: String,
+}
+
+/// Request body for `PATCH /api/orgs/:org/repos/:repo/collaborators/:user`.
+#[derive(Debug, Deserialize)]
+struct UpdateCollaboratorRequest {
+    /// New role: `"owner"`, `"admin"`, `"write"`, or `"read"`.
+    role: String,
+}
+
+/// Response body for repo collaborator endpoints.
+#[derive(Debug, Serialize)]
+struct CollaboratorResponse {
+    repo_id: String,
+    user_id: String,
+    role: String,
+    created_at: String,
+}
+
+impl From<crate::storage::RepoCollaborator> for CollaboratorResponse {
+    fn from(c: crate::storage::RepoCollaborator) -> Self {
+        CollaboratorResponse {
+            repo_id: c.repo_id.to_string(),
+            user_id: c.user_id.to_string(),
+            role: c.role.as_str().to_string(),
+            created_at: c.created_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Parses a repo role string, returning a 400 error for unknown values.
+fn parse_repo_role(s: &str) -> Result<crate::storage::RepoRole, ApiError> {
+    use crate::storage::RepoRole;
+    match s {
+        "owner" => Ok(RepoRole::Owner),
+        "admin" => Ok(RepoRole::Admin),
+        "write" => Ok(RepoRole::Write),
+        "read" => Ok(RepoRole::Read),
+        other => Err(ApiError::bad_request(format!(
+            "unknown repo role `{other}`; expected one of: owner, admin, write, read"
+        ))),
+    }
+}
+
+/// `POST /api/orgs/:org/repos/:repo/collaborators` — adds a collaborator to a repo.
+async fn add_collaborator_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath((org_slug, repo_name)): AxumPath<(String, String)>,
+    Json(body): Json<AddCollaboratorRequest>,
+) -> Result<(StatusCode, Json<CollaboratorResponse>), ApiError> {
+    let role = parse_repo_role(&body.role)?;
+    let orgs = state.storage.orgs();
+    let org = orgs.get_org_by_slug(&org_slug).await.map_err(ApiError::from)?;
+    let repo_id = orgs.get_repo_id_in_org(&org.id, &repo_name).await.map_err(ApiError::from)?;
+    let collaborator = orgs.add_collaborator(&repo_id, &body.user_id, role).await.map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(CollaboratorResponse::from(collaborator))))
+}
+
+/// `GET /api/orgs/:org/repos/:repo/collaborators` — lists all collaborators on a repo.
+async fn list_collaborators_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath((org_slug, repo_name)): AxumPath<(String, String)>,
+) -> Result<Json<Vec<CollaboratorResponse>>, ApiError> {
+    let orgs = state.storage.orgs();
+    let org = orgs.get_org_by_slug(&org_slug).await.map_err(ApiError::from)?;
+    let repo_id = orgs.get_repo_id_in_org(&org.id, &repo_name).await.map_err(ApiError::from)?;
+    let collaborators = orgs.list_collaborators(&repo_id).await.map_err(ApiError::from)?;
+    Ok(Json(collaborators.into_iter().map(CollaboratorResponse::from).collect()))
+}
+
+/// `PATCH /api/orgs/:org/repos/:repo/collaborators/:user` — updates a collaborator's role.
+async fn update_collaborator_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath((org_slug, repo_name, user_id)): AxumPath<(String, String, uuid::Uuid)>,
+    Json(body): Json<UpdateCollaboratorRequest>,
+) -> Result<Json<CollaboratorResponse>, ApiError> {
+    let role = parse_repo_role(&body.role)?;
+    let orgs = state.storage.orgs();
+    let org = orgs.get_org_by_slug(&org_slug).await.map_err(ApiError::from)?;
+    let repo_id = orgs.get_repo_id_in_org(&org.id, &repo_name).await.map_err(ApiError::from)?;
+    let collaborator = orgs.update_collaborator(&repo_id, &user_id, role).await.map_err(ApiError::from)?;
+    Ok(Json(CollaboratorResponse::from(collaborator)))
+}
+
+/// `DELETE /api/orgs/:org/repos/:repo/collaborators/:user` — removes a collaborator from a repo.
+async fn remove_collaborator_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath((org_slug, repo_name, user_id)): AxumPath<(String, String, uuid::Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    let orgs = state.storage.orgs();
+    let org = orgs.get_org_by_slug(&org_slug).await.map_err(ApiError::from)?;
+    let repo_id = orgs.get_repo_id_in_org(&org.id, &repo_name).await.map_err(ApiError::from)?;
+    orgs.remove_collaborator(&repo_id, &user_id).await.map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -3369,6 +3477,23 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
             axum::routing::patch(update_org_member_handler),
         )
         .route("/api/orgs/:org/members/:user", delete(remove_org_member_handler))
+        // Repository collaborator endpoints (PRD 10.3).
+        .route(
+            "/api/orgs/:org/repos/:repo/collaborators",
+            post(add_collaborator_handler),
+        )
+        .route(
+            "/api/orgs/:org/repos/:repo/collaborators",
+            get(list_collaborators_handler),
+        )
+        .route(
+            "/api/orgs/:org/repos/:repo/collaborators/:user",
+            axum::routing::patch(update_collaborator_handler),
+        )
+        .route(
+            "/api/orgs/:org/repos/:repo/collaborators/:user",
+            delete(remove_collaborator_handler),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
