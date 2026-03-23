@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tree_sitter::{Language, Node, Parser};
+use tree_sitter_typescript::{LANGUAGE_TSX, LANGUAGE_TYPESCRIPT};
 
 // ── Error types ───────────────────────────────────────────────────────────────
 
@@ -45,13 +46,14 @@ pub enum GraphError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
+    // ── Rust ──────────────────────────────────────────────────────────────────
     /// A standalone function or free function.
     Function,
-    /// A method defined inside an `impl` block.
+    /// A method defined inside an `impl` block or class.
     Method,
     /// A struct definition.
     Struct,
-    /// An enum definition.
+    /// An enum definition (Rust or TypeScript).
     Enum,
     /// A trait definition.
     Trait,
@@ -59,8 +61,21 @@ pub enum EntityKind {
     Impl,
     /// A module (`mod foo { ... }` or `mod foo;`).
     Module,
-    /// A `use` import statement.
+    /// A `use` import statement (Rust).
     UseStatement,
+    // ── TypeScript / JavaScript ────────────────────────────────────────────
+    /// A class declaration.
+    Class,
+    /// An interface declaration.
+    Interface,
+    /// A type alias (`type Foo = ...`).
+    TypeAlias,
+    /// A React component (function or arrow function returning JSX).
+    Component,
+    /// A custom hook (function whose name starts with `use`).
+    Hook,
+    /// An export statement (`export { ... }` or `export default ...`).
+    ExportStatement,
 }
 
 impl EntityKind {
@@ -75,6 +90,12 @@ impl EntityKind {
             EntityKind::Impl => "impl",
             EntityKind::Module => "module",
             EntityKind::UseStatement => "use_statement",
+            EntityKind::Class => "class",
+            EntityKind::Interface => "interface",
+            EntityKind::TypeAlias => "type_alias",
+            EntityKind::Component => "component",
+            EntityKind::Hook => "hook",
+            EntityKind::ExportStatement => "export_statement",
         }
     }
 
@@ -88,6 +109,12 @@ impl EntityKind {
             "impl" => Some(EntityKind::Impl),
             "module" => Some(EntityKind::Module),
             "use_statement" => Some(EntityKind::UseStatement),
+            "class" => Some(EntityKind::Class),
+            "interface" => Some(EntityKind::Interface),
+            "type_alias" => Some(EntityKind::TypeAlias),
+            "component" => Some(EntityKind::Component),
+            "hook" => Some(EntityKind::Hook),
+            "export_statement" => Some(EntityKind::ExportStatement),
             _ => None,
         }
     }
@@ -139,10 +166,14 @@ impl Entity {
 pub enum RelationshipKind {
     /// A parent entity contains a child entity (e.g., `impl` contains `method`).
     Contains,
-    /// One entity imports another (via a `use` statement).
+    /// One entity imports another (via a `use` or `import` statement).
     Imports,
     /// One entity calls another (best-effort, based on identifier matching).
     Calls,
+    /// A class implements an interface (`implements` clause in TypeScript).
+    Implements,
+    /// A class or interface extends another (`extends` clause).
+    Extends,
 }
 
 impl RelationshipKind {
@@ -151,6 +182,8 @@ impl RelationshipKind {
             RelationshipKind::Contains => "contains",
             RelationshipKind::Imports => "imports",
             RelationshipKind::Calls => "calls",
+            RelationshipKind::Implements => "implements",
+            RelationshipKind::Extends => "extends",
         }
     }
 
@@ -159,6 +192,8 @@ impl RelationshipKind {
             "contains" => Some(RelationshipKind::Contains),
             "imports" => Some(RelationshipKind::Imports),
             "calls" => Some(RelationshipKind::Calls),
+            "implements" => Some(RelationshipKind::Implements),
+            "extends" => Some(RelationshipKind::Extends),
             _ => None,
         }
     }
@@ -611,10 +646,11 @@ impl GraphSnapshot {
 
     /// Re-parses a single file and updates the graph with the new entities.
     ///
+    /// Dispatches to the appropriate language parser based on the file extension.
     /// All existing entities for the file are removed first.
     pub fn update_file(&self, file_path: &str, source: &[u8]) -> Result<ParseStats, GraphError> {
         self.remove_file(file_path)?;
-        let (entities, relationships) = parse_rust_source(file_path, source)?;
+        let (entities, relationships) = parse_source_file(file_path, source)?;
         let count = entities.len();
         for entity in &entities {
             self.upsert_entity(entity)?;
@@ -1120,6 +1156,547 @@ fn find_node_at_range<'a>(node: Node<'a>, start: usize, end: usize) -> Option<No
     None
 }
 
+// ── Language dispatcher ───────────────────────────────────────────────────────
+
+/// Parses a source file using the appropriate grammar for its extension.
+///
+/// Supported extensions:
+/// - `.rs` → Rust
+/// - `.ts`, `.js` → TypeScript
+/// - `.tsx`, `.jsx` → TSX
+pub fn parse_source_file(
+    file_path: &str,
+    source: &[u8],
+) -> Result<(Vec<Entity>, Vec<Relationship>), GraphError> {
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "rs" => parse_rust_source(file_path, source),
+        "ts" | "js" => parse_typescript_source(file_path, source, false),
+        "tsx" | "jsx" => parse_typescript_source(file_path, source, true),
+        _ => Ok((vec![], vec![])),
+    }
+}
+
+// ── TypeScript / TSX parser ───────────────────────────────────────────────────
+
+/// Parses a TypeScript or TSX source file and extracts all entities and relationships.
+///
+/// When `tsx` is `true`, uses the TSX grammar (which understands JSX syntax).
+pub fn parse_typescript_source(
+    file_path: &str,
+    source: &[u8],
+    tsx: bool,
+) -> Result<(Vec<Entity>, Vec<Relationship>), GraphError> {
+    let language: Language = if tsx {
+        LANGUAGE_TSX.into()
+    } else {
+        LANGUAGE_TYPESCRIPT.into()
+    };
+    let mut parser = Parser::new();
+    parser
+        .set_language(&language)
+        .map_err(|e| GraphError::Language(e.to_string()))?;
+
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| GraphError::Parse(format!("failed to parse {file_path}")))?;
+
+    let mut entities: Vec<Entity> = Vec::new();
+    let mut relationships: Vec<Relationship> = Vec::new();
+    let mut parent_stack: Vec<(String, String)> = Vec::new();
+
+    extract_ts_entities(
+        tree.root_node(),
+        source,
+        file_path,
+        &mut parent_stack,
+        &mut entities,
+        &mut relationships,
+    );
+
+    // Second pass: build Calls relationships.
+    build_ts_calls_relationships(
+        tree.root_node(),
+        source,
+        file_path,
+        &entities,
+        &mut relationships,
+    );
+
+    Ok((entities, relationships))
+}
+
+/// Recursively extracts entities from a TypeScript/TSX tree-sitter node.
+fn extract_ts_entities(
+    node: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    parent_stack: &mut Vec<(String, String)>,
+    entities: &mut Vec<Entity>,
+    relationships: &mut Vec<Relationship>,
+) {
+    match node.kind() {
+        "program" => {
+            // Root node: recurse into all top-level statements.
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                extract_ts_entities(child, source, file_path, parent_stack, entities, relationships);
+            }
+        }
+        "function_declaration" => {
+            if let Some(entity) = extract_ts_function(node, source, file_path, parent_stack) {
+                add_contains_rel(parent_stack, &entity.id, relationships);
+                let eid = entity.id.clone();
+                let eqn = entity.qualified_name.clone();
+                entities.push(entity);
+                // Recurse into the function body for nested items.
+                if let Some(body) = node.child_by_field_name("body") {
+                    parent_stack.push((eid, eqn));
+                    let mut cursor = body.walk();
+                    for child in body.named_children(&mut cursor) {
+                        extract_ts_entities(child, source, file_path, parent_stack, entities, relationships);
+                    }
+                    parent_stack.pop();
+                }
+            }
+        }
+        "lexical_declaration" | "variable_declaration" => {
+            // `const foo = () => {}` or `const Component = () => <div/>`
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "variable_declarator" {
+                    if let Some(entity) =
+                        extract_ts_variable_declarator(child, source, file_path, parent_stack)
+                    {
+                        add_contains_rel(parent_stack, &entity.id, relationships);
+                        entities.push(entity);
+                    }
+                }
+            }
+        }
+        "class_declaration" => {
+            if let Some(entity) =
+                extract_ts_class(node, source, file_path, parent_stack, relationships)
+            {
+                add_contains_rel(parent_stack, &entity.id, relationships);
+                let eid = entity.id.clone();
+                let eqn = entity.qualified_name.clone();
+                entities.push(entity);
+                // Recurse into class body for methods.
+                if let Some(body) = node.child_by_field_name("body") {
+                    parent_stack.push((eid, eqn));
+                    let mut cursor = body.walk();
+                    for child in body.named_children(&mut cursor) {
+                        extract_ts_entities(child, source, file_path, parent_stack, entities, relationships);
+                    }
+                    parent_stack.pop();
+                }
+            }
+        }
+        "method_definition" => {
+            if let Some(entity) = extract_ts_method(node, source, file_path, parent_stack) {
+                add_contains_rel(parent_stack, &entity.id, relationships);
+                entities.push(entity);
+            }
+        }
+        "interface_declaration" => {
+            if let Some(entity) = extract_ts_named(
+                node,
+                source,
+                file_path,
+                parent_stack,
+                EntityKind::Interface,
+            ) {
+                add_contains_rel(parent_stack, &entity.id, relationships);
+                entities.push(entity);
+            }
+        }
+        "type_alias_declaration" => {
+            if let Some(entity) = extract_ts_named(
+                node,
+                source,
+                file_path,
+                parent_stack,
+                EntityKind::TypeAlias,
+            ) {
+                add_contains_rel(parent_stack, &entity.id, relationships);
+                entities.push(entity);
+            }
+        }
+        "enum_declaration" => {
+            if let Some(entity) =
+                extract_ts_named(node, source, file_path, parent_stack, EntityKind::Enum)
+            {
+                add_contains_rel(parent_stack, &entity.id, relationships);
+                entities.push(entity);
+            }
+        }
+        "import_statement" => {
+            if let Some(entity) = extract_ts_import(node, source, file_path, parent_stack) {
+                add_contains_rel(parent_stack, &entity.id, relationships);
+                entities.push(entity);
+            }
+        }
+        "export_statement" => {
+            // Export statements may wrap declarations; recurse into them first,
+            // then record the export entity itself.
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                match child.kind() {
+                    "function_declaration"
+                    | "class_declaration"
+                    | "interface_declaration"
+                    | "type_alias_declaration"
+                    | "enum_declaration"
+                    | "lexical_declaration"
+                    | "variable_declaration" => {
+                        extract_ts_entities(
+                            child,
+                            source,
+                            file_path,
+                            parent_stack,
+                            entities,
+                            relationships,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(entity) = extract_ts_export(node, source, file_path, parent_stack) {
+                add_contains_rel(parent_stack, &entity.id, relationships);
+                entities.push(entity);
+            }
+        }
+        _ => {
+            // For other node kinds, recurse into children to catch nested declarations.
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                extract_ts_entities(child, source, file_path, parent_stack, entities, relationships);
+            }
+        }
+    }
+}
+
+/// Determines whether a node's subtree contains a JSX element (heuristic for component detection).
+fn subtree_has_jsx(node: Node<'_>) -> bool {
+    match node.kind() {
+        "jsx_element" | "jsx_self_closing_element" | "jsx_fragment" => return true,
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if subtree_has_jsx(child) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extracts a `function_declaration` as Function, Hook, or Component.
+fn extract_ts_function(
+    node: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    parent_stack: &[(String, String)],
+) -> Option<Entity> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(name_node, source)?;
+    let kind = ts_function_kind(&name, node);
+    let qualified_name = qualify(&name, parent_stack);
+    let id = Entity::compute_id(file_path, &qualified_name);
+    let parent_entity = parent_stack.last().map(|(id, _)| id.clone());
+    Some(Entity {
+        id,
+        kind,
+        name,
+        qualified_name,
+        file_path: file_path.to_owned(),
+        byte_range: (node.start_byte(), node.end_byte()),
+        line_range: (node.start_position().row + 1, node.end_position().row + 1),
+        parent_entity,
+    })
+}
+
+/// Determines the EntityKind for a named function based on name convention and JSX content.
+fn ts_function_kind(name: &str, node: Node<'_>) -> EntityKind {
+    // Hooks: start with lowercase `use` followed by an uppercase letter or end of name.
+    if name.starts_with("use")
+        && name.len() > 3
+        && name.chars().nth(3).map(|c| c.is_uppercase()).unwrap_or(false)
+    {
+        return EntityKind::Hook;
+    }
+    // Components: PascalCase and returns JSX.
+    if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) && subtree_has_jsx(node) {
+        return EntityKind::Component;
+    }
+    EntityKind::Function
+}
+
+/// Extracts a `variable_declarator` node as Function, Hook, or Component (arrow functions).
+fn extract_ts_variable_declarator(
+    node: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    parent_stack: &[(String, String)],
+) -> Option<Entity> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(name_node, source)?;
+    let value_node = node.child_by_field_name("value")?;
+    // Only extract arrow functions and function expressions.
+    if !matches!(value_node.kind(), "arrow_function" | "function_expression") {
+        return None;
+    }
+    let kind = ts_function_kind(&name, value_node);
+    let qualified_name = qualify(&name, parent_stack);
+    let id = Entity::compute_id(file_path, &qualified_name);
+    let parent_entity = parent_stack.last().map(|(id, _)| id.clone());
+    Some(Entity {
+        id,
+        kind,
+        name,
+        qualified_name,
+        file_path: file_path.to_owned(),
+        byte_range: (node.start_byte(), node.end_byte()),
+        line_range: (node.start_position().row + 1, node.end_position().row + 1),
+        parent_entity,
+    })
+}
+
+/// Extracts a `class_declaration` as a Class entity, also recording Extends/Implements relationships.
+fn extract_ts_class(
+    node: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    parent_stack: &[(String, String)],
+    relationships: &mut Vec<Relationship>,
+) -> Option<Entity> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(name_node, source)?;
+    let qualified_name = qualify(&name, parent_stack);
+    let id = Entity::compute_id(file_path, &qualified_name);
+    let parent_entity = parent_stack.last().map(|(id, _)| id.clone());
+
+    let entity = Entity {
+        id: id.clone(),
+        kind: EntityKind::Class,
+        name,
+        qualified_name,
+        file_path: file_path.to_owned(),
+        byte_range: (node.start_byte(), node.end_byte()),
+        line_range: (node.start_position().row + 1, node.end_position().row + 1),
+        parent_entity,
+    };
+
+    // Detect `extends` and `implements` clauses in the class heritage.
+    if let Some(heritage) = node.child_by_field_name("body") {
+        // Heritage is a sibling of body; scan siblings directly on the class node.
+        let _ = heritage; // used only as a marker that body exists
+    }
+    // Walk all named children to find class_heritage nodes.
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "class_heritage" => {
+                extract_ts_heritage(child, source, &id, file_path, relationships);
+            }
+            _ => {}
+        }
+    }
+
+    Some(entity)
+}
+
+/// Extracts `extends` and `implements` relationships from a class heritage node.
+fn extract_ts_heritage(
+    node: Node<'_>,
+    source: &[u8],
+    class_id: &str,
+    file_path: &str,
+    relationships: &mut Vec<Relationship>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "extends_clause" => {
+                // The referenced name becomes the target entity.
+                if let Some(value_node) = child.child_by_field_name("value") {
+                    if let Some(target_name) = node_text(value_node, source) {
+                        let target_id = Entity::compute_id(file_path, &target_name);
+                        relationships.push(Relationship::new(
+                            RelationshipKind::Extends,
+                            class_id,
+                            &target_id,
+                        ));
+                    }
+                }
+            }
+            "implements_clause" => {
+                // May have multiple implemented interfaces.
+                let mut ic = child.walk();
+                for iface in child.named_children(&mut ic) {
+                    if let Some(iface_name) = node_text(iface, source) {
+                        let target_id = Entity::compute_id(file_path, &iface_name);
+                        relationships.push(Relationship::new(
+                            RelationshipKind::Implements,
+                            class_id,
+                            &target_id,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Extracts a `method_definition` as a Method entity.
+fn extract_ts_method(
+    node: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    parent_stack: &[(String, String)],
+) -> Option<Entity> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(name_node, source)?;
+    let qualified_name = qualify(&name, parent_stack);
+    let id = Entity::compute_id(file_path, &qualified_name);
+    let parent_entity = parent_stack.last().map(|(id, _)| id.clone());
+    Some(Entity {
+        id,
+        kind: EntityKind::Method,
+        name,
+        qualified_name,
+        file_path: file_path.to_owned(),
+        byte_range: (node.start_byte(), node.end_byte()),
+        line_range: (node.start_position().row + 1, node.end_position().row + 1),
+        parent_entity,
+    })
+}
+
+/// Extracts a named declaration (interface, type alias, enum) by the `name` field.
+fn extract_ts_named(
+    node: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    parent_stack: &[(String, String)],
+    kind: EntityKind,
+) -> Option<Entity> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(name_node, source)?;
+    let qualified_name = qualify(&name, parent_stack);
+    let id = Entity::compute_id(file_path, &qualified_name);
+    let parent_entity = parent_stack.last().map(|(id, _)| id.clone());
+    Some(Entity {
+        id,
+        kind,
+        name,
+        qualified_name,
+        file_path: file_path.to_owned(),
+        byte_range: (node.start_byte(), node.end_byte()),
+        line_range: (node.start_position().row + 1, node.end_position().row + 1),
+        parent_entity,
+    })
+}
+
+/// Extracts an `import_statement` as a UseStatement-like import entity.
+fn extract_ts_import(
+    node: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    parent_stack: &[(String, String)],
+) -> Option<Entity> {
+    let text = node_text(node, source)?;
+    let name = text.trim().to_string();
+    let offset = node.start_byte();
+    let qualified_name = format!("import@{offset}");
+    let id = Entity::compute_id(file_path, &qualified_name);
+    let parent_entity = parent_stack.last().map(|(id, _)| id.clone());
+    Some(Entity {
+        id,
+        kind: EntityKind::UseStatement,
+        name,
+        qualified_name,
+        file_path: file_path.to_owned(),
+        byte_range: (node.start_byte(), node.end_byte()),
+        line_range: (node.start_position().row + 1, node.end_position().row + 1),
+        parent_entity,
+    })
+}
+
+/// Extracts an `export_statement` as an ExportStatement entity.
+fn extract_ts_export(
+    node: Node<'_>,
+    source: &[u8],
+    file_path: &str,
+    parent_stack: &[(String, String)],
+) -> Option<Entity> {
+    let text = node_text(node, source)?;
+    // Use a truncated summary as the name to keep it readable.
+    let name = text.lines().next().unwrap_or("export").trim().to_string();
+    let offset = node.start_byte();
+    let qualified_name = format!("export@{offset}");
+    let id = Entity::compute_id(file_path, &qualified_name);
+    let parent_entity = parent_stack.last().map(|(id, _)| id.clone());
+    Some(Entity {
+        id,
+        kind: EntityKind::ExportStatement,
+        name,
+        qualified_name,
+        file_path: file_path.to_owned(),
+        byte_range: (node.start_byte(), node.end_byte()),
+        line_range: (node.start_position().row + 1, node.end_position().row + 1),
+        parent_entity,
+    })
+}
+
+/// Builds best-effort `Calls` relationships for TypeScript source.
+fn build_ts_calls_relationships(
+    root: Node<'_>,
+    source: &[u8],
+    _file_path: &str,
+    entities: &[Entity],
+    relationships: &mut Vec<Relationship>,
+) {
+    let name_to_ids: HashMap<String, Vec<String>> = {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for entity in entities {
+            if matches!(
+                entity.kind,
+                EntityKind::Function
+                    | EntityKind::Method
+                    | EntityKind::Component
+                    | EntityKind::Hook
+            ) {
+                map.entry(entity.name.clone())
+                    .or_default()
+                    .push(entity.id.clone());
+            }
+        }
+        map
+    };
+
+    for entity in entities {
+        if !matches!(
+            entity.kind,
+            EntityKind::Function
+                | EntityKind::Method
+                | EntityKind::Component
+                | EntityKind::Hook
+        ) {
+            continue;
+        }
+        if let Some(func_node) =
+            find_node_at_range(root, entity.byte_range.0, entity.byte_range.1)
+        {
+            collect_calls(func_node, source, &entity.id, &name_to_ids, relationships);
+        }
+    }
+}
+
 // ── Utility ───────────────────────────────────────────────────────────────────
 
 /// Returns the UTF-8 text of a node, or `None` if conversion fails.
@@ -1342,5 +1919,159 @@ mod helpers {
         let ids_a: Vec<&str> = entities_a.iter().map(|e| e.id.as_str()).collect();
         let ids_b: Vec<&str> = entities_b.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids_a, ids_b, "entity IDs should be stable across re-parses");
+    }
+
+    // ── TypeScript tests ───────────────────────────────────────────────────────
+
+    const SAMPLE_TS: &str = r#"
+import { useState } from 'react';
+
+interface User {
+    id: number;
+    name: string;
+}
+
+type UserId = number;
+
+enum Role {
+    Admin = 'admin',
+    User = 'user',
+}
+
+class UserService {
+    private users: User[] = [];
+
+    getUser(id: number): User | undefined {
+        return this.users.find(u => u.id === id);
+    }
+
+    addUser(user: User): void {
+        this.users.push(user);
+    }
+}
+
+function formatName(user: User): string {
+    return user.name.toUpperCase();
+}
+
+const useCounter = (initial: number) => {
+    const [count, setCount] = useState(initial);
+    return { count, setCount };
+};
+
+export { UserService, formatName };
+"#;
+
+    const SAMPLE_TSX: &str = r#"
+import React, { useState } from 'react';
+
+interface Props {
+    title: string;
+}
+
+export function Header({ title }: Props) {
+    return <h1>{title}</h1>;
+}
+
+export const useTheme = () => {
+    const [dark, setDark] = useState(false);
+    return { dark, setDark };
+};
+
+export default function App() {
+    return (
+        <div>
+            <Header title="vai" />
+        </div>
+    );
+}
+"#;
+
+    #[test]
+    fn parse_typescript_extracts_basic_entities() {
+        let (entities, _rels) =
+            parse_typescript_source("src/service.ts", SAMPLE_TS.as_bytes(), false).unwrap();
+
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let kinds: Vec<&EntityKind> = entities.iter().map(|e| &e.kind).collect();
+
+        assert!(names.iter().any(|&n| n == "User"), "missing User interface");
+        assert!(names.iter().any(|&n| n == "UserId"), "missing UserId type alias");
+        assert!(names.iter().any(|&n| n == "Role"), "missing Role enum");
+        assert!(names.iter().any(|&n| n == "UserService"), "missing UserService class");
+        assert!(names.iter().any(|&n| n == "getUser"), "missing getUser method");
+        assert!(names.iter().any(|&n| n == "addUser"), "missing addUser method");
+        assert!(names.iter().any(|&n| n == "formatName"), "missing formatName function");
+        assert!(names.iter().any(|&n| n == "useCounter"), "missing useCounter hook");
+
+        assert!(kinds.contains(&&EntityKind::Interface), "missing Interface kind");
+        assert!(kinds.contains(&&EntityKind::TypeAlias), "missing TypeAlias kind");
+        assert!(kinds.contains(&&EntityKind::Enum), "missing Enum kind");
+        assert!(kinds.contains(&&EntityKind::Class), "missing Class kind");
+        assert!(kinds.contains(&&EntityKind::Method), "missing Method kind");
+        assert!(kinds.contains(&&EntityKind::Function), "missing Function kind");
+        assert!(kinds.contains(&&EntityKind::Hook), "missing Hook kind");
+        // Note: Component detection requires JSX (TSX grammar) — tested separately.
+        assert!(kinds.contains(&&EntityKind::UseStatement), "missing import UseStatement");
+        assert!(kinds.contains(&&EntityKind::ExportStatement), "missing ExportStatement");
+    }
+
+    #[test]
+    fn parse_tsx_extracts_components_and_hooks() {
+        let (entities, _rels) =
+            parse_typescript_source("src/App.tsx", SAMPLE_TSX.as_bytes(), true).unwrap();
+
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let kinds: Vec<&EntityKind> = entities.iter().map(|e| &e.kind).collect();
+
+        assert!(names.iter().any(|&n| n == "Header"), "missing Header component");
+        assert!(names.iter().any(|&n| n == "App"), "missing App component");
+        assert!(names.iter().any(|&n| n == "useTheme"), "missing useTheme hook");
+        assert!(names.iter().any(|&n| n == "Props"), "missing Props interface");
+
+        assert!(kinds.contains(&&EntityKind::Component), "missing Component kind");
+        assert!(kinds.contains(&&EntityKind::Hook), "missing Hook kind");
+        assert!(kinds.contains(&&EntityKind::Interface), "missing Interface kind");
+    }
+
+    #[test]
+    fn parse_typescript_contains_relationships() {
+        let (entities, rels) =
+            parse_typescript_source("src/service.ts", SAMPLE_TS.as_bytes(), false).unwrap();
+
+        let contains: Vec<_> = rels
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::Contains)
+            .collect();
+        assert!(!contains.is_empty(), "expected Contains relationships");
+
+        // UserService class should contain getUser and addUser.
+        let class_entity = entities
+            .iter()
+            .find(|e| e.name == "UserService")
+            .expect("UserService");
+        let get_user_entity = entities.iter().find(|e| e.name == "getUser").expect("getUser");
+        assert!(
+            contains.iter().any(|r| r.from_entity == class_entity.id
+                && r.to_entity == get_user_entity.id),
+            "UserService should contain getUser"
+        );
+    }
+
+    #[test]
+    fn parse_source_file_dispatches_by_extension() {
+        let (rs_entities, _) =
+            parse_source_file("src/auth.rs", SAMPLE_RUST.as_bytes()).unwrap();
+        let (ts_entities, _) =
+            parse_source_file("src/service.ts", SAMPLE_TS.as_bytes()).unwrap();
+        let (tsx_entities, _) =
+            parse_source_file("src/App.tsx", SAMPLE_TSX.as_bytes()).unwrap();
+        let (unknown_entities, _) =
+            parse_source_file("README.md", b"# hello").unwrap();
+
+        assert!(!rs_entities.is_empty(), "should parse .rs files");
+        assert!(!ts_entities.is_empty(), "should parse .ts files");
+        assert!(!tsx_entities.is_empty(), "should parse .tsx files");
+        assert!(unknown_entities.is_empty(), "should skip unknown extensions");
     }
 }

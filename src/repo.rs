@@ -300,7 +300,9 @@ pub fn read_config(vai_dir: &Path) -> Result<RepoConfig, RepoError> {
 
 // ── Source file collection ─────────────────────────────────────────────────────
 
-/// Recursively collects all `.rs` source files under `root`, respecting ignore patterns.
+/// Recursively collects all supported source files under `root`, respecting ignore patterns.
+///
+/// Supported extensions: `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`.
 fn collect_source_files(root: &Path, ignore: &[String]) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_recursive(root, ignore, &mut files);
@@ -323,7 +325,10 @@ fn collect_recursive(dir: &Path, ignore: &[String], files: &mut Vec<PathBuf>) {
         }
         if path.is_dir() {
             collect_recursive(&path, ignore, files);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+        } else if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("rs" | "ts" | "tsx" | "js" | "jsx")
+        ) {
             files.push(path);
         }
     }
