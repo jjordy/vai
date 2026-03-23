@@ -3040,7 +3040,19 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
     // Initialise structured logging if not already set up.
     let _ = tracing_subscriber::fmt::try_init();
 
-    let repo_config = repo::read_config(vai_dir)?;
+    // In multi-repo mode there is no per-repo config file; derive a display
+    // name from the storage root path instead.  In single-repo mode read the
+    // per-repo config as before.
+    let repo_name = if config.storage_root.is_some() {
+        config
+            .storage_root
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "multi-repo".to_string())
+    } else {
+        repo::read_config(vai_dir)?.name
+    };
+
     let repo_root = vai_dir
         .parent()
         .unwrap_or(Path::new("."))
@@ -3052,7 +3064,7 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
         vai_dir: vai_dir.to_owned(),
         repo_root,
         started_at: Instant::now(),
-        repo_name: repo_config.name.clone(),
+        repo_name: repo_name.clone(),
         vai_version: env!("CARGO_PKG_VERSION").to_string(),
         event_tx,
         event_seq: Arc::new(AtomicU64::new(0)),
@@ -3080,7 +3092,7 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
     tracing::info!(
         timestamp = %started_at.to_rfc3339(),
         addr = %actual_addr,
-        repo = %repo_config.name,
+        repo = %repo_name,
         version = env!("CARGO_PKG_VERSION"),
         "vai server started",
     );
@@ -3089,7 +3101,7 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
         started_at.format("%Y-%m-%dT%H:%M:%SZ"),
         actual_addr
     );
-    println!("repository: {}", repo_config.name);
+    println!("repository: {}", repo_name);
     println!("Press Ctrl+C to stop.");
 
     axum::serve(listener, app)
