@@ -696,6 +696,330 @@ async fn test_auth_store() {
     teardown(&storage, &repo_id).await;
 }
 
+// ── EventStore: NOTIFY delivery ───────────────────────────────────────────────
+
+/// Verifies that `append` fires a `pg_notify('vai_events', '<repo_id>:<event_id>')` so
+/// that WebSocket handlers using LISTEN can pick up new events without polling.
+#[tokio::test]
+async fn test_event_store_notify_delivery() {
+    let Some((storage, repo_id)) = setup().await else {
+        return;
+    };
+
+    // Create a PgListener on the `vai_events` channel *before* appending so we
+    // don't miss the notification.
+    let mut listener = storage
+        .create_listener()
+        .await
+        .expect("create_listener failed");
+    listener
+        .listen("vai_events")
+        .await
+        .expect("LISTEN failed");
+
+    let event_kind = EventKind::WorkspaceCreated {
+        workspace_id: Uuid::new_v4(),
+        intent: "notify test".to_string(),
+        base_version: "v0".to_string(),
+    };
+    let event = storage
+        .append(&repo_id, event_kind)
+        .await
+        .expect("append failed");
+
+    // The NOTIFY should arrive promptly.  Give it a generous timeout to avoid
+    // flakiness on slow CI machines.
+    let notification = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        listener.recv(),
+    )
+    .await
+    .expect("timed out waiting for NOTIFY")
+    .expect("PgListener recv error");
+
+    let expected_payload = format!("{repo_id}:{}", event.id);
+    assert_eq!(
+        notification.payload(),
+        expected_payload,
+        "NOTIFY payload should be '<repo_id>:<event_id>'"
+    );
+
+    teardown(&storage, &repo_id).await;
+}
+
+// ── EventStore: replay from last_event_id ─────────────────────────────────────
+
+/// Verifies that `query_since_id` returns only events that were appended
+/// *after* the supplied cursor ID, enabling WebSocket replay on reconnect.
+#[tokio::test]
+async fn test_event_store_replay_from_last_id() {
+    let Some((storage, repo_id)) = setup().await else {
+        return;
+    };
+
+    // Append three distinct events.
+    let ws1 = Uuid::new_v4();
+    let ws2 = Uuid::new_v4();
+
+    let e1 = storage
+        .append(
+            &repo_id,
+            EventKind::WorkspaceCreated {
+                workspace_id: ws1,
+                intent: "first".to_string(),
+                base_version: "v1".to_string(),
+            },
+        )
+        .await
+        .expect("append e1");
+
+    let e2 = storage
+        .append(
+            &repo_id,
+            EventKind::WorkspaceCreated {
+                workspace_id: ws2,
+                intent: "second".to_string(),
+                base_version: "v1".to_string(),
+            },
+        )
+        .await
+        .expect("append e2");
+
+    let e3 = storage
+        .append(
+            &repo_id,
+            EventKind::WorkspaceSubmitted {
+                workspace_id: ws1,
+                changes_summary: "done".to_string(),
+            },
+        )
+        .await
+        .expect("append e3");
+
+    // Replaying from e1 should return e2 and e3.
+    let since_e1 = storage
+        .query_since_id(&repo_id, e1.id as i64)
+        .await
+        .expect("query_since_id(e1)");
+    assert_eq!(since_e1.len(), 2);
+    assert_eq!(since_e1[0].id, e2.id);
+    assert_eq!(since_e1[1].id, e3.id);
+
+    // Replaying from e2 should return only e3.
+    let since_e2 = storage
+        .query_since_id(&repo_id, e2.id as i64)
+        .await
+        .expect("query_since_id(e2)");
+    assert_eq!(since_e2.len(), 1);
+    assert_eq!(since_e2[0].id, e3.id);
+
+    // Replaying from e3 (the latest) should return nothing.
+    let since_e3 = storage
+        .query_since_id(&repo_id, e3.id as i64)
+        .await
+        .expect("query_since_id(e3)");
+    assert!(since_e3.is_empty(), "no events should exist after e3");
+
+    teardown(&storage, &repo_id).await;
+}
+
+// ── EventStore: server-side filtering ─────────────────────────────────────────
+
+#[tokio::test]
+async fn test_event_filter_by_event_type() {
+    use vai::storage::EventFilter;
+
+    let Some((storage, repo_id)) = setup().await else {
+        return;
+    };
+
+    let ws = Uuid::new_v4();
+
+    let e1 = storage
+        .append(
+            &repo_id,
+            EventKind::WorkspaceCreated {
+                workspace_id: ws,
+                intent: "filter test".to_string(),
+                base_version: "v1".to_string(),
+            },
+        )
+        .await
+        .expect("append e1");
+
+    storage
+        .append(
+            &repo_id,
+            EventKind::WorkspaceSubmitted {
+                workspace_id: ws,
+                changes_summary: "done".to_string(),
+            },
+        )
+        .await
+        .expect("append e2");
+
+    // Filter: only WorkspaceCreated events since the beginning.
+    let filter = EventFilter {
+        event_types: vec!["WorkspaceCreated".to_string()],
+        ..Default::default()
+    };
+    let results = storage
+        .query_since_id_filtered(&repo_id, 0, &filter)
+        .await
+        .expect("query_since_id_filtered");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, e1.id);
+    assert_eq!(results[0].kind.event_type(), "WorkspaceCreated");
+
+    teardown(&storage, &repo_id).await;
+}
+
+#[tokio::test]
+async fn test_event_filter_by_workspace_id() {
+    use vai::storage::EventFilter;
+
+    let Some((storage, repo_id)) = setup().await else {
+        return;
+    };
+
+    let ws_a = Uuid::new_v4();
+    let ws_b = Uuid::new_v4();
+
+    storage
+        .append(
+            &repo_id,
+            EventKind::WorkspaceCreated {
+                workspace_id: ws_a,
+                intent: "workspace A".to_string(),
+                base_version: "v1".to_string(),
+            },
+        )
+        .await
+        .expect("append ws_a");
+
+    let eb = storage
+        .append(
+            &repo_id,
+            EventKind::WorkspaceCreated {
+                workspace_id: ws_b,
+                intent: "workspace B".to_string(),
+                base_version: "v1".to_string(),
+            },
+        )
+        .await
+        .expect("append ws_b");
+
+    // Filter: only events for workspace B.
+    let filter = EventFilter {
+        workspace_ids: vec![ws_b],
+        ..Default::default()
+    };
+    let results = storage
+        .query_since_id_filtered(&repo_id, 0, &filter)
+        .await
+        .expect("query_since_id_filtered");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, eb.id);
+
+    teardown(&storage, &repo_id).await;
+}
+
+#[tokio::test]
+async fn test_event_filter_empty_returns_all() {
+    use vai::storage::EventFilter;
+
+    let Some((storage, repo_id)) = setup().await else {
+        return;
+    };
+
+    let ws = Uuid::new_v4();
+    for i in 0..3u32 {
+        storage
+            .append(
+                &repo_id,
+                EventKind::WorkspaceCreated {
+                    workspace_id: ws,
+                    intent: format!("intent {i}"),
+                    base_version: "v1".to_string(),
+                },
+            )
+            .await
+            .expect("append");
+    }
+
+    // An empty filter should return all events.
+    let results = storage
+        .query_since_id_filtered(&repo_id, 0, &EventFilter::default())
+        .await
+        .expect("query_since_id_filtered");
+    assert_eq!(results.len(), 3);
+
+    teardown(&storage, &repo_id).await;
+}
+
+#[tokio::test]
+async fn test_event_filter_combined_type_and_workspace() {
+    use vai::storage::EventFilter;
+
+    let Some((storage, repo_id)) = setup().await else {
+        return;
+    };
+
+    let ws_a = Uuid::new_v4();
+    let ws_b = Uuid::new_v4();
+
+    // ws_a: Created + Submitted
+    storage
+        .append(
+            &repo_id,
+            EventKind::WorkspaceCreated {
+                workspace_id: ws_a,
+                intent: "A".to_string(),
+                base_version: "v1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    let submitted_a = storage
+        .append(
+            &repo_id,
+            EventKind::WorkspaceSubmitted {
+                workspace_id: ws_a,
+                changes_summary: "A done".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // ws_b: Created only
+    storage
+        .append(
+            &repo_id,
+            EventKind::WorkspaceCreated {
+                workspace_id: ws_b,
+                intent: "B".to_string(),
+                base_version: "v1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Filter: WorkspaceSubmitted events for ws_a only.
+    let filter = EventFilter {
+        event_types: vec!["WorkspaceSubmitted".to_string()],
+        workspace_ids: vec![ws_a],
+        ..Default::default()
+    };
+    let results = storage
+        .query_since_id_filtered(&repo_id, 0, &filter)
+        .await
+        .expect("query_since_id_filtered");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, submitted_a.id);
+
+    teardown(&storage, &repo_id).await;
+}
+
 // ── parity: SQLite vs Postgres for IssueStore ─────────────────────────────────
 //
 // Spot-check that the Postgres backend and the SQLite backend return
