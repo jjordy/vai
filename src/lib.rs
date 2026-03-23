@@ -15,6 +15,7 @@ pub mod graph;
 pub mod issue;
 pub mod merge;
 pub mod merge_patterns;
+pub mod remote_client;
 pub mod remote_workspace;
 pub mod repo;
 pub mod scope_history;

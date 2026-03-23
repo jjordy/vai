@@ -407,9 +407,15 @@ pub enum RemoteCommands {
     Add {
         /// Base URL of the remote vai server (e.g. `https://vai.example.com`).
         url: String,
-        /// API key for authenticating requests.
+        /// Literal API key value.
         #[arg(long)]
-        key: String,
+        key: Option<String>,
+        /// Name of an environment variable that holds the API key.
+        #[arg(long, conflicts_with_all = ["key", "key_cmd"])]
+        key_env: Option<String>,
+        /// Shell command whose stdout is the API key (e.g. `pass show vai/api-key`).
+        #[arg(long, conflicts_with_all = ["key", "key_env"])]
+        key_cmd: Option<String>,
     },
     /// Remove the remote server configuration.
     Remove,
@@ -2007,9 +2013,19 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
             let vai_dir = root.join(".vai");
             match remote_cmd {
-                RemoteCommands::Add { url, key } => {
+                RemoteCommands::Add { url, key, key_env, key_cmd } => {
+                    if key.is_none() && key_env.is_none() && key_cmd.is_none() {
+                        return Err(CliError::Other(
+                            "one of --key, --key-env, or --key-cmd is required".to_string(),
+                        ));
+                    }
                     let mut config = repo::read_config(&vai_dir)?;
-                    config.remote = Some(repo::RemoteServerConfig { url: url.clone(), api_key: key });
+                    config.remote = Some(repo::RemoteServerConfig {
+                        url: url.clone(),
+                        api_key: key,
+                        api_key_env: key_env,
+                        api_key_cmd: key_cmd,
+                    });
                     repo::write_config(&vai_dir, &config)?;
                     if cli.json {
                         println!("{}", serde_json::json!({"status": "ok", "url": url}));
@@ -2043,17 +2059,15 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         }
                         Some(remote) => {
                             // Test connectivity by pinging /api/status.
-                            let status_url = format!("{}/api/status", remote.url.trim_end_matches('/'));
                             let rt = tokio::runtime::Runtime::new()
                                 .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?;
+                            let client = crate::remote_client::RemoteClient::new(&remote)
+                                .map_err(|e| CliError::Other(format!("API key error: {e}")))?;
                             let reachable = rt.block_on(async {
-                                reqwest::Client::new()
-                                    .get(&status_url)
-                                    .bearer_auth(&remote.api_key)
-                                    .send()
+                                client
+                                    .get::<serde_json::Value>("/api/status")
                                     .await
-                                    .map(|r| r.status().is_success())
-                                    .unwrap_or(false)
+                                    .is_ok()
                             });
                             if cli.json {
                                 println!(

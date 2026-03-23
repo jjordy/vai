@@ -49,12 +49,73 @@ pub enum RepoError {
 ///
 /// When present, CLI commands proxy to this server instead of operating on the
 /// local `.vai/` directory directly.
+///
+/// Exactly one of `api_key`, `api_key_env`, or `api_key_cmd` should be set.
+/// Resolution order: env var → command → direct value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteServerConfig {
     /// Base HTTP URL of the remote vai server, e.g. `https://vai.example.com`.
     pub url: String,
-    /// API key for authenticating requests to the server.
-    pub api_key: String,
+    /// Literal API key value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Name of an environment variable that holds the API key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Shell command whose stdout is the API key (e.g. `pass show vai/api-key`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_cmd: Option<String>,
+}
+
+impl RemoteServerConfig {
+    /// Resolves the API key using the configured storage method.
+    ///
+    /// Evaluated in order: `api_key_env` (environment variable), `api_key_cmd`
+    /// (command stdout), then `api_key` (literal value).
+    ///
+    /// Returns an error if no key is configured or resolution fails.
+    pub fn resolve_api_key(&self) -> Result<String, ApiKeyError> {
+        // 1. Environment variable reference.
+        if let Some(var_name) = &self.api_key_env {
+            return std::env::var(var_name)
+                .map(|v| v.trim().to_string())
+                .map_err(|_| ApiKeyError::EnvVarNotSet(var_name.clone()));
+        }
+
+        // 2. Command output.
+        if let Some(cmd) = &self.api_key_cmd {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .output()
+                .map_err(|e| ApiKeyError::CommandFailed(format!("{cmd}: {e}")))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err(ApiKeyError::CommandFailed(format!("{cmd}: {stderr}")));
+            }
+            let key = String::from_utf8(output.stdout)
+                .map_err(|e| ApiKeyError::CommandFailed(format!("non-UTF-8 output: {e}")))?;
+            return Ok(key.trim().to_string());
+        }
+
+        // 3. Literal value.
+        self.api_key
+            .clone()
+            .ok_or(ApiKeyError::NotConfigured)
+    }
+}
+
+/// Errors that can occur when resolving the API key.
+#[derive(Debug, thiserror::Error)]
+pub enum ApiKeyError {
+    #[error("environment variable `{0}` is not set")]
+    EnvVarNotSet(String),
+
+    #[error("api_key_cmd failed: {0}")]
+    CommandFailed(String),
+
+    #[error("no API key configured — set api_key, api_key_env, or api_key_cmd in [remote]")]
+    NotConfigured,
 }
 
 /// Contents of `.vai/config.toml`.
