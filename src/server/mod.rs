@@ -39,6 +39,16 @@
 //!   - `POST /api/discoveries` — submit a discovery event from a watcher
 //!   - `POST /api/repos` — register and initialise a new repository (multi-repo mode)
 //!   - `GET /api/repos` — list all registered repositories with basic stats
+//!   - `POST /api/users` — create a new user account
+//!   - `GET /api/users/:user` — get user by UUID or email address
+//!   - `POST /api/orgs` — create a new organization
+//!   - `GET /api/orgs` — list all organizations
+//!   - `GET /api/orgs/:org` — get organization by slug
+//!   - `DELETE /api/orgs/:org` — delete organization (cascades to repos)
+//!   - `POST /api/orgs/:org/members` — add a user to an organization
+//!   - `GET /api/orgs/:org/members` — list members of an organization
+//!   - `PATCH /api/orgs/:org/members/:user` — update a member's role
+//!   - `DELETE /api/orgs/:org/members/:user` — remove a member from an organization
 //!
 //! ## Multi-Repo Endpoints (`/api/repos/:repo/`)
 //!   - `GET /api/repos/:repo/status` — per-repo health (same fields as `/api/status`)
@@ -2997,6 +3007,258 @@ async fn list_repos_handler(
     Ok(Json(responses))
 }
 
+// ── Org / User API types ──────────────────────────────────────────────────────
+
+/// Request body for `POST /api/orgs`.
+#[derive(Debug, Deserialize)]
+struct CreateOrgRequest {
+    name: String,
+    slug: String,
+}
+
+/// Request body for `POST /api/users`.
+#[derive(Debug, Deserialize)]
+struct CreateUserRequest {
+    email: String,
+    name: String,
+}
+
+/// Request body for `POST /api/orgs/:org/members`.
+#[derive(Debug, Deserialize)]
+struct AddMemberRequest {
+    /// User UUID to add.
+    user_id: uuid::Uuid,
+    /// Role within the org: `"owner"`, `"admin"`, or `"member"`.
+    role: String,
+}
+
+/// Request body for `PATCH /api/orgs/:org/members/:user`.
+#[derive(Debug, Deserialize)]
+struct UpdateMemberRequest {
+    /// New role: `"owner"`, `"admin"`, or `"member"`.
+    role: String,
+}
+
+/// Response body for org endpoints.
+#[derive(Debug, Serialize)]
+struct OrgResponse {
+    id: String,
+    name: String,
+    slug: String,
+    created_at: String,
+}
+
+impl From<crate::storage::Organization> for OrgResponse {
+    fn from(o: crate::storage::Organization) -> Self {
+        OrgResponse {
+            id: o.id.to_string(),
+            name: o.name,
+            slug: o.slug,
+            created_at: o.created_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Response body for user endpoints.
+#[derive(Debug, Serialize)]
+struct UserResponse {
+    id: String,
+    email: String,
+    name: String,
+    created_at: String,
+}
+
+impl From<crate::storage::User> for UserResponse {
+    fn from(u: crate::storage::User) -> Self {
+        UserResponse {
+            id: u.id.to_string(),
+            email: u.email,
+            name: u.name,
+            created_at: u.created_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Response body for org membership endpoints.
+#[derive(Debug, Serialize)]
+struct OrgMemberResponse {
+    org_id: String,
+    user_id: String,
+    role: String,
+    created_at: String,
+}
+
+impl From<crate::storage::OrgMember> for OrgMemberResponse {
+    fn from(m: crate::storage::OrgMember) -> Self {
+        OrgMemberResponse {
+            org_id: m.org_id.to_string(),
+            user_id: m.user_id.to_string(),
+            role: m.role.as_str().to_string(),
+            created_at: m.created_at.to_rfc3339(),
+        }
+    }
+}
+
+// ── Org / User handlers ───────────────────────────────────────────────────────
+
+/// `POST /api/orgs` — creates a new organization.
+async fn create_org_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateOrgRequest>,
+) -> Result<(StatusCode, Json<OrgResponse>), ApiError> {
+    use crate::storage::NewOrg;
+
+    if body.slug.is_empty()
+        || !body.slug.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ApiError::bad_request(
+            "slug must be non-empty and contain only alphanumeric characters, hyphens, and underscores",
+        ));
+    }
+
+    let org = state
+        .storage
+        .orgs()
+        .create_org(NewOrg { name: body.name, slug: body.slug })
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((StatusCode::CREATED, Json(OrgResponse::from(org))))
+}
+
+/// `GET /api/orgs` — lists all organizations (server-level admin use).
+async fn list_orgs_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<OrgResponse>>, ApiError> {
+    let orgs = state.storage.orgs().list_orgs().await.map_err(ApiError::from)?;
+    Ok(Json(orgs.into_iter().map(OrgResponse::from).collect()))
+}
+
+/// `GET /api/orgs/:org` — returns the organization with the given slug.
+async fn get_org_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<OrgResponse>, ApiError> {
+    let org = state.storage.orgs().get_org_by_slug(&slug).await.map_err(ApiError::from)?;
+    Ok(Json(OrgResponse::from(org)))
+}
+
+/// `DELETE /api/orgs/:org` — permanently deletes an org by slug (cascades to repos).
+async fn delete_org_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let org = state.storage.orgs().get_org_by_slug(&slug).await.map_err(ApiError::from)?;
+    state.storage.orgs().delete_org(&org.id).await.map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/users` — creates a new user account.
+async fn create_user_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateUserRequest>,
+) -> Result<(StatusCode, Json<UserResponse>), ApiError> {
+    use crate::storage::NewUser;
+
+    let user = state
+        .storage
+        .orgs()
+        .create_user(NewUser { email: body.email, name: body.name })
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
+}
+
+/// `GET /api/users/:user` — fetches a user by UUID or email.
+///
+/// The `:user` path segment is tried first as a UUID; if it cannot be parsed as
+/// one it is treated as an email address.
+async fn get_user_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(user_ref): AxumPath<String>,
+) -> Result<Json<UserResponse>, ApiError> {
+    let orgs = state.storage.orgs();
+    let user = if let Ok(id) = uuid::Uuid::parse_str(&user_ref) {
+        orgs.get_user(&id).await.map_err(ApiError::from)?
+    } else {
+        orgs.get_user_by_email(&user_ref).await.map_err(ApiError::from)?
+    };
+    Ok(Json(UserResponse::from(user)))
+}
+
+/// `GET /api/orgs/:org/members` — lists all members of an organization.
+async fn list_org_members_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+) -> Result<Json<Vec<OrgMemberResponse>>, ApiError> {
+    let orgs = state.storage.orgs();
+    let org = orgs.get_org_by_slug(&slug).await.map_err(ApiError::from)?;
+    let members = orgs.list_org_members(&org.id).await.map_err(ApiError::from)?;
+    Ok(Json(members.into_iter().map(OrgMemberResponse::from).collect()))
+}
+
+/// `POST /api/orgs/:org/members` — adds a user as a member of an organization.
+async fn add_org_member_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath(slug): AxumPath<String>,
+    Json(body): Json<AddMemberRequest>,
+) -> Result<(StatusCode, Json<OrgMemberResponse>), ApiError> {
+    use crate::storage::OrgRole;
+
+    let role = match body.role.as_str() {
+        "owner" => OrgRole::Owner,
+        "admin" => OrgRole::Admin,
+        "member" => OrgRole::Member,
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unknown org role `{other}`; expected one of: owner, admin, member"
+            )));
+        }
+    };
+
+    let orgs = state.storage.orgs();
+    let org = orgs.get_org_by_slug(&slug).await.map_err(ApiError::from)?;
+    let member = orgs.add_org_member(&org.id, &body.user_id, role).await.map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(OrgMemberResponse::from(member))))
+}
+
+/// `PATCH /api/orgs/:org/members/:user` — updates a member's role.
+async fn update_org_member_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath((slug, user_id)): AxumPath<(String, uuid::Uuid)>,
+    Json(body): Json<UpdateMemberRequest>,
+) -> Result<Json<OrgMemberResponse>, ApiError> {
+    use crate::storage::OrgRole;
+
+    let role = match body.role.as_str() {
+        "owner" => OrgRole::Owner,
+        "admin" => OrgRole::Admin,
+        "member" => OrgRole::Member,
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unknown org role `{other}`; expected one of: owner, admin, member"
+            )));
+        }
+    };
+
+    let orgs = state.storage.orgs();
+    let org = orgs.get_org_by_slug(&slug).await.map_err(ApiError::from)?;
+    let member = orgs.update_org_member(&org.id, &user_id, role).await.map_err(ApiError::from)?;
+    Ok(Json(OrgMemberResponse::from(member)))
+}
+
+/// `DELETE /api/orgs/:org/members/:user` — removes a user from an organization.
+async fn remove_org_member_handler(
+    State(state): State<Arc<AppState>>,
+    AxumPath((slug, user_id)): AxumPath<(String, uuid::Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    let orgs = state.storage.orgs();
+    let org = orgs.get_org_by_slug(&slug).await.map_err(ApiError::from)?;
+    orgs.remove_org_member(&org.id, &user_id).await.map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -3069,6 +3331,21 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         // Multi-repo management endpoints.
         .route("/api/repos", post(create_repo_handler))
         .route("/api/repos", get(list_repos_handler))
+        // User management endpoints.
+        .route("/api/users", post(create_user_handler))
+        .route("/api/users/:user", get(get_user_handler))
+        // Organization management endpoints (PRD 10.3).
+        .route("/api/orgs", post(create_org_handler))
+        .route("/api/orgs", get(list_orgs_handler))
+        .route("/api/orgs/:org", get(get_org_handler))
+        .route("/api/orgs/:org", delete(delete_org_handler))
+        .route("/api/orgs/:org/members", post(add_org_member_handler))
+        .route("/api/orgs/:org/members", get(list_org_members_handler))
+        .route(
+            "/api/orgs/:org/members/:user",
+            axum::routing::patch(update_org_member_handler),
+        )
+        .route("/api/orgs/:org/members/:user", delete(remove_org_member_handler))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
