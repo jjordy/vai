@@ -386,6 +386,9 @@ pub enum ServerCommands {
         /// IP address to bind to. Overrides `[server].host` in `.vai/config.toml`.
         #[arg(long)]
         host: Option<String>,
+        /// Write the server PID to this file on startup; removed on clean shutdown.
+        #[arg(long)]
+        pid_file: Option<std::path::PathBuf>,
     },
     /// Manage API keys for server authentication.
     #[command(subcommand)]
@@ -1369,7 +1372,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
             let vai_dir = root.join(".vai");
 
             match server_cmd {
-                ServerCommands::Start { port, host } => {
+                ServerCommands::Start { port, host, pid_file } => {
                     // Config layering (lowest → highest priority):
                     //   1. Built-in defaults (127.0.0.1:7865, no storage_root)
                     //   2. ~/.vai/server.toml [server] section (global, optional)
@@ -1395,6 +1398,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     // Layer 4: CLI flags
                     if let Some(h) = host { config.host = h; }
                     if let Some(p) = port { config.port = p; }
+                    if let Some(pf) = pid_file { config.pid_file = Some(pf); }
 
                     tokio::runtime::Runtime::new()
                         .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?

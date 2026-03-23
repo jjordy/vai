@@ -117,6 +117,8 @@ pub struct ServerConfig {
     pub port: u16,
     /// Root directory for multi-repo storage. `None` means single-repo (legacy) mode.
     pub storage_root: Option<std::path::PathBuf>,
+    /// Optional path to write a PID file on startup (removed on clean shutdown).
+    pub pid_file: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -125,6 +127,7 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 7865,
             storage_root: None,
+            pid_file: None,
         }
     }
 }
@@ -2659,12 +2662,27 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
     let listener = TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
 
+    // Write PID file if requested.
+    if let Some(ref pid_path) = config.pid_file {
+        let pid = std::process::id();
+        std::fs::write(pid_path, format!("{}\n", pid))
+            .map_err(ServerError::Io)?;
+        tracing::info!("PID {} written to {}", pid, pid_path.display());
+    }
+
+    let started_at = chrono::Utc::now();
     tracing::info!(
-        "vai server started on http://{} — repo: {}",
-        actual_addr,
-        repo_config.name
+        timestamp = %started_at.to_rfc3339(),
+        addr = %actual_addr,
+        repo = %repo_config.name,
+        version = env!("CARGO_PKG_VERSION"),
+        "vai server started",
     );
-    println!("vai server running on http://{actual_addr}");
+    println!(
+        "[{}] vai server running on http://{}",
+        started_at.format("%Y-%m-%dT%H:%M:%SZ"),
+        actual_addr
+    );
     println!("repository: {}", repo_config.name);
     println!("Press Ctrl+C to stop.");
 
@@ -2673,7 +2691,17 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
         .await
         .map_err(ServerError::Io)?;
 
-    tracing::info!("vai server stopped");
+    let stopped_at = chrono::Utc::now();
+    tracing::info!(timestamp = %stopped_at.to_rfc3339(), "vai server stopped");
+    println!("[{}] vai server stopped", stopped_at.format("%Y-%m-%dT%H:%M:%SZ"));
+
+    // Remove PID file on clean shutdown.
+    if let Some(ref pid_path) = config.pid_file {
+        if let Err(e) = std::fs::remove_file(pid_path) {
+            tracing::warn!("failed to remove PID file {}: {}", pid_path.display(), e);
+        }
+    }
+
     Ok(())
 }
 

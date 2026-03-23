@@ -1,0 +1,58 @@
+# Example systemd unit file for the vai server.
+#
+# Installation:
+#   sudo cp contrib/vai.service /etc/systemd/system/vai.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vai
+#
+# Configuration:
+#   Edit the ExecStart line below to point to your vai binary and repository.
+#   Adjust User/Group to the account that owns the repository.
+#   Set STORAGE_ROOT if using multi-repo mode.
+
+[Unit]
+Description=vai version-control server
+Documentation=https://github.com/your-org/vai
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=vai
+Group=vai
+
+# Path to the vai binary (adjust if installed elsewhere).
+ExecStart=/usr/local/bin/vai server start \
+    --host 0.0.0.0 \
+    --port 7865 \
+    --pid-file /run/vai/vai.pid
+
+# Working directory must be inside a vai repository (single-repo mode) or
+# any directory when using a storage_root in ~/.vai/server.toml (multi-repo).
+WorkingDirectory=/var/vai/repos/default
+
+# Environment variables (optional)
+# Environment=RUST_LOG=info
+
+# PID file written by vai itself via --pid-file.
+PIDFile=/run/vai/vai.pid
+RuntimeDirectory=vai
+RuntimeDirectoryMode=0755
+
+# Graceful shutdown: vai handles SIGTERM to drain in-flight requests.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/vai /run/vai
+
+[Install]
+WantedBy=multi-user.target
