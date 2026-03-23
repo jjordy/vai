@@ -106,7 +106,7 @@ use tokio::sync::Mutex;
 use std::time::Instant;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, Query as AxumQuery, Request, State};
+use axum::extract::{Extension, Path as AxumPath, Query as AxumQuery, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -794,46 +794,51 @@ impl From<crate::storage::StorageError> for ApiError {
 /// Checks that the authenticated user has at least `required` on `repo_id`.
 ///
 /// Returns the effective [`RepoRole`] on success, or a `403 Forbidden`
-/// response on failure.  Admin keys always pass with `Owner` access.
+/// error on failure.  Admin keys always pass with `Owner` access.
+///
+/// In local (SQLite) mode all authenticated keys receive `Owner` access for
+/// backward compatibility — RBAC is a server-mode (Postgres) feature.
 ///
 /// Call this from handlers that need to enforce per-repo permissions:
 ///
 /// ```ignore
-/// let role = require_repo_permission(&state, &identity, &repo_id, RepoRole::Write).await?;
+/// require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, RepoRole::Write).await?;
 /// ```
 async fn require_repo_permission(
-    state: &AppState,
+    storage: &crate::storage::StorageBackend,
     identity: &AgentIdentity,
     repo_id: &uuid::Uuid,
     required: crate::storage::RepoRole,
-) -> Result<crate::storage::RepoRole, Response> {
-    use crate::storage::RepoRole;
+) -> Result<crate::storage::RepoRole, ApiError> {
+    use crate::storage::{RepoRole, StorageBackend};
 
+    // Admin key always has full access.
     if identity.is_admin {
+        return Ok(RepoRole::Owner);
+    }
+
+    // In local (SQLite) mode there are no users/orgs — any valid key passes.
+    if matches!(storage, StorageBackend::Local(_)) {
         return Ok(RepoRole::Owner);
     }
 
     let user_id = match &identity.user_id {
         Some(uid) => uid,
         None => {
-            return Err(
-                ApiError::forbidden("this key is not associated with a user; cannot check repo permissions")
-                    .into_response(),
-            );
+            return Err(ApiError::forbidden(
+                "this key is not associated with a user; cannot check repo permissions",
+            ));
         }
     };
 
-    let resolved = state
-        .storage
+    let resolved = storage
         .orgs()
         .resolve_repo_role(user_id, repo_id)
         .await
-        .map_err(|e| ApiError::internal(format!("permission check failed: {e}")).into_response())?;
+        .map_err(|e| ApiError::internal(format!("permission check failed: {e}")))?;
 
     let effective = match resolved {
-        None => {
-            return Err(ApiError::forbidden("access denied").into_response());
-        }
+        None => return Err(ApiError::forbidden("access denied")),
         Some(r) => r,
     };
 
@@ -846,10 +851,24 @@ async fn require_repo_permission(
     };
 
     if effective.rank() < required.rank() {
-        return Err(ApiError::forbidden("insufficient permissions").into_response());
+        return Err(ApiError::forbidden("insufficient permissions"));
     }
 
     Ok(effective)
+}
+
+/// Asserts that the current request was made with the bootstrap admin key.
+///
+/// Returns `Ok(())` if `identity.is_admin` is true; otherwise a `403 Forbidden`
+/// error.  Use this for server-level management endpoints (org/user creation).
+fn require_server_admin(identity: &AgentIdentity) -> Result<(), ApiError> {
+    if identity.is_admin {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "this endpoint requires the bootstrap admin key",
+        ))
+    }
 }
 
 // ── API response types ────────────────────────────────────────────────────────
@@ -1159,10 +1178,12 @@ async fn server_stats_handler(
 /// Returns 201 Created with the workspace metadata.
 /// Broadcasts a `WorkspaceCreated` event to WebSocket subscribers.
 async fn create_workspace_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     Json(body): Json<CreateWorkspaceRequest>,
 ) -> Result<(StatusCode, Json<WorkspaceResponse>), ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
     let head = repo::read_head(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let result = workspace::create(&ctx.vai_dir, &body.intent, &head)
@@ -1187,8 +1208,10 @@ async fn create_workspace_handler(
 
 /// `GET /api/workspaces` — lists all active (non-discarded, non-merged) workspaces.
 async fn list_workspaces_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
 ) -> Result<Json<Vec<WorkspaceResponse>>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let workspaces = workspace::list(&ctx.vai_dir).map_err(ApiError::from)?;
     let response: Vec<WorkspaceResponse> = workspaces.into_iter().map(Into::into).collect();
     Ok(Json(response))
@@ -1198,9 +1221,11 @@ async fn list_workspaces_handler(
 ///
 /// Returns 404 if the workspace does not exist.
 async fn get_workspace_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<WorkspaceResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let meta = workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
     Ok(Json(WorkspaceResponse::from(meta)))
 }
@@ -1213,10 +1238,12 @@ async fn get_workspace_handler(
 /// Returns 404 if the workspace does not exist.
 /// Broadcasts a `WorkspaceSubmitted` event to WebSocket subscribers.
 async fn submit_workspace_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<SubmitResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
     // Verify the workspace exists before switching.
     let meta = workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
@@ -1312,10 +1339,12 @@ async fn submit_workspace_handler(
 /// Returns 204 No Content on success.
 /// Broadcasts a `WorkspaceDiscarded` event to WebSocket subscribers.
 async fn discard_workspace_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
     // Resolve UUID before discarding so we can remove it from the conflict engine.
     let ws_uuid = workspace::get(&ctx.vai_dir, &id)
@@ -1346,9 +1375,11 @@ async fn discard_workspace_handler(
 /// recent versions (the list is already oldest-first, so we truncate from
 /// the end after reversing).
 async fn list_versions_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumQuery(params): AxumQuery<ListVersionsQuery>,
 ) -> Result<Json<Vec<version::VersionMeta>>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let mut versions =
         version::list_versions(&ctx.vai_dir).map_err(ApiError::from)?;
     if let Some(limit) = params.limit {
@@ -1366,9 +1397,11 @@ async fn list_versions_handler(
 ///
 /// Returns 404 if the version does not exist.
 async fn get_version_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<version::VersionChanges>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let changes =
         version::get_version_changes(&ctx.vai_dir, &id).map_err(ApiError::from)?;
     Ok(Json(changes))
@@ -1384,9 +1417,13 @@ async fn get_version_handler(
 ///
 /// If `force` is `true`, the rollback proceeds regardless of downstream impact.
 async fn rollback_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     Json(body): Json<RollbackRequest>,
 ) -> Response {
+    if let Err(e) = require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await {
+        return e.into_response();
+    }
     // Compute impact analysis before attempting the rollback.
     let impact = match version::analyze_rollback_impact(&ctx.vai_dir, &body.version) {
         Ok(i) => i,
@@ -1760,11 +1797,13 @@ fn sha256_hex(data: &[u8]) -> String {
 /// - On first upload the workspace transitions from `Created` → `Active`.
 /// - Broadcasts a `FilesUploaded` WebSocket event on success.
 async fn upload_workspace_files_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<UploadFilesRequest>,
 ) -> Result<(StatusCode, Json<UploadFilesResponse>), ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
     let mut meta = workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
     let overlay = workspace::overlay_dir(&ctx.vai_dir, &id);
@@ -1921,9 +1960,11 @@ async fn upload_workspace_files_handler(
 /// repository (repo root) is used as a fallback. Returns 404 if the file
 /// exists in neither location. Response includes `found_in: "overlay"|"base"`.
 async fn get_workspace_file_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumPath((id, path)): AxumPath<(String, String)>,
 ) -> Result<Json<FileDownloadResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     // Verify workspace exists.
     workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
 
@@ -1971,8 +2012,10 @@ struct RepoFileListResponse {
 /// Returns relative paths suitable for use with `GET /api/files/*path`.
 /// Hidden directories (`.git`, `.vai`) and common build artefacts are excluded.
 async fn list_repo_files_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
 ) -> Result<Json<RepoFileListResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let head_version = std::fs::read_to_string(ctx.vai_dir.join("head"))
         .map_err(|e| ApiError::internal(format!("read head: {e}")))?
         .trim()
@@ -2027,9 +2070,11 @@ fn collect_repo_files(
 ///
 /// Returns the file as base64-encoded content. Returns 404 if not found.
 async fn get_main_file_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumPath(path): AxumPath<String>,
 ) -> Result<Json<FileDownloadResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let rel = sanitize_path(&path)
         .ok_or_else(|| ApiError::bad_request(format!("invalid path: '{path}'")))?;
 
@@ -2163,9 +2208,11 @@ fn open_graph(vai_dir: &std::path::Path) -> Result<GraphSnapshot, ApiError> {
 ///
 /// Query params: `kind`, `file`, `name` (all optional, combined with AND).
 async fn list_graph_entities_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumQuery(filter): AxumQuery<GraphEntityFilter>,
 ) -> Result<Json<Vec<EntitySummary>>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let graph = open_graph(&ctx.vai_dir)?;
     let entities = graph
         .filter_entities(
@@ -2179,9 +2226,11 @@ async fn list_graph_entities_handler(
 
 /// `GET /api/graph/entities/:id` — entity details and its relationships.
 async fn get_graph_entity_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<EntityDetailResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let graph = open_graph(&ctx.vai_dir)?;
     let entity = graph
         .get_entity_by_id(&id)
@@ -2199,9 +2248,11 @@ async fn get_graph_entity_handler(
 /// `GET /api/graph/entities/:id/deps` — all entities transitively reachable
 /// from this entity following any relationship direction.
 async fn get_entity_deps_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<EntityDepsResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let graph = open_graph(&ctx.vai_dir)?;
     // Verify the entity exists before traversal.
     graph
@@ -2234,9 +2285,11 @@ async fn get_entity_deps_handler(
 /// - `entities` — comma-separated entity IDs
 /// - `hops` — max traversal depth (default: 2)
 async fn get_blast_radius_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumQuery(query): AxumQuery<BlastRadiusQuery>,
 ) -> Result<Json<BlastRadiusResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let seed_ids: Vec<String> = query
         .entities
         .split(',')
@@ -2297,10 +2350,12 @@ async fn linked_workspace_ids(
 ///
 /// Returns 201 Created with the issue metadata.
 async fn create_issue_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     Json(body): Json<CreateIssueRequest>,
 ) -> Result<(StatusCode, Json<IssueResponse>), ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     use crate::issue::{AgentSource, IssueFilter, IssuePriority};
     use crate::storage::NewIssue;
 
@@ -2391,9 +2446,11 @@ async fn create_issue_handler(
 
 /// `GET /api/issues` — list issues with optional filters.
 async fn list_issues_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumQuery(query): AxumQuery<ListIssuesQuery>,
 ) -> Result<Json<Vec<IssueResponse>>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     use crate::issue::{IssueFilter, IssueStatus, IssuePriority};
 
     let status = query.status.as_deref()
@@ -2440,9 +2497,11 @@ async fn list_issues_handler(
 ///
 /// Returns 404 if the issue does not exist.
 async fn get_issue_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<IssueResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let issue_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
 
@@ -2460,11 +2519,13 @@ async fn get_issue_handler(
 ///
 /// Returns 404 if the issue does not exist.
 async fn update_issue_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<UpdateIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     use crate::issue::IssuePriority;
     use crate::storage::IssueUpdate;
 
@@ -2498,11 +2559,13 @@ async fn update_issue_handler(
 ///
 /// Returns 404 if the issue does not exist.
 async fn close_issue_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<CloseIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
 
     let issue_id = uuid::Uuid::parse_str(&id)
@@ -2578,9 +2641,11 @@ fn default_resolved_by() -> String {
 ///
 /// Optional `?status=pending|resolved` filter.
 async fn list_escalations_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumQuery(params): AxumQuery<ListEscalationsQuery>,
 ) -> Result<Json<Vec<EscalationResponse>>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let status_filter = params
         .status
         .as_deref()
@@ -2619,9 +2684,11 @@ struct ListEscalationsQuery {
 ///
 /// Returns 404 if the escalation does not exist.
 async fn get_escalation_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<EscalationResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let esc_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request(format!("invalid escalation ID `{id}`")))?;
 
@@ -2638,11 +2705,13 @@ async fn get_escalation_handler(
 /// Returns 404 if the escalation does not exist.
 /// Returns 400 if the escalation is already resolved or the option is invalid.
 async fn resolve_escalation_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<ResolveEscalationRequest>,
 ) -> Result<Json<EscalationResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     use crate::escalation::ResolutionOption;
 
     let esc_id = uuid::Uuid::parse_str(&id)
@@ -2697,9 +2766,11 @@ struct ClaimWorkRequest {
 /// semantic graph and checks each against active workspace scopes.
 /// Results are ranked by priority (critical → high → medium → low).
 async fn get_work_queue_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
 ) -> Result<Json<work_queue::WorkQueue>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let engine = state.conflict_engine.lock().await;
     let queue = work_queue::compute(&ctx.vai_dir, &engine)
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -2713,10 +2784,12 @@ async fn get_work_queue_handler(
 /// longer open or if a conflict has appeared since the queue was last fetched
 /// (caller should refresh the queue and retry with a different issue).
 async fn claim_work_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     Json(body): Json<ClaimWorkRequest>,
 ) -> Result<(StatusCode, Json<work_queue::ClaimResult>), ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
     let issue_id = body.issue_id.parse::<uuid::Uuid>().map_err(|_| {
         ApiError::bad_request(format!("invalid issue_id: {}", body.issue_id))
@@ -2794,10 +2867,12 @@ impl From<Watcher> for WatcherResponse {
 
 /// `POST /api/watchers/register` — register a new watcher agent.
 async fn register_watcher_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     Json(body): Json<RegisterWatcherRequest>,
 ) -> Result<(StatusCode, Json<WatcherResponse>), ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
     let store = WatcherStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let now = chrono::Utc::now();
@@ -2830,8 +2905,10 @@ async fn register_watcher_handler(
 
 /// `GET /api/watchers` — list all registered watchers.
 async fn list_watchers_handler(
+    Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
 ) -> Result<Json<Vec<WatcherResponse>>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let store = WatcherStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let watchers = store.list().map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(watchers.into_iter().map(Into::into).collect()))
@@ -2839,10 +2916,12 @@ async fn list_watchers_handler(
 
 /// `POST /api/watchers/:id/pause` — pause a watcher.
 async fn pause_watcher_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     AxumPath(agent_id): AxumPath<String>,
 ) -> Result<Json<WatcherResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
     let store = WatcherStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     store.pause(&agent_id).map_err(|e| {
@@ -2858,10 +2937,12 @@ async fn pause_watcher_handler(
 
 /// `POST /api/watchers/:id/resume` — resume a paused watcher.
 async fn resume_watcher_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     AxumPath(agent_id): AxumPath<String>,
 ) -> Result<Json<WatcherResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
     let store = WatcherStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     store.resume(&agent_id).map_err(|e| {
@@ -2898,10 +2979,12 @@ struct DiscoveryOutcomeResponse {
 
 /// `POST /api/discoveries` — submit a discovery event from a watcher.
 async fn submit_discovery_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     Json(body): Json<SubmitDiscoveryRequest>,
 ) -> Result<(StatusCode, Json<DiscoveryOutcomeResponse>), ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
     let watcher_store = WatcherStore::open(&ctx.vai_dir)
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -3050,9 +3133,11 @@ impl RepoResponse {
 /// the server registry. Returns 400 if multi-repo mode is not enabled (i.e.
 /// `storage_root` is not set) or if the name is already taken.
 async fn create_repo_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateRepoRequest>,
 ) -> Result<(StatusCode, Json<RepoResponse>), ApiError> {
+    require_server_admin(&identity)?;
     let storage_root = state.storage_root.as_ref().ok_or_else(|| {
         ApiError::bad_request(
             "server is not in multi-repo mode; set storage_root in ~/.vai/server.toml",
@@ -3114,8 +3199,10 @@ async fn create_repo_handler(
 /// Returns an empty array if no repos are registered or if storage_root is not
 /// set.
 async fn list_repos_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<RepoResponse>>, ApiError> {
+    require_server_admin(&identity)?;
     let storage_root = match state.storage_root.as_ref() {
         Some(sr) => sr,
         None => return Ok(Json(vec![])),
@@ -3227,9 +3314,11 @@ impl From<crate::storage::OrgMember> for OrgMemberResponse {
 
 /// `POST /api/orgs` — creates a new organization.
 async fn create_org_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateOrgRequest>,
 ) -> Result<(StatusCode, Json<OrgResponse>), ApiError> {
+    require_server_admin(&identity)?;
     use crate::storage::NewOrg;
 
     if body.slug.is_empty()
@@ -3252,26 +3341,32 @@ async fn create_org_handler(
 
 /// `GET /api/orgs` — lists all organizations (server-level admin use).
 async fn list_orgs_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<OrgResponse>>, ApiError> {
+    require_server_admin(&identity)?;
     let orgs = state.storage.orgs().list_orgs().await.map_err(ApiError::from)?;
     Ok(Json(orgs.into_iter().map(OrgResponse::from).collect()))
 }
 
 /// `GET /api/orgs/:org` — returns the organization with the given slug.
 async fn get_org_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     AxumPath(slug): AxumPath<String>,
 ) -> Result<Json<OrgResponse>, ApiError> {
+    require_server_admin(&identity)?;
     let org = state.storage.orgs().get_org_by_slug(&slug).await.map_err(ApiError::from)?;
     Ok(Json(OrgResponse::from(org)))
 }
 
 /// `DELETE /api/orgs/:org` — permanently deletes an org by slug (cascades to repos).
 async fn delete_org_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     AxumPath(slug): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
+    require_server_admin(&identity)?;
     let org = state.storage.orgs().get_org_by_slug(&slug).await.map_err(ApiError::from)?;
     state.storage.orgs().delete_org(&org.id).await.map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
@@ -3279,9 +3374,11 @@ async fn delete_org_handler(
 
 /// `POST /api/users` — creates a new user account.
 async fn create_user_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<UserResponse>), ApiError> {
+    require_server_admin(&identity)?;
     use crate::storage::NewUser;
 
     let user = state
@@ -3299,9 +3396,11 @@ async fn create_user_handler(
 /// The `:user` path segment is tried first as a UUID; if it cannot be parsed as
 /// one it is treated as an email address.
 async fn get_user_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     AxumPath(user_ref): AxumPath<String>,
 ) -> Result<Json<UserResponse>, ApiError> {
+    require_server_admin(&identity)?;
     let orgs = state.storage.orgs();
     let user = if let Ok(id) = uuid::Uuid::parse_str(&user_ref) {
         orgs.get_user(&id).await.map_err(ApiError::from)?
@@ -3313,9 +3412,11 @@ async fn get_user_handler(
 
 /// `GET /api/orgs/:org/members` — lists all members of an organization.
 async fn list_org_members_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     AxumPath(slug): AxumPath<String>,
 ) -> Result<Json<Vec<OrgMemberResponse>>, ApiError> {
+    require_server_admin(&identity)?;
     let orgs = state.storage.orgs();
     let org = orgs.get_org_by_slug(&slug).await.map_err(ApiError::from)?;
     let members = orgs.list_org_members(&org.id).await.map_err(ApiError::from)?;
@@ -3324,10 +3425,12 @@ async fn list_org_members_handler(
 
 /// `POST /api/orgs/:org/members` — adds a user as a member of an organization.
 async fn add_org_member_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     AxumPath(slug): AxumPath<String>,
     Json(body): Json<AddMemberRequest>,
 ) -> Result<(StatusCode, Json<OrgMemberResponse>), ApiError> {
+    require_server_admin(&identity)?;
     use crate::storage::OrgRole;
 
     let role = match body.role.as_str() {
@@ -3349,10 +3452,12 @@ async fn add_org_member_handler(
 
 /// `PATCH /api/orgs/:org/members/:user` — updates a member's role.
 async fn update_org_member_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     AxumPath((slug, user_id)): AxumPath<(String, uuid::Uuid)>,
     Json(body): Json<UpdateMemberRequest>,
 ) -> Result<Json<OrgMemberResponse>, ApiError> {
+    require_server_admin(&identity)?;
     use crate::storage::OrgRole;
 
     let role = match body.role.as_str() {
@@ -3374,9 +3479,11 @@ async fn update_org_member_handler(
 
 /// `DELETE /api/orgs/:org/members/:user` — removes a user from an organization.
 async fn remove_org_member_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     AxumPath((slug, user_id)): AxumPath<(String, uuid::Uuid)>,
 ) -> Result<StatusCode, ApiError> {
+    require_server_admin(&identity)?;
     let orgs = state.storage.orgs();
     let org = orgs.get_org_by_slug(&slug).await.map_err(ApiError::from)?;
     orgs.remove_org_member(&org.id, &user_id).await.map_err(ApiError::from)?;
@@ -3437,6 +3544,7 @@ fn parse_repo_role(s: &str) -> Result<crate::storage::RepoRole, ApiError> {
 
 /// `POST /api/orgs/:org/repos/:repo/collaborators` — adds a collaborator to a repo.
 async fn add_collaborator_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     AxumPath((org_slug, repo_name)): AxumPath<(String, String)>,
     Json(body): Json<AddCollaboratorRequest>,
@@ -3445,24 +3553,29 @@ async fn add_collaborator_handler(
     let orgs = state.storage.orgs();
     let org = orgs.get_org_by_slug(&org_slug).await.map_err(ApiError::from)?;
     let repo_id = orgs.get_repo_id_in_org(&org.id, &repo_name).await.map_err(ApiError::from)?;
+    // Write permission required to add collaborators (invite).
+    require_repo_permission(&state.storage, &identity, &repo_id, crate::storage::RepoRole::Write).await?;
     let collaborator = orgs.add_collaborator(&repo_id, &body.user_id, role).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(CollaboratorResponse::from(collaborator))))
 }
 
 /// `GET /api/orgs/:org/repos/:repo/collaborators` — lists all collaborators on a repo.
 async fn list_collaborators_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     AxumPath((org_slug, repo_name)): AxumPath<(String, String)>,
 ) -> Result<Json<Vec<CollaboratorResponse>>, ApiError> {
     let orgs = state.storage.orgs();
     let org = orgs.get_org_by_slug(&org_slug).await.map_err(ApiError::from)?;
     let repo_id = orgs.get_repo_id_in_org(&org.id, &repo_name).await.map_err(ApiError::from)?;
+    require_repo_permission(&state.storage, &identity, &repo_id, crate::storage::RepoRole::Read).await?;
     let collaborators = orgs.list_collaborators(&repo_id).await.map_err(ApiError::from)?;
     Ok(Json(collaborators.into_iter().map(CollaboratorResponse::from).collect()))
 }
 
 /// `PATCH /api/orgs/:org/repos/:repo/collaborators/:user` — updates a collaborator's role.
 async fn update_collaborator_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     AxumPath((org_slug, repo_name, user_id)): AxumPath<(String, String, uuid::Uuid)>,
     Json(body): Json<UpdateCollaboratorRequest>,
@@ -3471,18 +3584,23 @@ async fn update_collaborator_handler(
     let orgs = state.storage.orgs();
     let org = orgs.get_org_by_slug(&org_slug).await.map_err(ApiError::from)?;
     let repo_id = orgs.get_repo_id_in_org(&org.id, &repo_name).await.map_err(ApiError::from)?;
+    // Admin permission required to change roles.
+    require_repo_permission(&state.storage, &identity, &repo_id, crate::storage::RepoRole::Admin).await?;
     let collaborator = orgs.update_collaborator(&repo_id, &user_id, role).await.map_err(ApiError::from)?;
     Ok(Json(CollaboratorResponse::from(collaborator)))
 }
 
 /// `DELETE /api/orgs/:org/repos/:repo/collaborators/:user` — removes a collaborator from a repo.
 async fn remove_collaborator_handler(
+    Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     AxumPath((org_slug, repo_name, user_id)): AxumPath<(String, String, uuid::Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     let orgs = state.storage.orgs();
     let org = orgs.get_org_by_slug(&org_slug).await.map_err(ApiError::from)?;
     let repo_id = orgs.get_repo_id_in_org(&org.id, &repo_name).await.map_err(ApiError::from)?;
+    // Admin permission required to remove collaborators.
+    require_repo_permission(&state.storage, &identity, &repo_id, crate::storage::RepoRole::Admin).await?;
     orgs.remove_collaborator(&repo_id, &user_id).await.map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3901,8 +4019,13 @@ mod tests {
         let vai_dir = root.join(".vai");
         let repo_config = repo::read_config(&vai_dir).unwrap();
 
-        // Create a test API key so authenticated requests can succeed.
-        let (_, key) = auth::create(&vai_dir, "test-agent").unwrap();
+        // Create a regular API key for tests that need a revocable key
+        // (e.g. the authentication test). All other tests use the admin key.
+        auth::create(&vai_dir, "test-agent").unwrap();
+
+        // Use the bootstrap admin key so tests can access all endpoints,
+        // including admin-only routes like /api/repos and /api/orgs.
+        let key = "vai_admin_test".to_string();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4196,11 +4319,13 @@ mod tests {
         assert_eq!(resp.status(), 200, "status should be unauthenticated");
 
         // 5. Revoked key returns 401.
+        // Create a fresh key, use it once, then revoke it to verify 401.
         let vai_dir = root.join(".vai");
-        auth::revoke(&vai_dir, "test-agent").unwrap();
+        let (_, revocable_key) = auth::create(&vai_dir, "revoke-me").unwrap();
+        auth::revoke(&vai_dir, "revoke-me").unwrap();
         let resp = client
             .get(format!("http://{addr}/api/workspaces"))
-            .bearer_auth(&key)
+            .bearer_auth(&revocable_key)
             .send()
             .await
             .unwrap();
@@ -5867,7 +5992,9 @@ mod tests {
         repo::init(root).unwrap();
         let vai_dir = root.join(".vai");
         let repo_config = repo::read_config(&vai_dir).unwrap();
-        let (_, key) = auth::create(&vai_dir, "test-agent").unwrap();
+        // Use the bootstrap admin key so tests can access all endpoints,
+        // including admin-only routes like /api/repos.
+        let key = "vai_admin_test".to_string();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
