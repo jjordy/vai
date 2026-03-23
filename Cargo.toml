@@ -41,6 +41,7 @@ ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio-tungstenite = "0.24"
 async-trait = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-native-tls", "postgres", "uuid", "chrono", "json", "migrate"] }
 
 [dev-dependencies]
 tempfile = "3"

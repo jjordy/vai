@@ -14,6 +14,7 @@
 //! local repo's UUID (used for forward-compatibility). In Postgres mode it scopes
 //! all queries to the correct tenant.
 
+pub mod postgres;
 pub mod sqlite;
 
 use async_trait::async_trait;
