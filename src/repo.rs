@@ -41,6 +41,9 @@ pub enum RepoError {
 
     #[error("not inside a vai repository (no .vai/ directory found)")]
     NotARepo,
+
+    #[error("{0}")]
+    Other(String),
 }
 
 // ── On-disk config types ──────────────────────────────────────────────────────
@@ -130,6 +133,51 @@ pub struct LocalServerConfig {
     /// TCP port to listen on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+}
+
+/// Global server configuration stored in `~/.vai/server.toml` under `[server]`.
+///
+/// Applies to all repositories hosted by this server instance.  Per-repo
+/// settings in `.vai/config.toml` take precedence, and CLI flags override
+/// everything.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GlobalServerToml {
+    /// Top-level `[server]` table.
+    #[serde(default)]
+    pub server: GlobalServerSection,
+}
+
+/// Fields within the `[server]` table of `~/.vai/server.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GlobalServerSection {
+    /// IP address to bind to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// TCP port to listen on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Root directory where multi-repo storage lives (e.g. `/var/vai/repos`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_root: Option<PathBuf>,
+}
+
+/// Reads the global server config from `~/.vai/server.toml`.
+///
+/// Returns `Default` (all fields `None`) if the file does not exist; propagates
+/// I/O and parse errors.
+pub fn read_global_server_config() -> Result<GlobalServerSection, RepoError> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| RepoError::Other("cannot determine home directory".to_string()))?;
+    let path = PathBuf::from(home).join(".vai").join("server.toml");
+
+    if !path.exists() {
+        return Ok(GlobalServerSection::default());
+    }
+
+    let raw = fs::read_to_string(&path)?;
+    let parsed: GlobalServerToml = toml::from_str(&raw)?;
+    Ok(parsed.server)
 }
 
 /// Contents of `.vai/config.toml`.
@@ -578,6 +626,34 @@ mod tests {
             GraphSnapshot::open(&root.join(".vai").join("graph").join("snapshot.db")).unwrap();
         let entities = snapshot.search_entities_by_name("hello").unwrap();
         assert!(!entities.is_empty(), "expected entity 'hello' in graph");
+    }
+
+    #[test]
+    fn global_server_config_returns_defaults_when_missing() {
+        // Point HOME at a temp dir with no server.toml.
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let cfg = read_global_server_config().unwrap();
+        assert!(cfg.host.is_none());
+        assert!(cfg.port.is_none());
+        assert!(cfg.storage_root.is_none());
+    }
+
+    #[test]
+    fn global_server_config_parses_server_toml() {
+        let tmp = TempDir::new().unwrap();
+        let vai_dir = tmp.path().join(".vai");
+        fs::create_dir_all(&vai_dir).unwrap();
+        fs::write(
+            vai_dir.join("server.toml"),
+            b"[server]\nhost = \"0.0.0.0\"\nport = 9000\nstorage_root = \"/var/vai/repos\"\n",
+        )
+        .unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let cfg = read_global_server_config().unwrap();
+        assert_eq!(cfg.host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(cfg.port, Some(9000));
+        assert_eq!(cfg.storage_root, Some(PathBuf::from("/var/vai/repos")));
     }
 
     #[test]

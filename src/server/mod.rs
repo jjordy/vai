@@ -115,6 +115,8 @@ pub struct ServerConfig {
     pub host: String,
     /// TCP port to listen on (default: `7865`).
     pub port: u16,
+    /// Root directory for multi-repo storage. `None` means single-repo (legacy) mode.
+    pub storage_root: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -122,6 +124,7 @@ impl Default for ServerConfig {
         ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 7865,
+            storage_root: None,
         }
     }
 }

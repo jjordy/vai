@@ -1370,17 +1370,32 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
 
             match server_cmd {
                 ServerCommands::Start { port, host } => {
-                    // Build config: start from defaults, layer in [server] from
-                    // .vai/config.toml if present, then apply CLI flag overrides.
+                    // Config layering (lowest → highest priority):
+                    //   1. Built-in defaults (127.0.0.1:7865, no storage_root)
+                    //   2. ~/.vai/server.toml [server] section (global, optional)
+                    //   3. .vai/config.toml [server] section (per-repo, optional)
+                    //   4. CLI flags (--host, --port)
                     let mut config = server::ServerConfig::default();
+
+                    // Layer 2: global server config
+                    if let Ok(global) = repo::read_global_server_config() {
+                        if let Some(h) = global.host { config.host = h; }
+                        if let Some(p) = global.port { config.port = p; }
+                        if let Some(r) = global.storage_root { config.storage_root = Some(r); }
+                    }
+
+                    // Layer 3: per-repo config
                     if let Ok(repo_cfg) = repo::read_config(&vai_dir) {
                         if let Some(srv) = repo_cfg.server {
                             if let Some(h) = srv.host { config.host = h; }
                             if let Some(p) = srv.port { config.port = p; }
                         }
                     }
+
+                    // Layer 4: CLI flags
                     if let Some(h) = host { config.host = h; }
                     if let Some(p) = port { config.port = p; }
+
                     tokio::runtime::Runtime::new()
                         .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?
                         .block_on(server::start(&vai_dir, config))?;
