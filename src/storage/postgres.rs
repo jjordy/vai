@@ -1640,4 +1640,62 @@ impl OrgStore for PostgresStorage {
             })
             .collect())
     }
+
+    async fn resolve_repo_role(
+        &self,
+        user_id: &Uuid,
+        repo_id: &Uuid,
+    ) -> Result<Option<RepoRole>, StorageError> {
+        // Single query: join repos → org_members (via org_id) and
+        // repo_collaborators, both as LEFT JOINs so we always get a row when
+        // the repo exists.
+        let row = sqlx::query(
+            "SELECT om.role  AS org_role,
+                    rc.role  AS direct_role
+             FROM   repos r
+             LEFT JOIN org_members om
+                    ON r.org_id IS NOT NULL
+                   AND r.org_id   = om.org_id
+                   AND om.user_id = $1
+             LEFT JOIN repo_collaborators rc
+                    ON rc.repo_id  = $2
+                   AND rc.user_id  = $1
+             WHERE  r.id = $2",
+        )
+        .bind(user_id)
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let row = match row {
+            Some(r) => r,
+            // Repo not found — treat as no access.
+            None => return Ok(None),
+        };
+
+        // Derive an effective role from org membership (owner/admin only).
+        let org_derived: Option<RepoRole> = {
+            let org_role: Option<&str> = row.get("org_role");
+            match org_role {
+                Some("owner") => Some(RepoRole::Owner),
+                Some("admin") => Some(RepoRole::Admin),
+                // org members (role = "member") need a direct collaborator entry.
+                _ => None,
+            }
+        };
+
+        // Direct collaborator role on this specific repo.
+        let direct: Option<RepoRole> = {
+            let direct_role: Option<&str> = row.get("direct_role");
+            direct_role.map(RepoRole::from_str)
+        };
+
+        // Return the most permissive of the two, or None if neither exists.
+        Ok(match (org_derived, direct) {
+            (Some(a), Some(b)) => Some(RepoRole::max(a, b)),
+            (Some(r), None) | (None, Some(r)) => Some(r),
+            (None, None) => None,
+        })
+    }
 }

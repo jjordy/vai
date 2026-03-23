@@ -912,6 +912,14 @@ impl OrgStore for SqliteStorage {
     ) -> Result<Vec<RepoCollaborator>, StorageError> {
         Err(org_store_unsupported())
     }
+
+    async fn resolve_repo_role(
+        &self,
+        _user_id: &Uuid,
+        _repo_id: &Uuid,
+    ) -> Result<Option<RepoRole>, StorageError> {
+        Err(org_store_unsupported())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

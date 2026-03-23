@@ -527,6 +527,24 @@ impl RepoRole {
             RepoRole::Read => "read",
         }
     }
+
+    /// Numeric rank used to compare privilege levels (higher = more permissive).
+    ///
+    /// Used by permission resolution to return the most permissive role when a
+    /// user has both an org-derived role and a direct collaborator role.
+    pub fn rank(&self) -> u8 {
+        match self {
+            RepoRole::Owner => 4,
+            RepoRole::Admin => 3,
+            RepoRole::Write => 2,
+            RepoRole::Read => 1,
+        }
+    }
+
+    /// Returns the more permissive of two roles.
+    pub fn max(a: Self, b: Self) -> Self {
+        if a.rank() >= b.rank() { a } else { b }
+    }
 }
 
 /// An organization that owns repositories and has members.
@@ -685,6 +703,24 @@ pub trait OrgStore: Send + Sync {
         &self,
         repo_id: &Uuid,
     ) -> Result<Vec<RepoCollaborator>, StorageError>;
+
+    // ── Permission resolution ─────────────────────────────────────────────────
+
+    /// Computes the effective [`RepoRole`] for `user_id` on `repo_id`.
+    ///
+    /// Resolution order (PRD 10.1):
+    /// 1. If the repo belongs to an org and the user is an org **owner** or
+    ///    **admin**, they receive `Owner` or `Admin` access respectively on
+    ///    every repo in that org.
+    /// 2. A direct [`repo_collaborators`](RepoCollaborator) entry overrides or
+    ///    supplements the org-derived role — the more permissive of the two is
+    ///    returned.
+    /// 3. Returns `None` when the user has no access to the repo.
+    async fn resolve_repo_role(
+        &self,
+        user_id: &Uuid,
+        repo_id: &Uuid,
+    ) -> Result<Option<RepoRole>, StorageError>;
 }
 
 // ── FileStore ─────────────────────────────────────────────────────────────────
