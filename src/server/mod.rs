@@ -135,6 +135,9 @@ pub enum ServerError {
     #[error("Auth error: {0}")]
     Auth(#[from] auth::AuthError),
 
+    #[error("Storage error: {0}")]
+    Storage(#[from] crate::storage::StorageError),
+
     #[error("Invalid bind address `{addr}`: {source}")]
     BadAddress {
         addr: String,
@@ -156,6 +159,10 @@ pub struct ServerConfig {
     pub storage_root: Option<std::path::PathBuf>,
     /// Optional path to write a PID file on startup (removed on clean shutdown).
     pub pid_file: Option<std::path::PathBuf>,
+    /// Postgres connection URL. When set the server uses `PostgresStorage`
+    /// instead of the default SQLite backend. Example:
+    /// `postgres://vai:secret@localhost:5432/vai`
+    pub database_url: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -165,6 +172,7 @@ impl Default for ServerConfig {
             port: 7865,
             storage_root: None,
             pid_file: None,
+            database_url: None,
         }
     }
 }
@@ -334,6 +342,11 @@ pub(crate) struct AppState {
     repo_lock: Arc<Mutex<()>>,
     /// Root directory for multi-repo storage. `None` means single-repo (legacy) mode.
     storage_root: Option<PathBuf>,
+    /// Pluggable storage backend — SQLite for local mode, Postgres for server mode.
+    ///
+    /// Handlers should prefer this over direct `vai_dir`-based module calls when
+    /// the required operation is covered by a storage trait.
+    pub(crate) storage: crate::storage::StorageBackend,
 }
 
 impl AppState {
@@ -3007,6 +3020,7 @@ pub async fn start_for_testing(
         conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
         repo_lock: Arc::new(Mutex::new(())),
         storage_root: None,
+        storage: crate::storage::StorageBackend::local(vai_dir),
     });
 
     let app = build_app(state);
@@ -3060,6 +3074,13 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
 
     let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
+    // Build the storage backend: Postgres when a database URL is configured,
+    // SQLite otherwise (legacy local mode).
+    let storage = match &config.database_url {
+        Some(url) => crate::storage::StorageBackend::server(url, 10).await?,
+        None => crate::storage::StorageBackend::local(vai_dir),
+    };
+
     let state = Arc::new(AppState {
         vai_dir: vai_dir.to_owned(),
         repo_root,
@@ -3072,6 +3093,7 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
         conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
         repo_lock: Arc::new(Mutex::new(())),
         storage_root: config.storage_root.clone(),
+        storage,
     });
 
     let app = build_app(state);
@@ -3192,6 +3214,7 @@ mod tests {
             conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
             repo_lock: Arc::new(Mutex::new(())),
             storage_root: None,
+            storage: crate::storage::StorageBackend::local(&vai_dir),
         });
 
         let app = build_app(Arc::clone(&state));
@@ -5154,6 +5177,7 @@ mod tests {
             conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
             repo_lock: Arc::new(Mutex::new(())),
             storage_root: Some(storage_root),
+            storage: crate::storage::StorageBackend::local(&vai_dir),
         });
 
         let app = build_app(Arc::clone(&state));

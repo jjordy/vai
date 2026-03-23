@@ -3,9 +3,10 @@
 //! # Backends
 //!
 //! - [`sqlite`] — SQLite/filesystem backend for local CLI mode (see [`sqlite::SqliteStorage`]).
+//! - [`postgres`] — Postgres backend for hosted server mode (see [`postgres::PostgresStorage`]).
 //!
 //! This module defines the trait interfaces that decouple business logic from
-//! specific storage engines. Two backends are planned:
+//! specific storage engines. Two backends are supported:
 //!
 //! - **SQLite** (local CLI mode): single-file databases under `.vai/`
 //! - **Postgres** (hosted server mode): shared multi-tenant database with `repo_id` scoping
@@ -13,9 +14,14 @@
 //! Every trait method accepts a `repo_id` parameter. In SQLite mode this is the
 //! local repo's UUID (used for forward-compatibility). In Postgres mode it scopes
 //! all queries to the correct tenant.
+//!
+//! Use [`StorageBackend`] to construct and access the appropriate backend.
 
 pub mod postgres;
 pub mod sqlite;
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -496,4 +502,118 @@ pub trait FileStore: Send + Sync {
         repo_id: &Uuid,
         path: &str,
     ) -> Result<bool, StorageError>;
+}
+
+// ── StorageBackend factory ────────────────────────────────────────────────────
+
+/// A constructed, ready-to-use storage backend.
+///
+/// Wraps either [`sqlite::SqliteStorage`] (for local CLI mode) or
+/// [`postgres::PostgresStorage`] (for hosted server mode).  All accessor
+/// methods return `Arc<dyn Trait>` so callers are fully decoupled from the
+/// concrete implementation.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use vai::storage::StorageBackend;
+///
+/// // Local CLI mode:
+/// let backend = StorageBackend::local(".vai");
+/// let events = backend.events();
+///
+/// // Server mode (async):
+/// // let backend = StorageBackend::server("postgres://...", 10).await?;
+/// ```
+#[derive(Clone, Debug)]
+pub enum StorageBackend {
+    /// Local CLI mode — SQLite + filesystem under a `.vai/` directory.
+    Local(Arc<sqlite::SqliteStorage>),
+    /// Hosted server mode — Postgres with multi-tenant `repo_id` scoping.
+    Server(Arc<postgres::PostgresStorage>),
+}
+
+impl StorageBackend {
+    /// Creates a local SQLite backend rooted at `vai_dir`.
+    pub fn local(vai_dir: impl Into<PathBuf>) -> Self {
+        StorageBackend::Local(Arc::new(sqlite::SqliteStorage::new(vai_dir)))
+    }
+
+    /// Connects to Postgres at `database_url` and returns a server-mode backend.
+    ///
+    /// `max_connections` controls the pool size (10 is a reasonable default).
+    ///
+    /// Run migrations separately via [`postgres::PostgresStorage::migrate`]
+    /// before serving requests.
+    pub async fn server(database_url: &str, max_connections: u32) -> Result<Self, StorageError> {
+        let storage = postgres::PostgresStorage::connect(database_url, max_connections).await?;
+        Ok(StorageBackend::Server(Arc::new(storage)))
+    }
+
+    /// Returns the event log store.
+    pub fn events(&self) -> Arc<dyn EventStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn EventStore>,
+            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn EventStore>,
+        }
+    }
+
+    /// Returns the issue store.
+    pub fn issues(&self) -> Arc<dyn IssueStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn IssueStore>,
+            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn IssueStore>,
+        }
+    }
+
+    /// Returns the escalation store.
+    pub fn escalations(&self) -> Arc<dyn EscalationStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn EscalationStore>,
+            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn EscalationStore>,
+        }
+    }
+
+    /// Returns the semantic graph store.
+    pub fn graph(&self) -> Arc<dyn GraphStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn GraphStore>,
+            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn GraphStore>,
+        }
+    }
+
+    /// Returns the version history store.
+    pub fn versions(&self) -> Arc<dyn VersionStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn VersionStore>,
+            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn VersionStore>,
+        }
+    }
+
+    /// Returns the workspace metadata store.
+    pub fn workspaces(&self) -> Arc<dyn WorkspaceStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn WorkspaceStore>,
+            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn WorkspaceStore>,
+        }
+    }
+
+    /// Returns the API key (auth) store.
+    pub fn auth(&self) -> Arc<dyn AuthStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn AuthStore>,
+            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn AuthStore>,
+        }
+    }
+
+    /// Returns the file content store.
+    ///
+    /// For the `Server` backend the underlying Postgres implementation returns
+    /// an error on use — a real S3-backed [`FileStore`] is tracked in issue #76.
+    pub fn files(&self) -> Arc<dyn FileStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn FileStore>,
+            StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn FileStore>,
+        }
+    }
 }

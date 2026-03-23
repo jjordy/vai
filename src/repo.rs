@@ -159,6 +159,13 @@ pub struct GlobalServerSection {
     /// Root directory where multi-repo storage lives (e.g. `/var/vai/repos`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_root: Option<PathBuf>,
+    /// Postgres connection URL for server-mode storage.
+    ///
+    /// When set the server uses `PostgresStorage`; otherwise the SQLite/filesystem
+    /// backend is used. Can also be supplied via the `VAI_DATABASE_URL` environment
+    /// variable or the `--database-url` CLI flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_url: Option<String>,
 }
 
 /// Reads the global server config from `~/.vai/server.toml`.
