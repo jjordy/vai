@@ -118,6 +118,20 @@ pub enum ApiKeyError {
     NotConfigured,
 }
 
+/// Server bind settings stored in `.vai/config.toml` under `[server]`.
+///
+/// When present, these values are used as defaults for `vai server start`.
+/// CLI flags (`--host`, `--port`) override these values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalServerConfig {
+    /// IP address to bind to (e.g. `0.0.0.0` or `127.0.0.1`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// TCP port to listen on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
 /// Contents of `.vai/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
@@ -132,6 +146,9 @@ pub struct RepoConfig {
     /// Optional remote server configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteServerConfig>,
+    /// Optional local server bind configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<LocalServerConfig>,
 }
 
 /// Contents of `vai.toml` at the project root.
@@ -222,6 +239,7 @@ pub fn init(root: &Path) -> Result<InitResult, RepoError> {
         created_at: Utc::now(),
         vai_version: env!("CARGO_PKG_VERSION").to_string(),
         remote: None,
+        server: None,
     };
     fs::write(
         vai_dir.join("config.toml"),

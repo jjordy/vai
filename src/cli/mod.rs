@@ -380,12 +380,12 @@ pub enum MergeCommands {
 pub enum ServerCommands {
     /// Start the vai HTTP server for this repository.
     Start {
-        /// Port to listen on.
-        #[arg(long, default_value = "7832")]
-        port: u16,
-        /// Address to bind to.
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
+        /// TCP port to listen on. Overrides `[server].port` in `.vai/config.toml`.
+        #[arg(long)]
+        port: Option<u16>,
+        /// IP address to bind to. Overrides `[server].host` in `.vai/config.toml`.
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Manage API keys for server authentication.
     #[command(subcommand)]
@@ -1369,8 +1369,18 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
             let vai_dir = root.join(".vai");
 
             match server_cmd {
-                ServerCommands::Start { port, bind } => {
-                    let config = server::ServerConfig { bind, port };
+                ServerCommands::Start { port, host } => {
+                    // Build config: start from defaults, layer in [server] from
+                    // .vai/config.toml if present, then apply CLI flag overrides.
+                    let mut config = server::ServerConfig::default();
+                    if let Ok(repo_cfg) = repo::read_config(&vai_dir) {
+                        if let Some(srv) = repo_cfg.server {
+                            if let Some(h) = srv.host { config.host = h; }
+                            if let Some(p) = srv.port { config.port = p; }
+                        }
+                    }
+                    if let Some(h) = host { config.host = h; }
+                    if let Some(p) = port { config.port = p; }
                     tokio::runtime::Runtime::new()
                         .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?
                         .block_on(server::start(&vai_dir, config))?;

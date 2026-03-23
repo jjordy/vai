@@ -112,24 +112,24 @@ pub enum ServerError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// IP address to bind to (default: `127.0.0.1`).
-    pub bind: String,
-    /// TCP port to listen on (default: `7832`).
+    pub host: String,
+    /// TCP port to listen on (default: `7865`).
     pub port: u16,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            bind: "127.0.0.1".to_string(),
-            port: 7832,
+            host: "127.0.0.1".to_string(),
+            port: 7865,
         }
     }
 }
 
 impl ServerConfig {
-    /// Returns the socket address derived from bind + port.
+    /// Returns the socket address derived from host + port.
     pub fn socket_addr(&self) -> Result<SocketAddr, ServerError> {
-        let raw = format!("{}:{}", self.bind, self.port);
+        let raw = format!("{}:{}", self.host, self.port);
         raw.parse().map_err(|source| ServerError::BadAddress {
             addr: raw,
             source,
