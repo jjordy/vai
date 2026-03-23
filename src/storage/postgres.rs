@@ -121,6 +121,13 @@ impl EventStore for PostgresStorage {
         let payload =
             serde_json::to_value(&event).map_err(|e| StorageError::Serialization(e.to_string()))?;
 
+        // Use a transaction so the NOTIFY fires only after the INSERT commits.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
         let row = sqlx::query(
             r#"
             INSERT INTO events (repo_id, event_type, workspace_id, payload)
@@ -132,12 +139,26 @@ impl EventStore for PostgresStorage {
         .bind(&event_type)
         .bind(workspace_id)
         .bind(&payload)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
 
         let id: i64 = row.get("id");
         let created_at: DateTime<Utc> = row.get("created_at");
+
+        // Notify WebSocket listeners that a new event is available.
+        // Payload format: "<repo_id>:<event_id>" — lightweight pointer only.
+        // The listener queries the full event from the database.
+        let notify_payload = format!("{repo_id}:{id}");
+        sqlx::query("SELECT pg_notify('vai_events', $1)")
+            .bind(&notify_payload)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
 
         Ok(Event {
             id: id as u64,
