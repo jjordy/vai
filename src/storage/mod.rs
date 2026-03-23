@@ -4,6 +4,7 @@
 //!
 //! - [`sqlite`] — SQLite/filesystem backend for local CLI mode (see [`sqlite::SqliteStorage`]).
 //! - [`postgres`] — Postgres backend for hosted server mode (see [`postgres::PostgresStorage`]).
+//! - [`filesystem`] — Standalone filesystem [`FileStore`] (see [`filesystem::FilesystemFileStore`]).
 //!
 //! This module defines the trait interfaces that decouple business logic from
 //! specific storage engines. Two backends are supported:
@@ -17,6 +18,7 @@
 //!
 //! Use [`StorageBackend`] to construct and access the appropriate backend.
 
+pub mod filesystem;
 pub mod postgres;
 pub mod sqlite;
 
