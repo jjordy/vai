@@ -2479,6 +2479,10 @@ struct ServerGraphRefreshResponse {
 ///
 /// Should be called after `POST /api/files` completes to ensure the graph
 /// reflects the uploaded source files (PRD 12.4).
+///
+/// Writes entity and relationship data via the configured [`GraphStore`] backend
+/// (Postgres in server mode, SQLite in local mode) so the correct store is
+/// always updated.
 async fn server_graph_refresh_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
@@ -2493,13 +2497,71 @@ async fn server_graph_refresh_handler(
     .await?;
     let _lock = state.repo_lock.lock().await;
 
-    let result = crate::repo::refresh_graph(&ctx.repo_root)
-        .map_err(|e| ApiError::internal(format!("graph refresh failed: {e}")))?;
+    // Read ignore patterns from vai.toml (defaults if absent).
+    let vai_toml_path = ctx.repo_root.join("vai.toml");
+    let vai_toml: crate::repo::VaiToml = if vai_toml_path.exists() {
+        let raw = std::fs::read_to_string(&vai_toml_path)
+            .map_err(|e| ApiError::internal(format!("read vai.toml: {e}")))?;
+        toml::from_str(&raw)
+            .map_err(|e| ApiError::internal(format!("parse vai.toml: {e}")))?
+    } else {
+        crate::repo::VaiToml::default()
+    };
+
+    let source_files = crate::repo::collect_source_files(&ctx.repo_root, &vai_toml.ignore);
+    let graph = ctx.storage.graph();
+    let repo_id = ctx.repo_id;
+
+    let mut files_scanned = 0usize;
+    let mut total_entities = 0usize;
+    let mut total_relationships = 0usize;
+
+    for file_path in &source_files {
+        let rel = file_path
+            .strip_prefix(&ctx.repo_root)
+            .unwrap_or(file_path)
+            .to_string_lossy()
+            .into_owned();
+
+        let source = match std::fs::read(file_path) {
+            Ok(b) => b,
+            Err(_) => continue, // best-effort: skip unreadable files
+        };
+
+        let (entities, rels) = match crate::graph::parse_source_file(&rel, &source) {
+            Ok(r) => r,
+            Err(_) => continue, // best-effort: skip unparseable files
+        };
+
+        // Clear stale data for this file before upserting fresh entities.
+        graph
+            .clear_file(&repo_id, &rel)
+            .await
+            .map_err(|e| ApiError::internal(format!("clear graph for {rel}: {e}")))?;
+
+        total_entities += entities.len();
+        total_relationships += rels.len();
+
+        if !entities.is_empty() {
+            graph
+                .upsert_entities(&repo_id, entities)
+                .await
+                .map_err(|e| ApiError::internal(format!("upsert entities for {rel}: {e}")))?;
+        }
+        if !rels.is_empty() {
+            graph
+                .upsert_relationships(&repo_id, rels)
+                .await
+                .map_err(|e| ApiError::internal(format!("upsert relationships for {rel}: {e}")))?;
+        }
+
+        files_scanned += 1;
+    }
 
     Ok(Json(ServerGraphRefreshResponse {
-        files_scanned: result.files_scanned,
-        entities: result.graph_stats.entity_count,
-        relationships: result.graph_stats.relationship_count,
+        files_scanned,
+        entities: total_entities,
+        relationships: total_relationships,
     }))
 }
 

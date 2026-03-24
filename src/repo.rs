@@ -459,7 +459,7 @@ pub fn write_config(vai_dir: &Path, config: &RepoConfig) -> Result<(), RepoError
 /// Recursively collects all supported source files under `root`, respecting ignore patterns.
 ///
 /// Supported extensions: `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`.
-fn collect_source_files(root: &Path, ignore: &[String]) -> Vec<PathBuf> {
+pub(crate) fn collect_source_files(root: &Path, ignore: &[String]) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_recursive(root, ignore, &mut files);
     files
