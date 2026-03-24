@@ -108,7 +108,7 @@
 //! WebSocket auth uses the `key` query param.
 //! Keys are managed with `vai server keys`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -516,6 +516,39 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for RepoCtx {
     }
 }
 
+// ── Path parameter extractor ──────────────────────────────────────────────────
+
+/// Path extractor that resolves the `:id` parameter by name from the matched
+/// path segments.
+///
+/// Unlike `axum::extract::Path<String>`, which fails with "wrong number of
+/// arguments" when the route has more than one parameter, `PathId` extracts
+/// params as a `HashMap` and looks up `"id"` by key.  This means the same
+/// handler works correctly in both single-repo mode (e.g. `/workspaces/:id`)
+/// and multi-repo mode (e.g. `/api/repos/:repo/workspaces/:id`) without any
+/// code duplication.
+struct PathId(String);
+
+#[axum::async_trait]
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PathId {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let AxumPath(params) =
+            AxumPath::<HashMap<String, String>>::from_request_parts(parts, state)
+                .await
+                .map_err(|e| ApiError::bad_request(format!("path extraction failed: {e}")))?;
+        let id = params
+            .get("id")
+            .cloned()
+            .ok_or_else(|| ApiError::bad_request("missing `:id` path parameter"))?;
+        Ok(PathId(id))
+    }
+}
+
 // ── Authentication middleware ─────────────────────────────────────────────────
 
 /// Axum middleware that enforces `Authorization: Bearer <key>` on every request.
@@ -609,7 +642,7 @@ async fn repo_resolve_middleware(
 
     // Split the request so we can call the path extractor.
     let (mut parts, body) = request.into_parts();
-    let path_result = AxumPath::<std::collections::HashMap<String, String>>::from_request_parts(
+    let path_result = AxumPath::<HashMap<String, String>>::from_request_parts(
         &mut parts,
         &state,
     )
@@ -1320,7 +1353,7 @@ async fn list_workspaces_handler(
 async fn get_workspace_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
-    AxumPath(id): AxumPath<String>,
+    PathId(id): PathId,
 ) -> Result<Json<WorkspaceResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let meta = workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
@@ -1338,7 +1371,7 @@ async fn submit_workspace_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
-    AxumPath(id): AxumPath<String>,
+    PathId(id): PathId,
 ) -> Result<Json<SubmitResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
@@ -1439,7 +1472,7 @@ async fn discard_workspace_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
-    AxumPath(id): AxumPath<String>,
+    PathId(id): PathId,
 ) -> Result<StatusCode, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
@@ -1500,7 +1533,7 @@ async fn list_versions_handler(
 async fn get_version_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
-    AxumPath(id): AxumPath<String>,
+    PathId(id): PathId,
 ) -> Result<Json<version::VersionChanges>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let meta = ctx
@@ -2270,7 +2303,7 @@ async fn upload_workspace_files_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
-    AxumPath(id): AxumPath<String>,
+    PathId(id): PathId,
     Json(body): Json<UploadFilesRequest>,
 ) -> Result<(StatusCode, Json<UploadFilesResponse>), ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
@@ -2432,8 +2465,16 @@ async fn upload_workspace_files_handler(
 async fn get_workspace_file_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
-    AxumPath((id, path)): AxumPath<(String, String)>,
+    AxumPath(params): AxumPath<HashMap<String, String>>,
 ) -> Result<Json<FileDownloadResponse>, ApiError> {
+    let id = params
+        .get("id")
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request("missing `:id` path parameter"))?;
+    let path = params
+        .get("path")
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request("missing `*path` wildcard"))?;
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     // Verify workspace exists.
     workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
@@ -2712,8 +2753,12 @@ async fn server_graph_refresh_handler(
 async fn get_main_file_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
-    AxumPath(path): AxumPath<String>,
+    AxumPath(params): AxumPath<HashMap<String, String>>,
 ) -> Result<Json<FileDownloadResponse>, ApiError> {
+    let path = params
+        .get("path")
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request("missing `*path` wildcard"))?;
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let rel = sanitize_path(&path)
         .ok_or_else(|| ApiError::bad_request(format!("invalid path: '{path}'")))?;
@@ -2868,7 +2913,7 @@ async fn list_graph_entities_handler(
 async fn get_graph_entity_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
-    AxumPath(id): AxumPath<String>,
+    PathId(id): PathId,
 ) -> Result<Json<EntityDetailResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let graph = open_graph(&ctx.vai_dir)?;
@@ -2890,7 +2935,7 @@ async fn get_graph_entity_handler(
 async fn get_entity_deps_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
-    AxumPath(id): AxumPath<String>,
+    PathId(id): PathId,
 ) -> Result<Json<EntityDepsResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let graph = open_graph(&ctx.vai_dir)?;
@@ -3139,7 +3184,7 @@ async fn list_issues_handler(
 async fn get_issue_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
-    AxumPath(id): AxumPath<String>,
+    PathId(id): PathId,
 ) -> Result<Json<IssueResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let issue_id = uuid::Uuid::parse_str(&id)
@@ -3162,7 +3207,7 @@ async fn update_issue_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
-    AxumPath(id): AxumPath<String>,
+    PathId(id): PathId,
     Json(body): Json<UpdateIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
@@ -3202,7 +3247,7 @@ async fn close_issue_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
-    AxumPath(id): AxumPath<String>,
+    PathId(id): PathId,
     Json(body): Json<CloseIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
@@ -3326,7 +3371,7 @@ struct ListEscalationsQuery {
 async fn get_escalation_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
-    AxumPath(id): AxumPath<String>,
+    PathId(id): PathId,
 ) -> Result<Json<EscalationResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let esc_id = uuid::Uuid::parse_str(&id)
@@ -3348,7 +3393,7 @@ async fn resolve_escalation_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
-    AxumPath(id): AxumPath<String>,
+    PathId(id): PathId,
     Json(body): Json<ResolveEscalationRequest>,
 ) -> Result<Json<EscalationResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
@@ -3559,7 +3604,7 @@ async fn pause_watcher_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
-    AxumPath(agent_id): AxumPath<String>,
+    PathId(agent_id): PathId,
 ) -> Result<Json<WatcherResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
@@ -3580,7 +3625,7 @@ async fn resume_watcher_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
-    AxumPath(agent_id): AxumPath<String>,
+    PathId(agent_id): PathId,
 ) -> Result<Json<WatcherResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
