@@ -4242,9 +4242,11 @@ async fn revoke_key_handler(
 /// `POST /api/repos/:repo/migrate` (multi-repo).
 ///
 /// Accepts a [`MigrationPayload`] containing events, issues, versions, and
-/// escalations from a local SQLite repository and inserts everything into
-/// Postgres in a single transaction.  Rejects the request if the repository
-/// already contains events (prevents accidental double-migration).
+/// escalations from a local SQLite repository and upserts everything into
+/// Postgres in a single transaction.  The endpoint is idempotent: re-running
+/// after a partial failure is safe — items that already exist are skipped
+/// via `ON CONFLICT DO NOTHING`.  The returned counts reflect only the rows
+/// that were actually inserted (not skipped).
 ///
 /// Only available when the server is running in Postgres mode.
 async fn migrate_handler(
@@ -4277,22 +4279,6 @@ async fn migrate_handler(
     let repo_id = ctx.repo_id;
     let pool = pg.pool();
 
-    // Guard: reject if the repo already has events.
-    let existing: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events WHERE repo_id = $1",
-    )
-    .bind(repo_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| ApiError::internal(format!("failed to count existing events: {e}")))?;
-
-    if existing > 0 {
-        return Err(ApiError::conflict(format!(
-            "repository {repo_id} already has {existing} events; \
-             migration rejected to prevent data duplication"
-        )));
-    }
-
     let _lock = state.repo_lock.lock().await;
 
     let mut tx = pool
@@ -4301,27 +4287,37 @@ async fn migrate_handler(
         .map_err(|e| ApiError::internal(format!("failed to begin transaction: {e}")))?;
 
     // ── Insert events ──────────────────────────────────────────────────────────
+    // Uses `local_event_id` (the source repo's monotonic counter) to detect
+    // duplicates so the endpoint is safe to retry after partial failures.
+    let mut events_inserted: usize = 0;
     for event in &payload.events {
         let event_type = event.kind.event_type();
         let workspace_id = event.kind.workspace_id();
         let payload_val = serde_json::to_value(&event.kind)
             .map_err(|e| ApiError::internal(format!("failed to serialize event: {e}")))?;
+        let local_id = event.id as i64;
 
-        sqlx::query(
-            r#"INSERT INTO events (repo_id, event_type, workspace_id, payload, created_at)
-               VALUES ($1, $2, $3, $4, $5)"#,
+        let result = sqlx::query(
+            r#"INSERT INTO events
+                   (repo_id, event_type, workspace_id, payload, created_at, local_event_id)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (repo_id, local_event_id) WHERE local_event_id IS NOT NULL
+               DO NOTHING"#,
         )
         .bind(repo_id)
         .bind(&event_type)
         .bind(workspace_id)
         .bind(&payload_val)
         .bind(event.timestamp)
+        .bind(local_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal(format!("failed to insert event: {e}")))?;
+        events_inserted += result.rows_affected() as usize;
     }
 
     // ── Insert issues ──────────────────────────────────────────────────────────
+    let mut issues_inserted: usize = 0;
     for issue in &payload.issues {
         let priority = issue.priority.as_str().to_string();
         let status = issue.status.as_str().to_string();
@@ -4330,7 +4326,7 @@ async fn migrate_handler(
             .as_ref()
             .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null));
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"INSERT INTO issues
                    (id, repo_id, title, body, status, priority, labels,
                     creator, agent_source, resolution, created_at, updated_at)
@@ -4352,14 +4348,16 @@ async fn migrate_handler(
         .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal(format!("failed to insert issue: {e}")))?;
+        issues_inserted += result.rows_affected() as usize;
     }
 
     // ── Insert versions ────────────────────────────────────────────────────────
+    let mut versions_inserted: usize = 0;
     for version in &payload.versions {
         let merge_event_id = version.merge_event_id.map(|x| x as i64);
         let version_uuid = uuid::Uuid::new_v4();
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"INSERT INTO versions
                    (id, repo_id, version_id, parent_version_id, intent,
                     created_by, merge_event_id, created_at)
@@ -4377,9 +4375,11 @@ async fn migrate_handler(
         .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal(format!("failed to insert version: {e}")))?;
+        versions_inserted += result.rows_affected() as usize;
     }
 
     // ── Insert escalations ─────────────────────────────────────────────────────
+    let mut escalations_inserted: usize = 0;
     for esc in &payload.escalations {
         let esc_type = esc.escalation_type.as_str().to_string();
         let severity = esc.severity.as_str().to_string();
@@ -4388,7 +4388,7 @@ async fn migrate_handler(
         let resolution_options = serde_json::to_value(&esc.resolution_options)
             .map_err(|e| ApiError::internal(format!("failed to serialize resolution options: {e}")))?;
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"INSERT INTO escalations
                    (id, repo_id, escalation_type, severity, summary,
                     intents, agents, workspace_ids, affected_entities,
@@ -4415,13 +4415,19 @@ async fn migrate_handler(
         .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::internal(format!("failed to insert escalation: {e}")))?;
+        escalations_inserted += result.rows_affected() as usize;
     }
 
     // ── Set HEAD version ───────────────────────────────────────────────────────
+    // Only advance HEAD if the incoming version is numerically higher than the
+    // current one (safe to re-run without rolling back a newer HEAD).
     if let Some(ref head) = payload.head_version {
         sqlx::query(
             r#"INSERT INTO version_head (repo_id, version_id) VALUES ($1, $2)
-               ON CONFLICT (repo_id) DO UPDATE SET version_id = EXCLUDED.version_id"#,
+               ON CONFLICT (repo_id) DO UPDATE
+               SET version_id = EXCLUDED.version_id
+               WHERE (REGEXP_REPLACE(version_head.version_id, '[^0-9]', '', 'g'))::BIGINT
+                   < (REGEXP_REPLACE(EXCLUDED.version_id,     '[^0-9]', '', 'g'))::BIGINT"#,
         )
         .bind(repo_id)
         .bind(head)
@@ -4435,10 +4441,10 @@ async fn migrate_handler(
         .map_err(|e| ApiError::internal(format!("failed to commit migration transaction: {e}")))?;
 
     let summary = MigrationSummary {
-        events_migrated: payload.events.len(),
-        issues_migrated: payload.issues.len(),
-        versions_migrated: payload.versions.len(),
-        escalations_migrated: payload.escalations.len(),
+        events_migrated: events_inserted,
+        issues_migrated: issues_inserted,
+        versions_migrated: versions_inserted,
+        escalations_migrated: escalations_inserted,
         head_version: payload.head_version,
         migrated_at: chrono::Utc::now(),
     };

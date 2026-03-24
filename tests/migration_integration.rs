@@ -223,7 +223,7 @@ async fn test_migrate_local_repo_to_postgres() {
     );
     assert_eq!(stats.head_version, expected_head, "head version mismatch");
 
-    // ── Double-migration guard — second POST must be rejected ─────────────────
+    // ── Idempotency check — second POST must succeed and insert nothing new ────
     let dup_resp = client
         .post(format!("{base}/api/migrate"))
         .bearer_auth("vai_admin_test")
@@ -234,9 +234,27 @@ async fn test_migrate_local_repo_to_postgres() {
 
     assert_eq!(
         dup_resp.status(),
-        reqwest::StatusCode::CONFLICT,
-        "second migration should be rejected with 409 Conflict"
+        reqwest::StatusCode::OK,
+        "second migration should succeed (idempotent): {}",
+        dup_resp.text().await.unwrap_or_default()
     );
+
+    let dup_summary: MigrationSummary = client
+        .post(format!("{base}/api/migrate"))
+        .bearer_auth("vai_admin_test")
+        .json(&payload)
+        .send()
+        .await
+        .expect("third migrate request failed")
+        .json()
+        .await
+        .expect("failed to deserialize third MigrationSummary");
+
+    // All rows already exist — nothing new should be inserted.
+    assert_eq!(dup_summary.events_migrated, 0, "re-run should skip existing events");
+    assert_eq!(dup_summary.issues_migrated, 0, "re-run should skip existing issues");
+    assert_eq!(dup_summary.versions_migrated, 0, "re-run should skip existing versions");
+    assert_eq!(dup_summary.escalations_migrated, 0, "re-run should skip existing escalations");
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     let _ = shutdown_tx.send(());
