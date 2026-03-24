@@ -189,6 +189,13 @@ pub struct ServerConfig {
     /// instead of the default SQLite backend. Example:
     /// `postgres://vai:secret@localhost:5432/vai`
     pub database_url: Option<String>,
+    /// Maximum number of Postgres connections in the pool.
+    ///
+    /// Defaults to 25 when not set.  Increase this value if you observe
+    /// `pool timed out` errors under high load (many concurrent CLI commands
+    /// or WebSocket clients).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_pool_size: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -199,6 +206,7 @@ impl Default for ServerConfig {
             storage_root: None,
             pid_file: None,
             database_url: None,
+            db_pool_size: None,
         }
     }
 }
@@ -935,6 +943,18 @@ pub struct ServerStatsResponse {
     pub vai_version: String,
     /// Number of active workspaces in the current repository.
     pub workspace_count: usize,
+    /// Connections currently checked out from the Postgres pool.
+    /// `null` when running against a local SQLite backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_pool_active: Option<u32>,
+    /// Connections currently idle in the Postgres pool.
+    /// `null` when running against a local SQLite backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_pool_idle: Option<u32>,
+    /// Maximum connections allowed by the Postgres pool configuration.
+    /// `null` when running against a local SQLite backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_pool_max: Option<u32>,
 }
 
 /// Request body for `POST /api/workspaces`.
@@ -1220,7 +1240,8 @@ async fn health_handler() -> Json<HealthResponse> {
 
 /// `GET /api/server/stats` — server-level operational statistics.
 ///
-/// Returns uptime, vai version, and workspace count. No authentication required.
+/// Returns uptime, vai version, workspace count, and (when Postgres is in use)
+/// connection pool utilization. No authentication required.
 async fn server_stats_handler(
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
@@ -1233,10 +1254,19 @@ async fn server_stats_handler(
         .map(|w| w.len())
         .unwrap_or(0);
 
+    let (db_pool_active, db_pool_idle, db_pool_max) =
+        match state.storage.pool_stats() {
+            Some(stats) => (Some(stats.active), Some(stats.idle), Some(stats.max)),
+            None => (None, None, None),
+        };
+
     Json(ServerStatsResponse {
         uptime_secs: state.started_at.elapsed().as_secs(),
         vai_version: state.vai_version.clone(),
         workspace_count,
+        db_pool_active,
+        db_pool_idle,
+        db_pool_max,
     })
 }
 
@@ -5105,8 +5135,9 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
 
     // Build the storage backend: Postgres when a database URL is configured,
     // SQLite otherwise (legacy local mode).
+    let pool_size = config.db_pool_size.unwrap_or(25);
     let storage = match &config.database_url {
-        Some(url) => crate::storage::StorageBackend::server(url, 10).await?,
+        Some(url) => crate::storage::StorageBackend::server(url, pool_size).await?,
         None => crate::storage::StorageBackend::local(vai_dir),
     };
 

@@ -166,6 +166,11 @@ pub struct GlobalServerSection {
     /// variable or the `--database-url` CLI flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
+    /// Maximum number of Postgres connections in the pool (default: 25).
+    ///
+    /// Increase this if you see `pool timed out` errors under load.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_pool_size: Option<u32>,
 }
 
 /// Reads the global server config from `~/.vai/server.toml`.

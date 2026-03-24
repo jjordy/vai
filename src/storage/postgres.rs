@@ -26,6 +26,7 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::auth::ApiKey;
@@ -47,6 +48,17 @@ use super::{
 
 // ── PostgresStorage ───────────────────────────────────────────────────────────
 
+/// Connection pool utilization snapshot.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolStats {
+    /// Connections currently checked out (in use by a query).
+    pub active: u32,
+    /// Connections currently idle in the pool.
+    pub idle: u32,
+    /// Maximum number of connections allowed by the pool configuration.
+    pub max: u32,
+}
+
 /// Postgres-backed storage for multi-tenant hosted vai.
 ///
 /// All trait methods accept a `repo_id` parameter and scope every SQL query
@@ -54,20 +66,32 @@ use super::{
 #[derive(Clone, Debug)]
 pub struct PostgresStorage {
     pool: PgPool,
+    /// Configured upper limit for the connection pool (stored so it can be
+    /// reported in the server stats endpoint without calling into pool internals).
+    max_connections: u32,
 }
 
 impl PostgresStorage {
     /// Connects to Postgres at `database_url` and returns a new storage handle.
     ///
-    /// `max_connections` caps the pool size (10 is suitable for single-server
-    /// deployments; increase for high-throughput scenarios).
+    /// `max_connections` caps the pool size. 25 is a reasonable default for
+    /// single-server deployments under moderate load; increase for high-throughput
+    /// scenarios.  The pool is configured with a 5-second acquire timeout (so
+    /// callers get a clear error instead of hanging indefinitely) and releases
+    /// connections idle for more than 10 minutes.
     pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self, StorageError> {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            // Fail fast with a clear error rather than waiting indefinitely when
+            // the pool is exhausted.
+            .acquire_timeout(Duration::from_secs(5))
+            // Release idle connections after 10 minutes to avoid accumulating
+            // stale connections during quiet periods.
+            .idle_timeout(Duration::from_secs(600))
             .connect(database_url)
             .await
             .map_err(|e| StorageError::Database(e.to_string()))?;
-        Ok(Self { pool })
+        Ok(Self { pool, max_connections })
     }
 
     /// Applies all pending SQL migrations from `migrations/` at `migrations_path`.
@@ -89,6 +113,17 @@ impl PostgresStorage {
     /// Returns a reference to the underlying connection pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Returns a snapshot of connection pool utilization.
+    pub fn pool_stats(&self) -> PoolStats {
+        let size = self.pool.size();
+        let idle = self.pool.num_idle() as u32;
+        PoolStats {
+            active: size.saturating_sub(idle),
+            idle,
+            max: self.max_connections,
+        }
     }
 
     /// Creates a [`sqlx::postgres::PgListener`] connected via this pool.

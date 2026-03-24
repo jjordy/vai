@@ -398,6 +398,12 @@ pub enum ServerCommands {
         /// variable when the `env` clap feature is enabled.
         #[arg(long)]
         database_url: Option<String>,
+        /// Maximum number of Postgres connections in the pool (default: 25).
+        ///
+        /// Increase this value if the server returns `pool timed out` errors
+        /// under concurrent load (e.g. many agents + dashboard polling).
+        #[arg(long)]
+        db_pool_size: Option<u32>,
     },
     /// Manage API keys for server authentication.
     #[command(subcommand)]
@@ -1403,7 +1409,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
             };
 
             match server_cmd {
-                ServerCommands::Start { port, host, pid_file, database_url } => {
+                ServerCommands::Start { port, host, pid_file, database_url, db_pool_size } => {
                     // Config layering (lowest → highest priority):
                     //   1. Built-in defaults (127.0.0.1:7865, no storage_root)
                     //   2. ~/.vai/server.toml [server] section (global, optional)
@@ -1416,6 +1422,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     if let Some(p) = global_cfg.port { config.port = p; }
                     if let Some(r) = global_cfg.storage_root { config.storage_root = Some(r); }
                     if let Some(u) = global_cfg.database_url { config.database_url = Some(u); }
+                    if let Some(s) = global_cfg.db_pool_size { config.db_pool_size = Some(s); }
 
                     // Layer 3: per-repo config (single-repo mode only).
                     if !is_multi_repo {
@@ -1432,6 +1439,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     if let Some(p) = port { config.port = p; }
                     if let Some(pf) = pid_file { config.pid_file = Some(pf); }
                     if let Some(u) = database_url { config.database_url = Some(u); }
+                    if let Some(s) = db_pool_size { config.db_pool_size = Some(s); }
 
                     tokio::runtime::Runtime::new()
                         .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?

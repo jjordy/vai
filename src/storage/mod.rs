@@ -949,6 +949,16 @@ impl StorageBackend {
         Ok(StorageBackend::ServerWithS3(pg, Arc::new(file_store)))
     }
 
+    /// Returns connection pool statistics, or `None` for local (SQLite) backends.
+    pub fn pool_stats(&self) -> Option<postgres::PoolStats> {
+        match self {
+            StorageBackend::Server(pg) | StorageBackend::ServerWithS3(pg, _) => {
+                Some(pg.pool_stats())
+            }
+            StorageBackend::Local(_) => None,
+        }
+    }
+
     /// Returns the event log store.
     pub fn events(&self) -> Arc<dyn EventStore> {
         match self {
