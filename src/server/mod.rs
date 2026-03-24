@@ -1130,9 +1130,25 @@ async fn status_handler(
     ctx: RepoCtx,
 ) -> Json<StatusResponse> {
     use crate::issue::{IssueFilter, IssueStatus};
+    use crate::storage::StorageBackend;
 
-    let head = repo::read_head(&ctx.vai_dir).unwrap_or_else(|_| "unknown".to_string());
-    let workspace_count = workspace::list(&ctx.vai_dir)
+    // Read HEAD from storage trait so Postgres-backed servers return the
+    // migrated version rather than the stale filesystem `.vai/head` file.
+    let head = ctx
+        .storage
+        .versions()
+        .read_head(&ctx.repo_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Read workspace count from storage trait (works for both local + Postgres).
+    let workspace_count = ctx
+        .storage
+        .workspaces()
+        .list_workspaces(&ctx.repo_id, false)
+        .await
         .map(|w| w.len())
         .unwrap_or(0);
 
@@ -1151,15 +1167,37 @@ async fn status_handler(
         .map(|v| v.len())
         .unwrap_or(0);
 
-    let entity_count = open_graph(&ctx.vai_dir)
-        .and_then(|g| g.stats().map_err(|e| ApiError::internal(e.to_string())))
-        .map(|s| s.entity_count)
+    // Read entity count from storage trait; fall back to zero on error.
+    let entity_count = ctx
+        .storage
+        .graph()
+        .list_entities(&ctx.repo_id, None)
+        .await
+        .map(|e| e.len())
         .unwrap_or(0);
 
-    // Derive repo name from config if available; fall back to the path stem.
-    let repo_name = repo::read_config(&ctx.vai_dir)
-        .map(|c| c.name)
-        .unwrap_or_else(|_| state.repo_name.clone());
+    // In multi-repo Postgres mode, look up the repo name from the `repos`
+    // table (keyed by repo_id) rather than from the global `state.repo_name`,
+    // which is set to the storage_root path in that mode.  In single-repo
+    // and local modes, fall back to the config file or state name.
+    let repo_name = match &state.storage {
+        StorageBackend::Server(ref pg) | StorageBackend::ServerWithS3(ref pg, _) => {
+            sqlx::query_scalar::<_, String>("SELECT name FROM repos WHERE id = $1")
+                .bind(ctx.repo_id)
+                .fetch_optional(pg.pool())
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| {
+                    repo::read_config(&ctx.vai_dir)
+                        .map(|c| c.name)
+                        .unwrap_or_else(|_| state.repo_name.clone())
+                })
+        }
+        StorageBackend::Local(_) => repo::read_config(&ctx.vai_dir)
+            .map(|c| c.name)
+            .unwrap_or_else(|_| state.repo_name.clone()),
+    };
 
     Json(StatusResponse {
         repo_name,
@@ -1187,7 +1225,11 @@ async fn server_stats_handler(
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
 ) -> Json<ServerStatsResponse> {
-    let workspace_count = workspace::list(&ctx.vai_dir)
+    let workspace_count = ctx
+        .storage
+        .workspaces()
+        .list_workspaces(&ctx.repo_id, false)
+        .await
         .map(|w| w.len())
         .unwrap_or(0);
 
