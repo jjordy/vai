@@ -1447,8 +1447,12 @@ async fn list_versions_handler(
     AxumQuery(params): AxumQuery<ListVersionsQuery>,
 ) -> Result<Json<Vec<version::VersionMeta>>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    let mut versions =
-        version::list_versions(&ctx.vai_dir).map_err(ApiError::from)?;
+    let mut versions = ctx
+        .storage
+        .versions()
+        .list_versions(&ctx.repo_id)
+        .await
+        .map_err(ApiError::from)?;
     if let Some(limit) = params.limit {
         // Keep the N most-recent: the list is oldest-first, so drop from the front.
         let len = versions.len();
@@ -1469,9 +1473,116 @@ async fn get_version_handler(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<version::VersionChanges>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    let changes =
-        version::get_version_changes(&ctx.vai_dir, &id).map_err(ApiError::from)?;
-    Ok(Json(changes))
+    let meta = ctx
+        .storage
+        .versions()
+        .get_version(&ctx.repo_id, &id)
+        .await
+        .map_err(ApiError::from)?;
+
+    let Some(merge_event_id) = meta.merge_event_id else {
+        return Ok(Json(version::VersionChanges {
+            version: meta,
+            entity_changes: vec![],
+            file_changes: vec![],
+        }));
+    };
+
+    // Find the MergeCompleted event to get the workspace_id, then replay
+    // all workspace events to reconstruct entity and file changes.
+    let merge_events = ctx
+        .storage
+        .events()
+        .query_by_type(&ctx.repo_id, "MergeCompleted")
+        .await
+        .map_err(ApiError::from)?;
+    let workspace_id = merge_events
+        .into_iter()
+        .find(|e| e.id == merge_event_id)
+        .and_then(|e| e.kind.workspace_id());
+    let Some(workspace_id) = workspace_id else {
+        return Ok(Json(version::VersionChanges {
+            version: meta,
+            entity_changes: vec![],
+            file_changes: vec![],
+        }));
+    };
+
+    let events = ctx
+        .storage
+        .events()
+        .query_by_workspace(&ctx.repo_id, &workspace_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    let mut entity_changes = Vec::new();
+    let mut file_changes = Vec::new();
+    for event in events {
+        match event.kind {
+            EventKind::EntityAdded { entity, .. } => {
+                entity_changes.push(version::VersionEntityChange {
+                    entity_id: entity.id,
+                    change_type: version::VersionChangeType::Added,
+                    kind: Some(entity.kind),
+                    qualified_name: Some(entity.qualified_name),
+                    file_path: Some(entity.file_path),
+                    change_description: None,
+                });
+            }
+            EventKind::EntityModified {
+                entity_id,
+                change_description,
+                ..
+            } => {
+                entity_changes.push(version::VersionEntityChange {
+                    entity_id,
+                    change_type: version::VersionChangeType::Modified,
+                    kind: None,
+                    qualified_name: None,
+                    file_path: None,
+                    change_description: Some(change_description),
+                });
+            }
+            EventKind::EntityRemoved { entity_id, .. } => {
+                entity_changes.push(version::VersionEntityChange {
+                    entity_id,
+                    change_type: version::VersionChangeType::Removed,
+                    kind: None,
+                    qualified_name: None,
+                    file_path: None,
+                    change_description: None,
+                });
+            }
+            EventKind::FileAdded { path, hash, .. } => {
+                file_changes.push(version::VersionFileChange {
+                    path,
+                    change_type: version::VersionFileChangeType::Added,
+                    hash: Some(hash),
+                });
+            }
+            EventKind::FileModified { path, new_hash, .. } => {
+                file_changes.push(version::VersionFileChange {
+                    path,
+                    change_type: version::VersionFileChangeType::Modified,
+                    hash: Some(new_hash),
+                });
+            }
+            EventKind::FileRemoved { path, .. } => {
+                file_changes.push(version::VersionFileChange {
+                    path,
+                    change_type: version::VersionFileChangeType::Removed,
+                    hash: None,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Json(version::VersionChanges {
+        version: meta,
+        entity_changes,
+        file_changes,
+    }))
 }
 
 /// `POST /api/versions/rollback` — rolls back the changes introduced by a
