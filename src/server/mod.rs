@@ -519,6 +519,19 @@ async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // WebSocket upgrade requests authenticate via the `key` query parameter
+    // inside the handler itself — skip the Bearer token check for them.
+    let is_ws_upgrade = request
+        .headers()
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+
+    if is_ws_upgrade {
+        return next.run(request).await;
+    }
+
     let auth_header = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -3556,10 +3569,26 @@ async fn create_repo_handler(
     // repo::init is synchronous and may do significant I/O; run on the
     // blocking thread pool so we don't stall the async executor.
     let repo_root_clone = repo_root.clone();
-    tokio::task::spawn_blocking(move || repo::init(&repo_root_clone))
+    let init_result = tokio::task::spawn_blocking(move || repo::init(&repo_root_clone))
         .await
         .map_err(|e| ApiError::internal(format!("task join error: {e}")))?
         .map_err(|e| ApiError::internal(format!("vai init failed: {e}")))?;
+
+    let repo_id = init_result.config.repo_id;
+
+    // If a Postgres backend is configured, insert the repo row so FK
+    // constraints on events, issues, versions, and workspaces are satisfied.
+    if let crate::storage::StorageBackend::Server(ref pg)
+    | crate::storage::StorageBackend::ServerWithS3(ref pg, _) = state.storage
+    {
+        sqlx::query("INSERT INTO repos (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
+            .bind(repo_id)
+            .bind(&body.name)
+            .execute(pg.pool())
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to insert repo into Postgres: {e}")))?;
+        tracing::debug!(repo_id = %repo_id, name = %body.name, "repo inserted into Postgres");
+    }
 
     let entry = RepoRegistryEntry {
         name: body.name.clone(),
@@ -3571,7 +3600,7 @@ async fn create_repo_handler(
     registry.repos.push(entry.clone());
     registry.save(storage_root).map_err(|e| ApiError::internal(e.to_string()))?;
 
-    tracing::info!(name = %entry.name, path = %entry.path.display(), "repo registered");
+    tracing::info!(repo_id = %repo_id, name = %entry.name, path = %entry.path.display(), "repo registered");
 
     Ok((StatusCode::CREATED, Json(RepoResponse::from_entry(&entry))))
 }
