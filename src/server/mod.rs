@@ -14,6 +14,7 @@
 //!   - `DELETE /api/workspaces/:id` — discard a workspace
 //!   - `GET /api/versions` — list version history (optional `?limit=N`)
 //!   - `GET /api/versions/:id` — version details with entity-level changes
+//!   - `GET /api/versions/:id/diff` — unified diffs for all files changed in a version (`?base=<version_id>`)
 //!   - `POST /api/versions/rollback` — rollback to a prior version
 //!   - `POST /api/workspaces/:id/files` — upload files into a workspace overlay (base64 JSON)
 //!   - `GET /api/workspaces/:id/files/*path` — download a file from workspace (overlay or base)
@@ -1048,6 +1049,35 @@ struct ListVersionsQuery {
     limit: Option<usize>,
 }
 
+/// Query parameters for `GET /api/versions/:id/diff`.
+#[derive(Debug, Default, Deserialize)]
+struct VersionDiffQuery {
+    /// Version to diff against instead of the parent. Must be an ancestor of `:id`.
+    base: Option<String>,
+}
+
+/// File-level diff entry returned by `GET /api/versions/:id/diff`.
+#[derive(Debug, Serialize)]
+struct VersionDiffFile {
+    /// File path relative to the repository root.
+    path: String,
+    /// How the file was changed: `"added"`, `"modified"`, or `"removed"`.
+    change_type: String,
+    /// Unified diff string for this file.
+    diff: String,
+}
+
+/// Response body for `GET /api/versions/:id/diff`.
+#[derive(Debug, Serialize)]
+struct VersionDiffResponse {
+    /// The version whose changes are shown.
+    version_id: String,
+    /// The version used as the diff base (the parent, or the explicit `?base`).
+    base_version_id: String,
+    /// Per-file diffs.
+    files: Vec<VersionDiffFile>,
+}
+
 /// Request body for `POST /api/versions/rollback`.
 #[derive(Debug, Deserialize)]
 struct RollbackRequest {
@@ -1645,6 +1675,158 @@ async fn get_version_handler(
         version: meta,
         entity_changes,
         file_changes,
+    }))
+}
+
+/// `GET /api/versions/:id/diff` — returns unified diffs for all files changed
+/// in this version compared to its parent (or a specific `?base=<version_id>`).
+///
+/// Response includes a per-file diff string in unified diff format.
+/// Returns 404 if the version does not exist.
+async fn get_version_diff_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    PathId(id): PathId,
+    AxumQuery(query): AxumQuery<VersionDiffQuery>,
+) -> Result<Json<VersionDiffResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
+
+    // Fetch version metadata.
+    let meta = ctx
+        .storage
+        .versions()
+        .get_version(&ctx.repo_id, &id)
+        .await
+        .map_err(ApiError::from)?;
+
+    let base_version_id = query
+        .base
+        .or_else(|| meta.parent_version_id.clone())
+        .unwrap_or_default();
+
+    let Some(merge_event_id) = meta.merge_event_id else {
+        // Initial version — no files changed.
+        return Ok(Json(VersionDiffResponse {
+            version_id: id,
+            base_version_id,
+            files: vec![],
+        }));
+    };
+
+    // Find the workspace that produced this version via MergeCompleted event.
+    let merge_events = ctx
+        .storage
+        .events()
+        .query_by_type(&ctx.repo_id, "MergeCompleted")
+        .await
+        .map_err(ApiError::from)?;
+
+    let workspace_id = merge_events
+        .into_iter()
+        .find(|e| e.id == merge_event_id)
+        .and_then(|e| e.kind.workspace_id());
+
+    let Some(workspace_id) = workspace_id else {
+        return Ok(Json(VersionDiffResponse {
+            version_id: id,
+            base_version_id,
+            files: vec![],
+        }));
+    };
+
+    // Replay workspace events to collect file-level changes.
+    let events = ctx
+        .storage
+        .events()
+        .query_by_workspace(&ctx.repo_id, &workspace_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    let mut file_changes: Vec<version::VersionFileChange> = Vec::new();
+    for event in events {
+        match event.kind {
+            EventKind::FileAdded { path, hash, .. } => {
+                file_changes.push(version::VersionFileChange {
+                    path,
+                    change_type: version::VersionFileChangeType::Added,
+                    hash: Some(hash),
+                });
+            }
+            EventKind::FileModified { path, new_hash, .. } => {
+                file_changes.push(version::VersionFileChange {
+                    path,
+                    change_type: version::VersionFileChangeType::Modified,
+                    hash: Some(new_hash),
+                });
+            }
+            EventKind::FileRemoved { path, .. } => {
+                file_changes.push(version::VersionFileChange {
+                    path,
+                    change_type: version::VersionFileChangeType::Removed,
+                    hash: None,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Paths used for old/new file content.
+    // Old (pre-version) content is in the snapshot saved before the merge.
+    let snapshot_dir = ctx.vai_dir.join("versions").join(&id).join("snapshot");
+    // New (post-version) content is in the workspace overlay.
+    let overlay_dir = workspace::overlay_dir(&ctx.vai_dir, &workspace_id.to_string());
+
+    let mut diff_files = Vec::new();
+    for fc in file_changes {
+        let old_path = snapshot_dir.join(&fc.path);
+        let new_path = overlay_dir.join(&fc.path);
+
+        let old_text = if old_path.exists() {
+            std::fs::read_to_string(&old_path).ok()
+        } else {
+            None
+        };
+        let new_text = if new_path.exists() {
+            std::fs::read_to_string(&new_path).ok()
+        } else {
+            None
+        };
+
+        let change_type = match fc.change_type {
+            version::VersionFileChangeType::Added => "added",
+            version::VersionFileChangeType::Modified => "modified",
+            version::VersionFileChangeType::Removed => "removed",
+        };
+
+        let diff = match (&old_text, &new_text) {
+            (None, Some(new)) => {
+                // Added: show entire file as additions.
+                let patch = diffy::create_patch("", new);
+                format!("{patch}")
+            }
+            (Some(old), None) => {
+                // Removed: show entire old file as deletions.
+                let patch = diffy::create_patch(old, "");
+                format!("{patch}")
+            }
+            (Some(old), Some(new)) => {
+                let patch = diffy::create_patch(old, new);
+                format!("{patch}")
+            }
+            (None, None) => String::new(),
+        };
+
+        diff_files.push(VersionDiffFile {
+            path: fc.path,
+            change_type: change_type.to_string(),
+            diff,
+        });
+    }
+
+    Ok(Json(VersionDiffResponse {
+        version_id: id,
+        base_version_id,
+        files: diff_files,
     }))
 }
 
@@ -4825,6 +5007,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         // Static route registered before the dynamic one so that
         // POST /api/versions/rollback is never captured by :id.
         .route("/api/versions/rollback", post(rollback_handler))
+        .route("/api/versions/:id/diff", get(get_version_diff_handler))
         .route("/api/versions/:id", get(get_version_handler))
         // Graph query endpoints.
         .route("/api/graph/entities", get(list_graph_entities_handler))
@@ -4921,6 +5104,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/files/*path", get(get_main_file_handler))
         .route("/versions", get(list_versions_handler))
         .route("/versions/rollback", post(rollback_handler))
+        .route("/versions/:id/diff", get(get_version_diff_handler))
         .route("/versions/:id", get(get_version_handler))
         .route("/graph/entities", get(list_graph_entities_handler))
         .route("/graph/blast-radius", get(get_blast_radius_handler))
@@ -6172,6 +6356,71 @@ mod tests {
         // GET /api/versions/v999 → 404.
         let resp = client
             .get(format!("http://{addr}/api/versions/v999"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn get_version_diff_endpoint() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
+
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Create v2 by modifying src/lib.rs.
+        create_version_via_submit(
+            root,
+            addr,
+            &key,
+            "add world function",
+            b"pub fn hello() {}\npub fn world() -> u32 { 42 }\n",
+        )
+        .await;
+
+        // GET /api/versions/v2/diff returns file diffs.
+        let resp = client
+            .get(format!("http://{addr}/api/versions/v2/diff"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["version_id"], "v2");
+        assert_eq!(body["base_version_id"], "v1");
+        let files = body["files"].as_array().unwrap();
+        assert!(!files.is_empty(), "v2 should have file diffs");
+        let file = &files[0];
+        assert_eq!(file["path"], "src/lib.rs");
+        let diff = file["diff"].as_str().unwrap();
+        assert!(
+            diff.contains('+') || diff.contains('-'),
+            "diff should contain + or - markers"
+        );
+
+        // GET /api/versions/v1/diff → initial version has no file diffs.
+        let resp = client
+            .get(format!("http://{addr}/api/versions/v1/diff"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["files"].as_array().unwrap().len(), 0);
+
+        // GET /api/versions/v999/diff → 404.
+        let resp = client
+            .get(format!("http://{addr}/api/versions/v999/diff"))
             .bearer_auth(&key)
             .send()
             .await

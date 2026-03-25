@@ -44,6 +44,7 @@ async-trait = "0.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-native-tls", "postgres", "uuid", "chrono", "json", "migrate"] }
 aws-config = "1"
 aws-sdk-s3 = "1"
+diffy = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
