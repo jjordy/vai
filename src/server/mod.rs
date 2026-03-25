@@ -1417,6 +1417,20 @@ async fn submit_workspace_handler(
             // Remove from conflict engine — workspace is no longer active.
             state.conflict_engine.lock().await.remove_workspace(&workspace_uuid);
 
+            // Persist pre-change snapshot to FileStore so diffs survive container
+            // restarts and cross-server migrations.
+            {
+                let snap_dir = ctx.vai_dir
+                    .join("versions")
+                    .join(&result.version.version_id)
+                    .join("snapshot");
+                let file_store = ctx.storage.files();
+                for (rel, bytes) in collect_dir_files_with_content(&snap_dir) {
+                    let key = format!("versions/{}/snapshot/{rel}", result.version.version_id);
+                    let _ = file_store.put(&ctx.repo_id, &key, &bytes).await;
+                }
+            }
+
             // Broadcast the submit/merge event.
             state.broadcast(BroadcastEvent {
                 event_type: "WorkspaceSubmitted".to_string(),
@@ -1770,27 +1784,37 @@ async fn get_version_diff_handler(
         }
     }
 
-    // Paths used for old/new file content.
-    // Old (pre-version) content is in the snapshot saved before the merge.
+    // Filesystem fallback paths (used in local/SQLite mode or as a backup).
     let snapshot_dir = ctx.vai_dir.join("versions").join(&id).join("snapshot");
-    // New (post-version) content is in the workspace overlay.
     let overlay_dir = workspace::overlay_dir(&ctx.vai_dir, &workspace_id.to_string());
+    let file_store = ctx.storage.files();
 
     let mut diff_files = Vec::new();
     for fc in file_changes {
-        let old_path = snapshot_dir.join(&fc.path);
-        let new_path = overlay_dir.join(&fc.path);
+        // Try FileStore first (persistent across container restarts and
+        // cross-server migrations).  Fall back to local filesystem for
+        // local/SQLite deployments where the FileStore is not populated.
+        let old_store_key = format!("versions/{}/snapshot/{}", id, fc.path);
+        let new_store_key = format!("workspaces/{}/{}", workspace_id, fc.path);
 
-        let old_text = if old_path.exists() {
-            std::fs::read_to_string(&old_path).ok()
-        } else {
-            None
-        };
-        let new_text = if new_path.exists() {
-            std::fs::read_to_string(&new_path).ok()
-        } else {
-            None
-        };
+        let old_text = file_store
+            .get(&ctx.repo_id, &old_store_key)
+            .await
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .or_else(|| {
+                let p = snapshot_dir.join(&fc.path);
+                if p.exists() { std::fs::read_to_string(&p).ok() } else { None }
+            });
+        let new_text = file_store
+            .get(&ctx.repo_id, &new_store_key)
+            .await
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .or_else(|| {
+                let p = overlay_dir.join(&fc.path);
+                if p.exists() { std::fs::read_to_string(&p).ok() } else { None }
+            });
 
         let change_type = match fc.change_type {
             version::VersionFileChangeType::Added => "added",
@@ -2556,6 +2580,12 @@ async fn upload_workspace_files_handler(
                 new_hash,
             })
             .map_err(|e| ApiError::internal(format!("event log append: {e}")))?;
+        }
+
+        // Persist to FileStore for durable diff generation (server/S3 deployments).
+        {
+            let store_key = format!("workspaces/{}/{}", id, path_str);
+            let _ = ctx.storage.files().put(&ctx.repo_id, &store_key, &content).await;
         }
 
         uploaded_paths.push(path_str);
@@ -5462,6 +5492,47 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("shutdown signal received, draining in-flight requests…");
+}
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+/// Recursively collects all files under `dir`, returning `(relative_path,
+/// content)` pairs.  `relative_path` uses `/` separators.
+///
+/// Returns an empty vec if `dir` does not exist.  Silently skips any entry
+/// that cannot be read.
+fn collect_dir_files_with_content(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    collect_dir_recursive(dir, dir, &mut out);
+    out
+}
+
+fn collect_dir_recursive(
+    base: &std::path::Path,
+    cur: &std::path::Path,
+    out: &mut Vec<(String, Vec<u8>)>,
+) {
+    let entries = match std::fs::read_dir(cur) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_dir_recursive(base, &path, out);
+        } else {
+            let rel = path
+                .strip_prefix(base)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            if rel.is_empty() {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&path) {
+                out.push((rel.to_owned(), bytes));
+            }
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
