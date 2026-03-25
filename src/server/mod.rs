@@ -1756,65 +1756,146 @@ async fn get_version_diff_handler(
         .await
         .map_err(ApiError::from)?;
 
-    let mut file_changes: Vec<version::VersionFileChange> = Vec::new();
+    // Collect file changes with both old and new hashes directly from workspace
+    // events.  `FileModified` carries both `old_hash` and `new_hash`; `FileAdded`
+    // carries only `new_hash`; `FileRemoved` carries no hash (resolved below).
+    struct FileChangeHashes {
+        path: String,
+        change_type: version::VersionFileChangeType,
+        new_hash: Option<String>,
+        old_hash: Option<String>,
+    }
+
+    let mut file_changes: Vec<FileChangeHashes> = Vec::new();
+    let mut has_removed_files = false;
+
     for event in events {
         match event.kind {
             EventKind::FileAdded { path, hash, .. } => {
-                file_changes.push(version::VersionFileChange {
+                file_changes.push(FileChangeHashes {
                     path,
                     change_type: version::VersionFileChangeType::Added,
-                    hash: Some(hash),
+                    new_hash: Some(hash),
+                    old_hash: None,
                 });
             }
-            EventKind::FileModified { path, new_hash, .. } => {
-                file_changes.push(version::VersionFileChange {
+            EventKind::FileModified { path, old_hash, new_hash, .. } => {
+                file_changes.push(FileChangeHashes {
                     path,
                     change_type: version::VersionFileChangeType::Modified,
-                    hash: Some(new_hash),
+                    new_hash: Some(new_hash),
+                    old_hash: Some(old_hash),
                 });
             }
             EventKind::FileRemoved { path, .. } => {
-                file_changes.push(version::VersionFileChange {
+                has_removed_files = true;
+                file_changes.push(FileChangeHashes {
                     path,
                     change_type: version::VersionFileChangeType::Removed,
-                    hash: None,
+                    new_hash: None,
+                    old_hash: None,
                 });
             }
             _ => {}
         }
     }
 
-    // Filesystem fallback paths (used in local/SQLite mode or as a backup).
+    // For removed files there is no hash in the event.  Scan the full event log
+    // (excluding the current workspace's events) to reconstruct the last known
+    // hash for each path, i.e. the content that existed in the parent version.
+    if has_removed_files {
+        let all_events = ctx
+            .storage
+            .events()
+            .query_since_id(&ctx.repo_id, 0)
+            .await
+            .map_err(ApiError::from)?;
+
+        let mut path_to_hash: HashMap<String, String> = HashMap::new();
+        for e in &all_events {
+            if e.kind.workspace_id() == Some(workspace_id) {
+                // Skip events from the current workspace — we want the state
+                // *before* this version's changes were applied.
+                continue;
+            }
+            match &e.kind {
+                EventKind::FileAdded { path, hash, .. } => {
+                    path_to_hash.insert(path.clone(), hash.clone());
+                }
+                EventKind::FileModified { path, new_hash, .. } => {
+                    path_to_hash.insert(path.clone(), new_hash.clone());
+                }
+                EventKind::FileRemoved { path, .. } => {
+                    path_to_hash.remove(path);
+                }
+                _ => {}
+            }
+        }
+
+        for fc in &mut file_changes {
+            if fc.change_type == version::VersionFileChangeType::Removed && fc.old_hash.is_none() {
+                fc.old_hash = path_to_hash.get(&fc.path).cloned();
+            }
+        }
+    }
+
+    // Fallback paths for pre-blob-storage versions (local/SQLite mode or versions
+    // created before content-addressable storage was introduced).
     let snapshot_dir = ctx.vai_dir.join("versions").join(&id).join("snapshot");
     let overlay_dir = workspace::overlay_dir(&ctx.vai_dir, &workspace_id.to_string());
     let file_store = ctx.storage.files();
 
     let mut diff_files = Vec::new();
     for fc in file_changes {
-        // Try FileStore first (persistent across container restarts and
-        // cross-server migrations).  Fall back to local filesystem for
-        // local/SQLite deployments where the FileStore is not populated.
-        let old_store_key = format!("versions/{}/snapshot/{}", id, fc.path);
-        let new_store_key = format!("workspaces/{}/{}", workspace_id, fc.path);
+        // Fetch old content.
+        // Primary: content-addressable lookup by hash (works for all versions).
+        // Fallback: snapshot directory written at merge time (pre-blob versions).
+        let old_text = match fc.old_hash.as_deref() {
+            Some(hash) => file_store
+                .get(&ctx.repo_id, &format!("blobs/{hash}"))
+                .await
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok()),
+            None => None,
+        };
+        let old_text = if old_text.is_none() {
+            file_store
+                .get(&ctx.repo_id, &format!("versions/{}/snapshot/{}", id, fc.path))
+                .await
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .or_else(|| {
+                    let p = snapshot_dir.join(&fc.path);
+                    if p.exists() { std::fs::read_to_string(&p).ok() } else { None }
+                })
+        } else {
+            old_text
+        };
 
-        let old_text = file_store
-            .get(&ctx.repo_id, &old_store_key)
-            .await
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok())
-            .or_else(|| {
-                let p = snapshot_dir.join(&fc.path);
-                if p.exists() { std::fs::read_to_string(&p).ok() } else { None }
-            });
-        let new_text = file_store
-            .get(&ctx.repo_id, &new_store_key)
-            .await
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok())
-            .or_else(|| {
-                let p = overlay_dir.join(&fc.path);
-                if p.exists() { std::fs::read_to_string(&p).ok() } else { None }
-            });
+        // Fetch new content.
+        // Primary: content-addressable lookup by hash.
+        // Fallback: workspace overlay path or local filesystem overlay.
+        let new_text = match fc.new_hash.as_deref() {
+            Some(hash) => file_store
+                .get(&ctx.repo_id, &format!("blobs/{hash}"))
+                .await
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok()),
+            None => None,
+        };
+        let new_text = if new_text.is_none() && fc.new_hash.is_some() {
+            file_store
+                .get(&ctx.repo_id, &format!("workspaces/{}/{}", workspace_id, fc.path))
+                .await
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .or_else(|| {
+                    let p = overlay_dir.join(&fc.path);
+                    if p.exists() { std::fs::read_to_string(&p).ok() } else { None }
+                })
+        } else {
+            new_text
+        };
 
         let change_type = match fc.change_type {
             version::VersionFileChangeType::Added => "added",
@@ -2549,14 +2630,18 @@ async fn upload_workspace_files_handler(
         // Determine whether this is an add or a modify.
         let new_hash = sha256_hex(&content);
         let is_new = !dest.exists();
-        let old_hash = if !is_new {
-            sha256_hex(
-                &std::fs::read(&dest)
-                    .map_err(|e| ApiError::internal(format!("read existing overlay file: {e}")))?,
-            )
+        let (old_hash, old_content) = if !is_new {
+            let bytes = std::fs::read(&dest)
+                .map_err(|e| ApiError::internal(format!("read existing overlay file: {e}")))?;
+            let hash = sha256_hex(&bytes);
+            (hash, Some(bytes))
         } else {
-            String::new()
+            (String::new(), None)
         };
+
+        // Clone hashes before they are moved into the event log record.
+        let new_hash_blob = new_hash.clone();
+        let old_hash_blob = old_hash.clone();
 
         std::fs::write(&dest, &content)
             .map_err(|e| ApiError::internal(format!("write overlay file: {e}")))?;
@@ -2584,8 +2669,15 @@ async fn upload_workspace_files_handler(
 
         // Persist to FileStore for durable diff generation (server/S3 deployments).
         {
+            let file_store = ctx.storage.files();
             let store_key = format!("workspaces/{}/{}", id, path_str);
-            let _ = ctx.storage.files().put(&ctx.repo_id, &store_key, &content).await;
+            let _ = file_store.put(&ctx.repo_id, &store_key, &content).await;
+            // Also store content-addressably by hash so diffs can be computed for
+            // all versions (including migrated ones) without relying on snapshots.
+            let _ = file_store.put(&ctx.repo_id, &format!("blobs/{new_hash_blob}"), &content).await;
+            if let Some(old_bytes) = old_content {
+                let _ = file_store.put(&ctx.repo_id, &format!("blobs/{old_hash_blob}"), &old_bytes).await;
+            }
         }
 
         uploaded_paths.push(path_str);
@@ -2845,6 +2937,10 @@ async fn upload_source_files_handler(
         }
         std::fs::write(&dest, &content)
             .map_err(|e| ApiError::internal(format!("write source file: {e}")))?;
+
+        // Store content-addressably so diffs can be computed for migrated versions.
+        let hash = sha256_hex(&content);
+        let _ = ctx.storage.files().put(&ctx.repo_id, &format!("blobs/{hash}"), &content).await;
 
         uploaded_paths.push(rel.to_string_lossy().replace('\\', "/"));
     }
