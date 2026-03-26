@@ -197,6 +197,17 @@ pub struct ServerConfig {
     /// or WebSocket clients).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_pool_size: Option<u32>,
+    /// S3-compatible file store configuration.
+    ///
+    /// When set alongside `database_url`, the server uses
+    /// [`crate::storage::StorageBackend::ServerWithS3`] so that file uploads
+    /// (migration files, blob snapshots) are durably stored in S3 instead of
+    /// being silently discarded by the no-op stub.
+    ///
+    /// AWS credentials come from the environment (`AWS_ACCESS_KEY_ID`,
+    /// `AWS_SECRET_ACCESS_KEY`) via the AWS SDK default credential chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3: Option<crate::storage::s3::S3Config>,
 }
 
 impl Default for ServerConfig {
@@ -208,6 +219,7 @@ impl Default for ServerConfig {
             pid_file: None,
             database_url: None,
             db_pool_size: None,
+            s3: None,
         }
     }
 }
@@ -5464,7 +5476,7 @@ fn resolve_admin_key() -> String {
 /// Binds to the address configured in `config`, initialises shared state from
 /// the repository at `vai_dir`, and serves requests until a SIGINT or SIGTERM
 /// is received. Uses axum's built-in graceful shutdown.
-pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerError> {
+pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), ServerError> {
     // Initialise structured logging if not already set up.
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -5489,12 +5501,27 @@ pub async fn start(vai_dir: &Path, config: ServerConfig) -> Result<(), ServerErr
     let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
     // Build the storage backend: Postgres when a database URL is configured,
-    // SQLite otherwise (legacy local mode).
+    // SQLite otherwise (legacy local mode).  When an S3 config is also present,
+    // use the full ServerWithS3 variant so file uploads are durably stored.
     let pool_size = config.db_pool_size.unwrap_or(25);
-    let storage = match &config.database_url {
-        Some(url) => crate::storage::StorageBackend::server(url, pool_size).await?,
-        None => crate::storage::StorageBackend::local(vai_dir),
+    let storage = match (config.database_url.as_deref(), config.s3.take()) {
+        (Some(url), Some(s3_cfg)) => {
+            crate::storage::StorageBackend::server_with_s3(url, pool_size, s3_cfg).await?
+        }
+        (Some(url), None) => crate::storage::StorageBackend::server(url, pool_size).await?,
+        _ => crate::storage::StorageBackend::local(vai_dir),
     };
+
+    // Run schema migrations when using a Postgres backend so the server is
+    // always up-to-date (including the file_index table required by S3 mode).
+    if let crate::storage::StorageBackend::Server(ref pg)
+        | crate::storage::StorageBackend::ServerWithS3(ref pg, _) = storage
+    {
+        let migrations_path = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+        pg.migrate(migrations_path)
+            .await
+            .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+    }
 
     let admin_key = resolve_admin_key();
 

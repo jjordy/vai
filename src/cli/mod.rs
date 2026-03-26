@@ -1423,6 +1423,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     if let Some(r) = global_cfg.storage_root { config.storage_root = Some(r); }
                     if let Some(u) = global_cfg.database_url { config.database_url = Some(u); }
                     if let Some(s) = global_cfg.db_pool_size { config.db_pool_size = Some(s); }
+                    if let Some(s3) = global_cfg.s3 { config.s3 = Some(s3); }
 
                     // Layer 3: per-repo config (single-repo mode only).
                     if !is_multi_repo {

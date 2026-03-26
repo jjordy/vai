@@ -145,6 +145,9 @@ pub struct GlobalServerToml {
     /// Top-level `[server]` table.
     #[serde(default)]
     pub server: GlobalServerSection,
+    /// Optional `[s3]` table for S3-compatible file storage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3: Option<crate::storage::s3::S3Config>,
 }
 
 /// Fields within the `[server]` table of `~/.vai/server.toml`.
@@ -171,6 +174,12 @@ pub struct GlobalServerSection {
     /// Increase this if you see `pool timed out` errors under load.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_pool_size: Option<u32>,
+    /// S3-compatible file store config from the `[s3]` table in `server.toml`.
+    ///
+    /// When present and `database_url` is also set, the server uses
+    /// `StorageBackend::ServerWithS3` for durable file storage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3: Option<crate::storage::s3::S3Config>,
 }
 
 /// Reads the global server config from `~/.vai/server.toml`.
@@ -189,7 +198,12 @@ pub fn read_global_server_config() -> Result<GlobalServerSection, RepoError> {
 
     let raw = fs::read_to_string(&path)?;
     let parsed: GlobalServerToml = toml::from_str(&raw)?;
-    Ok(parsed.server)
+    let mut section = parsed.server;
+    // Promote the top-level `[s3]` table into the section so callers see it.
+    if section.s3.is_none() {
+        section.s3 = parsed.s3;
+    }
+    Ok(section)
 }
 
 /// Contents of `.vai/config.toml`.

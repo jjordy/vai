@@ -37,7 +37,7 @@ use super::{FileMetadata, FileStore, StorageError};
 /// The AWS default credential chain (env vars, EC2 instance profile, etc.) is
 /// used for authentication.  For MinIO set `endpoint_url` and export
 /// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct S3Config {
     /// Bucket name.  For vai the convention is `vai-{environment}`.
     pub bucket: String,
