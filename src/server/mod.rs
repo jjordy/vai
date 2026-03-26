@@ -3340,6 +3340,359 @@ async fn get_main_file_handler(
     }))
 }
 
+// ── Repo file download / pull ─────────────────────────────────────────────────
+
+/// Query parameters for `GET /api/repos/:repo/files/download`.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+struct FilesDownloadQuery {
+    /// Version to download (e.g. `"v42"`). Defaults to the current HEAD.
+    /// Accepted for forward-compatibility; not yet used.
+    #[allow(dead_code)]
+    version: Option<String>,
+}
+
+/// Query parameters for `GET /api/repos/:repo/files/pull`.
+#[derive(Debug, Deserialize, ToSchema)]
+struct FilesPullQuery {
+    /// The version the caller already has. Only files changed after this
+    /// version (exclusive) up to HEAD (inclusive) are returned.
+    since: String,
+}
+
+/// Describes the kind of change applied to a single file in a pull response.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum FileChangeType {
+    Added,
+    Modified,
+    Removed,
+}
+
+/// A single file change entry returned by `GET /api/repos/:repo/files/pull`.
+#[derive(Debug, Serialize, ToSchema)]
+struct PullFileEntry {
+    /// Path relative to the repository root (e.g. `"src/lib.rs"`).
+    pub path: String,
+    /// How this file changed since the base version.
+    pub change_type: FileChangeType,
+    /// Base64-encoded file content. Present for `added` and `modified` entries;
+    /// absent for `removed` entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_base64: Option<String>,
+}
+
+/// Response body for `GET /api/repos/:repo/files/pull`.
+#[derive(Debug, Serialize, ToSchema)]
+struct FilesPullResponse {
+    /// The version the caller supplied as the `since` parameter.
+    pub base_version: String,
+    /// The current HEAD version.
+    pub head_version: String,
+    /// Files that changed between `base_version` (exclusive) and `head_version`
+    /// (inclusive).
+    pub files: Vec<PullFileEntry>,
+}
+
+/// Parses a `"vN"` version string and returns the numeric part.
+///
+/// Returns 0 for unrecognised strings so unversioned repos sort before v1.
+fn parse_version_num(version_id: &str) -> u64 {
+    version_id
+        .strip_prefix('v')
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/repos/{repo}/files/download",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+        ("version" = Option<String>, Query, description = "Version to download (default: HEAD)"),
+    ),
+    responses(
+        (status = 200, description = "Tar-gzip archive of all repo files", content_type = "application/gzip"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Repository not found", body = ErrorBody),
+        (status = 500, description = "Internal error", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "files"
+)]
+/// `GET /api/repos/:repo/files/download` — downloads all source files as a
+/// `.tar.gz` archive.
+///
+/// Returns a tarball of every file in the repository root at the current HEAD
+/// version.  Hidden directories (`.vai`, `.git`) and build artefacts are
+/// excluded.  The `Content-Disposition` header is set to suggest a filename of
+/// the form `<repo>-<version>.tar.gz`.
+///
+/// The optional `?version=vN` query parameter is accepted for forward
+/// compatibility but currently ignored; files are always read from the
+/// current HEAD state on disk.
+async fn files_download_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    AxumQuery(_query): AxumQuery<FilesDownloadQuery>,
+) -> Result<Response, ApiError> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    require_repo_permission(
+        &ctx.storage,
+        &identity,
+        &ctx.repo_id,
+        crate::storage::RepoRole::Read,
+    )
+    .await?;
+
+    let head_version = ctx
+        .storage
+        .versions()
+        .read_head(&ctx.repo_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Collect file paths to include in the archive.
+    let mut rel_paths: Vec<String> = Vec::new();
+    collect_repo_files(&ctx.repo_root, &ctx.repo_root, &mut rel_paths)
+        .map_err(|e| ApiError::internal(format!("list files: {e}")))?;
+    rel_paths.sort();
+
+    // Build an in-memory tar.gz archive.
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut archive = tar::Builder::new(&mut encoder);
+        for rel in &rel_paths {
+            let full = ctx.repo_root.join(rel);
+            let content = std::fs::read(&full)
+                .map_err(|e| ApiError::internal(format!("read file '{rel}': {e}")))?;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, rel, content.as_slice())
+                .map_err(|e| ApiError::internal(format!("tar append '{rel}': {e}")))?;
+        }
+        archive
+            .finish()
+            .map_err(|e| ApiError::internal(format!("tar finish: {e}")))?;
+    }
+    let gz_bytes = encoder
+        .finish()
+        .map_err(|e| ApiError::internal(format!("gzip finish: {e}")))?;
+
+    let repo_name = ctx
+        .repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+    let filename = format!("{repo_name}-{head_version}.tar.gz");
+
+    let response = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/gzip")
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(gz_bytes))
+        .map_err(|e| ApiError::internal(format!("build response: {e}")))?;
+
+    Ok(response)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/repos/{repo}/files/pull",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+        ("since" = String, Query, description = "Version to pull changes since (e.g. `v60`)"),
+    ),
+    responses(
+        (status = 200, description = "Files changed since the given version", body = FilesPullResponse),
+        (status = 400, description = "Missing or invalid `since` parameter", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Repository or version not found", body = ErrorBody),
+        (status = 500, description = "Internal error", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "files"
+)]
+/// `GET /api/repos/:repo/files/pull` — returns files changed since a version.
+///
+/// Intended for agents that already have a local working copy (downloaded via
+/// `/files/download`) and want to sync with the latest server state after one
+/// or more versions have been committed.
+///
+/// The `since` query parameter is **required**.  Only files that were added,
+/// modified, or removed between `since` (exclusive) and HEAD (inclusive) are
+/// returned.  Content is base64-encoded; removed files omit the content field.
+async fn files_pull_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    AxumQuery(query): AxumQuery<FilesPullQuery>,
+) -> Result<Json<FilesPullResponse>, ApiError> {
+    require_repo_permission(
+        &ctx.storage,
+        &identity,
+        &ctx.repo_id,
+        crate::storage::RepoRole::Read,
+    )
+    .await?;
+
+    let head_version = ctx
+        .storage
+        .versions()
+        .read_head(&ctx.repo_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let since_num = parse_version_num(&query.since);
+    let head_num = parse_version_num(&head_version);
+
+    // If the caller is already at HEAD, return an empty diff.
+    if since_num >= head_num {
+        return Ok(Json(FilesPullResponse {
+            base_version: query.since,
+            head_version,
+            files: vec![],
+        }));
+    }
+
+    // Enumerate all versions created after `since`.
+    let all_versions = ctx
+        .storage
+        .versions()
+        .list_versions(&ctx.repo_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    let mut newer_versions: Vec<_> = all_versions
+        .into_iter()
+        .filter(|v| {
+            let n = parse_version_num(&v.version_id);
+            n > since_num && n <= head_num
+        })
+        .collect();
+    newer_versions.sort_by_key(|v| parse_version_num(&v.version_id));
+
+    // For each newer version, find which workspace produced it by matching the
+    // MergeCompleted event whose ID equals the version's `merge_event_id`.
+    let merge_events = ctx
+        .storage
+        .events()
+        .query_by_type(&ctx.repo_id, "MergeCompleted")
+        .await
+        .map_err(ApiError::from)?;
+
+    // Track the final change state for each path.  We process versions in
+    // ascending order so later versions overwrite earlier ones.
+    #[derive(Clone)]
+    enum ChangeState {
+        Added,
+        Modified,
+        Removed,
+    }
+    let mut path_changes: std::collections::HashMap<String, ChangeState> =
+        std::collections::HashMap::new();
+
+    for version in &newer_versions {
+        let Some(merge_event_id) = version.merge_event_id else {
+            continue;
+        };
+
+        let workspace_id = merge_events
+            .iter()
+            .find(|e| e.id == merge_event_id)
+            .and_then(|e| e.kind.workspace_id());
+
+        let Some(workspace_id) = workspace_id else {
+            continue;
+        };
+
+        let ws_events = ctx
+            .storage
+            .events()
+            .query_by_workspace(&ctx.repo_id, &workspace_id)
+            .await
+            .map_err(ApiError::from)?;
+
+        for event in ws_events {
+            match event.kind {
+                EventKind::FileAdded { path, .. } => {
+                    path_changes.insert(path, ChangeState::Added);
+                }
+                EventKind::FileModified { path, .. } => {
+                    // Preserve "added" for files added within this pull range.
+                    path_changes
+                        .entry(path)
+                        .and_modify(|s| {
+                            if !matches!(s, ChangeState::Added) {
+                                *s = ChangeState::Modified;
+                            }
+                        })
+                        .or_insert(ChangeState::Modified);
+                }
+                EventKind::FileRemoved { path, .. } => {
+                    path_changes.insert(path, ChangeState::Removed);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Build the response, reading current file content for added/modified files.
+    let mut files: Vec<PullFileEntry> = Vec::new();
+    for (path, state) in path_changes {
+        match state {
+            ChangeState::Removed => {
+                files.push(PullFileEntry {
+                    path,
+                    change_type: FileChangeType::Removed,
+                    content_base64: None,
+                });
+            }
+            ChangeState::Added | ChangeState::Modified => {
+                let rel = sanitize_path(&path).ok_or_else(|| {
+                    ApiError::bad_request(format!("invalid path: '{path}'"))
+                })?;
+                let full = ctx.repo_root.join(&rel);
+                let content_base64 = if full.exists() {
+                    let bytes = std::fs::read(&full)
+                        .map_err(|e| ApiError::internal(format!("read '{path}': {e}")))?;
+                    Some(BASE64.encode(&bytes))
+                } else {
+                    // File may have been merged but not yet written to repo_root
+                    // (e.g. S3-only deployment). Omit content rather than error.
+                    None
+                };
+                let change_type = match state {
+                    ChangeState::Added => FileChangeType::Added,
+                    _ => FileChangeType::Modified,
+                };
+                files.push(PullFileEntry {
+                    path,
+                    change_type,
+                    content_base64,
+                });
+            }
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(Json(FilesPullResponse {
+        base_version: query.since,
+        head_version,
+        files,
+    }))
+}
+
 // ── Graph API types ───────────────────────────────────────────────────────────
 
 /// Query parameters for `GET /api/graph/entities`.
@@ -5998,6 +6351,8 @@ impl utoipa::Modify for SecurityAddon {
         migrate_handler,
         migration_stats_handler,
         openapi_handler,
+        files_download_handler,
+        files_pull_handler,
     ),
     components(
         schemas(
@@ -6074,6 +6429,11 @@ impl utoipa::Modify for SecurityAddon {
             crate::work_queue::WorkQueue,
             crate::work_queue::ClaimResult,
             crate::migration::MigrationSummary,
+            FilesDownloadQuery,
+            FilesPullQuery,
+            FileChangeType,
+            PullFileEntry,
+            FilesPullResponse,
         )
     ),
     modifiers(&SecurityAddon),
@@ -6255,6 +6615,9 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/workspaces/:id", delete(discard_workspace_handler))
         .route("/files", get(list_repo_files_handler))
         .route("/files", post(upload_source_files_handler))
+        // Static sub-routes must come before the wildcard `/files/*path`.
+        .route("/files/download", get(files_download_handler))
+        .route("/files/pull", get(files_pull_handler))
         .route("/files/*path", get(get_main_file_handler))
         .route("/versions", get(list_versions_handler))
         .route("/versions/rollback", post(rollback_handler))

@@ -45,6 +45,8 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 aws-config = "1"
 aws-sdk-s3 = "1"
 diffy = "0.4"
+flate2 = "1"
+tar = "0.4"
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-axum = "0.2"
 
