@@ -27,10 +27,10 @@ use crate::version;
 use crate::workspace;
 
 use super::{
-    AuthStore, EscalationStore, EventStore, FileMetadata, FileStore, GraphStore, IssueStore,
-    IssueUpdate, NewEscalation, NewIssue, NewOrg, NewUser, NewVersion, NewWorkspace, OrgMember,
-    OrgRole, OrgStore, Organization, RepoCollaborator, RepoRole, StorageError, User, VersionStore,
-    WorkspaceStore, WorkspaceUpdate,
+    AuthStore, CommentStore, EscalationStore, EventStore, FileMetadata, FileStore, GraphStore,
+    IssueComment, IssueStore, IssueUpdate, NewEscalation, NewIssue, NewIssueComment, NewOrg,
+    NewUser, NewVersion, NewWorkspace, OrgMember, OrgRole, OrgStore, Organization,
+    RepoCollaborator, RepoRole, StorageError, User, VersionStore, WorkspaceStore, WorkspaceUpdate,
 };
 use crate::auth::ApiKey;
 use crate::escalation::{Escalation, ResolutionOption};
@@ -320,6 +320,34 @@ impl IssueStore for SqliteStorage {
                 }
                 other => StorageError::Database(other.to_string()),
             })
+    }
+}
+
+// ── CommentStore ──────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl CommentStore for SqliteStorage {
+    async fn create_comment(
+        &self,
+        _repo_id: &Uuid,
+        issue_id: &Uuid,
+        comment: NewIssueComment,
+    ) -> Result<IssueComment, StorageError> {
+        let store = self.open_issue_store()?;
+        store
+            .create_comment(*issue_id, &comment.author, &comment.body)
+            .map_err(|e| StorageError::Database(e.to_string()))
+    }
+
+    async fn list_comments(
+        &self,
+        _repo_id: &Uuid,
+        issue_id: &Uuid,
+    ) -> Result<Vec<IssueComment>, StorageError> {
+        let store = self.open_issue_store()?;
+        store
+            .list_comments(*issue_id)
+            .map_err(|e| StorageError::Database(e.to_string()))
     }
 }
 

@@ -41,10 +41,10 @@ use crate::version::VersionMeta;
 use crate::workspace::{WorkspaceMeta, WorkspaceStatus};
 
 use super::{
-    AuthStore, EscalationStore, EventFilter, EventStore, FileMetadata, FileStore, GraphStore,
-    IssueStore, IssueUpdate, NewEscalation, NewIssue, NewOrg, NewUser, NewVersion, NewWorkspace,
-    OrgMember, OrgRole, OrgStore, Organization, RepoCollaborator, RepoRole, StorageError, User,
-    VersionStore, WorkspaceStore, WorkspaceUpdate,
+    AuthStore, CommentStore, EscalationStore, EventFilter, EventStore, FileMetadata, FileStore,
+    GraphStore, IssueComment, IssueStore, IssueUpdate, NewEscalation, NewIssue, NewIssueComment,
+    NewOrg, NewUser, NewVersion, NewWorkspace, OrgMember, OrgRole, OrgStore, Organization,
+    RepoCollaborator, RepoRole, StorageError, User, VersionStore, WorkspaceStore, WorkspaceUpdate,
 };
 
 // ── PostgresStorage ───────────────────────────────────────────────────────────
@@ -635,6 +635,70 @@ fn filter_matches_issue(issue: &Issue, filter: &IssueFilter) -> bool {
         }
     }
     true
+}
+
+// ── CommentStore ──────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl CommentStore for PostgresStorage {
+    async fn create_comment(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+        comment: NewIssueComment,
+    ) -> Result<IssueComment, StorageError> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO issue_comments (repo_id, issue_id, author, body)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, issue_id, author, body, created_at
+            "#,
+        )
+        .bind(repo_id)
+        .bind(issue_id)
+        .bind(&comment.author)
+        .bind(&comment.body)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(IssueComment {
+            id: row.get("id"),
+            issue_id: row.get("issue_id"),
+            author: row.get("author"),
+            body: row.get("body"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn list_comments(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+    ) -> Result<Vec<IssueComment>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT id, issue_id, author, body, created_at \
+             FROM issue_comments \
+             WHERE repo_id = $1 AND issue_id = $2 \
+             ORDER BY created_at ASC",
+        )
+        .bind(repo_id)
+        .bind(issue_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| IssueComment {
+                id: row.get("id"),
+                issue_id: row.get("issue_id"),
+                author: row.get("author"),
+                body: row.get("body"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
 }
 
 // ── EscalationStore ───────────────────────────────────────────────────────────

@@ -4657,6 +4657,125 @@ async fn close_issue_handler(
     Ok(Json(IssueResponse::from_issue(issue, linked, vec![])))
 }
 
+// ── Issue comment handlers ────────────────────────────────────────────────────
+
+/// Request body for `POST /api/repos/:repo/issues/:id/comments`.
+#[derive(Debug, Deserialize, ToSchema)]
+struct CreateCommentRequest {
+    /// Author username or agent ID.
+    author: String,
+    /// Comment body (Markdown supported).
+    body: String,
+}
+
+/// Response body for a single issue comment.
+#[derive(Debug, Serialize, ToSchema)]
+struct CommentResponse {
+    id: String,
+    issue_id: String,
+    author: String,
+    body: String,
+    created_at: String,
+}
+
+impl From<crate::issue::IssueComment> for CommentResponse {
+    fn from(c: crate::issue::IssueComment) -> Self {
+        CommentResponse {
+            id: c.id.to_string(),
+            issue_id: c.issue_id.to_string(),
+            author: c.author,
+            body: c.body,
+            created_at: c.created_at.to_rfc3339(),
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/repos/{repo}/issues/{id}/comments",
+    params(
+        ("repo" = String, Path, description = "Repository slug"),
+        ("id" = String, Path, description = "Issue UUID"),
+    ),
+    request_body = CreateCommentRequest,
+    responses(
+        (status = 201, description = "Comment created", body = CommentResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Issue not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
+/// `POST /api/repos/:repo/issues/:id/comments` — add a comment to an issue.
+async fn create_issue_comment_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    PathId(id): PathId,
+    Json(body): Json<CreateCommentRequest>,
+) -> Result<(StatusCode, Json<CommentResponse>), ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
+
+    let issue_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
+
+    // Verify the issue exists.
+    ctx.storage.issues()
+        .get_issue(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    let comment = ctx.storage.comments()
+        .create_comment(&ctx.repo_id, &issue_id, crate::storage::NewIssueComment {
+            author: body.author,
+            body: body.body,
+        })
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((StatusCode::CREATED, Json(CommentResponse::from(comment))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/repos/{repo}/issues/{id}/comments",
+    params(
+        ("repo" = String, Path, description = "Repository slug"),
+        ("id" = String, Path, description = "Issue UUID"),
+    ),
+    responses(
+        (status = 200, description = "List of comments", body = Vec<CommentResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Issue not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
+/// `GET /api/repos/:repo/issues/:id/comments` — list comments for an issue.
+async fn list_issue_comments_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    PathId(id): PathId,
+) -> Result<Json<Vec<CommentResponse>>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
+
+    let issue_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
+
+    // Verify the issue exists.
+    ctx.storage.issues()
+        .get_issue(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    let comments = ctx.storage.comments()
+        .list_comments(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(comments.into_iter().map(CommentResponse::from).collect()))
+}
+
 // ── Escalation handlers ───────────────────────────────────────────────────────
 
 /// Response body for a single escalation.
@@ -6848,6 +6967,8 @@ impl utoipa::Modify for SecurityAddon {
         get_issue_handler,
         update_issue_handler,
         close_issue_handler,
+        create_issue_comment_handler,
+        list_issue_comments_handler,
         list_escalations_handler,
         get_escalation_handler,
         resolve_escalation_handler,
@@ -6902,6 +7023,8 @@ impl utoipa::Modify for SecurityAddon {
             UpdateIssueRequest,
             CloseIssueRequest,
             IssueResponse,
+            CreateCommentRequest,
+            CommentResponse,
             FileUploadEntry,
             UploadFilesRequest,
             UploadFilesResponse,
@@ -7160,6 +7283,8 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/issues", post(create_issue_handler))
         .route("/issues", get(list_issues_handler))
         .route("/issues/:id/close", post(close_issue_handler))
+        .route("/issues/:id/comments", post(create_issue_comment_handler))
+        .route("/issues/:id/comments", get(list_issue_comments_handler))
         .route("/issues/:id", get(get_issue_handler))
         .route("/issues/:id", axum::routing::patch(update_issue_handler))
         .route("/escalations", get(list_escalations_handler))

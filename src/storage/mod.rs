@@ -302,6 +302,41 @@ pub trait EventStore: Send + Sync {
     async fn count(&self, repo_id: &Uuid) -> Result<u64, StorageError>;
 }
 
+// ── IssueComment ──────────────────────────────────────────────────────────────
+
+/// Re-exported from `crate::issue` for use by storage trait consumers.
+pub use crate::issue::IssueComment;
+
+/// Input for creating a new comment.
+#[derive(Debug, Clone)]
+pub struct NewIssueComment {
+    /// Author username or agent ID.
+    pub author: String,
+    /// Comment body.
+    pub body: String,
+}
+
+// ── CommentStore ──────────────────────────────────────────────────────────────
+
+/// Storage for issue comments.
+#[async_trait]
+pub trait CommentStore: Send + Sync {
+    /// Creates a new comment on an issue.
+    async fn create_comment(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+        comment: NewIssueComment,
+    ) -> Result<IssueComment, StorageError>;
+
+    /// Lists comments for an issue, ordered by `created_at` ascending.
+    async fn list_comments(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+    ) -> Result<Vec<IssueComment>, StorageError>;
+}
+
 // ── IssueStore ────────────────────────────────────────────────────────────────
 
 /// CRUD storage for issues.
@@ -1002,6 +1037,16 @@ impl StorageBackend {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn IssueStore>,
             StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
                 Arc::clone(s) as Arc<dyn IssueStore>
+            }
+        }
+    }
+
+    /// Returns the issue comment store.
+    pub fn comments(&self) -> Arc<dyn CommentStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn CommentStore>,
+            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
+                Arc::clone(s) as Arc<dyn CommentStore>
             }
         }
     }

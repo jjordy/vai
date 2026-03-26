@@ -144,6 +144,23 @@ impl IssueResolution {
     }
 }
 
+// ── Issue comment ─────────────────────────────────────────────────────────────
+
+/// A comment on an issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueComment {
+    /// Unique comment identifier.
+    pub id: Uuid,
+    /// The issue this comment belongs to.
+    pub issue_id: Uuid,
+    /// Author username or agent ID.
+    pub author: String,
+    /// Comment body (Markdown supported).
+    pub body: String,
+    /// When the comment was created.
+    pub created_at: DateTime<Utc>,
+}
+
 // ── Agent source metadata ─────────────────────────────────────────────────────
 
 /// Source metadata attached to issues created by an agent.
@@ -263,7 +280,16 @@ impl IssueStore {
                 issue_id      TEXT NOT NULL,
                 depends_on_id TEXT NOT NULL,
                 PRIMARY KEY (issue_id, depends_on_id)
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS issue_comments (
+                id         TEXT NOT NULL PRIMARY KEY,
+                issue_id   TEXT NOT NULL,
+                author     TEXT NOT NULL,
+                body       TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_issue_comments_issue_id ON issue_comments (issue_id);",
         )?;
         // Migrate existing databases that lack the agent_source column.
         let _ = self.conn.execute(
@@ -783,6 +809,59 @@ impl IssueStore {
             resolution: resolution.to_string(),
         })?;
         self.get(id)
+    }
+
+    /// Create a comment on an issue.
+    pub fn create_comment(
+        &self,
+        issue_id: Uuid,
+        author: &str,
+        body: &str,
+    ) -> Result<IssueComment, IssueError> {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        self.conn.execute(
+            "INSERT INTO issue_comments (id, issue_id, author, body, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id.to_string(),
+                issue_id.to_string(),
+                author,
+                body,
+                now.to_rfc3339(),
+            ],
+        )?;
+        Ok(IssueComment { id, issue_id, author: author.to_string(), body: body.to_string(), created_at: now })
+    }
+
+    /// List all comments for an issue, ordered by `created_at` ascending.
+    pub fn list_comments(&self, issue_id: Uuid) -> Result<Vec<IssueComment>, IssueError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, issue_id, author, body, created_at \
+             FROM issue_comments WHERE issue_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![issue_id.to_string()], |row| {
+            let id_str: String = row.get(0)?;
+            let iid_str: String = row.get(1)?;
+            let author: String = row.get(2)?;
+            let body: String = row.get(3)?;
+            let ts: String = row.get(4)?;
+            Ok((id_str, iid_str, author, body, ts))
+        })?;
+
+        let mut comments = Vec::new();
+        for row in rows {
+            let (id_str, iid_str, author, body, ts) = row?;
+            let id = Uuid::parse_str(&id_str)
+                .map_err(|_| IssueError::Sqlite(rusqlite::Error::InvalidColumnType(0, "id".into(), rusqlite::types::Type::Text)))?;
+            let iid = Uuid::parse_str(&iid_str)
+                .map_err(|_| IssueError::Sqlite(rusqlite::Error::InvalidColumnType(1, "issue_id".into(), rusqlite::types::Type::Text)))?;
+            let created_at = chrono::DateTime::parse_from_rfc3339(&ts)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| IssueError::Sqlite(rusqlite::Error::InvalidColumnType(4, "created_at".into(), rusqlite::types::Type::Text)))?;
+            comments.push(IssueComment { id, issue_id: iid, author, body, created_at });
+        }
+        Ok(comments)
     }
 
     /// List workspaces linked to an issue.
