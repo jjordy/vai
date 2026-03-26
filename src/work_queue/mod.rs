@@ -409,7 +409,7 @@ pub fn claim(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Numeric rank for priority sorting (lower = higher priority).
-fn priority_rank(priority: &str) -> u8 {
+pub fn priority_rank(priority: &str) -> u8 {
     match priority {
         "critical" => 0,
         "high" => 1,

@@ -1398,25 +1398,37 @@ async fn create_workspace_handler(
 ) -> Result<(StatusCode, Json<WorkspaceResponse>), ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
-    let head = repo::read_head(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let result = workspace::create(&ctx.vai_dir, &body.intent, &head)
+    let head = ctx.storage.versions()
+        .read_head(&ctx.repo_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string());
+    let ws = ctx.storage.workspaces()
+        .create_workspace(&ctx.repo_id, crate::storage::NewWorkspace {
+            id: None,
+            intent: body.intent.clone(),
+            base_version: head,
+            issue_id: None,
+        })
+        .await
         .map_err(ApiError::from)?;
 
     // Broadcast the workspace creation event to all WebSocket subscribers.
-    let ws_id = result.workspace.id.to_string();
+    let ws_id = ws.id.to_string();
     state.broadcast(BroadcastEvent {
         event_type: "WorkspaceCreated".to_string(),
-        event_id: 0, // event ID not surfaced by workspace::CreateResult
+        event_id: 0,
         workspace_id: Some(ws_id.clone()),
-        timestamp: result.workspace.created_at.to_rfc3339(),
+        timestamp: ws.created_at.to_rfc3339(),
         data: serde_json::json!({
             "workspace_id": ws_id,
-            "intent": result.workspace.intent,
-            "base_version": result.workspace.base_version,
+            "intent": ws.intent,
+            "base_version": ws.base_version,
         }),
     });
 
-    Ok((StatusCode::CREATED, Json(WorkspaceResponse::from(result.workspace))))
+    Ok((StatusCode::CREATED, Json(WorkspaceResponse::from(ws))))
 }
 
 /// `GET /api/workspaces` — lists all active (non-discarded, non-merged) workspaces.
@@ -1435,7 +1447,10 @@ async fn list_workspaces_handler(
     ctx: RepoCtx,
 ) -> Result<Json<Vec<WorkspaceResponse>>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    let workspaces = workspace::list(&ctx.vai_dir).map_err(ApiError::from)?;
+    let workspaces = ctx.storage.workspaces()
+        .list_workspaces(&ctx.repo_id, false)
+        .await
+        .map_err(ApiError::from)?;
     let response: Vec<WorkspaceResponse> = workspaces.into_iter().map(Into::into).collect();
     Ok(Json(response))
 }
@@ -1463,7 +1478,12 @@ async fn get_workspace_handler(
     PathId(id): PathId,
 ) -> Result<Json<WorkspaceResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    let meta = workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
+    let ws_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::not_found(format!("workspace `{id}` not found")))?;
+    let meta = ctx.storage.workspaces()
+        .get_workspace(&ctx.repo_id, &ws_id)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(WorkspaceResponse::from(meta)))
 }
 
@@ -4554,11 +4574,70 @@ async fn get_work_queue_handler(
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
 ) -> Result<Json<work_queue::WorkQueue>, ApiError> {
+    use crate::issue::{IssueFilter, IssueStatus};
+
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    let engine = state.conflict_engine.lock().await;
-    let queue = work_queue::compute(&ctx.vai_dir, &engine)
+
+    // Fetch open issues from storage (works for both SQLite and Postgres backends).
+    let open_issues = ctx.storage.issues()
+        .list_issues(&ctx.repo_id, &IssueFilter {
+            status: Some(IssueStatus::Open),
+            ..Default::default()
+        })
+        .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(queue))
+
+    let engine = state.conflict_engine.lock().await;
+    let active_scopes: Vec<_> = engine.all_scopes().cloned().collect();
+
+    let mut available: Vec<work_queue::AvailableWork> = Vec::new();
+    let mut blocked: Vec<work_queue::BlockedWork> = Vec::new();
+
+    for issue in open_issues {
+        let text = format!("{} {}", issue.title, issue.description);
+        let prediction = work_queue::predict_scope(&text, &ctx.vai_dir)
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+
+        let pred_ids = prediction.entity_ids();
+        let pred_files = prediction.file_set();
+
+        let mut conflicting_ws: Vec<String> = Vec::new();
+        let mut reasons: Vec<String> = Vec::new();
+
+        for scope in &active_scopes {
+            let file_conflict = pred_files.iter().any(|f| scope.write_files.contains(f));
+            let entity_conflict = pred_ids.iter().any(|id| scope.blast_radius.contains(id));
+            if file_conflict || entity_conflict {
+                conflicting_ws.push(scope.workspace_id.to_string());
+                reasons.push(format!(
+                    "workspace {} is modifying related code (intent: \"{}\")",
+                    scope.workspace_id, scope.intent
+                ));
+            }
+        }
+
+        if conflicting_ws.is_empty() {
+            available.push(work_queue::AvailableWork {
+                issue_id: issue.id.to_string(),
+                title: issue.title,
+                priority: issue.priority.as_str().to_string(),
+                predicted_scope: prediction,
+            });
+        } else {
+            blocked.push(work_queue::BlockedWork {
+                issue_id: issue.id.to_string(),
+                title: issue.title,
+                priority: issue.priority.as_str().to_string(),
+                blocked_by: conflicting_ws,
+                reason: reasons.join("; "),
+            });
+        }
+    }
+
+    available.sort_by_key(|w| work_queue::priority_rank(&w.priority));
+    blocked.sort_by_key(|w| work_queue::priority_rank(&w.priority));
+
+    Ok(Json(work_queue::WorkQueue { available_work: available, blocked_work: blocked }))
 }
 
 #[utoipa::path(
@@ -4586,24 +4665,85 @@ async fn claim_work_handler(
     ctx: RepoCtx,
     Json(body): Json<ClaimWorkRequest>,
 ) -> Result<(StatusCode, Json<work_queue::ClaimResult>), ApiError> {
+    use crate::issue::IssueStatus;
+    use crate::storage::{IssueUpdate, NewWorkspace};
+
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
     let issue_id = body.issue_id.parse::<uuid::Uuid>().map_err(|_| {
         ApiError::bad_request(format!("invalid issue_id: {}", body.issue_id))
     })?;
 
-    let engine = state.conflict_engine.lock().await;
-    let result = work_queue::claim(&ctx.vai_dir, issue_id, &engine).map_err(|e| {
-        use work_queue::WorkQueueError;
-        match &e {
-            WorkQueueError::IssueNotOpen(_) => ApiError::conflict(e.to_string()),
-            WorkQueueError::IssueConflicting(_) => ApiError::conflict(e.to_string()),
-            WorkQueueError::Issue(crate::issue::IssueError::NotFound(_)) => {
-                ApiError::not_found(e.to_string())
-            }
+    // Fetch issue from storage (works for both SQLite and Postgres backends).
+    let issue = ctx.storage.issues()
+        .get_issue(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(|e| match &e {
+            crate::storage::StorageError::NotFound(_) => ApiError::not_found(e.to_string()),
             _ => ApiError::internal(e.to_string()),
+        })?;
+
+    // Guard: issue must still be Open.
+    if issue.status != IssueStatus::Open {
+        return Err(ApiError::conflict(format!(
+            "Issue {issue_id} is no longer open — refresh the work queue and try again"
+        )));
+    }
+
+    // Guard: re-check for conflicts against current active scopes.
+    let engine = state.conflict_engine.lock().await;
+    let text = format!("{} {}", issue.title, issue.description);
+    let prediction = work_queue::predict_scope(&text, &ctx.vai_dir)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let pred_ids = prediction.entity_ids();
+    let pred_files = prediction.file_set();
+
+    for scope in engine.all_scopes() {
+        let file_conflict = pred_files.iter().any(|f| scope.write_files.contains(f));
+        let entity_conflict = pred_ids.iter().any(|id| scope.blast_radius.contains(id));
+        if file_conflict || entity_conflict {
+            return Err(ApiError::conflict(format!(
+                "Issue {issue_id} conflicts with active workspaces — refresh the work queue and try again"
+            )));
         }
-    })?;
+    }
+    drop(engine);
+
+    // Read HEAD from storage.
+    let head = ctx.storage.versions()
+        .read_head(&ctx.repo_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Create workspace linked to this issue.
+    let ws = ctx.storage.workspaces()
+        .create_workspace(&ctx.repo_id, NewWorkspace {
+            id: None,
+            intent: issue.title.clone(),
+            base_version: head,
+            issue_id: Some(issue_id),
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Transition issue to InProgress, linking the new workspace.
+    ctx.storage.issues()
+        .update_issue(&ctx.repo_id, &issue_id, IssueUpdate {
+            status: Some(IssueStatus::InProgress),
+            workspace_id: Some(ws.id),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let result = work_queue::ClaimResult {
+        issue_id: issue_id.to_string(),
+        workspace_id: ws.id.to_string(),
+        intent: issue.title.clone(),
+        predicted_scope: prediction,
+    };
 
     // Broadcast workspace creation event.
     state.broadcast(BroadcastEvent {
