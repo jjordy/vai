@@ -204,6 +204,12 @@ pub struct Issue {
     /// Issue IDs that must be closed before this issue becomes available.
     #[serde(default)]
     pub depends_on: Vec<Uuid>,
+    /// Testable conditions that define when the issue is considered complete.
+    ///
+    /// The work queue prefers issues with non-empty acceptance criteria because
+    /// they give agents a concrete definition of done.
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
     /// When the issue was created.
     pub created_at: DateTime<Utc>,
     /// When the issue was last updated.
@@ -296,6 +302,11 @@ impl IssueStore {
             "ALTER TABLE issues ADD COLUMN agent_source TEXT",
             [],
         );
+        // Migrate existing databases that lack the acceptance_criteria column.
+        let _ = self.conn.execute(
+            "ALTER TABLE issues ADD COLUMN acceptance_criteria TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
         Ok(())
     }
 
@@ -352,6 +363,7 @@ impl IssueStore {
             resolution: None,
             agent_source: None,
             depends_on: Vec::new(),
+            acceptance_criteria: Vec::new(),
             created_at: now,
             updated_at: now,
         })
@@ -441,6 +453,7 @@ impl IssueStore {
             resolution: None,
             agent_source: Some(source),
             depends_on: Vec::new(),
+            acceptance_criteria: Vec::new(),
             created_at: now,
             updated_at: now,
         };
@@ -531,6 +544,23 @@ impl IssueStore {
         Ok(())
     }
 
+    /// Set the acceptance criteria for an existing issue.
+    ///
+    /// Stores the criteria as a JSON array in the `acceptance_criteria` column.
+    /// Used by storage trait implementations to attach criteria after `create()`.
+    pub fn set_acceptance_criteria(
+        &self,
+        id: Uuid,
+        criteria: &[String],
+    ) -> Result<(), IssueError> {
+        let json = serde_json::to_string(criteria).unwrap_or_else(|_| "[]".to_string());
+        self.conn.execute(
+            "UPDATE issues SET acceptance_criteria = ?1 WHERE id = ?2",
+            params![json, id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Add direct dependency relationships for an issue.
     ///
     /// Idempotent — safe to call multiple times with the same pair.
@@ -578,7 +608,7 @@ impl IssueStore {
     /// Fetch a single issue by ID.
     pub fn get(&self, id: Uuid) -> Result<Issue, IssueError> {
         let result = self.conn.query_row(
-            "SELECT id, title, description, status, priority, labels, creator, resolution, agent_source, created_at, updated_at
+            "SELECT id, title, description, status, priority, labels, creator, resolution, agent_source, created_at, updated_at, acceptance_criteria
              FROM issues WHERE id = ?1",
             params![id.to_string()],
             row_to_issue,
@@ -631,7 +661,7 @@ impl IssueStore {
         };
 
         let sql = format!(
-            "SELECT id, title, description, status, priority, labels, creator, resolution, agent_source, created_at, updated_at
+            "SELECT id, title, description, status, priority, labels, creator, resolution, agent_source, created_at, updated_at, acceptance_criteria
              FROM issues {} ORDER BY created_at DESC",
             where_clause
         );
@@ -956,6 +986,7 @@ fn row_to_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
     let agent_source_json: Option<String> = row.get(8)?;
     let created_str: String = row.get(9)?;
     let updated_str: String = row.get(10)?;
+    let acceptance_criteria_json: Option<String> = row.get(11).unwrap_or(None);
 
     let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::nil());
     let status = IssueStatus::from_str(&status_str).unwrap_or(IssueStatus::Open);
@@ -968,6 +999,10 @@ fn row_to_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
     let agent_source = agent_source_json
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
+    let acceptance_criteria: Vec<String> = acceptance_criteria_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
     let created_at = DateTime::parse_from_rfc3339(&created_str)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
@@ -986,6 +1021,7 @@ fn row_to_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
         resolution,
         agent_source,
         depends_on: Vec::new(),
+        acceptance_criteria,
         created_at,
         updated_at,
     })

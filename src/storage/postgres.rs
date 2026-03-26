@@ -402,8 +402,8 @@ impl IssueStore for PostgresStorage {
 
         sqlx::query(
             r#"
-            INSERT INTO issues (id, repo_id, title, body, priority, labels, creator, agent_source)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO issues (id, repo_id, title, body, priority, labels, creator, agent_source, acceptance_criteria)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             "#,
         )
         .bind(id)
@@ -414,6 +414,7 @@ impl IssueStore for PostgresStorage {
         .bind(&issue.labels)
         .bind(&issue.creator)
         .bind(&agent_source)
+        .bind(&issue.acceptance_criteria)
         .execute(&self.pool)
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -436,7 +437,7 @@ impl IssueStore for PostgresStorage {
     async fn get_issue(&self, repo_id: &Uuid, id: &Uuid) -> Result<Issue, StorageError> {
         let row = sqlx::query(
             "SELECT id, title, body, status, priority, labels, creator, agent_source, \
-                    resolution, created_at, updated_at \
+                    resolution, created_at, updated_at, acceptance_criteria \
              FROM issues WHERE repo_id = $1 AND id = $2",
         )
         .bind(repo_id)
@@ -469,7 +470,7 @@ impl IssueStore for PostgresStorage {
     ) -> Result<Vec<Issue>, StorageError> {
         let rows = sqlx::query(
             "SELECT id, title, body, status, priority, labels, creator, agent_source, \
-                    resolution, created_at, updated_at \
+                    resolution, created_at, updated_at, acceptance_criteria \
              FROM issues WHERE repo_id = $1 ORDER BY created_at DESC",
         )
         .bind(repo_id)
@@ -533,13 +534,14 @@ impl IssueStore for PostgresStorage {
             .map(|s| s.as_str().to_string())
             .unwrap_or_else(|| current.status.as_str().to_string());
         let resolution = update.resolution.or(current.resolution);
+        let acceptance_criteria = update.acceptance_criteria.unwrap_or(current.acceptance_criteria);
 
         sqlx::query(
             r#"
             UPDATE issues
             SET title = $1, body = $2, priority = $3, labels = $4,
-                status = $5, resolution = $6, updated_at = now()
-            WHERE repo_id = $7 AND id = $8
+                status = $5, resolution = $6, acceptance_criteria = $7, updated_at = now()
+            WHERE repo_id = $8 AND id = $9
             "#,
         )
         .bind(&title)
@@ -548,6 +550,7 @@ impl IssueStore for PostgresStorage {
         .bind(&labels)
         .bind(&status)
         .bind(&resolution)
+        .bind(&acceptance_criteria)
         .bind(repo_id)
         .bind(id)
         .execute(&self.pool)
@@ -591,6 +594,7 @@ fn row_to_issue(row: sqlx::postgres::PgRow) -> Result<Issue, StorageError> {
     let resolution: Option<String> = row.get("resolution");
     let created_at: DateTime<Utc> = row.get("created_at");
     let updated_at: DateTime<Utc> = row.get("updated_at");
+    let acceptance_criteria: Vec<String> = row.try_get("acceptance_criteria").unwrap_or_default();
 
     let status = IssueStatus::from_str(&status_str).unwrap_or(IssueStatus::Open);
     let priority = IssuePriority::from_str(&priority_str).unwrap_or(IssuePriority::Medium);
@@ -608,6 +612,7 @@ fn row_to_issue(row: sqlx::postgres::PgRow) -> Result<Issue, StorageError> {
         agent_source,
         resolution,
         depends_on: Vec::new(),
+        acceptance_criteria,
         created_at,
         updated_at,
     })

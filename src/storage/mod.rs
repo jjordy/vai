@@ -96,6 +96,8 @@ pub struct NewIssue {
     pub agent_source: Option<serde_json::Value>,
     /// Issue IDs that must be closed before this issue is available.
     pub depends_on: Vec<Uuid>,
+    /// Testable conditions that define when the issue is complete.
+    pub acceptance_criteria: Vec<String>,
 }
 
 /// Fields that can be updated on an existing issue.
@@ -109,6 +111,8 @@ pub struct IssueUpdate {
     pub resolution: Option<String>,
     /// ID of the workspace linked to this issue.
     pub workspace_id: Option<Uuid>,
+    /// Testable conditions that define when the issue is complete.
+    pub acceptance_criteria: Option<Vec<String>>,
 }
 
 /// Input for creating a new escalation.

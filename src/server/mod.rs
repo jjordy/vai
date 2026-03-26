@@ -1130,6 +1130,9 @@ struct CreateIssueRequest {
     /// Issue IDs that must be closed before this issue becomes available.
     #[serde(default)]
     depends_on: Vec<String>,
+    /// Testable conditions that define when the issue is complete.
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
 }
 
 /// Agent discovery source passed via the REST API.
@@ -1160,6 +1163,8 @@ struct UpdateIssueRequest {
     description: Option<String>,
     priority: Option<String>,
     labels: Option<Vec<String>>,
+    /// Testable conditions that define when the issue is complete.
+    acceptance_criteria: Option<Vec<String>>,
 }
 
 /// Request body for `POST /api/issues/:id/close`.
@@ -1200,6 +1205,8 @@ struct IssueResponse {
     depends_on: Vec<String>,
     /// IDs of issues that depend on this issue (reverse deps).
     blocked_by_issues: Vec<String>,
+    /// Testable conditions that define when the issue is complete.
+    acceptance_criteria: Vec<String>,
     created_at: String,
     updated_at: String,
 }
@@ -1223,6 +1230,7 @@ impl IssueResponse {
             linked_workspace_ids: linked.iter().map(|u| u.to_string()).collect(),
             depends_on: issue.depends_on.iter().map(|id| id.to_string()).collect(),
             blocked_by_issues: blocked_by_issues.iter().map(|id| id.to_string()).collect(),
+            acceptance_criteria: issue.acceptance_criteria,
             created_at: issue.created_at.to_rfc3339(),
             updated_at: issue.updated_at.to_rfc3339(),
         }
@@ -4368,6 +4376,7 @@ async fn create_issue_handler(
             serde_json::to_value(s).unwrap_or(serde_json::Value::Null)
         }),
         depends_on: dep_ids,
+        acceptance_criteria: body.acceptance_criteria.clone(),
     };
 
     let issue = issues
@@ -4568,6 +4577,7 @@ async fn update_issue_handler(
         body.description.as_ref().map(|_| "description"),
         priority.as_ref().map(|_| "priority"),
         body.labels.as_ref().map(|_| "labels"),
+        body.acceptance_criteria.as_ref().map(|_| "acceptance_criteria"),
     ]
     .into_iter()
     .flatten()
@@ -4579,6 +4589,7 @@ async fn update_issue_handler(
         description: body.description,
         priority,
         labels: body.labels,
+        acceptance_criteria: body.acceptance_criteria,
         ..Default::default()
     };
 
@@ -5113,7 +5124,9 @@ async fn get_work_queue_handler(
         }
     }
 
-    // Secondary sort: within same priority, issues that unblock the most work come first.
+    // Secondary sort keys: issues that unblock the most work come first; within
+    // that, issues with acceptance criteria are preferred (they have a clear
+    // definition of done, so agents can work more autonomously).
     let dep_count_map: std::collections::HashMap<uuid::Uuid, usize> = {
         let mut map: std::collections::HashMap<uuid::Uuid, usize> = std::collections::HashMap::new();
         for issue in &all_issues_for_deps {
@@ -5123,10 +5136,14 @@ async fn get_work_queue_handler(
         }
         map
     };
+    let has_criteria_map: std::collections::HashMap<uuid::Uuid, bool> =
+        all_issues_for_deps.iter().map(|i| (i.id, !i.acceptance_criteria.is_empty())).collect();
     available.sort_by_key(|w| {
         let issue_id = uuid::Uuid::parse_str(&w.issue_id).unwrap_or_default();
         let dep_count = dep_count_map.get(&issue_id).copied().unwrap_or(0);
-        (work_queue::priority_rank(&w.priority), std::cmp::Reverse(dep_count))
+        // Lower value = higher priority. Negate has_criteria so true (1) → 0, false (0) → 1.
+        let no_criteria = if has_criteria_map.get(&issue_id).copied().unwrap_or(false) { 0u8 } else { 1u8 };
+        (work_queue::priority_rank(&w.priority), no_criteria, std::cmp::Reverse(dep_count))
     });
     blocked.sort_by_key(|w| work_queue::priority_rank(&w.priority));
 
@@ -6691,8 +6708,8 @@ async fn migrate_handler(
         let result = sqlx::query(
             r#"INSERT INTO issues
                    (id, repo_id, title, body, status, priority, labels,
-                    creator, agent_source, resolution, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    creator, agent_source, resolution, acceptance_criteria, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                ON CONFLICT (id) DO NOTHING"#,
         )
         .bind(issue.id)
@@ -6705,6 +6722,7 @@ async fn migrate_handler(
         .bind(&issue.creator)
         .bind(&agent_source)
         .bind(&issue.resolution)
+        .bind(&issue.acceptance_criteria)
         .bind(issue.created_at)
         .bind(issue.updated_at)
         .execute(&mut *tx)

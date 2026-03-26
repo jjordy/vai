@@ -194,6 +194,14 @@ impl IssueStore for SqliteStorage {
             created.depends_on = issue.depends_on.clone();
         }
 
+        // Persist acceptance criteria if provided.
+        if !issue.acceptance_criteria.is_empty() {
+            store
+                .set_acceptance_criteria(created.id, &issue.acceptance_criteria)
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            created.acceptance_criteria = issue.acceptance_criteria.clone();
+        }
+
         Ok(created)
     }
 
@@ -295,6 +303,13 @@ impl IssueStore for SqliteStorage {
                         .map_err(|e| StorageError::Database(e.to_string()))?;
                 }
             }
+        }
+
+        // Update acceptance criteria if provided.
+        if let Some(criteria) = update.acceptance_criteria {
+            store
+                .set_acceptance_criteria(*id, &criteria)
+                .map_err(|e| StorageError::Database(e.to_string()))?;
         }
 
         // Return the updated issue.
@@ -1066,6 +1081,7 @@ mod tests {
                     creator: "agent-1".to_string(),
                     agent_source: None,
                     depends_on: vec![],
+                    acceptance_criteria: vec![],
                 },
             )
             .await
@@ -1098,6 +1114,7 @@ mod tests {
                     creator: "agent".to_string(),
                     agent_source: None,
                     depends_on: vec![],
+                    acceptance_criteria: vec![],
                 },
             )
             .await

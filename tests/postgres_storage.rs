@@ -216,6 +216,7 @@ async fn test_issue_store_crud() {
         creator: "alice".to_string(),
         agent_source: None,
         depends_on: vec![],
+        acceptance_criteria: vec![],
     };
 
     // create
@@ -1054,6 +1055,7 @@ async fn test_issue_parity_with_sqlite() {
         creator: "parity-test".to_string(),
         agent_source: None,
         depends_on: vec![],
+        acceptance_criteria: vec![],
     };
 
     // Create in both backends.
