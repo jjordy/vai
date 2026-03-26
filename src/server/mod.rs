@@ -1535,10 +1535,23 @@ async fn submit_workspace_handler(
 ) -> Result<Json<SubmitResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
-    // Verify the workspace exists before switching.
-    let meta = workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
+
+    // Read workspace metadata from storage (works in both local SQLite and Postgres modes).
+    let ws_uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::not_found(format!("workspace `{id}` not found")))?;
+    let meta = ctx.storage.workspaces()
+        .get_workspace(&ctx.repo_id, &ws_uuid)
+        .await
+        .map_err(ApiError::from)?;
     let workspace_uuid = meta.id;
     let workspace_intent = meta.intent.clone();
+
+    // Ensure the workspace overlay and filesystem state are ready for merge::submit.
+    // In Postgres server mode workspaces live in the database + FileStore; this
+    // step downloads them to the local .vai/ tree that the synchronous merge
+    // engine expects.
+    prepare_workspace_for_submit(&ctx, &meta).await?;
+
     // Make it the active workspace so merge::submit can find it.
     workspace::switch(&ctx.vai_dir, &id).map_err(ApiError::from)?;
 
@@ -1546,6 +1559,34 @@ async fn submit_workspace_handler(
         Ok(result) => {
             // Remove from conflict engine — workspace is no longer active.
             state.conflict_engine.lock().await.remove_workspace(&workspace_uuid);
+
+            // Sync the new version and HEAD to the storage trait.
+            // In Postgres server mode these writes go to the database; in local
+            // SQLite mode they duplicate what merge::submit already wrote to disk,
+            // which is harmless (same files, same data).
+            let _ = ctx.storage.versions()
+                .create_version(&ctx.repo_id, crate::storage::NewVersion {
+                    version_id: result.version.version_id.clone(),
+                    parent_version_id: result.version.parent_version_id.clone(),
+                    intent: result.version.intent.clone(),
+                    created_by: result.version.created_by.clone(),
+                    merge_event_id: result.version.merge_event_id,
+                })
+                .await;
+            let _ = ctx.storage.versions()
+                .advance_head(&ctx.repo_id, &result.version.version_id)
+                .await;
+            // Mark workspace as Merged in storage trait.
+            let _ = ctx.storage.workspaces()
+                .update_workspace(
+                    &ctx.repo_id,
+                    &workspace_uuid,
+                    crate::storage::WorkspaceUpdate {
+                        status: Some(crate::workspace::WorkspaceStatus::Merged),
+                        ..Default::default()
+                    },
+                )
+                .await;
 
             // Persist pre-change snapshot to FileStore so diffs survive container
             // restarts and cross-server migrations.
@@ -7351,6 +7392,185 @@ async fn shutdown_signal() {
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
+
+/// Ensures the workspace is present on the local filesystem so `merge::submit` can run.
+///
+/// In Postgres server mode, workspaces are created in the database only; their
+/// overlay files live in FileStore (S3). This function:
+///
+/// 1. Creates the workspace directory and `meta.toml` from storage if missing.
+/// 2. Downloads overlay files from FileStore into the local overlay directory
+///    if it is empty.
+/// 3. Syncs the current HEAD from storage into the local `.vai/head` file.
+/// 4. Creates a version TOML stub for the current HEAD so that
+///    `version::next_version_id` returns the correct next ID.
+/// 5. Downloads version snapshot files needed for the semantic merge path.
+async fn prepare_workspace_for_submit(
+    ctx: &RepoCtx,
+    ws_meta: &workspace::WorkspaceMeta,
+) -> Result<(), ApiError> {
+    let ws_id = ws_meta.id.to_string();
+    let ws_dir = ctx.vai_dir.join("workspaces").join(&ws_id);
+    let overlay_dir = ws_dir.join("overlay");
+
+    // ── 1. Create workspace directory and meta.toml if missing ────────────────
+    if !ws_dir.exists() {
+        std::fs::create_dir_all(&overlay_dir)
+            .map_err(|e| ApiError::internal(format!("create workspace dir: {e}")))?;
+        workspace::update_meta(&ctx.vai_dir, ws_meta)
+            .map_err(|e| ApiError::internal(format!("write workspace meta: {e}")))?;
+    }
+
+    // ── 2. Download overlay files from FileStore if the overlay is empty ──────
+    let overlay_is_empty = std::fs::read_dir(&overlay_dir)
+        .map(|mut d| d.next().is_none())
+        .unwrap_or(true);
+
+    if overlay_is_empty {
+        let file_store = ctx.storage.files();
+        let prefix = format!("workspaces/{ws_id}/");
+        // Best-effort — if FileStore is not configured (local SQLite mode) the
+        // list will return an empty vec and we let merge::submit fail naturally.
+        let files = file_store.list(&ctx.repo_id, &prefix).await.unwrap_or_default();
+
+        for file_meta in files {
+            let rel = file_meta
+                .path
+                .strip_prefix(&prefix)
+                .unwrap_or(&file_meta.path)
+                .to_string();
+            if rel.is_empty() {
+                continue;
+            }
+            let content = file_store
+                .get(&ctx.repo_id, &file_meta.path)
+                .await
+                .map_err(|e| ApiError::internal(format!("download overlay file `{rel}`: {e}")))?;
+            let dest = overlay_dir.join(&rel);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| ApiError::internal(format!("create overlay parent dir: {e}")))?;
+            }
+            std::fs::write(&dest, &content)
+                .map_err(|e| ApiError::internal(format!("write overlay file `{rel}`: {e}")))?;
+        }
+
+        // Verify that we have something to merge.
+        let still_empty = std::fs::read_dir(&overlay_dir)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(true);
+        if still_empty {
+            return Err(ApiError::bad_request("workspace has no overlay files to submit"));
+        }
+    }
+
+    // ── 3. Sync HEAD from storage to local filesystem ─────────────────────────
+    let current_head = ctx
+        .storage
+        .versions()
+        .read_head(&ctx.repo_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("read HEAD from storage: {e}")))?
+        .unwrap_or_else(|| ws_meta.base_version.clone());
+
+    std::fs::write(ctx.vai_dir.join("head"), format!("{current_head}\n"))
+        .map_err(|e| ApiError::internal(format!("write local head file: {e}")))?;
+
+    // ── 4. Ensure a version TOML exists for current HEAD ─────────────────────
+    // `version::next_version_id` scans `.vai/versions/` to find the highest
+    // version number.  In server mode that directory may be empty, so we write
+    // at least a stub for the current HEAD version so the scan returns the
+    // correct next ID.
+    let versions_dir = ctx.vai_dir.join("versions");
+    std::fs::create_dir_all(&versions_dir)
+        .map_err(|e| ApiError::internal(format!("create versions dir: {e}")))?;
+
+    let head_toml_path = versions_dir.join(format!("{current_head}.toml"));
+    if !head_toml_path.exists() {
+        let toml_str = ctx
+            .storage
+            .versions()
+            .get_version(&ctx.repo_id, &current_head)
+            .await
+            .ok()
+            .and_then(|vm| toml::to_string_pretty(&vm).ok())
+            .unwrap_or_else(|| {
+                format!(
+                    "version_id = \"{current_head}\"\nintent = \"placeholder\"\n\
+                     created_by = \"server\"\ncreated_at = \"{}\"\n",
+                    chrono::Utc::now().to_rfc3339()
+                )
+            });
+        std::fs::write(&head_toml_path, toml_str)
+            .map_err(|e| ApiError::internal(format!("write version toml for {current_head}: {e}")))?;
+    }
+
+    // ── 5. Download snapshot files for semantic merge ─────────────────────────
+    // The three-level merge reads pre-change snapshots from
+    // `.vai/versions/<id>/snapshot/` for each version between the workspace
+    // base and the current HEAD.  These were uploaded to FileStore by earlier
+    // submit operations.
+    let base_n = server_parse_version_num(&ws_meta.base_version);
+    let head_n = server_parse_version_num(&current_head);
+
+    if head_n > base_n {
+        let file_store = ctx.storage.files();
+        for n in (base_n + 1)..=head_n {
+            let ver_id = format!("v{n}");
+
+            // Also ensure a version TOML exists for every intermediate version
+            // so the merge engine can scan the versions directory correctly.
+            let ver_toml = versions_dir.join(format!("{ver_id}.toml"));
+            if !ver_toml.exists() {
+                if let Ok(vm) = ctx.storage.versions().get_version(&ctx.repo_id, &ver_id).await {
+                    if let Ok(s) = toml::to_string_pretty(&vm) {
+                        let _ = std::fs::write(&ver_toml, s);
+                    }
+                }
+            }
+
+            let snap_dir = versions_dir.join(&ver_id).join("snapshot");
+
+            // Skip if snapshots are already on disk.
+            if snap_dir.exists()
+                && std::fs::read_dir(&snap_dir)
+                    .map(|mut d| d.next().is_some())
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let prefix = format!("versions/{ver_id}/snapshot/");
+            if let Ok(snap_files) = file_store.list(&ctx.repo_id, &prefix).await {
+                for sf in snap_files {
+                    let rel = sf
+                        .path
+                        .strip_prefix(&prefix)
+                        .unwrap_or(&sf.path)
+                        .to_string();
+                    if rel.is_empty() {
+                        continue;
+                    }
+                    if let Ok(content) = file_store.get(&ctx.repo_id, &sf.path).await {
+                        let dest = snap_dir.join(&rel);
+                        if let Some(parent) = dest.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(&dest, content);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Parses a version string like `"v3"` into the integer `3`.
+/// Returns `0` for unrecognised formats.
+fn server_parse_version_num(version: &str) -> u64 {
+    version.trim_start_matches('v').parse::<u64>().unwrap_or(0)
+}
 
 /// Recursively collects all files under `dir`, returning `(relative_path,
 /// content)` pairs.  `relative_path` uses `/` separators.
