@@ -1414,6 +1414,15 @@ async fn create_workspace_handler(
         .await
         .map_err(ApiError::from)?;
 
+    // Append event to event store — triggers pg_notify in Postgres mode.
+    let _ = ctx.storage.events()
+        .append(&ctx.repo_id, EventKind::WorkspaceCreated {
+            workspace_id: ws.id,
+            intent: ws.intent.clone(),
+            base_version: ws.base_version.clone(),
+        })
+        .await;
+
     // Broadcast the workspace creation event to all WebSocket subscribers.
     let ws_id = ws.id.to_string();
     state.broadcast(BroadcastEvent {
@@ -1543,6 +1552,17 @@ async fn submit_workspace_handler(
                 }
             }
 
+            // Append event to event store — triggers pg_notify in Postgres mode.
+            let _ = ctx.storage.events()
+                .append(&ctx.repo_id, EventKind::WorkspaceSubmitted {
+                    workspace_id: workspace_uuid,
+                    changes_summary: format!(
+                        "{} files applied, {} entities changed, new version {}",
+                        result.files_applied, result.entities_changed, result.version.version_id
+                    ),
+                })
+                .await;
+
             // Broadcast the submit/merge event.
             state.broadcast(BroadcastEvent {
                 event_type: "WorkspaceSubmitted".to_string(),
@@ -1594,6 +1614,17 @@ async fn submit_workspace_handler(
                     .create_escalation(&ctx.repo_id, new_esc)
                     .await
                 {
+                    // Append escalation event to event store.
+                    let _ = ctx.storage.events()
+                        .append(&ctx.repo_id, EventKind::EscalationCreated {
+                            escalation_id: escalation.id,
+                            escalation_type: "MergeConflict".to_string(),
+                            severity: "High".to_string(),
+                            workspace_ids: vec![workspace_uuid.to_string()],
+                            summary: summary.clone(),
+                        })
+                        .await;
+
                     // Broadcast the escalation creation.
                     state.broadcast(BroadcastEvent {
                         event_type: "EscalationCreated".to_string(),
@@ -1655,6 +1686,16 @@ async fn discard_workspace_handler(
     // Remove from conflict engine — workspace is no longer active.
     if let Some(uuid) = ws_uuid {
         state.conflict_engine.lock().await.remove_workspace(&uuid);
+    }
+
+    // Append event to event store — triggers pg_notify in Postgres mode.
+    if let Some(uuid) = ws_uuid {
+        let _ = ctx.storage.events()
+            .append(&ctx.repo_id, EventKind::WorkspaceDiscarded {
+                workspace_id: uuid,
+                reason: "discarded via API".to_string(),
+            })
+            .await;
     }
 
     // Broadcast discard event.
@@ -4102,6 +4143,16 @@ async fn create_issue_handler(
         .map_err(ApiError::from)?;
 
     let issue_id = issue.id;
+    // Append event to event store — triggers pg_notify in Postgres mode.
+    let _ = ctx.storage.events()
+        .append(&ctx.repo_id, EventKind::IssueCreated {
+            issue_id,
+            title: issue.title.clone(),
+            creator: issue.creator.clone(),
+            priority: issue.priority.as_str().to_string(),
+        })
+        .await;
+
     state.broadcast(BroadcastEvent {
         event_type: "IssueCreated".to_string(),
         event_id: 0,
@@ -4259,6 +4310,18 @@ async fn update_issue_handler(
         .map(|p| IssuePriority::from_str(p).ok_or_else(|| ApiError::bad_request(format!("unknown priority `{p}`"))))
         .transpose()?;
 
+    // Collect changed field names before moving body fields into update.
+    let fields_changed: Vec<String> = [
+        body.title.as_ref().map(|_| "title"),
+        body.description.as_ref().map(|_| "description"),
+        priority.as_ref().map(|_| "priority"),
+        body.labels.as_ref().map(|_| "labels"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(String::from)
+    .collect();
+
     let update = IssueUpdate {
         title: body.title,
         description: body.description,
@@ -4271,6 +4334,11 @@ async fn update_issue_handler(
         .update_issue(&ctx.repo_id, &issue_id, update)
         .await
         .map_err(ApiError::from)?;
+
+    // Append event to event store — triggers pg_notify in Postgres mode.
+    let _ = ctx.storage.events()
+        .append(&ctx.repo_id, EventKind::IssueUpdated { issue_id, fields_changed })
+        .await;
 
     let linked = linked_workspace_ids(&ctx, issue_id).await;
     Ok(Json(IssueResponse::from_issue(issue, linked)))
@@ -4312,6 +4380,26 @@ async fn close_issue_handler(
         .close_issue(&ctx.repo_id, &issue_id, &body.resolution)
         .await
         .map_err(ApiError::from)?;
+
+    // Append event to event store — triggers pg_notify in Postgres mode.
+    let _ = ctx.storage.events()
+        .append(&ctx.repo_id, EventKind::IssueClosed {
+            issue_id,
+            resolution: body.resolution.clone(),
+        })
+        .await;
+
+    // Broadcast the close event.
+    state.broadcast(BroadcastEvent {
+        event_type: "IssueClosed".to_string(),
+        event_id: 0,
+        workspace_id: None,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        data: serde_json::json!({
+            "issue_id": issue_id.to_string(),
+            "resolution": body.resolution,
+        }),
+    });
 
     let linked = linked_workspace_ids(&ctx, issue_id).await;
     Ok(Json(IssueResponse::from_issue(issue, linked)))
@@ -4730,6 +4818,21 @@ async fn claim_work_handler(
         intent: issue.title.clone(),
         predicted_scope: prediction,
     };
+
+    // Append events to event store — triggers pg_notify in Postgres mode.
+    let _ = ctx.storage.events()
+        .append(&ctx.repo_id, EventKind::WorkspaceCreated {
+            workspace_id: ws.id,
+            intent: ws.intent.clone(),
+            base_version: ws.base_version.clone(),
+        })
+        .await;
+    let _ = ctx.storage.events()
+        .append(&ctx.repo_id, EventKind::IssueLinkedToWorkspace {
+            issue_id,
+            workspace_id: ws.id,
+        })
+        .await;
 
     // Broadcast workspace creation event.
     state.broadcast(BroadcastEvent {
