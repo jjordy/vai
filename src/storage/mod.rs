@@ -460,6 +460,31 @@ pub trait VersionStore: Send + Sync {
         repo_id: &Uuid,
     ) -> Result<Vec<VersionMeta>, StorageError>;
 
+    /// Returns versions whose numeric suffix is `> since_num` and `<= head_num`,
+    /// in ascending numeric order.
+    ///
+    /// The default implementation calls [`list_versions`] and filters in memory.
+    /// Backends with indexed storage should override this for efficiency.
+    async fn list_versions_since(
+        &self,
+        repo_id: &Uuid,
+        since_num: u64,
+        head_num: u64,
+    ) -> Result<Vec<VersionMeta>, StorageError> {
+        fn version_num(id: &str) -> u64 {
+            id.strip_prefix('v')
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+        }
+        let mut versions = self.list_versions(repo_id).await?;
+        versions.retain(|v| {
+            let n = version_num(&v.version_id);
+            n > since_num && n <= head_num
+        });
+        versions.sort_by_key(|v| version_num(&v.version_id));
+        Ok(versions)
+    }
+
     /// Returns the current HEAD version ID, or `None` if no versions exist yet.
     async fn read_head(&self, repo_id: &Uuid) -> Result<Option<String>, StorageError>;
 

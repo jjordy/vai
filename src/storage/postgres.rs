@@ -816,6 +816,32 @@ impl VersionStore for PostgresStorage {
         rows.into_iter().map(row_to_version).collect()
     }
 
+    async fn list_versions_since(
+        &self,
+        repo_id: &Uuid,
+        since_num: u64,
+        head_num: u64,
+    ) -> Result<Vec<VersionMeta>, StorageError> {
+        // Cast the numeric suffix of version_id (e.g. "v7" → 7) for range filtering.
+        // This avoids loading all versions into memory for large repos.
+        let rows = sqlx::query(
+            "SELECT version_id, parent_version_id, intent, created_by, merge_event_id, created_at \
+             FROM versions \
+             WHERE repo_id = $1 \
+               AND CAST(SUBSTRING(version_id FROM 2) AS BIGINT) > $2 \
+               AND CAST(SUBSTRING(version_id FROM 2) AS BIGINT) <= $3 \
+             ORDER BY CAST(SUBSTRING(version_id FROM 2) AS BIGINT)",
+        )
+        .bind(repo_id)
+        .bind(since_num as i64)
+        .bind(head_num as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        rows.into_iter().map(row_to_version).collect()
+    }
+
     async fn read_head(&self, repo_id: &Uuid) -> Result<Option<String>, StorageError> {
         let row = sqlx::query(
             "SELECT version_id FROM version_head WHERE repo_id = $1",

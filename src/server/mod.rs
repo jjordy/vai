@@ -3612,25 +3612,31 @@ async fn files_pull_handler(
         }));
     }
 
-    // Enumerate all versions created after `since`.
-    let all_versions = ctx
+    // Enumerate only the versions in the (since, head] range — avoids loading
+    // the full version history for large repos.
+    let newer_versions = ctx
         .storage
         .versions()
-        .list_versions(&ctx.repo_id)
+        .list_versions_since(&ctx.repo_id, since_num, head_num)
         .await
         .map_err(ApiError::from)?;
 
-    let mut newer_versions: Vec<_> = all_versions
-        .into_iter()
-        .filter(|v| {
-            let n = parse_version_num(&v.version_id);
-            n > since_num && n <= head_num
-        })
+    // Collect the merge_event_ids so we can look up workspace_ids in one pass.
+    let merge_event_ids: Vec<u64> = newer_versions
+        .iter()
+        .filter_map(|v| v.merge_event_id)
         .collect();
-    newer_versions.sort_by_key(|v| parse_version_num(&v.version_id));
 
-    // For each newer version, find which workspace produced it by matching the
-    // MergeCompleted event whose ID equals the version's `merge_event_id`.
+    if merge_event_ids.is_empty() {
+        return Ok(Json(FilesPullResponse {
+            base_version: query.since,
+            head_version,
+            files: vec![],
+        }));
+    }
+
+    // Resolve workspace IDs: fetch only the MergeCompleted events we need.
+    // Uses a single query filtered by event_type instead of loading all events.
     let merge_events = ctx
         .storage
         .events()
@@ -3638,8 +3644,40 @@ async fn files_pull_handler(
         .await
         .map_err(ApiError::from)?;
 
-    // Track the final change state for each path.  We process versions in
-    // ascending order so later versions overwrite earlier ones.
+    let mut workspace_ids: Vec<uuid::Uuid> = newer_versions
+        .iter()
+        .filter_map(|v| {
+            let mid = v.merge_event_id?;
+            merge_events
+                .iter()
+                .find(|e| e.id == mid)
+                .and_then(|e| e.kind.workspace_id())
+        })
+        .collect();
+    workspace_ids.sort_unstable();
+    workspace_ids.dedup();
+
+    // Fetch all file events for all relevant workspaces in a single batch query.
+    use crate::storage::EventFilter;
+    let file_event_filter = EventFilter {
+        event_types: vec![
+            "FileAdded".to_string(),
+            "FileModified".to_string(),
+            "FileRemoved".to_string(),
+        ],
+        workspace_ids,
+        ..EventFilter::default()
+    };
+    let all_file_events = ctx
+        .storage
+        .events()
+        .query_since_id_filtered(&ctx.repo_id, 0, &file_event_filter)
+        .await
+        .map_err(ApiError::from)?;
+
+    // Track the final change state for each path.  We process events in
+    // order (query_since_id_filtered returns events ordered by ID) so later
+    // events overwrite earlier ones.
     #[derive(Clone)]
     enum ChangeState {
         Added,
@@ -3649,48 +3687,26 @@ async fn files_pull_handler(
     let mut path_changes: std::collections::HashMap<String, ChangeState> =
         std::collections::HashMap::new();
 
-    for version in &newer_versions {
-        let Some(merge_event_id) = version.merge_event_id else {
-            continue;
-        };
-
-        let workspace_id = merge_events
-            .iter()
-            .find(|e| e.id == merge_event_id)
-            .and_then(|e| e.kind.workspace_id());
-
-        let Some(workspace_id) = workspace_id else {
-            continue;
-        };
-
-        let ws_events = ctx
-            .storage
-            .events()
-            .query_by_workspace(&ctx.repo_id, &workspace_id)
-            .await
-            .map_err(ApiError::from)?;
-
-        for event in ws_events {
-            match event.kind {
-                EventKind::FileAdded { path, .. } => {
-                    path_changes.insert(path, ChangeState::Added);
-                }
-                EventKind::FileModified { path, .. } => {
-                    // Preserve "added" for files added within this pull range.
-                    path_changes
-                        .entry(path)
-                        .and_modify(|s| {
-                            if !matches!(s, ChangeState::Added) {
-                                *s = ChangeState::Modified;
-                            }
-                        })
-                        .or_insert(ChangeState::Modified);
-                }
-                EventKind::FileRemoved { path, .. } => {
-                    path_changes.insert(path, ChangeState::Removed);
-                }
-                _ => {}
+    for event in all_file_events {
+        match event.kind {
+            EventKind::FileAdded { path, .. } => {
+                path_changes.insert(path, ChangeState::Added);
             }
+            EventKind::FileModified { path, .. } => {
+                // Preserve "added" for files added within this pull range.
+                path_changes
+                    .entry(path)
+                    .and_modify(|s| {
+                        if !matches!(s, ChangeState::Added) {
+                            *s = ChangeState::Modified;
+                        }
+                    })
+                    .or_insert(ChangeState::Modified);
+            }
+            EventKind::FileRemoved { path, .. } => {
+                path_changes.insert(path, ChangeState::Removed);
+            }
+            _ => {}
         }
     }
 
