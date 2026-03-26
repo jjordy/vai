@@ -20,6 +20,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use utoipa::ToSchema;
 
 use crate::event_log::{EventKind, EventLog, EventLogError};
 
@@ -47,7 +48,7 @@ pub enum VersionError {
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// Metadata for a single version, stored in `.vai/versions/v<N>.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VersionMeta {
     /// Version identifier, e.g. `"v1"`.
     pub version_id: String,
@@ -145,7 +146,7 @@ pub fn next_version_id(vai_dir: &Path) -> Result<String, VersionError> {
 // ── Change summary types ───────────────────────────────────────────────────────
 
 /// How an entity was changed within a version.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum VersionChangeType {
     Added,
@@ -174,7 +175,7 @@ impl VersionChangeType {
 }
 
 /// Summary of an entity change in a version, derived from event log records.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VersionEntityChange {
     /// The stable entity ID (SHA-256).
     pub entity_id: String,
@@ -191,7 +192,7 @@ pub struct VersionEntityChange {
 }
 
 /// How a file was changed within a version.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum VersionFileChangeType {
     Added,
@@ -200,7 +201,7 @@ pub enum VersionFileChangeType {
 }
 
 /// Summary of a file change in a version.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VersionFileChange {
     /// File path relative to the repository root.
     pub path: String,
@@ -211,7 +212,7 @@ pub struct VersionFileChange {
 }
 
 /// All changes introduced in a single version.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VersionChanges {
     /// Version metadata.
     pub version: VersionMeta,
@@ -224,7 +225,7 @@ pub struct VersionChanges {
 // ── Rollback types ─────────────────────────────────────────────────────────────
 
 /// Risk level for a downstream version that depends on rolled-back changes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum RiskLevel {
     /// Version references rolled-back entities but doesn't directly depend on changed logic.
@@ -247,7 +248,7 @@ impl RiskLevel {
 }
 
 /// A downstream version that may be affected by rolling back a target version.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ImpactItem {
     /// Version ID of the downstream version (e.g., `"v3"`).
     pub version_id: String,
@@ -262,7 +263,7 @@ pub struct ImpactItem {
 }
 
 /// Full impact analysis for a prospective rollback.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ImpactAnalysis {
     /// The version being rolled back.
     pub target_version: VersionMeta,
@@ -273,7 +274,7 @@ pub struct ImpactAnalysis {
 }
 
 /// Result of a successful rollback operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RollbackResult {
     /// The new version created by this rollback.
     pub new_version: VersionMeta,

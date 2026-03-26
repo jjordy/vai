@@ -1222,6 +1222,14 @@ impl IssueResponse {
 
 // ── Route handlers ────────────────────────────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/api/status",
+    responses(
+        (status = 200, description = "Success", body = StatusResponse),
+    ),
+    tag = "status"
+)]
 /// `GET /api/status` — returns live repository and server health info.
 ///
 /// This is the only unauthenticated REST endpoint.
@@ -1311,6 +1319,14 @@ async fn status_handler(
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses(
+        (status = 200, description = "Success", body = HealthResponse),
+    ),
+    tag = "status"
+)]
 /// `GET /health` — simple liveness probe for load balancers.
 ///
 /// Returns `200 OK` with `{ "status": "ok" }`. No authentication required.
@@ -1318,6 +1334,14 @@ async fn health_handler() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/server/stats",
+    responses(
+        (status = 200, description = "Success", body = ServerStatsResponse),
+    ),
+    tag = "status"
+)]
 /// `GET /api/server/stats` — server-level operational statistics.
 ///
 /// Returns uptime, vai version, workspace count, and (when Postgres is in use)
@@ -1354,6 +1378,18 @@ async fn server_stats_handler(
 ///
 /// Returns 201 Created with the workspace metadata.
 /// Broadcasts a `WorkspaceCreated` event to WebSocket subscribers.
+#[utoipa::path(
+    post,
+    path = "/api/workspaces",
+    request_body = CreateWorkspaceRequest,
+    responses(
+        (status = 201, description = "Workspace created", body = WorkspaceResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
 async fn create_workspace_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
@@ -1384,6 +1420,16 @@ async fn create_workspace_handler(
 }
 
 /// `GET /api/workspaces` — lists all active (non-discarded, non-merged) workspaces.
+#[utoipa::path(
+    get,
+    path = "/api/workspaces",
+    responses(
+        (status = 200, description = "List of workspaces", body = Vec<WorkspaceResponse>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
 async fn list_workspaces_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
@@ -1397,6 +1443,20 @@ async fn list_workspaces_handler(
 /// `GET /api/workspaces/:id` — returns details for a single workspace.
 ///
 /// Returns 404 if the workspace does not exist.
+#[utoipa::path(
+    get,
+    path = "/api/workspaces/{id}",
+    params(
+        ("id" = String, Path, description = "Workspace ID"),
+    ),
+    responses(
+        (status = 200, description = "Workspace details", body = WorkspaceResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Workspace not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
 async fn get_workspace_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
@@ -1414,6 +1474,21 @@ async fn get_workspace_handler(
 /// an escalation is also created automatically.
 /// Returns 404 if the workspace does not exist.
 /// Broadcasts a `WorkspaceSubmitted` event to WebSocket subscribers.
+#[utoipa::path(
+    post,
+    path = "/api/workspaces/{id}/submit",
+    params(
+        ("id" = String, Path, description = "Workspace ID"),
+    ),
+    responses(
+        (status = 200, description = "Workspace submitted", body = SubmitResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Workspace not found", body = ErrorBody),
+        (status = 409, description = "Merge conflict", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
 async fn submit_workspace_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
@@ -1529,6 +1604,20 @@ async fn submit_workspace_handler(
 /// Returns 404 if the workspace does not exist.
 /// Returns 204 No Content on success.
 /// Broadcasts a `WorkspaceDiscarded` event to WebSocket subscribers.
+#[utoipa::path(
+    delete,
+    path = "/api/workspaces/{id}",
+    params(
+        ("id" = String, Path, description = "Workspace ID"),
+    ),
+    responses(
+        (status = 204, description = "Workspace discarded"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Workspace not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
 async fn discard_workspace_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
@@ -1560,6 +1649,19 @@ async fn discard_workspace_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/versions",
+    params(
+        ("limit" = Option<usize>, Query, description = "Maximum number of versions to return"),
+    ),
+    responses(
+        (status = 200, description = "List of versions", body = Vec<version::VersionMeta>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "versions"
+)]
 /// `GET /api/versions` — lists all versions in chronological order.
 ///
 /// Optional `?limit=N` query parameter truncates the result to the N most
@@ -1587,6 +1689,20 @@ async fn list_versions_handler(
     Ok(Json(versions))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/versions/{id}",
+    params(
+        ("id" = String, Path, description = "Version ID"),
+    ),
+    responses(
+        (status = 200, description = "Version details", body = version::VersionChanges),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Version not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "versions"
+)]
 /// `GET /api/versions/:id` — returns details for a single version, including
 /// entity-level and file-level changes derived from the event log.
 ///
@@ -1709,6 +1825,21 @@ async fn get_version_handler(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/versions/{id}/diff",
+    params(
+        ("id" = String, Path, description = "Version ID"),
+        ("base" = Option<String>, Query, description = "Base version ID to diff against"),
+    ),
+    responses(
+        (status = 200, description = "Version diff", body = VersionDiffResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Version not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "versions"
+)]
 /// `GET /api/versions/:id/diff` — returns unified diffs for all files changed
 /// in this version compared to its parent (or a specific `?base=<version_id>`).
 ///
@@ -1952,6 +2083,20 @@ async fn get_version_diff_handler(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/versions/rollback",
+    request_body = RollbackRequest,
+    responses(
+        (status = 200, description = "Rollback successful"),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Version not found", body = ErrorBody),
+        (status = 409, description = "Downstream versions conflict", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "versions"
+)]
 /// `POST /api/versions/rollback` — rolls back the changes introduced by a
 /// specific version by creating a new append-only version that restores the
 /// prior state.
@@ -2020,6 +2165,19 @@ struct WsQueryParams {
 /// An empty list for any field means "match all". Events are delivered as JSON
 /// matching [`BroadcastEvent`]. The client can send updated subscribe messages
 /// at any time to change the filter.
+#[utoipa::path(
+    get,
+    path = "/ws/events",
+    params(
+        ("key" = String, Query, description = "API key for authentication"),
+        ("last_event_id" = Option<u64>, Query, description = "Last received event ID for replay on reconnect"),
+    ),
+    responses(
+        (status = 101, description = "WebSocket connection upgraded — events stream as JSON BroadcastEvent messages"),
+        (status = 401, description = "Unauthorized — missing or invalid key"),
+    ),
+    tag = "status"
+)]
 async fn ws_events_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -2593,6 +2751,22 @@ fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/workspaces/{id}/files",
+    params(
+        ("id" = String, Path, description = "Workspace ID"),
+    ),
+    request_body = UploadFilesRequest,
+    responses(
+        (status = 201, description = "Files uploaded", body = UploadFilesResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Workspace not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
 /// `POST /api/workspaces/:id/files` — uploads one or more files into the
 /// workspace overlay.
 ///
@@ -2778,6 +2952,21 @@ async fn upload_workspace_files_handler(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/workspaces/{id}/files/{path}",
+    params(
+        ("id" = String, Path, description = "Workspace ID"),
+        ("path" = String, Path, description = "File path within workspace"),
+    ),
+    responses(
+        (status = 200, description = "File content", body = FileDownloadResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "File not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
 /// `GET /api/workspaces/:id/files/*path` — downloads a file from a workspace.
 ///
 /// The overlay is checked first; if the file is not present there the base
@@ -2839,6 +3028,16 @@ struct RepoFileListResponse {
     head_version: String,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/repo/files",
+    responses(
+        (status = 200, description = "List of repo files", body = RepoFileListResponse),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
 /// `GET /api/repo/files` — lists every file in the current main codebase.
 ///
 /// Returns relative paths suitable for use with `GET /api/files/*path`.
@@ -2900,6 +3099,18 @@ fn collect_repo_files(
 
 // ── Source file upload (migration) ───────────────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/api/files",
+    request_body = UploadFilesRequest,
+    responses(
+        (status = 200, description = "Files uploaded", body = UploadFilesResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
 /// `POST /api/files` — uploads source files into the repository root.
 ///
 /// Used by `vai remote migrate` (PRD 12.3) to copy the local project directory
@@ -2982,6 +3193,16 @@ struct ServerGraphRefreshResponse {
     relationships: usize,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/graph/refresh",
+    responses(
+        (status = 200, description = "Graph refreshed", body = ServerGraphRefreshResponse),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "graph"
+)]
 /// `POST /api/graph/refresh` — rebuilds the semantic graph from source files.
 ///
 /// Should be called after `POST /api/files` completes to ensure the graph
@@ -3072,6 +3293,20 @@ async fn server_graph_refresh_handler(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/files/{path}",
+    params(
+        ("path" = String, Path, description = "File path relative to repo root"),
+    ),
+    responses(
+        (status = 200, description = "File content", body = FileDownloadResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "File not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
 /// `GET /api/files/*path` — downloads a file from the current main version.
 ///
 /// Returns the file as base64-encoded content. Returns 404 if not found.
@@ -3214,6 +3449,21 @@ fn open_graph(vai_dir: &std::path::Path) -> Result<GraphSnapshot, ApiError> {
 
 // ── Graph API handlers ────────────────────────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/api/graph/entities",
+    params(
+        ("kind" = Option<String>, Query, description = "Filter by entity kind (e.g. \"function\", \"struct\")"),
+        ("file" = Option<String>, Query, description = "Filter by exact file path"),
+        ("name" = Option<String>, Query, description = "Filter by entity name substring"),
+    ),
+    responses(
+        (status = 200, description = "List of entities", body = Vec<EntitySummary>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "graph"
+)]
 /// `GET /api/graph/entities` — lists entities with optional filters.
 ///
 /// Query params: `kind`, `file`, `name` (all optional, combined with AND).
@@ -3234,6 +3484,20 @@ async fn list_graph_entities_handler(
     Ok(Json(entities.into_iter().map(Into::into).collect()))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/graph/entities/{id}",
+    params(
+        ("id" = String, Path, description = "Entity ID"),
+    ),
+    responses(
+        (status = 200, description = "Entity details and relationships", body = EntityDetailResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Entity not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "graph"
+)]
 /// `GET /api/graph/entities/:id` — entity details and its relationships.
 async fn get_graph_entity_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -3255,6 +3519,20 @@ async fn get_graph_entity_handler(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/graph/entities/{id}/deps",
+    params(
+        ("id" = String, Path, description = "Entity ID"),
+    ),
+    responses(
+        (status = 200, description = "Transitive dependencies of the entity", body = EntityDepsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Entity not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "graph"
+)]
 /// `GET /api/graph/entities/:id/deps` — all entities transitively reachable
 /// from this entity following any relationship direction.
 async fn get_entity_deps_handler(
@@ -3289,6 +3567,21 @@ async fn get_entity_deps_handler(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/graph/blast-radius",
+    params(
+        ("entities" = String, Query, description = "Comma-separated entity IDs"),
+        ("hops" = Option<usize>, Query, description = "Maximum traversal depth (default: 2)"),
+    ),
+    responses(
+        (status = 200, description = "Blast radius result", body = BlastRadiusResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "graph"
+)]
 /// `GET /api/graph/blast-radius` — entities reachable from a set of seeds within N hops.
 ///
 /// Query params:
@@ -3350,6 +3643,19 @@ async fn linked_workspace_ids(
         .collect()
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/issues",
+    request_body = CreateIssueRequest,
+    responses(
+        (status = 201, description = "Issue created", body = IssueResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 429, description = "Rate limit exceeded"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
 /// `POST /api/issues` — create a new issue.
 ///
 /// When `created_by_agent` is set the request is treated as an agent-initiated
@@ -3454,6 +3760,22 @@ async fn create_issue_handler(
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/issues",
+    params(
+        ("status" = Option<String>, Query, description = "Filter by status (open, in_progress, closed)"),
+        ("priority" = Option<String>, Query, description = "Filter by priority"),
+        ("label" = Option<String>, Query, description = "Filter by label"),
+        ("created_by" = Option<String>, Query, description = "Filter by creator"),
+    ),
+    responses(
+        (status = 200, description = "List of issues", body = Vec<IssueResponse>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
 /// `GET /api/issues` — list issues with optional filters.
 async fn list_issues_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -3503,6 +3825,20 @@ async fn list_issues_handler(
     Ok(Json(response))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/issues/{id}",
+    params(
+        ("id" = String, Path, description = "Issue ID"),
+    ),
+    responses(
+        (status = 200, description = "Issue details", body = IssueResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Issue not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
 /// `GET /api/issues/:id` — issue details with linked workspaces.
 ///
 /// Returns 404 if the issue does not exist.
@@ -3525,6 +3861,22 @@ async fn get_issue_handler(
     Ok(Json(IssueResponse::from_issue(issue, linked)))
 }
 
+#[utoipa::path(
+    patch,
+    path = "/api/issues/{id}",
+    params(
+        ("id" = String, Path, description = "Issue ID"),
+    ),
+    request_body = UpdateIssueRequest,
+    responses(
+        (status = 200, description = "Updated issue", body = IssueResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Issue not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
 /// `PATCH /api/issues/:id` — update mutable fields of an issue.
 ///
 /// Returns 404 if the issue does not exist.
@@ -3565,6 +3917,22 @@ async fn update_issue_handler(
     Ok(Json(IssueResponse::from_issue(issue, linked)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/issues/{id}/close",
+    params(
+        ("id" = String, Path, description = "Issue ID"),
+    ),
+    request_body = CloseIssueRequest,
+    responses(
+        (status = 200, description = "Closed issue", body = IssueResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Issue not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
 /// `POST /api/issues/:id/close` — close an issue with a resolution.
 ///
 /// Returns 404 if the issue does not exist.
@@ -3647,6 +4015,19 @@ fn default_resolved_by() -> String {
     "api".to_string()
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/escalations",
+    params(
+        ("status" = Option<String>, Query, description = "Filter by status (pending, resolved)"),
+    ),
+    responses(
+        (status = 200, description = "List of escalations", body = Vec<EscalationResponse>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "escalations"
+)]
 /// `GET /api/escalations` — list escalations.
 ///
 /// Optional `?status=pending|resolved` filter.
@@ -3690,6 +4071,20 @@ struct ListEscalationsQuery {
     status: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/escalations/{id}",
+    params(
+        ("id" = String, Path, description = "Escalation ID"),
+    ),
+    responses(
+        (status = 200, description = "Escalation details", body = EscalationResponse),
+        (status = 404, description = "Escalation not found", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "escalations"
+)]
 /// `GET /api/escalations/:id` — details for a single escalation.
 ///
 /// Returns 404 if the escalation does not exist.
@@ -3710,6 +4105,22 @@ async fn get_escalation_handler(
     Ok(Json(EscalationResponse::from(escalation)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/escalations/{id}/resolve",
+    params(
+        ("id" = String, Path, description = "Escalation ID"),
+    ),
+    request_body = ResolveEscalationRequest,
+    responses(
+        (status = 200, description = "Escalation resolved", body = EscalationResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 404, description = "Escalation not found", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "escalations"
+)]
 /// `POST /api/escalations/:id/resolve` — resolve an escalation.
 ///
 /// Returns 404 if the escalation does not exist.
@@ -3770,6 +4181,16 @@ struct ClaimWorkRequest {
 
 // ── Work queue route handlers ─────────────────────────────────────────────────
 
+#[utoipa::path(
+    get,
+    path = "/api/work-queue",
+    responses(
+        (status = 200, description = "Work queue", body = work_queue::WorkQueue),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "work-queue"
+)]
 /// `GET /api/work-queue` — returns available and blocked work.
 ///
 /// Predicts the scope of every open issue via keyword matching against the
@@ -3787,6 +4208,19 @@ async fn get_work_queue_handler(
     Ok(Json(queue))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/work-queue/claim",
+    request_body = ClaimWorkRequest,
+    responses(
+        (status = 201, description = "Work claimed", body = work_queue::ClaimResult),
+        (status = 404, description = "Issue not found", body = ErrorBody),
+        (status = 409, description = "Issue no longer claimable", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "work-queue"
+)]
 /// `POST /api/work-queue/claim` — atomically claim an issue and create a workspace.
 ///
 /// Verifies the issue is still `Open` and uncontested, then creates a workspace
@@ -3875,6 +4309,19 @@ impl From<Watcher> for WatcherResponse {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/watchers/register",
+    request_body = RegisterWatcherRequest,
+    responses(
+        (status = 201, description = "Watcher registered", body = WatcherResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 409, description = "Watcher already registered", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "watchers"
+)]
 /// `POST /api/watchers/register` — register a new watcher agent.
 async fn register_watcher_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -3913,6 +4360,16 @@ async fn register_watcher_handler(
     Ok((StatusCode::CREATED, Json(watcher.into())))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/watchers",
+    responses(
+        (status = 200, description = "List of registered watchers", body = Vec<WatcherResponse>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "watchers"
+)]
 /// `GET /api/watchers` — list all registered watchers.
 async fn list_watchers_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -3924,6 +4381,20 @@ async fn list_watchers_handler(
     Ok(Json(watchers.into_iter().map(Into::into).collect()))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/watchers/{id}/pause",
+    params(
+        ("id" = String, Path, description = "Watcher agent ID"),
+    ),
+    responses(
+        (status = 200, description = "Watcher paused", body = WatcherResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Watcher not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "watchers"
+)]
 /// `POST /api/watchers/:id/pause` — pause a watcher.
 async fn pause_watcher_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -3945,6 +4416,20 @@ async fn pause_watcher_handler(
     Ok(Json(watcher.into()))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/watchers/{id}/resume",
+    params(
+        ("id" = String, Path, description = "Watcher agent ID"),
+    ),
+    responses(
+        (status = 200, description = "Watcher resumed", body = WatcherResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Watcher not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "watchers"
+)]
 /// `POST /api/watchers/:id/resume` — resume a paused watcher.
 async fn resume_watcher_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -3987,6 +4472,18 @@ struct DiscoveryOutcomeResponse {
     message: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/discoveries",
+    request_body = SubmitDiscoveryRequest,
+    responses(
+        (status = 201, description = "Discovery submitted", body = DiscoveryOutcomeResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "watchers"
+)]
 /// `POST /api/discoveries` — submit a discovery event from a watcher.
 async fn submit_discovery_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4137,6 +4634,19 @@ impl RepoResponse {
 
 // ── Repository management handlers ────────────────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/api/repos",
+    request_body = CreateRepoRequest,
+    responses(
+        (status = 201, description = "Repository created", body = RepoResponse),
+        (status = 400, description = "Bad request or multi-repo mode not enabled", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 409, description = "Repository already exists", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
 /// `POST /api/repos` — registers and initialises a new repository.
 ///
 /// Creates `{storage_root}/{name}/`, runs `vai init`, and records the repo in
@@ -4220,6 +4730,16 @@ async fn create_repo_handler(
     Ok((StatusCode::CREATED, Json(RepoResponse::from_entry(&entry))))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/repos",
+    responses(
+        (status = 200, description = "List of registered repositories", body = Vec<RepoResponse>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
 /// `GET /api/repos` — lists all registered repositories with basic stats.
 ///
 /// Returns an empty array if no repos are registered or if storage_root is not
@@ -4339,6 +4859,20 @@ impl From<crate::storage::OrgMember> for OrgMemberResponse {
 
 // ── Org / User handlers ───────────────────────────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/api/orgs",
+    request_body = CreateOrgRequest,
+    responses(
+        (status = 201, description = "Organization created", body = OrgResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — requires admin key"),
+        (status = 409, description = "Slug already exists", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "orgs"
+)]
 /// `POST /api/orgs` — creates a new organization.
 async fn create_org_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4366,6 +4900,17 @@ async fn create_org_handler(
     Ok((StatusCode::CREATED, Json(OrgResponse::from(org))))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/orgs",
+    responses(
+        (status = 200, description = "List of organizations", body = Vec<OrgResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — requires admin key"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "orgs"
+)]
 /// `GET /api/orgs` — lists all organizations (server-level admin use).
 async fn list_orgs_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4376,6 +4921,21 @@ async fn list_orgs_handler(
     Ok(Json(orgs.into_iter().map(OrgResponse::from).collect()))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/orgs/{org}",
+    params(
+        ("org" = String, Path, description = "Organization slug"),
+    ),
+    responses(
+        (status = 200, description = "Organization found", body = OrgResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — requires admin key"),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "orgs"
+)]
 /// `GET /api/orgs/:org` — returns the organization with the given slug.
 async fn get_org_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4387,6 +4947,21 @@ async fn get_org_handler(
     Ok(Json(OrgResponse::from(org)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/orgs/{org}",
+    params(
+        ("org" = String, Path, description = "Organization slug"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — requires admin key"),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "orgs"
+)]
 /// `DELETE /api/orgs/:org` — permanently deletes an org by slug (cascades to repos).
 async fn delete_org_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4399,6 +4974,20 @@ async fn delete_org_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/users",
+    request_body = CreateUserRequest,
+    responses(
+        (status = 201, description = "User created", body = UserResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — requires admin key"),
+        (status = 409, description = "User already exists", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "auth"
+)]
 /// `POST /api/users` — creates a new user account.
 async fn create_user_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4418,6 +5007,21 @@ async fn create_user_handler(
     Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/users/{user}",
+    params(
+        ("user" = String, Path, description = "User UUID or email address"),
+    ),
+    responses(
+        (status = 200, description = "User found", body = UserResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — requires admin key"),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "auth"
+)]
 /// `GET /api/users/:user` — fetches a user by UUID or email.
 ///
 /// The `:user` path segment is tried first as a UUID; if it cannot be parsed as
@@ -4437,6 +5041,21 @@ async fn get_user_handler(
     Ok(Json(UserResponse::from(user)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/orgs/{org}/members",
+    params(
+        ("org" = String, Path, description = "Organization slug"),
+    ),
+    responses(
+        (status = 200, description = "List of org members", body = Vec<OrgMemberResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — requires admin key"),
+        (status = 404, description = "Organization not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "orgs"
+)]
 /// `GET /api/orgs/:org/members` — lists all members of an organization.
 async fn list_org_members_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4450,6 +5069,23 @@ async fn list_org_members_handler(
     Ok(Json(members.into_iter().map(OrgMemberResponse::from).collect()))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/orgs/{org}/members",
+    params(
+        ("org" = String, Path, description = "Organization slug"),
+    ),
+    request_body = AddMemberRequest,
+    responses(
+        (status = 201, description = "Member added", body = OrgMemberResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — requires admin key"),
+        (status = 404, description = "Organization or user not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "orgs"
+)]
 /// `POST /api/orgs/:org/members` — adds a user as a member of an organization.
 async fn add_org_member_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4477,6 +5113,24 @@ async fn add_org_member_handler(
     Ok((StatusCode::CREATED, Json(OrgMemberResponse::from(member))))
 }
 
+#[utoipa::path(
+    patch,
+    path = "/api/orgs/{org}/members/{user}",
+    params(
+        ("org" = String, Path, description = "Organization slug"),
+        ("user" = String, Path, description = "User UUID"),
+    ),
+    request_body = UpdateMemberRequest,
+    responses(
+        (status = 200, description = "Member role updated", body = OrgMemberResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — requires admin key"),
+        (status = 404, description = "Organization or member not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "orgs"
+)]
 /// `PATCH /api/orgs/:org/members/:user` — updates a member's role.
 async fn update_org_member_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4504,6 +5158,22 @@ async fn update_org_member_handler(
     Ok(Json(OrgMemberResponse::from(member)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/orgs/{org}/members/{user}",
+    params(
+        ("org" = String, Path, description = "Organization slug"),
+        ("user" = String, Path, description = "User UUID"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — requires admin key"),
+        (status = 404, description = "Organization or member not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "orgs"
+)]
 /// `DELETE /api/orgs/:org/members/:user` — removes a user from an organization.
 async fn remove_org_member_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4570,6 +5240,23 @@ fn parse_repo_role(s: &str) -> Result<crate::storage::RepoRole, ApiError> {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/orgs/{org}/repos/{repo}/collaborators",
+    params(
+        ("org" = String, Path, description = "Organization slug"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    request_body = AddCollaboratorRequest,
+    responses(
+        (status = 201, description = "Collaborator added", body = CollaboratorResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
 /// `POST /api/orgs/:org/repos/:repo/collaborators` — adds a collaborator to a repo.
 async fn add_collaborator_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4587,6 +5274,20 @@ async fn add_collaborator_handler(
     Ok((StatusCode::CREATED, Json(CollaboratorResponse::from(collaborator))))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/orgs/{org}/repos/{repo}/collaborators",
+    params(
+        ("org" = String, Path, description = "Organization slug"),
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "List of collaborators", body = Vec<CollaboratorResponse>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
 /// `GET /api/orgs/:org/repos/:repo/collaborators` — lists all collaborators on a repo.
 async fn list_collaborators_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4601,6 +5302,24 @@ async fn list_collaborators_handler(
     Ok(Json(collaborators.into_iter().map(CollaboratorResponse::from).collect()))
 }
 
+#[utoipa::path(
+    patch,
+    path = "/api/orgs/{org}/repos/{repo}/collaborators/{user}",
+    params(
+        ("org" = String, Path, description = "Organization slug"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("user" = String, Path, description = "User ID"),
+    ),
+    request_body = UpdateCollaboratorRequest,
+    responses(
+        (status = 200, description = "Collaborator updated", body = CollaboratorResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
 /// `PATCH /api/orgs/:org/repos/:repo/collaborators/:user` — updates a collaborator's role.
 async fn update_collaborator_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4618,6 +5337,22 @@ async fn update_collaborator_handler(
     Ok(Json(CollaboratorResponse::from(collaborator)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/orgs/{org}/repos/{repo}/collaborators/{user}",
+    params(
+        ("org" = String, Path, description = "Organization slug"),
+        ("repo" = String, Path, description = "Repository name"),
+        ("user" = String, Path, description = "User ID"),
+    ),
+    responses(
+        (status = 204, description = "Collaborator removed"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
 /// `DELETE /api/orgs/:org/repos/:repo/collaborators/:user` — removes a collaborator from a repo.
 async fn remove_collaborator_handler(
     Extension(identity): Extension<AgentIdentity>,
@@ -4684,6 +5419,19 @@ impl From<crate::auth::ApiKey> for ApiKeyResponse {
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/keys",
+    request_body = CreateKeyRequest,
+    responses(
+        (status = 201, description = "API key created", body = CreateKeyResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "auth"
+)]
 /// `POST /api/keys` — creates a new API key scoped to the authenticated user.
 ///
 /// The key's effective permissions are the lesser of the creator's own role and
@@ -4755,6 +5503,16 @@ async fn create_key_handler(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/keys",
+    responses(
+        (status = 200, description = "List of API keys", body = Vec<ApiKeyResponse>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "auth"
+)]
 /// `GET /api/keys` — lists all active keys belonging to the authenticated user.
 ///
 /// Admin keys see all server-level keys; user keys see only keys owned by
@@ -4781,6 +5539,21 @@ async fn list_keys_handler(
     Ok(Json(keys.into_iter().map(ApiKeyResponse::from).collect()))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/keys/{id}",
+    params(
+        ("id" = String, Path, description = "API key record UUID"),
+    ),
+    responses(
+        (status = 204, description = "Key revoked"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "auth"
+)]
 /// `DELETE /api/keys/:id` — revokes a key by its record UUID.
 ///
 /// Users can only revoke their own keys; admin can revoke any key.
@@ -4814,6 +5587,18 @@ async fn revoke_key_handler(
 
 // ── Migration handler (PRD 12.2) ──────────────────────────────────────────────
 
+#[utoipa::path(
+    post,
+    path = "/api/migrate",
+    request_body(content = inline(serde_json::Value), description = "Migration payload (events, issues, versions, escalations)"),
+    responses(
+        (status = 201, description = "Migration successful", body = crate::migration::MigrationSummary),
+        (status = 400, description = "Not running in Postgres mode or invalid payload", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
 /// Bulk migration endpoint: `POST /api/migrate` (single-repo) and
 /// `POST /api/repos/:repo/migrate` (multi-repo).
 ///
@@ -5046,6 +5831,17 @@ pub struct MigrationStatsResponse {
     pub head_version: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/migration-stats",
+    responses(
+        (status = 200, description = "Migration statistics", body = MigrationStatsResponse),
+        (status = 400, description = "Not running in Postgres mode", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
 /// `GET /api/migration-stats` and `GET /api/repos/:repo/migration-stats`
 ///
 /// Returns counts of events, issues, versions, and escalations for the repository.

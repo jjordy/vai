@@ -23,6 +23,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::conflict::ConflictEngine;
@@ -68,7 +69,7 @@ const STOP_WORDS: &[&str] = &[
 // ── Confidence levels ─────────────────────────────────────────────────────────
 
 /// Confidence level of a scope prediction for a single entity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PredictionConfidence {
     /// Direct name match against the semantic graph.
@@ -82,7 +83,7 @@ pub enum PredictionConfidence {
 // ── Predicted entity ──────────────────────────────────────────────────────────
 
 /// A single entity included in a scope prediction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PredictedEntity {
     /// Stable entity identifier (SHA-256 of `file::qualified_name`).
     pub id: String,
@@ -97,7 +98,7 @@ pub struct PredictedEntity {
 // ── Scope prediction ──────────────────────────────────────────────────────────
 
 /// Predicted scope of work for an issue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ScopePrediction {
     /// Predicted entities ordered by confidence (High first).
     pub entities: Vec<PredictedEntity>,
@@ -231,7 +232,7 @@ pub fn predict_scope(text: &str, vai_dir: &Path) -> Result<ScopePrediction, Work
 // ── Work queue entries ────────────────────────────────────────────────────────
 
 /// An issue safe to start — no conflicts with in-flight workspace scopes.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct AvailableWork {
     /// Issue identifier.
     pub issue_id: String,
@@ -244,7 +245,7 @@ pub struct AvailableWork {
 }
 
 /// An issue that cannot be safely started due to active workspace conflicts.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct BlockedWork {
     /// Issue identifier.
     pub issue_id: String,
@@ -259,7 +260,7 @@ pub struct BlockedWork {
 }
 
 /// Full work queue response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct WorkQueue {
     /// Issues safe to start immediately.
     pub available_work: Vec<AvailableWork>,
@@ -342,7 +343,7 @@ pub fn compute(
 // ── Atomic claim ──────────────────────────────────────────────────────────────
 
 /// Result of a successful issue claim.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ClaimResult {
     /// The issue that was claimed.
     pub issue_id: String,
