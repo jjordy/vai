@@ -215,6 +215,7 @@ async fn test_issue_store_crud() {
         labels: vec!["bug".to_string(), "auth".to_string()],
         creator: "alice".to_string(),
         agent_source: None,
+        depends_on: vec![],
     };
 
     // create
@@ -1052,6 +1053,7 @@ async fn test_issue_parity_with_sqlite() {
         labels: vec!["test".to_string()],
         creator: "parity-test".to_string(),
         agent_source: None,
+        depends_on: vec![],
     };
 
     // Create in both backends.

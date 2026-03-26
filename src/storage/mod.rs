@@ -94,6 +94,8 @@ pub struct NewIssue {
     pub creator: String,
     /// Optional agent discovery metadata (JSON).
     pub agent_source: Option<serde_json::Value>,
+    /// Issue IDs that must be closed before this issue is available.
+    pub depends_on: Vec<Uuid>,
 }
 
 /// Fields that can be updated on an existing issue.

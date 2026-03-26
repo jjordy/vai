@@ -184,6 +184,9 @@ pub struct Issue {
     /// Source metadata if this issue was created by an agent; `None` for
     /// human-created issues.
     pub agent_source: Option<AgentSource>,
+    /// Issue IDs that must be closed before this issue becomes available.
+    #[serde(default)]
+    pub depends_on: Vec<Uuid>,
     /// When the issue was created.
     pub created_at: DateTime<Utc>,
     /// When the issue was last updated.
@@ -254,6 +257,12 @@ impl IssueStore {
                 hour_bucket TEXT NOT NULL,
                 count       INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (agent_id, hour_bucket)
+            );
+
+            CREATE TABLE IF NOT EXISTS issue_dependencies (
+                issue_id      TEXT NOT NULL,
+                depends_on_id TEXT NOT NULL,
+                PRIMARY KEY (issue_id, depends_on_id)
             );",
         )?;
         // Migrate existing databases that lack the agent_source column.
@@ -316,6 +325,7 @@ impl IssueStore {
             creator,
             resolution: None,
             agent_source: None,
+            depends_on: Vec::new(),
             created_at: now,
             updated_at: now,
         })
@@ -404,6 +414,7 @@ impl IssueStore {
             creator: agent_id,
             resolution: None,
             agent_source: Some(source),
+            depends_on: Vec::new(),
             created_at: now,
             updated_at: now,
         };
@@ -494,6 +505,39 @@ impl IssueStore {
         Ok(())
     }
 
+    /// Add direct dependency relationships for an issue.
+    ///
+    /// Idempotent — safe to call multiple times with the same pair.
+    pub fn add_dependencies(&self, issue_id: Uuid, depends_on: &[Uuid]) -> Result<(), IssueError> {
+        for dep_id in depends_on {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO issue_dependencies (issue_id, depends_on_id) VALUES (?1, ?2)",
+                params![issue_id.to_string(), dep_id.to_string()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Return the direct dependencies of an issue (IDs it depends on).
+    fn get_dependencies_for(&self, issue_id: Uuid) -> Result<Vec<Uuid>, IssueError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT depends_on_id FROM issue_dependencies WHERE issue_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![issue_id.to_string()], |row| {
+            let s: String = row.get(0)?;
+            Ok(s)
+        })?;
+        let mut deps = Vec::new();
+        for row in rows {
+            if let Ok(s) = row {
+                if let Ok(uid) = Uuid::parse_str(&s) {
+                    deps.push(uid);
+                }
+            }
+        }
+        Ok(deps)
+    }
+
     pub fn count_open(&self) -> Result<usize, IssueError> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM issues WHERE status = 'open'",
@@ -514,7 +558,10 @@ impl IssueStore {
             row_to_issue,
         );
         match result {
-            Ok(issue) => Ok(issue),
+            Ok(mut issue) => {
+                issue.depends_on = self.get_dependencies_for(id)?;
+                Ok(issue)
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Err(IssueError::NotFound(id)),
             Err(e) => Err(IssueError::Sqlite(e)),
         }
@@ -570,6 +617,9 @@ impl IssueStore {
         let mut issues = Vec::new();
         for row in rows {
             issues.push(row?);
+        }
+        for issue in &mut issues {
+            issue.depends_on = self.get_dependencies_for(issue.id)?;
         }
         Ok(issues)
     }
@@ -856,6 +906,7 @@ fn row_to_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
         creator,
         resolution,
         agent_source,
+        depends_on: Vec::new(),
         created_at,
         updated_at,
     })

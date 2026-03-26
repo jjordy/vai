@@ -1127,6 +1127,9 @@ struct CreateIssueRequest {
     /// Max issues this agent may create per hour (default: 20).
     #[serde(default = "default_max_per_hour")]
     max_per_hour: u32,
+    /// Issue IDs that must be closed before this issue becomes available.
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 /// Agent discovery source passed via the REST API.
@@ -1193,12 +1196,16 @@ struct IssueResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     possible_duplicate_of: Option<String>,
     linked_workspace_ids: Vec<String>,
+    /// Issue IDs that must be closed before this issue becomes available.
+    depends_on: Vec<String>,
+    /// IDs of issues that depend on this issue (reverse deps).
+    blocked_by_issues: Vec<String>,
     created_at: String,
     updated_at: String,
 }
 
 impl IssueResponse {
-    fn from_issue(issue: crate::issue::Issue, linked: Vec<uuid::Uuid>) -> Self {
+    fn from_issue(issue: crate::issue::Issue, linked: Vec<uuid::Uuid>, blocked_by_issues: Vec<uuid::Uuid>) -> Self {
         let agent_source = issue.agent_source.as_ref().map(|s| {
             serde_json::to_value(s).unwrap_or(serde_json::Value::Null)
         });
@@ -1214,6 +1221,8 @@ impl IssueResponse {
             agent_source,
             possible_duplicate_of: None,
             linked_workspace_ids: linked.iter().map(|u| u.to_string()).collect(),
+            depends_on: issue.depends_on.iter().map(|id| id.to_string()).collect(),
+            blocked_by_issues: blocked_by_issues.iter().map(|id| id.to_string()).collect(),
             created_at: issue.created_at.to_rfc3339(),
             updated_at: issue.updated_at.to_rfc3339(),
         }
@@ -4161,6 +4170,19 @@ async fn create_issue_handler(
             (body.creator.clone(), None, None)
         };
 
+    // Parse and validate dependency IDs.
+    let mut dep_ids: Vec<uuid::Uuid> = Vec::new();
+    for dep_str in &body.depends_on {
+        let dep_id = uuid::Uuid::parse_str(dep_str)
+            .map_err(|_| ApiError::bad_request(format!("invalid dependency ID `{dep_str}`")))?;
+        // Verify the dependency exists.
+        ctx.storage.issues()
+            .get_issue(&ctx.repo_id, &dep_id)
+            .await
+            .map_err(|_| ApiError::bad_request(format!("dependency issue `{dep_id}` not found")))?;
+        dep_ids.push(dep_id);
+    }
+
     let new_issue = NewIssue {
         title: body.title.clone(),
         description: body.description.clone(),
@@ -4170,6 +4192,7 @@ async fn create_issue_handler(
         agent_source: agent_source.map(|s| {
             serde_json::to_value(s).unwrap_or(serde_json::Value::Null)
         }),
+        depends_on: dep_ids,
     };
 
     let issue = issues
@@ -4199,7 +4222,7 @@ async fn create_issue_handler(
         }),
     });
 
-    let mut resp = IssueResponse::from_issue(issue, vec![]);
+    let mut resp = IssueResponse::from_issue(issue, vec![], vec![]);
     resp.possible_duplicate_of = possible_duplicate_id.map(|id| id.to_string());
 
     Ok((StatusCode::CREATED, Json(resp)))
@@ -4255,6 +4278,14 @@ async fn list_issues_handler(
         .await
         .unwrap_or_default();
 
+    // Build reverse-dep map: issue_id → list of issue_ids that depend on it.
+    let mut reverse_deps: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>> = std::collections::HashMap::new();
+    for issue in &issues {
+        for dep_id in &issue.depends_on {
+            reverse_deps.entry(*dep_id).or_default().push(issue.id);
+        }
+    }
+
     let response = issues
         .into_iter()
         .map(|issue| {
@@ -4263,7 +4294,8 @@ async fn list_issues_handler(
                 .filter(|ws| ws.issue_id == Some(issue.id))
                 .map(|ws| ws.id)
                 .collect();
-            IssueResponse::from_issue(issue, linked)
+            let blocked_by = reverse_deps.get(&issue.id).cloned().unwrap_or_default();
+            IssueResponse::from_issue(issue, linked, blocked_by)
         })
         .collect();
 
@@ -4301,9 +4333,19 @@ async fn get_issue_handler(
         .await
         .map_err(ApiError::from)?;
 
+    let all_issues = ctx.storage.issues()
+        .list_issues(&ctx.repo_id, &crate::issue::IssueFilter::default())
+        .await
+        .unwrap_or_default();
+    let blocked_by_issues: Vec<uuid::Uuid> = all_issues
+        .iter()
+        .filter(|i| i.depends_on.contains(&issue_id))
+        .map(|i| i.id)
+        .collect();
+
     let linked = linked_workspace_ids(&ctx, issue_id).await;
 
-    Ok(Json(IssueResponse::from_issue(issue, linked)))
+    Ok(Json(IssueResponse::from_issue(issue, linked, blocked_by_issues)))
 }
 
 #[utoipa::path(
@@ -4376,7 +4418,7 @@ async fn update_issue_handler(
         .await;
 
     let linked = linked_workspace_ids(&ctx, issue_id).await;
-    Ok(Json(IssueResponse::from_issue(issue, linked)))
+    Ok(Json(IssueResponse::from_issue(issue, linked, vec![])))
 }
 
 #[utoipa::path(
@@ -4437,7 +4479,7 @@ async fn close_issue_handler(
     });
 
     let linked = linked_workspace_ids(&ctx, issue_id).await;
-    Ok(Json(IssueResponse::from_issue(issue, linked)))
+    Ok(Json(IssueResponse::from_issue(issue, linked, vec![])))
 }
 
 // ── Escalation handlers ───────────────────────────────────────────────────────
@@ -4696,6 +4738,17 @@ async fn get_work_queue_handler(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
+    // Fetch all issues for dependency status lookups.
+    let all_issues_for_deps = ctx.storage.issues()
+        .list_issues(&ctx.repo_id, &IssueFilter::default())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let issue_status_map: std::collections::HashMap<uuid::Uuid, &crate::issue::IssueStatus> =
+        all_issues_for_deps.iter().map(|i| (i.id, &i.status)).collect();
+    let issue_title_map: std::collections::HashMap<uuid::Uuid, &str> =
+        all_issues_for_deps.iter().map(|i| (i.id, i.title.as_str())).collect();
+
     let engine = state.conflict_engine.lock().await;
     let active_scopes: Vec<_> = engine.all_scopes().cloned().collect();
 
@@ -4703,6 +4756,29 @@ async fn get_work_queue_handler(
     let mut blocked: Vec<work_queue::BlockedWork> = Vec::new();
 
     for issue in open_issues {
+        // Check dependency blocking.
+        let open_dep_titles: Vec<String> = issue.depends_on.iter()
+            .filter_map(|dep_id| {
+                issue_status_map.get(dep_id).map(|status| (dep_id, *status))
+            })
+            .filter(|(_, status)| {
+                **status != crate::issue::IssueStatus::Closed
+                    && **status != crate::issue::IssueStatus::Resolved
+            })
+            .filter_map(|(dep_id, _)| issue_title_map.get(dep_id).map(|t| t.to_string()))
+            .collect();
+
+        if !open_dep_titles.is_empty() {
+            blocked.push(work_queue::BlockedWork {
+                issue_id: issue.id.to_string(),
+                title: issue.title.clone(),
+                priority: issue.priority.as_str().to_string(),
+                blocked_by: issue.depends_on.iter().map(|id| id.to_string()).collect(),
+                reason: format!("Blocked by: {}", open_dep_titles.join(", ")),
+            });
+            continue;
+        }
+
         let text = format!("{} {}", issue.title, issue.description);
         let prediction = work_queue::predict_scope(&text, &ctx.vai_dir)
             .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -4743,7 +4819,21 @@ async fn get_work_queue_handler(
         }
     }
 
-    available.sort_by_key(|w| work_queue::priority_rank(&w.priority));
+    // Secondary sort: within same priority, issues that unblock the most work come first.
+    let dep_count_map: std::collections::HashMap<uuid::Uuid, usize> = {
+        let mut map: std::collections::HashMap<uuid::Uuid, usize> = std::collections::HashMap::new();
+        for issue in &all_issues_for_deps {
+            for dep_id in &issue.depends_on {
+                *map.entry(*dep_id).or_insert(0) += 1;
+            }
+        }
+        map
+    };
+    available.sort_by_key(|w| {
+        let issue_id = uuid::Uuid::parse_str(&w.issue_id).unwrap_or_default();
+        let dep_count = dep_count_map.get(&issue_id).copied().unwrap_or(0);
+        (work_queue::priority_rank(&w.priority), std::cmp::Reverse(dep_count))
+    });
     blocked.sort_by_key(|w| work_queue::priority_rank(&w.priority));
 
     Ok(Json(work_queue::WorkQueue { available_work: available, blocked_work: blocked }))
