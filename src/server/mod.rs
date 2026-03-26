@@ -2602,6 +2602,28 @@ fn event_to_broadcast(event: crate::event_log::Event) -> BroadcastEvent {
     }
 }
 
+/// Creates a fresh [`sqlx::postgres::PgListener`] subscribed to `vai_events`.
+///
+/// Returns `None` and logs the error if either the connection or the
+/// `LISTEN` command fails.
+async fn create_pg_listener(
+    pg: &crate::storage::postgres::PostgresStorage,
+) -> Option<sqlx::postgres::PgListener> {
+    match pg.create_listener().await {
+        Ok(mut l) => match l.listen("vai_events").await {
+            Ok(()) => Some(l),
+            Err(e) => {
+                tracing::error!("failed to LISTEN on vai_events: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::error!("failed to create PgListener: {e}");
+            None
+        }
+    }
+}
+
 /// Manages a WebSocket connection backed by Postgres LISTEN/NOTIFY.
 ///
 /// This is the server-mode counterpart to [`handle_ws_connection`]. Instead of
@@ -2614,6 +2636,18 @@ fn event_to_broadcast(event: crate::event_log::Event) -> BroadcastEvent {
 /// 3. On each `NOTIFY vai_events, '<repo_id>:<event_id>'`, queries all events
 ///    since the last delivered ID for the subscribed repo, applies the client's
 ///    subscription filter, and sends matching events.
+///
+/// ## Reliability
+/// - **Keepalive**: if no NOTIFY arrives for 60 s the listener is recreated so
+///   the pool's idle-timeout cannot silently close the underlying connection.
+/// - **Reconnection**: on `recv()` errors the listener is recreated with
+///   exponential backoff (1 s → 2 s → … capped at 30 s). The WebSocket is
+///   closed after [`MAX_RECONNECT`] consecutive failures.
+/// - **Query errors** do NOT advance `last_delivered_id` so no events are lost.
+/// - **recv_task monitoring**: the main loop exits when the client recv task
+///   finishes, ensuring clean shutdown on client disconnect.
+/// - **WebSocket ping/pong**: a ping frame is sent every 30 s; if no pong
+///   arrives within 10 s the connection is closed (catches silent TCP drops).
 async fn handle_ws_connection_pg(
     socket: WebSocket,
     pg: Arc<crate::storage::postgres::PostgresStorage>,
@@ -2621,6 +2655,15 @@ async fn handle_ws_connection_pg(
     agent_name: String,
     last_event_id: Option<u64>,
 ) {
+    /// Seconds between keepalive listener recreations when no NOTIFY arrives.
+    const KEEPALIVE_SECS: u64 = 60;
+    /// Seconds between outgoing WebSocket ping frames.
+    const PING_SECS: u64 = 30;
+    /// Seconds to wait for a pong before closing the connection.
+    const PONG_TIMEOUT_SECS: u64 = 10;
+    /// Maximum consecutive PgListener failures before giving up.
+    const MAX_RECONNECT: u32 = 5;
+
     let (ws_tx, ws_rx) = socket.split();
     let ws_tx = Arc::new(Mutex::new(ws_tx));
 
@@ -2630,9 +2673,6 @@ async fn handle_ws_connection_pg(
     let ws_tx_for_recv = Arc::clone(&ws_tx);
 
     // Tracks the highest event ID we have delivered to this client.
-    // Initialised to `last_event_id` so live NOTIFY delivery picks up from
-    // where the client left off even if it sends no last_event_id (value 0
-    // means "from the beginning").
     let last_delivered_id = Arc::new(AtomicU64::new(last_event_id.unwrap_or(0)));
     let last_delivered_for_recv = Arc::clone(&last_delivered_id);
 
@@ -2642,11 +2682,18 @@ async fn handle_ws_connection_pg(
 
     let pg_for_recv = Arc::clone(&pg);
 
+    // Channel to relay WebSocket Pong frames from recv_task to the main loop.
+    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<()>(4);
+
     // Spawn a task that reads incoming client messages (subscription updates).
-    let recv_task = tokio::spawn(async move {
+    let mut recv_task = tokio::spawn(async move {
         let mut ws_rx = ws_rx;
         while let Some(msg) = ws_rx.next().await {
             match msg {
+                Ok(Message::Pong(_)) => {
+                    // Signal the main loop that a pong was received.
+                    let _ = pong_tx.try_send(());
+                }
                 Ok(Message::Text(text)) => {
                     match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(ClientMessage::Subscribe { subscribe }) => {
@@ -2723,92 +2770,179 @@ async fn handle_ws_connection_pg(
         }
     });
 
-    // Create a Postgres listener on the `vai_events` channel.
-    let mut listener = match pg.create_listener().await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("failed to create PgListener: {e}");
+    // Create the initial PgListener.
+    let mut listener = match create_pg_listener(&pg).await {
+        Some(l) => l,
+        None => {
             recv_task.abort();
             return;
         }
     };
-    if let Err(e) = listener.listen("vai_events").await {
-        tracing::error!("failed to listen on vai_events: {e}");
-        recv_task.abort();
-        return;
-    }
 
-    // Forward events to the client whenever a NOTIFY arrives for this repo.
-    loop {
-        let notification = match listener.recv().await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!("PgListener recv error: {e}");
-                break;
-            }
-        };
+    let mut ping_interval =
+        tokio::time::interval(std::time::Duration::from_secs(PING_SECS));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Deadline by which a pong must arrive; `None` when no ping is outstanding.
+    let mut pong_deadline: Option<tokio::time::Instant> = None;
+    let mut reconnect_count = 0u32;
 
-        // Payload format: "<repo_id>:<event_id>" — lightweight pointer only.
-        let payload = notification.payload();
-        let Some((repo_str, event_id_str)) = payload.split_once(':') else {
-            continue;
-        };
-        let Ok(notif_repo) = repo_str.parse::<uuid::Uuid>() else {
-            continue;
-        };
-        let Ok(notif_event_id) = event_id_str.parse::<i64>() else {
-            continue;
-        };
-        // Only handle NOTIFYs for the repo this client is subscribed to.
-        if notif_repo != repo_id {
-            continue;
-        }
+    'main: loop {
+        tokio::select! {
+            // Monitor recv_task — exit cleanly when the client disconnects.
+            _ = &mut recv_task => { break 'main; }
 
-        // Gate delivery: client must have sent a subscribe message first.
-        let current_filter = {
-            let guard = filter.lock().await;
-            guard.clone()
-        };
-        let Some(ref sub) = current_filter else {
-            continue;
-        };
+            // Postgres LISTEN/NOTIFY with a keepalive timeout.
+            result = tokio::time::timeout(
+                std::time::Duration::from_secs(KEEPALIVE_SECS),
+                listener.recv(),
+            ) => {
+                match result {
+                    // Timeout: no NOTIFY for KEEPALIVE_SECS.  Recreate the
+                    // listener to prevent the pool's idle-timeout from closing
+                    // the underlying connection silently.
+                    Err(_timeout) => {
+                        tracing::debug!("PgListener keepalive: recreating listener");
+                        match create_pg_listener(&pg).await {
+                            Some(new_listener) => {
+                                listener = new_listener;
+                                reconnect_count = 0;
+                            }
+                            None => {
+                                reconnect_count += 1;
+                                if reconnect_count >= MAX_RECONNECT {
+                                    tracing::error!(
+                                        "PgListener keepalive failed {MAX_RECONNECT} times, closing WebSocket"
+                                    );
+                                    break 'main;
+                                }
+                            }
+                        }
+                    }
 
-        // Build a storage-level filter from the subscription so Postgres can
-        // apply it in the query rather than loading all events into memory.
-        let ev_filter = subscription_to_event_filter(sub);
+                    // NOTIFY received — forward matching events to the client.
+                    Ok(Ok(notification)) => {
+                        reconnect_count = 0;
 
-        // Query only matching events since the last delivered ID.
-        let since = last_delivered_id.load(Ordering::Relaxed) as i64;
-        let events = match pg.query_since_id_filtered(&repo_id, since, &ev_filter).await {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::error!("query_since_id_filtered failed: {e}");
-                // Still advance cursor so a transient error doesn't replay
-                // non-matching events on the next NOTIFY.
-                last_delivered_id.fetch_max(notif_event_id as u64, Ordering::Relaxed);
-                continue;
-            }
-        };
+                        // Payload format: "<repo_id>:<event_id>"
+                        let payload = notification.payload();
+                        let Some((repo_str, event_id_str)) = payload.split_once(':') else {
+                            continue;
+                        };
+                        let Ok(notif_repo) = repo_str.parse::<uuid::Uuid>() else {
+                            continue;
+                        };
+                        let Ok(notif_event_id) = event_id_str.parse::<i64>() else {
+                            continue;
+                        };
+                        // Only handle NOTIFYs for this client's repo.
+                        if notif_repo != repo_id {
+                            continue;
+                        }
 
-        for event in events {
-            let bc = event_to_broadcast(event);
-            let json = match serde_json::to_string(&bc) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("serialize event failed: {e}");
-                    continue;
+                        // Gate delivery: client must have subscribed first.
+                        let current_filter = {
+                            let guard = filter.lock().await;
+                            guard.clone()
+                        };
+                        let Some(ref sub) = current_filter else {
+                            continue;
+                        };
+
+                        let ev_filter = subscription_to_event_filter(sub);
+                        let since = last_delivered_id.load(Ordering::Relaxed) as i64;
+                        let events = match pg
+                            .query_since_id_filtered(&repo_id, since, &ev_filter)
+                            .await
+                        {
+                            Ok(e) => e,
+                            Err(e) => {
+                                // Do NOT advance last_delivered_id on error — events
+                                // must not be permanently skipped on a transient failure.
+                                tracing::error!("query_since_id_filtered failed: {e}");
+                                continue;
+                            }
+                        };
+
+                        for event in events {
+                            let bc = event_to_broadcast(event);
+                            let json = match serde_json::to_string(&bc) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::error!("serialize event failed: {e}");
+                                    continue;
+                                }
+                            };
+                            if ws_tx.lock().await.send(Message::Text(json)).await.is_err() {
+                                break 'main;
+                            }
+                        }
+
+                        // Advance cursor to the notified event ID so subsequent
+                        // NOTIFYs don't re-scan already-considered events.
+                        last_delivered_id
+                            .fetch_max(notif_event_id as u64, Ordering::Relaxed);
+                    }
+
+                    // recv() error — reconnect with exponential backoff.
+                    Ok(Err(e)) => {
+                        tracing::error!("PgListener recv error: {e}");
+                        reconnect_count += 1;
+                        if reconnect_count >= MAX_RECONNECT {
+                            tracing::error!(
+                                "PgListener failed {MAX_RECONNECT} consecutive times, closing WebSocket"
+                            );
+                            break 'main;
+                        }
+                        let backoff = std::time::Duration::from_secs(
+                            (1u64 << (reconnect_count - 1)).min(30),
+                        );
+                        tracing::info!(
+                            attempt = reconnect_count,
+                            delay_secs = backoff.as_secs(),
+                            "reconnecting PgListener"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        if let Some(new_listener) = create_pg_listener(&pg).await {
+                            listener = new_listener;
+                        }
+                        // If reconnect fails, the next iteration will try again
+                        // until MAX_RECONNECT is reached.
+                    }
                 }
-            };
-            if ws_tx.lock().await.send(Message::Text(json)).await.is_err() {
-                recv_task.abort();
-                return;
+            }
+
+            // Send a WebSocket ping frame on each tick.
+            _ = ping_interval.tick() => {
+                // Close the connection if the previous ping timed out.
+                if let Some(deadline) = pong_deadline {
+                    if tokio::time::Instant::now() >= deadline {
+                        tracing::warn!("WebSocket pong timeout, closing connection");
+                        break 'main;
+                    }
+                }
+                // Drain any already-queued pongs before issuing a new ping so
+                // we don't confuse stale pongs with the one we're requesting.
+                while pong_rx.try_recv().is_ok() {}
+                if ws_tx
+                    .lock()
+                    .await
+                    .send(Message::Ping(vec![]))
+                    .await
+                    .is_err()
+                {
+                    break 'main;
+                }
+                pong_deadline = Some(
+                    tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(PONG_TIMEOUT_SECS),
+                );
+            }
+
+            // Pong received — cancel the outstanding deadline.
+            Some(()) = pong_rx.recv() => {
+                pong_deadline = None;
             }
         }
-
-        // Advance cursor to the notified event ID so subsequent NOTIFYs don't
-        // re-scan events that were already considered (even if they didn't match
-        // the filter).
-        last_delivered_id.fetch_max(notif_event_id as u64, Ordering::Relaxed);
     }
 
     recv_task.abort();
