@@ -97,7 +97,7 @@ impl WatchType {
 }
 
 /// Policy controlling whether and how discoveries auto-create issues.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct IssueCreationPolicy {
     /// When true, issues are created automatically without human approval
     /// (subject to `require_approval_above`).
@@ -198,7 +198,7 @@ pub struct Watcher {
 ///
 /// Each variant captures the structured data relevant to that discovery type.
 /// All variants serialize to/from JSON for storage.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DiscoveryEventKind {
     /// A test in a test suite failed.

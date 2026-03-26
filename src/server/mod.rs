@@ -127,6 +127,7 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use utoipa::ToSchema;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
@@ -318,7 +319,7 @@ impl EventBuffer {
 /// An event broadcast to all connected WebSocket clients.
 ///
 /// Clients receive this as a JSON message on their WebSocket connection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BroadcastEvent {
     /// Discriminant matching `EventKind` variant names (e.g. `"WorkspaceCreated"`).
     #[serde(rename = "type")]
@@ -331,13 +332,14 @@ pub struct BroadcastEvent {
     /// RFC 3339 timestamp.
     pub timestamp: String,
     /// Event-specific payload as a JSON object.
+    #[schema(value_type = Object)]
     pub data: serde_json::Value,
 }
 
 /// Subscription filter sent by the client after connecting.
 ///
 /// An empty list for any field means "match all" for that dimension.
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, ToSchema)]
 pub struct SubscriptionFilter {
     /// Match events touching any of these entity IDs.
     #[serde(default)]
@@ -718,7 +720,7 @@ async fn repo_resolve_middleware(
 // ── API error helper ──────────────────────────────────────────────────────────
 
 /// JSON body for error responses.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ErrorBody {
     error: String,
 }
@@ -953,7 +955,7 @@ fn require_server_admin(identity: &AgentIdentity) -> Result<(), ApiError> {
 // ── API response types ────────────────────────────────────────────────────────
 
 /// Response body for `GET /api/status`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StatusResponse {
     /// Repository name.
     pub repo_name: String,
@@ -974,14 +976,15 @@ pub struct StatusResponse {
 }
 
 /// Response body for `GET /health`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
     /// Always `"ok"` when the server is healthy.
+    #[schema(value_type = String)]
     pub status: &'static str,
 }
 
 /// Response body for `GET /api/server/stats`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ServerStatsResponse {
     /// Number of seconds the server has been running.
     pub uptime_secs: u64,
@@ -1004,14 +1007,14 @@ pub struct ServerStatsResponse {
 }
 
 /// Request body for `POST /api/workspaces`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct CreateWorkspaceRequest {
     /// Stated agent intent for this workspace.
     intent: String,
 }
 
 /// Response body for workspace creation and detail endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct WorkspaceResponse {
     id: String,
     intent: String,
@@ -1035,7 +1038,7 @@ impl From<workspace::WorkspaceMeta> for WorkspaceResponse {
 }
 
 /// Response body for `POST /api/workspaces/:id/submit`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct SubmitResponse {
     version: String,
     files_applied: usize,
@@ -1069,7 +1072,7 @@ struct VersionDiffQuery {
 }
 
 /// File-level diff entry returned by `GET /api/versions/:id/diff`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct VersionDiffFile {
     /// File path relative to the repository root.
     path: String,
@@ -1080,7 +1083,7 @@ struct VersionDiffFile {
 }
 
 /// Response body for `GET /api/versions/:id/diff`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct VersionDiffResponse {
     /// The version whose changes are shown.
     version_id: String,
@@ -1091,7 +1094,7 @@ struct VersionDiffResponse {
 }
 
 /// Request body for `POST /api/versions/rollback`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct RollbackRequest {
     /// Version identifier to roll back (e.g., `"v3"`).
     version: String,
@@ -1104,7 +1107,7 @@ struct RollbackRequest {
 // ── Issue API types ───────────────────────────────────────────────────────────
 
 /// Request body for `POST /api/issues`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct CreateIssueRequest {
     title: String,
     #[serde(default)]
@@ -1127,10 +1130,11 @@ struct CreateIssueRequest {
 }
 
 /// Agent discovery source passed via the REST API.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct AgentSourceRequest {
     source_type: String,
     #[serde(default)]
+    #[schema(value_type = Object)]
     details: serde_json::Value,
 }
 
@@ -1147,7 +1151,7 @@ fn default_max_per_hour() -> u32 {
 }
 
 /// Request body for `PATCH /api/issues/:id`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct UpdateIssueRequest {
     title: Option<String>,
     description: Option<String>,
@@ -1156,7 +1160,7 @@ struct UpdateIssueRequest {
 }
 
 /// Request body for `POST /api/issues/:id/close`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct CloseIssueRequest {
     /// Resolution: "resolved", "wontfix", or "duplicate".
     resolution: String,
@@ -1172,7 +1176,7 @@ struct ListIssuesQuery {
 }
 
 /// Response body for issue endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct IssueResponse {
     id: String,
     title: String,
@@ -1183,6 +1187,7 @@ struct IssueResponse {
     creator: String,
     resolution: Option<String>,
     /// Present when the issue was created by an agent.
+    #[schema(value_type = Option<Object>)]
     agent_source: Option<serde_json::Value>,
     /// Set on creation responses when a similar open issue was detected.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2527,7 +2532,7 @@ async fn handle_ws_connection_pg(
 const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024;
 
 /// A single file entry within an upload request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct FileUploadEntry {
     /// Path relative to the repository root (e.g. `src/auth.rs`).
     path: String,
@@ -2536,14 +2541,14 @@ struct FileUploadEntry {
 }
 
 /// Request body for `POST /api/workspaces/:id/files`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct UploadFilesRequest {
     /// One or more files to upload into the workspace overlay.
     files: Vec<FileUploadEntry>,
 }
 
 /// Response body for a successful file upload.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct UploadFilesResponse {
     /// Number of files successfully written.
     uploaded: usize,
@@ -2552,7 +2557,7 @@ struct UploadFilesResponse {
 }
 
 /// Response body for file download endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct FileDownloadResponse {
     /// Path relative to the repository root.
     path: String,
@@ -2824,7 +2829,7 @@ async fn get_workspace_file_handler(
 }
 
 /// Response for `GET /api/repo/files`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct RepoFileListResponse {
     /// Relative paths of all files in the repository root, sorted.
     files: Vec<String>,
@@ -2967,7 +2972,7 @@ async fn upload_source_files_handler(
 }
 
 /// Response body for `POST /api/graph/refresh`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ServerGraphRefreshResponse {
     /// Number of source files scanned during the rebuild.
     files_scanned: usize,
@@ -3103,7 +3108,7 @@ async fn get_main_file_handler(
 // ── Graph API types ───────────────────────────────────────────────────────────
 
 /// Query parameters for `GET /api/graph/entities`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, ToSchema)]
 struct GraphEntityFilter {
     /// Filter by entity kind (e.g. `"function"`, `"struct"`).
     kind: Option<String>,
@@ -3114,7 +3119,7 @@ struct GraphEntityFilter {
 }
 
 /// Query parameters for `GET /api/graph/blast-radius`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct BlastRadiusQuery {
     /// Comma-separated entity IDs to use as seeds.
     entities: String,
@@ -3128,7 +3133,7 @@ fn default_hops() -> usize {
 }
 
 /// Lightweight entity summary returned by graph list endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct EntitySummary {
     id: String,
     kind: String,
@@ -3156,14 +3161,14 @@ impl From<crate::graph::Entity> for EntitySummary {
 }
 
 /// Response body for `GET /api/graph/entities/:id`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct EntityDetailResponse {
     entity: EntitySummary,
     relationships: Vec<RelationshipSummary>,
 }
 
 /// Relationship summary used in graph API responses.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct RelationshipSummary {
     id: String,
     kind: String,
@@ -3183,7 +3188,7 @@ impl From<crate::graph::Relationship> for RelationshipSummary {
 }
 
 /// Response body for `GET /api/graph/entities/:id/deps`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct EntityDepsResponse {
     entity_id: String,
     deps: Vec<EntitySummary>,
@@ -3191,7 +3196,7 @@ struct EntityDepsResponse {
 }
 
 /// Response body for `GET /api/graph/blast-radius`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct BlastRadiusResponse {
     seed_entities: Vec<String>,
     hops: usize,
@@ -3588,7 +3593,7 @@ async fn close_issue_handler(
 // ── Escalation handlers ───────────────────────────────────────────────────────
 
 /// Response body for a single escalation.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct EscalationResponse {
     id: String,
     escalation_type: String,
@@ -3628,7 +3633,7 @@ impl From<crate::escalation::Escalation> for EscalationResponse {
 }
 
 /// Request body for `POST /api/escalations/:id/resolve`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct ResolveEscalationRequest {
     /// Resolution option: keep_agent_a, keep_agent_b,
     /// send_back_to_agent_a, send_back_to_agent_b, pause_both.
@@ -3757,7 +3762,7 @@ async fn resolve_escalation_handler(
 // ── Work queue API types ──────────────────────────────────────────────────────
 
 /// Request body for `POST /api/work-queue/claim`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct ClaimWorkRequest {
     /// Issue ID to claim.
     issue_id: String,
@@ -3833,7 +3838,7 @@ async fn claim_work_handler(
 // ── Watcher handlers ──────────────────────────────────────────────────────────
 
 /// Request body for `POST /api/watchers/register`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct RegisterWatcherRequest {
     agent_id: String,
     watch_type: String,
@@ -3843,7 +3848,7 @@ struct RegisterWatcherRequest {
 }
 
 /// Response body for watcher endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct WatcherResponse {
     agent_id: String,
     watch_type: String,
@@ -3962,7 +3967,7 @@ async fn resume_watcher_handler(
 }
 
 /// Request body for `POST /api/discoveries`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct SubmitDiscoveryRequest {
     /// The watcher agent submitting this event.
     agent_id: String,
@@ -3971,7 +3976,7 @@ struct SubmitDiscoveryRequest {
 }
 
 /// Response body for `POST /api/discoveries`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct DiscoveryOutcomeResponse {
     record_id: String,
     agent_id: String,
@@ -4094,14 +4099,14 @@ impl RepoRegistry {
 // ── Request / response types for /api/repos ───────────────────────────────────
 
 /// Request body for `POST /api/repos`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct CreateRepoRequest {
     /// Short name for the new repository (alphanumeric, hyphens, underscores).
     name: String,
 }
 
 /// Response body for repo list and creation endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct RepoResponse {
     /// Short name of the repository.
     name: String,
@@ -4242,37 +4247,38 @@ async fn list_repos_handler(
 // ── Org / User API types ──────────────────────────────────────────────────────
 
 /// Request body for `POST /api/orgs`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct CreateOrgRequest {
     name: String,
     slug: String,
 }
 
 /// Request body for `POST /api/users`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct CreateUserRequest {
     email: String,
     name: String,
 }
 
 /// Request body for `POST /api/orgs/:org/members`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct AddMemberRequest {
     /// User UUID to add.
+    #[schema(value_type = String)]
     user_id: uuid::Uuid,
     /// Role within the org: `"owner"`, `"admin"`, or `"member"`.
     role: String,
 }
 
 /// Request body for `PATCH /api/orgs/:org/members/:user`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct UpdateMemberRequest {
     /// New role: `"owner"`, `"admin"`, or `"member"`.
     role: String,
 }
 
 /// Response body for org endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct OrgResponse {
     id: String,
     name: String,
@@ -4292,7 +4298,7 @@ impl From<crate::storage::Organization> for OrgResponse {
 }
 
 /// Response body for user endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct UserResponse {
     id: String,
     email: String,
@@ -4312,7 +4318,7 @@ impl From<crate::storage::User> for UserResponse {
 }
 
 /// Response body for org membership endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct OrgMemberResponse {
     org_id: String,
     user_id: String,
@@ -4514,23 +4520,24 @@ async fn remove_org_member_handler(
 // ── Repo collaborator handlers (PRD 10.3) ─────────────────────────────────────
 
 /// Request body for `POST /api/orgs/:org/repos/:repo/collaborators`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct AddCollaboratorRequest {
     /// User UUID to add as a collaborator.
+    #[schema(value_type = String)]
     user_id: uuid::Uuid,
     /// Role on the repository: `"owner"`, `"admin"`, `"write"`, or `"read"`.
     role: String,
 }
 
 /// Request body for `PATCH /api/orgs/:org/repos/:repo/collaborators/:user`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct UpdateCollaboratorRequest {
     /// New role: `"owner"`, `"admin"`, `"write"`, or `"read"`.
     role: String,
 }
 
 /// Response body for repo collaborator endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CollaboratorResponse {
     repo_id: String,
     user_id: String,
@@ -4629,11 +4636,12 @@ async fn remove_collaborator_handler(
 // ── API key management (PRD 10.3) ─────────────────────────────────────────────
 
 /// Request body for `POST /api/keys`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 struct CreateKeyRequest {
     /// Human-readable name for this key.
     name: String,
     /// Repository UUID to scope this key to. `None` for server-level keys.
+    #[schema(value_type = Option<String>)]
     repo_id: Option<uuid::Uuid>,
     /// Optional role cap. When set, the key's effective permissions are the
     /// lesser of the creator's role and this value.
@@ -4642,7 +4650,7 @@ struct CreateKeyRequest {
 }
 
 /// Response body for key creation.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct CreateKeyResponse {
     /// Key metadata (same shape as `ApiKeyResponse`).
     key: ApiKeyResponse,
@@ -4651,7 +4659,7 @@ struct CreateKeyResponse {
 }
 
 /// Response body for key list/get endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ApiKeyResponse {
     id: String,
     name: String,
@@ -5024,7 +5032,7 @@ async fn migrate_handler(
 /// Response body for `GET /api/migration-stats` and `GET /api/repos/:repo/migration-stats`.
 ///
 /// Returns counts of all data in the repository, useful for post-migration verification.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct MigrationStatsResponse {
     /// Total number of events in the repository.
     pub events: i64,
