@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod cli;
+pub mod ignore_rules;
 pub mod storage;
 pub mod clone;
 pub mod dashboard;

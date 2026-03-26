@@ -478,41 +478,16 @@ pub fn write_config(vai_dir: &Path, config: &RepoConfig) -> Result<(), RepoError
 /// Recursively collects all supported source files under `root`, respecting ignore patterns.
 ///
 /// Supported extensions: `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`.
+/// Respects `.gitignore`, `.vaignore`, and `ignore` patterns from `vai.toml`.
 pub(crate) fn collect_source_files(root: &Path, ignore: &[String]) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    collect_recursive(root, ignore, &mut files);
-    files
+    crate::ignore_rules::collect_source_files(root, ignore)
 }
 
-fn collect_recursive(dir: &Path, ignore: &[String], files: &mut Vec<PathBuf>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        if path_should_ignore(&name, ignore) {
-            continue;
-        }
-        if path.is_dir() {
-            collect_recursive(&path, ignore, files);
-        } else if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("rs" | "ts" | "tsx" | "js" | "jsx")
-        ) {
-            files.push(path);
-        }
-    }
-}
-
-/// Collects all files under `root` for migration, respecting vai.toml ignore patterns.
+/// Collects all files under `root` for migration, respecting ignore rules.
 ///
-/// Unlike [`collect_source_files`], this returns every regular file regardless of
-/// extension — suitable for a full project upload via `vai remote migrate` (PRD 12.3).
+/// Returns every regular file regardless of extension — suitable for a full
+/// project upload via `vai remote migrate` (PRD 12.3).
+/// Respects `.gitignore`, `.vaignore`, and `vai.toml` ignore patterns.
 pub fn list_migration_files(root: &Path) -> Vec<PathBuf> {
     let vai_toml_path = root.join("vai.toml");
     let vai_toml: VaiToml = if vai_toml_path.exists() {
@@ -521,47 +496,7 @@ pub fn list_migration_files(root: &Path) -> Vec<PathBuf> {
     } else {
         VaiToml::default()
     };
-    let mut files = Vec::new();
-    collect_all_recursive(root, &vai_toml.ignore, &mut files);
-    files
-}
-
-/// Recursively collects all regular files under `dir`, respecting ignore patterns.
-fn collect_all_recursive(dir: &Path, ignore: &[String], files: &mut Vec<PathBuf>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        if path_should_ignore(&name, ignore) {
-            continue;
-        }
-        if path.is_dir() {
-            collect_all_recursive(&path, ignore, files);
-        } else if path.is_file() {
-            files.push(path);
-        }
-    }
-}
-
-/// Returns `true` if a file or directory `name` matches any ignore pattern.
-fn path_should_ignore(name: &str, ignore: &[String]) -> bool {
-    for pattern in ignore {
-        let p = pattern.trim_end_matches('/');
-        if let Some(ext) = p.strip_prefix("*.") {
-            if name.ends_with(&format!(".{ext}")) {
-                return true;
-            }
-        } else if name == p {
-            return true;
-        }
-    }
-    false
+    crate::ignore_rules::collect_all_files(root, &vai_toml.ignore)
 }
 
 /// Prints the init result to stdout in human-readable format.
@@ -722,13 +657,4 @@ mod tests {
         assert_eq!(cfg.storage_root, Some(PathBuf::from("/var/vai/repos")));
     }
 
-    #[test]
-    fn path_should_ignore_matches_dir_and_glob() {
-        let ignore = vec![".vai/".to_string(), "target/".to_string(), "*.o".to_string()];
-        assert!(path_should_ignore(".vai", &ignore));
-        assert!(path_should_ignore("target", &ignore));
-        assert!(path_should_ignore("foo.o", &ignore));
-        assert!(!path_should_ignore("src", &ignore));
-        assert!(!path_should_ignore("main.rs", &ignore));
-    }
 }

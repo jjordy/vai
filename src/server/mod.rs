@@ -3072,9 +3072,9 @@ async fn list_repo_files_handler(
         .trim()
         .to_string();
 
-    let mut files = Vec::new();
-    collect_repo_files(&ctx.repo_root, &ctx.repo_root, &mut files)
-        .map_err(|e| ApiError::internal(format!("list files: {e}")))?;
+    let vai_toml_ignore = read_vai_toml_ignore(&ctx.repo_root);
+    let mut files =
+        crate::ignore_rules::collect_all_files_relative(&ctx.repo_root, &vai_toml_ignore);
     files.sort();
 
     let count = files.len();
@@ -3085,36 +3085,22 @@ async fn list_repo_files_handler(
     }))
 }
 
-/// Recursively collects relative file paths under `dir`, skipping common
-/// build artefacts and hidden directories (`.vai`, `.git`, `target`, etc.).
-fn collect_repo_files(
-    root: &std::path::Path,
-    dir: &std::path::Path,
-    out: &mut Vec<String>,
-) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-        // Skip hidden/build directories.
-        if name.starts_with('.') || name == "target" || name == "node_modules" {
-            continue;
-        }
-        if path.is_dir() {
-            collect_repo_files(root, &path, out)?;
-        } else {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            out.push(rel);
-        }
+/// Reads the `ignore` list from `vai.toml` at `repo_root`.
+///
+/// Returns an empty vec if `vai.toml` is absent or unparseable so that
+/// callers degrade gracefully and still apply `.gitignore`/`.vaignore` rules.
+fn read_vai_toml_ignore(repo_root: &std::path::Path) -> Vec<String> {
+    let path = repo_root.join("vai.toml");
+    if !path.exists() {
+        return Vec::new();
     }
-    Ok(())
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    toml::from_str::<crate::repo::VaiToml>(&raw)
+        .map(|t| t.ignore)
+        .unwrap_or_default()
 }
 
 // ── Source file upload (migration) ───────────────────────────────────────────
@@ -3475,10 +3461,10 @@ async fn files_download_handler(
         .flatten()
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Collect file paths to include in the archive.
-    let mut rel_paths: Vec<String> = Vec::new();
-    collect_repo_files(&ctx.repo_root, &ctx.repo_root, &mut rel_paths)
-        .map_err(|e| ApiError::internal(format!("list files: {e}")))?;
+    // Collect file paths to include in the archive (respects .gitignore, .vaignore, vai.toml).
+    let vai_toml_ignore = read_vai_toml_ignore(&ctx.repo_root);
+    let mut rel_paths =
+        crate::ignore_rules::collect_all_files_relative(&ctx.repo_root, &vai_toml_ignore);
     rel_paths.sort();
 
     // Build an in-memory tar.gz archive.
