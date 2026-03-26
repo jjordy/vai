@@ -7216,6 +7216,86 @@ pub async fn start_for_testing_pg(
     Ok((addr, shutdown_tx, repo_id))
 }
 
+/// Variant of [`start_for_testing`] for multi-repo Postgres mode.
+///
+/// Connects to `database_url`, runs schema migrations, then binds to a random
+/// port and starts the server with `storage_root` set to `storage_root`.
+/// The server begins with no repositories; use `POST /api/repos` to create
+/// them during the test.
+///
+/// No `.vai/` directory needs to exist on disk before calling this function.
+/// The test admin key is `"vai_admin_test"`.
+///
+/// # Cleanup
+///
+/// Call `shutdown_tx.send(())` to stop the server.  Drop the `storage_root`
+/// directory (or its `TempDir`) to remove all on-disk state created by
+/// `POST /api/repos`.  Remove Postgres state with:
+/// `DELETE FROM repos WHERE id = ANY($1)`.
+pub async fn start_for_testing_pg_multi_repo(
+    storage_root: &Path,
+    database_url: &str,
+) -> Result<(SocketAddr, tokio::sync::oneshot::Sender<()>), ServerError> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Connect to Postgres and run schema migrations.
+    let storage = crate::storage::StorageBackend::server(database_url, 5)
+        .await
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    let pg = match &storage {
+        crate::storage::StorageBackend::Server(pg)
+        | crate::storage::StorageBackend::ServerWithS3(pg, _) => pg.clone(),
+        _ => unreachable!(),
+    };
+
+    let migrations_path = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+    pg.migrate(migrations_path)
+        .await
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    // In multi-repo mode the top-level vai_dir is unused (each repo gets its
+    // own vai_dir under storage_root/{name}/.vai/).  We point it at a
+    // non-existent path within the storage root as a clear placeholder.
+    let vai_dir = storage_root.join(".vai");
+
+    let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
+    let state = Arc::new(AppState {
+        vai_dir,
+        repo_root: storage_root.to_path_buf(),
+        started_at: Instant::now(),
+        repo_name: "multi-repo-test".to_string(),
+        vai_version: env!("CARGO_PKG_VERSION").to_string(),
+        event_tx,
+        event_seq: Arc::new(AtomicU64::new(0)),
+        event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
+        conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
+        repo_lock: Arc::new(Mutex::new(())),
+        storage_root: Some(storage_root.to_path_buf()),
+        storage,
+        admin_key: "vai_admin_test".to_string(),
+    });
+
+    let app = build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                shutdown_rx.await.ok();
+            })
+            .await
+            .ok();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    Ok((addr, shutdown_tx))
+}
+
 // ── Bootstrap admin key ───────────────────────────────────────────────────────
 
 /// Returns the bootstrap admin key to use for this server instance.
