@@ -25,6 +25,7 @@ use crate::merge_patterns::MergePatternStore;
 use crate::remote_workspace;
 use crate::repo;
 use crate::server;
+use crate::pull as remote_pull;
 use crate::sync as remote_sync;
 use crate::version::VersionMeta;
 use crate::version;
@@ -61,6 +62,9 @@ pub enum CliError {
 
     #[error("Clone error: {0}")]
     Clone(#[from] remote_clone::CloneError),
+
+    #[error("Pull error: {0}")]
+    Pull(#[from] remote_pull::PullError),
 
     #[error("Sync error: {0}")]
     Sync(#[from] remote_sync::SyncError),
@@ -178,6 +182,20 @@ pub enum Commands {
         /// API key for authenticating with the remote server.
         #[arg(long)]
         key: String,
+    },
+    /// Pull the latest changes from the remote server into the local working directory.
+    ///
+    /// Uses the remote configured via `vai remote add`, or explicit --from/--key/--repo flags.
+    Pull {
+        /// Remote server URL (e.g. `http://localhost:7865`). Uses configured remote if omitted.
+        #[arg(long)]
+        from: Option<String>,
+        /// API key for the remote server. Required when --from is set.
+        #[arg(long)]
+        key: Option<String>,
+        /// Repository name on the server. Required when --from is set.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Pull the latest changes from the remote server (incremental).
     Sync,
@@ -1544,6 +1562,38 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
             } else {
                 remote_clone::print_clone_result(&result);
+            }
+        }
+        Some(Commands::Pull { from, key, repo }) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+
+            // Build PullConfig from explicit flags or the configured remote.
+            let pull_config = if let Some(server_url) = from {
+                let api_key = key.ok_or(remote_pull::PullError::MissingKey)?;
+                let repo_name = repo.ok_or(remote_pull::PullError::MissingRepo)?;
+                remote_pull::PullConfig { server_url, api_key, repo_name }
+            } else {
+                let config = repo::read_config(&vai_dir)?;
+                let remote = config.remote.ok_or(remote_pull::PullError::NoRemote)?;
+                let api_key = remote.resolve_api_key()
+                    .map_err(|e| CliError::Other(format!("API key error: {e}")))?;
+                remote_pull::PullConfig {
+                    server_url: remote.url,
+                    api_key,
+                    repo_name: config.name,
+                }
+            };
+
+            let result = make_rt()?.block_on(remote_pull::pull(&root, pull_config))?;
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            } else {
+                remote_pull::print_pull_result(&result);
             }
         }
         Some(Commands::Sync) => {

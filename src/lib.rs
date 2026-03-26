@@ -23,6 +23,7 @@ pub mod repo;
 pub mod scope_history;
 pub mod scope_inference;
 pub mod server;
+pub mod pull;
 pub mod sync;
 pub mod version;
 pub mod watcher;
