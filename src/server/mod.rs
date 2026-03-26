@@ -1677,26 +1677,45 @@ async fn discard_workspace_handler(
 ) -> Result<StatusCode, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
-    // Resolve UUID before discarding so we can remove it from the conflict engine.
-    let ws_uuid = workspace::get(&ctx.vai_dir, &id)
-        .map(|m| m.id)
-        .ok();
-    workspace::discard(&ctx.vai_dir, &id, None).map_err(ApiError::from)?;
+    // Resolve UUID from path parameter.
+    let ws_uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::not_found(format!("workspace `{id}` not found")))?;
+    // Look up workspace via storage (works in both local and Postgres mode).
+    let meta = ctx.storage.workspaces()
+        .get_workspace(&ctx.repo_id, &ws_uuid)
+        .await
+        .map_err(ApiError::from)?;
+    let issue_id = meta.issue_id;
+    // Discard via storage trait — avoids filesystem-only lookup that fails in Postgres mode.
+    ctx.storage.workspaces()
+        .discard_workspace(&ctx.repo_id, &ws_uuid)
+        .await
+        .map_err(ApiError::from)?;
 
     // Remove from conflict engine — workspace is no longer active.
-    if let Some(uuid) = ws_uuid {
-        state.conflict_engine.lock().await.remove_workspace(&uuid);
+    state.conflict_engine.lock().await.remove_workspace(&ws_uuid);
+
+    // If workspace was linked to an issue, transition it back to Open.
+    if let Some(iid) = issue_id {
+        let _ = ctx.storage.issues()
+            .update_issue(
+                &ctx.repo_id,
+                &iid,
+                crate::storage::IssueUpdate {
+                    status: Some(crate::issue::IssueStatus::Open),
+                    ..Default::default()
+                },
+            )
+            .await;
     }
 
     // Append event to event store — triggers pg_notify in Postgres mode.
-    if let Some(uuid) = ws_uuid {
-        let _ = ctx.storage.events()
-            .append(&ctx.repo_id, EventKind::WorkspaceDiscarded {
-                workspace_id: uuid,
-                reason: "discarded via API".to_string(),
-            })
-            .await;
-    }
+    let _ = ctx.storage.events()
+        .append(&ctx.repo_id, EventKind::WorkspaceDiscarded {
+            workspace_id: ws_uuid,
+            reason: "discarded via API".to_string(),
+        })
+        .await;
 
     // Broadcast discard event.
     state.broadcast(BroadcastEvent {
