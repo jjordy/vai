@@ -127,7 +127,7 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use utoipa::ToSchema;
+use utoipa::{OpenApi, ToSchema};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
@@ -5909,6 +5909,217 @@ async fn migration_stats_handler(
     }))
 }
 
+// ── OpenAPI spec ──────────────────────────────────────────────────────────────
+
+/// Adds the Bearer token security scheme to the generated OpenAPI spec.
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearer_auth",
+                utoipa::openapi::security::SecurityScheme::Http(
+                    utoipa::openapi::security::HttpBuilder::new()
+                        .scheme(utoipa::openapi::security::HttpAuthScheme::Bearer)
+                        .bearer_format("API key")
+                        .build(),
+                ),
+            );
+        }
+    }
+}
+
+/// OpenAPI 3.1 spec for the vai REST API.
+///
+/// Built from all `#[utoipa::path]`-annotated handlers.  Served at
+/// `GET /api/openapi.json` (unauthenticated) so the dashboard's orval
+/// code generator can fetch it without credentials.
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        status_handler,
+        health_handler,
+        server_stats_handler,
+        create_workspace_handler,
+        list_workspaces_handler,
+        get_workspace_handler,
+        submit_workspace_handler,
+        discard_workspace_handler,
+        upload_workspace_files_handler,
+        get_workspace_file_handler,
+        list_versions_handler,
+        get_version_handler,
+        get_version_diff_handler,
+        rollback_handler,
+        ws_events_handler,
+        list_repo_files_handler,
+        upload_source_files_handler,
+        get_main_file_handler,
+        server_graph_refresh_handler,
+        list_graph_entities_handler,
+        get_graph_entity_handler,
+        get_entity_deps_handler,
+        get_blast_radius_handler,
+        create_issue_handler,
+        list_issues_handler,
+        get_issue_handler,
+        update_issue_handler,
+        close_issue_handler,
+        list_escalations_handler,
+        get_escalation_handler,
+        resolve_escalation_handler,
+        get_work_queue_handler,
+        claim_work_handler,
+        register_watcher_handler,
+        list_watchers_handler,
+        pause_watcher_handler,
+        resume_watcher_handler,
+        submit_discovery_handler,
+        create_repo_handler,
+        list_repos_handler,
+        create_org_handler,
+        list_orgs_handler,
+        get_org_handler,
+        delete_org_handler,
+        create_user_handler,
+        get_user_handler,
+        add_org_member_handler,
+        list_org_members_handler,
+        update_org_member_handler,
+        remove_org_member_handler,
+        add_collaborator_handler,
+        list_collaborators_handler,
+        update_collaborator_handler,
+        remove_collaborator_handler,
+        create_key_handler,
+        list_keys_handler,
+        revoke_key_handler,
+        migrate_handler,
+        migration_stats_handler,
+        openapi_handler,
+    ),
+    components(
+        schemas(
+            BroadcastEvent,
+            SubscriptionFilter,
+            ErrorBody,
+            StatusResponse,
+            HealthResponse,
+            ServerStatsResponse,
+            CreateWorkspaceRequest,
+            WorkspaceResponse,
+            SubmitResponse,
+            VersionDiffFile,
+            VersionDiffResponse,
+            RollbackRequest,
+            CreateIssueRequest,
+            AgentSourceRequest,
+            UpdateIssueRequest,
+            CloseIssueRequest,
+            IssueResponse,
+            FileUploadEntry,
+            UploadFilesRequest,
+            UploadFilesResponse,
+            FileDownloadResponse,
+            RepoFileListResponse,
+            ServerGraphRefreshResponse,
+            GraphEntityFilter,
+            BlastRadiusQuery,
+            EntitySummary,
+            EntityDetailResponse,
+            RelationshipSummary,
+            EntityDepsResponse,
+            BlastRadiusResponse,
+            EscalationResponse,
+            ResolveEscalationRequest,
+            ClaimWorkRequest,
+            RegisterWatcherRequest,
+            WatcherResponse,
+            SubmitDiscoveryRequest,
+            DiscoveryOutcomeResponse,
+            CreateRepoRequest,
+            RepoResponse,
+            CreateOrgRequest,
+            CreateUserRequest,
+            AddMemberRequest,
+            UpdateMemberRequest,
+            OrgResponse,
+            UserResponse,
+            OrgMemberResponse,
+            AddCollaboratorRequest,
+            UpdateCollaboratorRequest,
+            CollaboratorResponse,
+            CreateKeyRequest,
+            CreateKeyResponse,
+            ApiKeyResponse,
+            MigrationStatsResponse,
+            crate::version::VersionMeta,
+            crate::version::VersionEntityChange,
+            crate::version::VersionChangeType,
+            crate::version::VersionFileChange,
+            crate::version::VersionFileChangeType,
+            crate::version::VersionChanges,
+            crate::version::RiskLevel,
+            crate::version::ImpactItem,
+            crate::version::ImpactAnalysis,
+            crate::version::RollbackResult,
+            crate::watcher::IssueCreationPolicy,
+            crate::watcher::DiscoveryEventKind,
+            crate::work_queue::PredictionConfidence,
+            crate::work_queue::PredictedEntity,
+            crate::work_queue::ScopePrediction,
+            crate::work_queue::AvailableWork,
+            crate::work_queue::BlockedWork,
+            crate::work_queue::WorkQueue,
+            crate::work_queue::ClaimResult,
+            crate::migration::MigrationSummary,
+        )
+    ),
+    modifiers(&SecurityAddon),
+    info(
+        title = "vai API",
+        version = env!("CARGO_PKG_VERSION"),
+        description = "REST API for vai — a version control system built for AI agents",
+    ),
+    servers(
+        (url = "http://localhost:7865", description = "Default local server")
+    ),
+    tags(
+        (name = "status", description = "Server and repository health"),
+        (name = "workspaces", description = "Workspace management"),
+        (name = "versions", description = "Version history and rollback"),
+        (name = "files", description = "File upload and download"),
+        (name = "graph", description = "Semantic graph queries"),
+        (name = "issues", description = "Issue tracking"),
+        (name = "escalations", description = "Escalation management"),
+        (name = "work-queue", description = "Work queue and task claiming"),
+        (name = "watchers", description = "Watcher agent registration"),
+        (name = "repos", description = "Repository management"),
+        (name = "orgs", description = "Organization management"),
+        (name = "users", description = "User management"),
+        (name = "keys", description = "API key management"),
+        (name = "migration", description = "Data migration"),
+    ),
+)]
+struct VaiApi;
+
+/// `GET /api/openapi.json` — returns the generated OpenAPI 3.1 spec as JSON.
+///
+/// Unauthenticated. Consumed by the dashboard's orval code generator and
+/// can optionally serve a Swagger UI in the future.
+#[utoipa::path(
+    get,
+    path = "/api/openapi.json",
+    responses(
+        (status = 200, description = "OpenAPI 3.1 specification", content_type = "application/json"),
+    ),
+    tag = "status"
+)]
+async fn openapi_handler() -> impl IntoResponse {
+    Json(VaiApi::openapi())
+}
+
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
 
 /// Constructs the axum [`Router`] with all registered routes.
@@ -5930,6 +6141,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/health", get(health_handler))
         .route("/api/status", get(status_handler))
         .route("/api/server/stats", get(server_stats_handler))
+        .route("/api/openapi.json", get(openapi_handler))
         .route("/ws/events", get(ws_events_handler));
 
     // Routes requiring `Authorization: Bearer <key>`.
