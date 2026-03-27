@@ -3026,8 +3026,12 @@ struct UploadFilesRequest {
 /// Response body for a successful file upload.
 #[derive(Debug, Serialize, ToSchema)]
 struct UploadFilesResponse {
-    /// Number of files successfully written.
+    /// Number of files successfully written to storage.
     uploaded: usize,
+    /// Number of files skipped because they were already present in storage
+    /// with the same content hash (resumability — Postgres mode only).
+    #[serde(default)]
+    skipped: usize,
     /// Repository-relative paths of all written files.
     paths: Vec<String>,
 }
@@ -3383,6 +3387,7 @@ async fn upload_workspace_files_handler(
         StatusCode::OK,
         Json(UploadFilesResponse {
             uploaded: count,
+            skipped: 0,
             paths: uploaded_paths,
         }),
     ))
@@ -3809,21 +3814,33 @@ fn read_vai_toml_ignore(repo_root: &std::path::Path) -> Vec<String> {
     security(("bearer_auth" = [])),
     tag = "repos"
 )]
-/// `POST /api/files` — uploads source files into the repository root.
+/// `POST /api/files` — uploads source files to storage during migration.
 ///
-/// Used by `vai remote migrate` (PRD 12.3) to copy the local project directory
-/// to the server after the metadata migration completes.  Files are written
-/// directly to `repo_root`.  Call `POST /api/graph/refresh` afterwards to
-/// rebuild the semantic graph from the uploaded files.
+/// Used by `vai remote migrate` (PRD 12.3) to seed the server with the
+/// complete repository state after metadata migration completes.  Each file
+/// is written to two storage keys:
 ///
-/// Accepts the same `{"files":[{"path":"…","content_base64":"…"}]}` format as
-/// the workspace overlay upload endpoint.
+/// - `blobs/{sha256}` — content-addressable blob, used for diff computation.
+/// - `current/{path}` — the live repo state served by list/download handlers.
+///
+/// No files are written to the local filesystem.  In server mode `repo_root`
+/// contains only `.vai/config.toml`; source files live exclusively in S3.
+///
+/// **Resumability (Postgres mode):** progress is tracked in the
+/// `migration_state` table.  Files whose `(repo_id, path, hash)` tuple is
+/// already recorded are skipped, so interrupted migrations can be retried
+/// without re-uploading already-confirmed files.
+///
+/// Call `POST /api/graph/refresh` after all batches complete to rebuild the
+/// semantic graph from the uploaded files.
 async fn upload_source_files_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     Json(body): Json<UploadFilesRequest>,
 ) -> Result<(StatusCode, Json<UploadFilesResponse>), ApiError> {
+    use crate::storage::StorageBackend;
+
     require_repo_permission(
         &ctx.storage,
         &identity,
@@ -3833,7 +3850,18 @@ async fn upload_source_files_handler(
     .await?;
     let _lock = state.repo_lock.lock().await;
 
+    // Extract Postgres pool for migration_state tracking (Postgres mode only).
+    let pg_pool: Option<sqlx::PgPool> = match &ctx.storage {
+        StorageBackend::Server(pg) | StorageBackend::ServerWithS3(pg, _) => {
+            Some(pg.pool().clone())
+        }
+        StorageBackend::Local(_) => None,
+    };
+
+    let repo_id = ctx.repo_id;
+    let file_store = ctx.storage.files();
     let mut uploaded_paths: Vec<String> = Vec::new();
+    let mut skipped: usize = 0;
 
     for entry in &body.files {
         let content = BASE64
@@ -3855,24 +3883,48 @@ async fn upload_source_files_handler(
 
         let rel = sanitize_path(&entry.path)
             .ok_or_else(|| ApiError::bad_request(format!("invalid path: '{}'", entry.path)))?;
+        let path_str = rel.to_string_lossy().replace('\\', "/");
+        let hash = sha256_hex(&content);
 
-        let dest = ctx.repo_root.join(&rel);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ApiError::internal(format!("create dirs: {e}")))?;
+        // Resumability check: skip files already confirmed uploaded in this repo
+        // with the same content hash (Postgres mode only).
+        if let Some(pool) = &pg_pool {
+            let already_done: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM migration_state WHERE repo_id = $1 AND path = $2 AND hash = $3)"
+            )
+            .bind(repo_id)
+            .bind(&path_str)
+            .bind(&hash)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+
+            if already_done {
+                skipped += 1;
+                continue;
+            }
         }
-        std::fs::write(&dest, &content)
-            .map_err(|e| ApiError::internal(format!("write source file: {e}")))?;
 
         // Store content-addressably so diffs can be computed for migrated versions.
-        let hash = sha256_hex(&content);
-        let file_store = ctx.storage.files();
-        let _ = file_store.put(&ctx.repo_id, &format!("blobs/{hash}"), &content).await;
+        let _ = file_store.put(&repo_id, &format!("blobs/{hash}"), &content).await;
 
-        // Also write to `current/` prefix so list/download handlers can serve
-        // these files in Postgres/S3 mode without needing a local `.vai/` directory.
-        let path_str = rel.to_string_lossy().replace('\\', "/");
-        let _ = file_store.put(&ctx.repo_id, &format!("current/{path_str}"), &content).await;
+        // Write to `current/` prefix — the live repo state served by all
+        // list/download handlers.  No filesystem write: server mode keeps
+        // source files exclusively in S3.
+        let _ = file_store.put(&repo_id, &format!("current/{path_str}"), &content).await;
+
+        // Record progress in migration_state so this file is skipped on retry.
+        if let Some(pool) = &pg_pool {
+            let _ = sqlx::query(
+                "INSERT INTO migration_state (repo_id, path, hash) VALUES ($1, $2, $3)
+                 ON CONFLICT (repo_id, path) DO UPDATE SET hash = EXCLUDED.hash, uploaded_at = NOW()"
+            )
+            .bind(repo_id)
+            .bind(&path_str)
+            .bind(&hash)
+            .execute(pool)
+            .await;
+        }
 
         uploaded_paths.push(path_str);
     }
@@ -3881,6 +3933,7 @@ async fn upload_source_files_handler(
         StatusCode::OK,
         Json(UploadFilesResponse {
             uploaded: uploaded_paths.len(),
+            skipped,
             paths: uploaded_paths,
         }),
     ))
