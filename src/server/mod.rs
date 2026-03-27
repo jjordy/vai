@@ -504,7 +504,9 @@ fn repo_storage(
     use crate::storage::StorageBackend;
     match state_storage {
         StorageBackend::Local(_) => StorageBackend::local(vai_dir),
-        StorageBackend::Server(_) | StorageBackend::ServerWithS3(_, _) => state_storage.clone(),
+        StorageBackend::Server(_)
+        | StorageBackend::ServerWithS3(_, _)
+        | StorageBackend::ServerWithMemFs(_, _) => state_storage.clone(),
     }
 }
 
@@ -1315,7 +1317,9 @@ async fn status_handler(
     // which is set to the storage_root path in that mode.  In single-repo
     // and local modes, fall back to the config file or state name.
     let repo_name = match &state.storage {
-        StorageBackend::Server(ref pg) | StorageBackend::ServerWithS3(ref pg, _) => {
+        StorageBackend::Server(ref pg)
+        | StorageBackend::ServerWithS3(ref pg, _)
+        | StorageBackend::ServerWithMemFs(ref pg, _) => {
             sqlx::query_scalar::<_, String>("SELECT name FROM repos WHERE id = $1")
                 .bind(ctx.repo_id)
                 .fetch_optional(pg.pool())
@@ -1564,9 +1568,11 @@ async fn submit_workspace_handler(
     let workspace_intent = meta.intent.clone();
 
     // Choose merge strategy based on storage backend.
+    // ServerWithMemFs uses the same S3MergeFs path as ServerWithS3 (for testing).
     let using_s3_merge = matches!(
         &ctx.storage,
         crate::storage::StorageBackend::ServerWithS3(_, _)
+            | crate::storage::StorageBackend::ServerWithMemFs(_, _)
     );
 
     let submit_result = if using_s3_merge {
@@ -2440,7 +2446,8 @@ async fn ws_events_handler(
     // In local mode (SQLite), fall back to the in-memory broadcast channel.
     match ctx.storage {
         crate::storage::StorageBackend::Server(ref pg)
-        | crate::storage::StorageBackend::ServerWithS3(ref pg, _) => {
+        | crate::storage::StorageBackend::ServerWithS3(ref pg, _)
+        | crate::storage::StorageBackend::ServerWithMemFs(ref pg, _) => {
             let pg = Arc::clone(pg);
             let repo_id = ctx.repo_id;
             ws.on_upgrade(move |socket| {
@@ -3897,7 +3904,9 @@ async fn upload_source_files_handler(
 
     // Extract Postgres pool for migration_state tracking (Postgres mode only).
     let pg_pool: Option<sqlx::PgPool> = match &ctx.storage {
-        StorageBackend::Server(pg) | StorageBackend::ServerWithS3(pg, _) => {
+        StorageBackend::Server(pg)
+        | StorageBackend::ServerWithS3(pg, _)
+        | StorageBackend::ServerWithMemFs(pg, _) => {
             Some(pg.pool().clone())
         }
         StorageBackend::Local(_) => None,
@@ -6675,7 +6684,8 @@ async fn create_repo_handler(
     // If a Postgres backend is configured, insert the repo row so FK
     // constraints on events, issues, versions, and workspaces are satisfied.
     if let crate::storage::StorageBackend::Server(ref pg)
-    | crate::storage::StorageBackend::ServerWithS3(ref pg, _) = state.storage
+    | crate::storage::StorageBackend::ServerWithS3(ref pg, _)
+    | crate::storage::StorageBackend::ServerWithMemFs(ref pg, _) = state.storage
     {
         sqlx::query("INSERT INTO repos (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
             .bind(repo_id)
@@ -7599,7 +7609,9 @@ async fn migrate_handler(
     .await?;
 
     let pg = match &ctx.storage {
-        StorageBackend::Server(pg) | StorageBackend::ServerWithS3(pg, _) => pg.clone(),
+        StorageBackend::Server(pg)
+        | StorageBackend::ServerWithS3(pg, _)
+        | StorageBackend::ServerWithMemFs(pg, _) => pg.clone(),
         StorageBackend::Local(_) => {
             return Err(ApiError::bad_request(
                 "migration endpoint requires a Postgres-backed server; \
@@ -7834,7 +7846,9 @@ async fn migration_stats_handler(
     .await?;
 
     let pg = match &ctx.storage {
-        StorageBackend::Server(pg) | StorageBackend::ServerWithS3(pg, _) => pg.clone(),
+        StorageBackend::Server(pg)
+        | StorageBackend::ServerWithS3(pg, _)
+        | StorageBackend::ServerWithMemFs(pg, _) => pg.clone(),
         StorageBackend::Local(_) => {
             return Err(ApiError::bad_request(
                 "migration-stats endpoint requires a Postgres-backed server; \
@@ -8401,7 +8415,8 @@ pub async fn start_for_testing_pg(
 
     let pg = match &storage {
         crate::storage::StorageBackend::Server(pg)
-        | crate::storage::StorageBackend::ServerWithS3(pg, _) => pg.clone(),
+        | crate::storage::StorageBackend::ServerWithS3(pg, _)
+        | crate::storage::StorageBackend::ServerWithMemFs(pg, _) => pg.clone(),
         _ => unreachable!(),
     };
 
@@ -8487,7 +8502,8 @@ pub async fn start_for_testing_pg_multi_repo(
 
     let pg = match &storage {
         crate::storage::StorageBackend::Server(pg)
-        | crate::storage::StorageBackend::ServerWithS3(pg, _) => pg.clone(),
+        | crate::storage::StorageBackend::ServerWithS3(pg, _)
+        | crate::storage::StorageBackend::ServerWithMemFs(pg, _) => pg.clone(),
         _ => unreachable!(),
     };
 
@@ -8508,6 +8524,73 @@ pub async fn start_for_testing_pg_multi_repo(
         repo_root: storage_root.to_path_buf(),
         started_at: Instant::now(),
         repo_name: "multi-repo-test".to_string(),
+        vai_version: env!("CARGO_PKG_VERSION").to_string(),
+        event_tx,
+        event_seq: Arc::new(AtomicU64::new(0)),
+        event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
+        conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
+        repo_lock: Arc::new(Mutex::new(())),
+        storage_root: Some(storage_root.to_path_buf()),
+        storage,
+        admin_key: "vai_admin_test".to_string(),
+    });
+
+    let app = build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                shutdown_rx.await.ok();
+            })
+            .await
+            .ok();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    Ok((addr, shutdown_tx))
+}
+
+/// Starts a vai server backed by Postgres + an in-memory file store for testing.
+///
+/// This is identical to [`start_for_testing_pg_multi_repo`] except it uses
+/// [`StorageBackend::ServerWithMemFs`] instead of [`StorageBackend::Server`].
+/// That causes the submit handler to use the `S3MergeFs` code path (which
+/// updates `current/` in the file store) rather than the local disk path,
+/// allowing end-to-end tests to verify that `current/` is correctly maintained
+/// after merges without requiring real S3.
+pub async fn start_for_testing_pg_with_mem_fs(
+    storage_root: &Path,
+    database_url: &str,
+) -> Result<(SocketAddr, tokio::sync::oneshot::Sender<()>), ServerError> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Connect to Postgres + in-memory file store, then run migrations.
+    let storage = crate::storage::StorageBackend::server_with_mem_fs(database_url, 5)
+        .await
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    let pg = match &storage {
+        crate::storage::StorageBackend::ServerWithMemFs(pg, _) => pg.clone(),
+        _ => unreachable!(),
+    };
+
+    let migrations_path = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+    pg.migrate(migrations_path)
+        .await
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    let vai_dir = storage_root.join(".vai");
+    let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
+    let state = Arc::new(AppState {
+        vai_dir,
+        repo_root: storage_root.to_path_buf(),
+        started_at: Instant::now(),
+        repo_name: "multi-repo-test-memfs".to_string(),
         vai_version: env!("CARGO_PKG_VERSION").to_string(),
         event_tx,
         event_seq: Arc::new(AtomicU64::new(0)),
@@ -8611,7 +8694,8 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
     // Run schema migrations when using a Postgres backend so the server is
     // always up-to-date (including the file_index table required by S3 mode).
     if let crate::storage::StorageBackend::Server(ref pg)
-        | crate::storage::StorageBackend::ServerWithS3(ref pg, _) = storage
+        | crate::storage::StorageBackend::ServerWithS3(ref pg, _)
+        | crate::storage::StorageBackend::ServerWithMemFs(ref pg, _) = storage
     {
         let migrations_path = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
         pg.migrate(migrations_path)

@@ -32,7 +32,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use vai::server::start_for_testing_pg_multi_repo;
+use vai::server::{start_for_testing_pg_multi_repo, start_for_testing_pg_with_mem_fs};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -913,6 +913,423 @@ async fn test_version_diff_via_storage() {
         diff_text.contains("greet"),
         "diff must contain content from the uploaded file"
     );
+
+    shutdown_tx.send(()).ok();
+}
+
+// ── submit → current/ update (MemFs backend) ─────────────────────────────────
+
+/// Verifies that after a successful submit the `current/` prefix in the file
+/// store is updated to reflect the submitted overlay — i.e. a subsequent file
+/// download returns exactly the content that was uploaded.
+///
+/// Uses the `ServerWithMemFs` backend so the `S3MergeFs` submit path is
+/// exercised without real S3.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_submit_updates_current_files_match() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_with_mem_fs(tmp.path(), &url)
+        .await
+        .expect("start_for_testing_pg_with_mem_fs failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": "e2e-submit-files-match" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create repo: {}", resp.text().await.unwrap_or_default());
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // Create and claim an issue.
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "add greeter",
+            "description": "add greeter.rs",
+            "priority": "medium"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    let issue_id = issue["id"].as_str().unwrap();
+
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim: {}", resp.text().await.unwrap_or_default());
+    let claim: serde_json::Value = resp.json().await.unwrap();
+    let ws_id = claim["workspace_id"].as_str().unwrap().to_string();
+
+    // Upload a file.
+    let file_content = b"pub fn greet() -> &'static str { \"hello\" }\n";
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws_id}/files"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "files": [{ "path": "src/greeter.rs", "content_base64": b64(file_content) }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload: {}", resp.text().await.unwrap_or_default());
+
+    // Submit.
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "add greeter" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit: {}", resp.text().await.unwrap_or_default());
+
+    // Download the full repo tarball — must include the submitted file.
+    let resp = client
+        .get(format!("{rp}/files/download"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "files/download after submit: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let tarball = resp.bytes().await.unwrap();
+    assert!(!tarball.is_empty(), "download tarball must not be empty");
+
+    // Extract the tarball and verify the file content matches.
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(&tarball[..]));
+    let mut archive = tar::Archive::new(decoder);
+    let mut found = false;
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().to_string_lossy().into_owned();
+        if path.contains("greeter.rs") {
+            let mut content = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut content).unwrap();
+            assert_eq!(
+                content, file_content as &[u8],
+                "downloaded greeter.rs content must match uploaded content"
+            );
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "greeter.rs must be present in the download tarball");
+
+    shutdown_tx.send(()).ok();
+}
+
+/// Verifies that after a submit with deleted files, the deleted files are
+/// absent from a subsequent `current/` download.
+///
+/// Flow: seed `current/` with a file via upload+submit, then submit a second
+/// workspace that deletes it.  The final download must not contain the deleted file.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_submit_with_deletions_files_absent() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_with_mem_fs(tmp.path(), &url)
+        .await
+        .expect("start_for_testing_pg_with_mem_fs failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": "e2e-submit-deletions" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // ── Step 1: upload + submit a file to seed current/ ───────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "add temp file",
+            "description": "add a file that will be deleted",
+            "priority": "low"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue1: serde_json::Value = resp.json().await.unwrap();
+    let issue1_id = issue1["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue1_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim1: {}", resp.text().await.unwrap_or_default());
+    let claim1: serde_json::Value = resp.json().await.unwrap();
+    let ws1_id = claim1["workspace_id"].as_str().unwrap().to_string();
+
+    let to_delete_content = b"fn to_be_deleted() {}\n";
+    client
+        .post(format!("{rp}/workspaces/{ws1_id}/files"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "files": [{ "path": "src/temp.rs", "content_base64": b64(to_delete_content) }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws1_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "add temp file" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit1: {}", resp.text().await.unwrap_or_default());
+
+    // ── Step 2: upload-snapshot (with deletion) + submit ──────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "delete temp file",
+            "description": "remove the temp.rs file",
+            "priority": "low"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue2: serde_json::Value = resp.json().await.unwrap();
+    let issue2_id = issue2["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue2_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim2: {}", resp.text().await.unwrap_or_default());
+    let claim2: serde_json::Value = resp.json().await.unwrap();
+    let ws2_id = claim2["workspace_id"].as_str().unwrap().to_string();
+
+    // Upload a snapshot containing only the files to KEEP (not temp.rs).
+    // The upload-snapshot handler diffs against current/ and records temp.rs
+    // as deleted in the workspace's deleted_paths column.
+    {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let keep_content = b"fn keep() {}\n";
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut ar = tar::Builder::new(&mut enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(keep_content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            ar.append_data(&mut header, "src/keep.rs", keep_content.as_slice()).unwrap();
+            ar.finish().unwrap();
+        }
+        let tarball_bytes = enc.finish().unwrap();
+
+        let resp = client
+            .post(format!("{rp}/workspaces/{ws2_id}/upload-snapshot"))
+            .bearer_auth(admin)
+            .header("content-type", "application/gzip")
+            .body(tarball_bytes)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "upload-snapshot: {}",
+            resp.text().await.unwrap_or_default()
+        );
+    }
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws2_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "delete temp file" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit2: {}", resp.text().await.unwrap_or_default());
+
+    // ── Verify: download must NOT contain the deleted file ────────────────
+    let resp = client
+        .get(format!("{rp}/files/download"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "files/download after deletion submit: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let tarball = resp.bytes().await.unwrap();
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(&tarball[..]));
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries().unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path().unwrap().to_string_lossy().into_owned();
+        assert!(
+            !path.contains("temp.rs"),
+            "src/temp.rs must be absent from current/ after deletion submit; found: {path}"
+        );
+    }
+
+    shutdown_tx.send(()).ok();
+}
+
+/// Verifies that two sequential submits both update `current/` so the final
+/// download reflects the combined state of both workspaces.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sequential_submits_current_reflects_both() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_with_mem_fs(tmp.path(), &url)
+        .await
+        .expect("start_for_testing_pg_with_mem_fs failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": "e2e-sequential-submits" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // Submit file A, then file B sequentially.
+    for (title, path, content) in [
+        ("add alpha", "src/alpha.rs", b"pub fn alpha() {}\n" as &[u8]),
+        ("add beta", "src/beta.rs", b"pub fn beta() {}\n" as &[u8]),
+    ] {
+        let resp = client
+            .post(format!("{rp}/issues"))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "title": title,
+                "description": title,
+                "priority": "medium"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let issue: serde_json::Value = resp.json().await.unwrap();
+        let issue_id = issue["id"].as_str().unwrap().to_string();
+
+        let resp = client
+            .post(format!("{rp}/work-queue/claim"))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({ "issue_id": issue_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "claim {title}: {}", resp.text().await.unwrap_or_default());
+        let claim: serde_json::Value = resp.json().await.unwrap();
+        let ws_id = claim["workspace_id"].as_str().unwrap().to_string();
+
+        let resp = client
+            .post(format!("{rp}/workspaces/{ws_id}/files"))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "files": [{ "path": path, "content_base64": b64(content) }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "upload {path}: {}", resp.text().await.unwrap_or_default());
+
+        let resp = client
+            .post(format!("{rp}/workspaces/{ws_id}/submit"))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({ "summary": title }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "submit {title}: {}", resp.text().await.unwrap_or_default());
+    }
+
+    // Download — both files must be present with correct content.
+    let resp = client
+        .get(format!("{rp}/files/download"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "files/download after 2 submits: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let tarball = resp.bytes().await.unwrap();
+
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(&tarball[..]));
+    let mut archive = tar::Archive::new(decoder);
+    let mut found_alpha = false;
+    let mut found_beta = false;
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().to_string_lossy().into_owned();
+        if path.contains("alpha.rs") {
+            let mut content = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut content).unwrap();
+            assert_eq!(content, b"pub fn alpha() {}\n", "alpha.rs content must match");
+            found_alpha = true;
+        } else if path.contains("beta.rs") {
+            let mut content = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut content).unwrap();
+            assert_eq!(content, b"pub fn beta() {}\n", "beta.rs content must match");
+            found_beta = true;
+        }
+    }
+    assert!(found_alpha, "src/alpha.rs must be present after sequential submits");
+    assert!(found_beta, "src/beta.rs must be present after sequential submits");
 
     shutdown_tx.send(()).ok();
 }

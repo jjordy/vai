@@ -23,8 +23,9 @@ pub mod postgres;
 pub mod s3;
 pub mod sqlite;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -1042,6 +1043,97 @@ pub trait FileStore: Send + Sync {
     ) -> Result<bool, StorageError>;
 }
 
+// ── MemFileStore ──────────────────────────────────────────────────────────────
+
+/// In-memory [`FileStore`] implementation for testing.
+///
+/// All operations are backed by a `HashMap` protected by a `Mutex`.
+/// Suitable for unit tests and integration tests that need a functional
+/// file store without real S3 access.
+#[derive(Debug, Default)]
+pub struct MemFileStore {
+    files: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl MemFileStore {
+    /// Creates a new empty `MemFileStore`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Computes the SHA-256 hex digest of `data`.
+fn mem_sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[async_trait]
+impl FileStore for MemFileStore {
+    async fn put(
+        &self,
+        _repo_id: &uuid::Uuid,
+        path: &str,
+        content: &[u8],
+    ) -> Result<String, StorageError> {
+        let hash = mem_sha256_hex(content);
+        self.files.lock().unwrap().insert(path.to_string(), content.to_vec());
+        Ok(hash)
+    }
+
+    async fn get(
+        &self,
+        _repo_id: &uuid::Uuid,
+        path: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        self.files
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .ok_or_else(|| StorageError::NotFound(path.to_string()))
+    }
+
+    async fn list(
+        &self,
+        _repo_id: &uuid::Uuid,
+        prefix: &str,
+    ) -> Result<Vec<FileMetadata>, StorageError> {
+        let guard = self.files.lock().unwrap();
+        let now = Utc::now();
+        let result = guard
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| FileMetadata {
+                path: k.clone(),
+                size: v.len() as u64,
+                content_hash: mem_sha256_hex(v),
+                updated_at: now,
+            })
+            .collect();
+        Ok(result)
+    }
+
+    async fn delete(
+        &self,
+        _repo_id: &uuid::Uuid,
+        path: &str,
+    ) -> Result<(), StorageError> {
+        self.files.lock().unwrap().remove(path);
+        Ok(())
+    }
+
+    async fn exists(
+        &self,
+        _repo_id: &uuid::Uuid,
+        path: &str,
+    ) -> Result<bool, StorageError> {
+        Ok(self.files.lock().unwrap().contains_key(path))
+    }
+}
+
 // ── StorageBackend factory ────────────────────────────────────────────────────
 
 /// A constructed, ready-to-use storage backend.
@@ -1078,6 +1170,13 @@ pub enum StorageBackend {
     /// All database traits delegate to the Postgres backend; [`FileStore`]
     /// delegates to the S3 backend.
     ServerWithS3(Arc<postgres::PostgresStorage>, Arc<s3::S3FileStore>),
+    /// Hosted server mode with an in-memory file store (for testing only).
+    ///
+    /// All database traits delegate to the Postgres backend; [`FileStore`]
+    /// delegates to an in-memory [`MemFileStore`].  This variant activates
+    /// the same `S3MergeFs` code path as [`ServerWithS3`] so tests exercise
+    /// the real server-mode merge/submit logic without requiring real S3.
+    ServerWithMemFs(Arc<postgres::PostgresStorage>, Arc<MemFileStore>),
 }
 
 impl StorageBackend {
@@ -1115,12 +1214,26 @@ impl StorageBackend {
         Ok(StorageBackend::ServerWithS3(pg, Arc::new(file_store)))
     }
 
+    /// Connects to Postgres and wraps it with an in-memory file store for testing.
+    ///
+    /// Activates the same `S3MergeFs` submit path as [`StorageBackend::ServerWithS3`]
+    /// so integration tests can verify `current/` updates without real S3.
+    pub async fn server_with_mem_fs(
+        database_url: &str,
+        max_connections: u32,
+    ) -> Result<Self, StorageError> {
+        let pg = postgres::PostgresStorage::connect(database_url, max_connections).await?;
+        let pg = Arc::new(pg);
+        let mem_fs = Arc::new(MemFileStore::new());
+        Ok(StorageBackend::ServerWithMemFs(pg, mem_fs))
+    }
+
     /// Returns connection pool statistics, or `None` for local (SQLite) backends.
     pub fn pool_stats(&self) -> Option<postgres::PoolStats> {
         match self {
-            StorageBackend::Server(pg) | StorageBackend::ServerWithS3(pg, _) => {
-                Some(pg.pool_stats())
-            }
+            StorageBackend::Server(pg)
+            | StorageBackend::ServerWithS3(pg, _)
+            | StorageBackend::ServerWithMemFs(pg, _) => Some(pg.pool_stats()),
             StorageBackend::Local(_) => None,
         }
     }
@@ -1129,9 +1242,9 @@ impl StorageBackend {
     pub fn events(&self) -> Arc<dyn EventStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn EventStore>,
-            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
-                Arc::clone(s) as Arc<dyn EventStore>
-            }
+            StorageBackend::Server(s)
+            | StorageBackend::ServerWithS3(s, _)
+            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn EventStore>,
         }
     }
 
@@ -1139,9 +1252,9 @@ impl StorageBackend {
     pub fn issues(&self) -> Arc<dyn IssueStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn IssueStore>,
-            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
-                Arc::clone(s) as Arc<dyn IssueStore>
-            }
+            StorageBackend::Server(s)
+            | StorageBackend::ServerWithS3(s, _)
+            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn IssueStore>,
         }
     }
 
@@ -1149,9 +1262,9 @@ impl StorageBackend {
     pub fn comments(&self) -> Arc<dyn CommentStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn CommentStore>,
-            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
-                Arc::clone(s) as Arc<dyn CommentStore>
-            }
+            StorageBackend::Server(s)
+            | StorageBackend::ServerWithS3(s, _)
+            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn CommentStore>,
         }
     }
 
@@ -1159,9 +1272,9 @@ impl StorageBackend {
     pub fn links(&self) -> Arc<dyn IssueLinkStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn IssueLinkStore>,
-            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
-                Arc::clone(s) as Arc<dyn IssueLinkStore>
-            }
+            StorageBackend::Server(s)
+            | StorageBackend::ServerWithS3(s, _)
+            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn IssueLinkStore>,
         }
     }
 
@@ -1169,9 +1282,9 @@ impl StorageBackend {
     pub fn escalations(&self) -> Arc<dyn EscalationStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn EscalationStore>,
-            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
-                Arc::clone(s) as Arc<dyn EscalationStore>
-            }
+            StorageBackend::Server(s)
+            | StorageBackend::ServerWithS3(s, _)
+            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn EscalationStore>,
         }
     }
 
@@ -1179,9 +1292,9 @@ impl StorageBackend {
     pub fn graph(&self) -> Arc<dyn GraphStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn GraphStore>,
-            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
-                Arc::clone(s) as Arc<dyn GraphStore>
-            }
+            StorageBackend::Server(s)
+            | StorageBackend::ServerWithS3(s, _)
+            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn GraphStore>,
         }
     }
 
@@ -1189,9 +1302,9 @@ impl StorageBackend {
     pub fn versions(&self) -> Arc<dyn VersionStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn VersionStore>,
-            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
-                Arc::clone(s) as Arc<dyn VersionStore>
-            }
+            StorageBackend::Server(s)
+            | StorageBackend::ServerWithS3(s, _)
+            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn VersionStore>,
         }
     }
 
@@ -1199,9 +1312,9 @@ impl StorageBackend {
     pub fn workspaces(&self) -> Arc<dyn WorkspaceStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn WorkspaceStore>,
-            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
-                Arc::clone(s) as Arc<dyn WorkspaceStore>
-            }
+            StorageBackend::Server(s)
+            | StorageBackend::ServerWithS3(s, _)
+            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn WorkspaceStore>,
         }
     }
 
@@ -1209,9 +1322,9 @@ impl StorageBackend {
     pub fn auth(&self) -> Arc<dyn AuthStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn AuthStore>,
-            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
-                Arc::clone(s) as Arc<dyn AuthStore>
-            }
+            StorageBackend::Server(s)
+            | StorageBackend::ServerWithS3(s, _)
+            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn AuthStore>,
         }
     }
 
@@ -1222,9 +1335,9 @@ impl StorageBackend {
     pub fn orgs(&self) -> Arc<dyn OrgStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn OrgStore>,
-            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
-                Arc::clone(s) as Arc<dyn OrgStore>
-            }
+            StorageBackend::Server(s)
+            | StorageBackend::ServerWithS3(s, _)
+            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn OrgStore>,
         }
     }
 
@@ -1233,11 +1346,13 @@ impl StorageBackend {
     /// - [`StorageBackend::Local`]: filesystem-backed store under `.vai/`.
     /// - [`StorageBackend::Server`]: stub that returns errors (use `ServerWithS3`).
     /// - [`StorageBackend::ServerWithS3`]: S3-backed store with Postgres index.
+    /// - [`StorageBackend::ServerWithMemFs`]: in-memory store (for testing).
     pub fn files(&self) -> Arc<dyn FileStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn FileStore>,
             StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn FileStore>,
             StorageBackend::ServerWithS3(_, f) => Arc::clone(f) as Arc<dyn FileStore>,
+            StorageBackend::ServerWithMemFs(_, f) => Arc::clone(f) as Arc<dyn FileStore>,
         }
     }
 }
