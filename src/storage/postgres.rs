@@ -26,7 +26,6 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
-use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -420,18 +419,6 @@ impl IssueStore for PostgresStorage {
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
 
-        // Insert dependency relationships.
-        for dep_id in &issue.depends_on {
-            sqlx::query(
-                "INSERT INTO issue_dependencies (issue_id, depends_on_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            )
-            .bind(id)
-            .bind(dep_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::Database(e.to_string()))?;
-        }
-
         self.get_issue(repo_id, &id).await
     }
 
@@ -448,18 +435,7 @@ impl IssueStore for PostgresStorage {
         .map_err(|e| StorageError::Database(e.to_string()))?
         .ok_or_else(|| StorageError::NotFound(format!("issue {id}")))?;
 
-        let mut issue = row_to_issue(row)?;
-
-        // Fetch direct dependencies.
-        let dep_rows = sqlx::query(
-            "SELECT depends_on_id FROM issue_dependencies WHERE issue_id = $1",
-        )
-        .bind(id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StorageError::Database(e.to_string()))?;
-
-        issue.depends_on = dep_rows.iter().map(|r| r.get::<Uuid, _>("depends_on_id")).collect();
+        let issue = row_to_issue(row)?;
 
         Ok(issue)
     }
@@ -484,31 +460,6 @@ impl IssueStore for PostgresStorage {
             let issue = row_to_issue(row)?;
             if filter_matches_issue(&issue, filter) {
                 issues.push(issue);
-            }
-        }
-
-        // Batch-load dependencies for all issues.
-        if !issues.is_empty() {
-            let ids: Vec<Uuid> = issues.iter().map(|i| i.id).collect();
-            let dep_rows = sqlx::query(
-                "SELECT issue_id, depends_on_id FROM issue_dependencies WHERE issue_id = ANY($1)",
-            )
-            .bind(&ids)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| StorageError::Database(e.to_string()))?;
-
-            let mut deps_map: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
-            for row in dep_rows {
-                let issue_id: Uuid = row.get("issue_id");
-                let dep_id: Uuid = row.get("depends_on_id");
-                deps_map.entry(issue_id).or_default().push(dep_id);
-            }
-
-            for issue in &mut issues {
-                if let Some(deps) = deps_map.remove(&issue.id) {
-                    issue.depends_on = deps;
-                }
             }
         }
 
@@ -612,7 +563,6 @@ fn row_to_issue(row: sqlx::postgres::PgRow) -> Result<Issue, StorageError> {
         creator,
         agent_source,
         resolution,
-        depends_on: Vec::new(),
         acceptance_criteria,
         created_at,
         updated_at,

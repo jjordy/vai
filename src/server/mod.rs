@@ -1138,9 +1138,9 @@ struct CreateIssueRequest {
     /// Max issues this agent may create per hour (default: 20).
     #[serde(default = "default_max_per_hour")]
     max_per_hour: u32,
-    /// Issue IDs that must be closed before this issue becomes available.
+    /// Issue IDs that block this issue (creates `blocks` links where blocker → this issue).
     #[serde(default)]
-    depends_on: Vec<String>,
+    blocked_by: Vec<String>,
     /// Testable conditions that define when the issue is complete.
     #[serde(default)]
     acceptance_criteria: Vec<String>,
@@ -1212,10 +1212,10 @@ struct IssueResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     possible_duplicate_of: Option<String>,
     linked_workspace_ids: Vec<String>,
-    /// Issue IDs that must be closed before this issue becomes available.
-    depends_on: Vec<String>,
-    /// IDs of issues that depend on this issue (reverse deps).
-    blocked_by_issues: Vec<String>,
+    /// IDs of issues that block this one (source blocks this issue).
+    blocked_by: Vec<String>,
+    /// IDs of issues that this issue blocks (this issue is source, others are target).
+    blocking: Vec<String>,
     /// Testable conditions that define when the issue is complete.
     acceptance_criteria: Vec<String>,
     created_at: String,
@@ -1223,7 +1223,12 @@ struct IssueResponse {
 }
 
 impl IssueResponse {
-    fn from_issue(issue: crate::issue::Issue, linked: Vec<uuid::Uuid>, blocked_by_issues: Vec<uuid::Uuid>) -> Self {
+    fn from_issue(
+        issue: crate::issue::Issue,
+        linked: Vec<uuid::Uuid>,
+        blocked_by: Vec<uuid::Uuid>,
+        blocking: Vec<uuid::Uuid>,
+    ) -> Self {
         let agent_source = issue.agent_source.as_ref().map(|s| {
             serde_json::to_value(s).unwrap_or(serde_json::Value::Null)
         });
@@ -1239,8 +1244,8 @@ impl IssueResponse {
             agent_source,
             possible_duplicate_of: None,
             linked_workspace_ids: linked.iter().map(|u| u.to_string()).collect(),
-            depends_on: issue.depends_on.iter().map(|id| id.to_string()).collect(),
-            blocked_by_issues: blocked_by_issues.iter().map(|id| id.to_string()).collect(),
+            blocked_by: blocked_by.iter().map(|id| id.to_string()).collect(),
+            blocking: blocking.iter().map(|id| id.to_string()).collect(),
             acceptance_criteria: issue.acceptance_criteria,
             created_at: issue.created_at.to_rfc3339(),
             updated_at: issue.updated_at.to_rfc3339(),
@@ -5114,6 +5119,38 @@ async fn linked_workspace_ids(
         .collect()
 }
 
+/// Returns `(blocked_by, blocking)` for an issue from the `issue_links` table.
+///
+/// - `blocked_by`: IDs of issues that have a `blocks` link targeting `issue_id`.
+/// - `blocking`: IDs of issues that `issue_id` has a `blocks` link targeting.
+async fn links_for_issue(
+    ctx: &RepoCtx,
+    issue_id: uuid::Uuid,
+) -> (Vec<uuid::Uuid>, Vec<uuid::Uuid>) {
+    let links = ctx.storage
+        .links()
+        .list_links(&ctx.repo_id, &issue_id)
+        .await
+        .unwrap_or_default();
+
+    let mut blocked_by = Vec::new();
+    let mut blocking = Vec::new();
+
+    for link in links {
+        if link.relationship == crate::storage::IssueLinkRelationship::Blocks {
+            if link.target_id == issue_id {
+                // source blocks this issue
+                blocked_by.push(link.source_id);
+            } else if link.source_id == issue_id {
+                // this issue blocks target
+                blocking.push(link.target_id);
+            }
+        }
+    }
+
+    (blocked_by, blocking)
+}
+
 #[utoipa::path(
     post,
     path = "/api/issues",
@@ -5197,17 +5234,17 @@ async fn create_issue_handler(
             (body.creator.clone(), None, None)
         };
 
-    // Parse and validate dependency IDs.
-    let mut dep_ids: Vec<uuid::Uuid> = Vec::new();
-    for dep_str in &body.depends_on {
-        let dep_id = uuid::Uuid::parse_str(dep_str)
-            .map_err(|_| ApiError::bad_request(format!("invalid dependency ID `{dep_str}`")))?;
-        // Verify the dependency exists.
+    // Parse and validate blocked_by IDs (each blocker must exist).
+    let mut blocker_ids: Vec<uuid::Uuid> = Vec::new();
+    for blocker_str in &body.blocked_by {
+        let blocker_id = uuid::Uuid::parse_str(blocker_str)
+            .map_err(|_| ApiError::bad_request(format!("invalid blocker ID `{blocker_str}`")))?;
+        // Verify the blocker exists.
         ctx.storage.issues()
-            .get_issue(&ctx.repo_id, &dep_id)
+            .get_issue(&ctx.repo_id, &blocker_id)
             .await
-            .map_err(|_| ApiError::bad_request(format!("dependency issue `{dep_id}` not found")))?;
-        dep_ids.push(dep_id);
+            .map_err(|_| ApiError::bad_request(format!("blocker issue `{blocker_id}` not found")))?;
+        blocker_ids.push(blocker_id);
     }
 
     let new_issue = NewIssue {
@@ -5219,7 +5256,6 @@ async fn create_issue_handler(
         agent_source: agent_source.map(|s| {
             serde_json::to_value(s).unwrap_or(serde_json::Value::Null)
         }),
-        depends_on: dep_ids,
         acceptance_criteria: body.acceptance_criteria.clone(),
     };
 
@@ -5250,7 +5286,21 @@ async fn create_issue_handler(
         }),
     });
 
-    let mut resp = IssueResponse::from_issue(issue, vec![], vec![]);
+    // Create `blocks` links for each blocker: source=blocker, target=new issue.
+    for blocker_id in &blocker_ids {
+        let _ = ctx.storage.links()
+            .create_link(
+                &ctx.repo_id,
+                blocker_id,
+                crate::storage::NewIssueLink {
+                    target_id: issue_id,
+                    relationship: crate::storage::IssueLinkRelationship::Blocks,
+                },
+            )
+            .await;
+    }
+
+    let mut resp = IssueResponse::from_issue(issue, vec![], blocker_ids, vec![]);
     resp.possible_duplicate_of = possible_duplicate_id.map(|id| id.to_string());
 
     Ok((StatusCode::CREATED, Json(resp)))
@@ -5306,26 +5356,16 @@ async fn list_issues_handler(
         .await
         .unwrap_or_default();
 
-    // Build reverse-dep map: issue_id → list of issue_ids that depend on it.
-    let mut reverse_deps: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>> = std::collections::HashMap::new();
-    for issue in &issues {
-        for dep_id in &issue.depends_on {
-            reverse_deps.entry(*dep_id).or_default().push(issue.id);
-        }
+    let mut response = Vec::with_capacity(issues.len());
+    for issue in issues {
+        let linked: Vec<uuid::Uuid> = all_workspaces
+            .iter()
+            .filter(|ws| ws.issue_id == Some(issue.id))
+            .map(|ws| ws.id)
+            .collect();
+        let (blocked_by, blocking) = links_for_issue(&ctx, issue.id).await;
+        response.push(IssueResponse::from_issue(issue, linked, blocked_by, blocking));
     }
-
-    let response = issues
-        .into_iter()
-        .map(|issue| {
-            let linked: Vec<uuid::Uuid> = all_workspaces
-                .iter()
-                .filter(|ws| ws.issue_id == Some(issue.id))
-                .map(|ws| ws.id)
-                .collect();
-            let blocked_by = reverse_deps.get(&issue.id).cloned().unwrap_or_default();
-            IssueResponse::from_issue(issue, linked, blocked_by)
-        })
-        .collect();
 
     Ok(Json(response))
 }
@@ -5361,19 +5401,10 @@ async fn get_issue_handler(
         .await
         .map_err(ApiError::from)?;
 
-    let all_issues = ctx.storage.issues()
-        .list_issues(&ctx.repo_id, &crate::issue::IssueFilter::default())
-        .await
-        .unwrap_or_default();
-    let blocked_by_issues: Vec<uuid::Uuid> = all_issues
-        .iter()
-        .filter(|i| i.depends_on.contains(&issue_id))
-        .map(|i| i.id)
-        .collect();
-
     let linked = linked_workspace_ids(&ctx, issue_id).await;
+    let (blocked_by, blocking) = links_for_issue(&ctx, issue_id).await;
 
-    Ok(Json(IssueResponse::from_issue(issue, linked, blocked_by_issues)))
+    Ok(Json(IssueResponse::from_issue(issue, linked, blocked_by, blocking)))
 }
 
 #[utoipa::path(
@@ -5448,7 +5479,8 @@ async fn update_issue_handler(
         .await;
 
     let linked = linked_workspace_ids(&ctx, issue_id).await;
-    Ok(Json(IssueResponse::from_issue(issue, linked, vec![])))
+    let (blocked_by, blocking) = links_for_issue(&ctx, issue_id).await;
+    Ok(Json(IssueResponse::from_issue(issue, linked, blocked_by, blocking)))
 }
 
 #[utoipa::path(
@@ -5509,7 +5541,8 @@ async fn close_issue_handler(
     });
 
     let linked = linked_workspace_ids(&ctx, issue_id).await;
-    Ok(Json(IssueResponse::from_issue(issue, linked, vec![])))
+    let (blocked_by, blocking) = links_for_issue(&ctx, issue_id).await;
+    Ok(Json(IssueResponse::from_issue(issue, linked, blocked_by, blocking)))
 }
 
 // ── Issue comment handlers ────────────────────────────────────────────────────
@@ -6047,16 +6080,16 @@ async fn get_work_queue_handler(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    // Fetch all issues for dependency status lookups.
+    // Fetch all issues for blocker status lookups.
     let all_issues_for_deps = ctx.storage.issues()
         .list_issues(&ctx.repo_id, &IssueFilter::default())
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let issue_status_map: std::collections::HashMap<uuid::Uuid, &crate::issue::IssueStatus> =
-        all_issues_for_deps.iter().map(|i| (i.id, &i.status)).collect();
-    let issue_title_map: std::collections::HashMap<uuid::Uuid, &str> =
-        all_issues_for_deps.iter().map(|i| (i.id, i.title.as_str())).collect();
+    let issue_status_map: std::collections::HashMap<uuid::Uuid, crate::issue::IssueStatus> =
+        all_issues_for_deps.iter().map(|i| (i.id, i.status.clone())).collect();
+    let issue_title_map: std::collections::HashMap<uuid::Uuid, String> =
+        all_issues_for_deps.iter().map(|i| (i.id, i.title.clone())).collect();
 
     let engine = state.conflict_engine.lock().await;
     let active_scopes: Vec<_> = engine.all_scopes().cloned().collect();
@@ -6065,25 +6098,37 @@ async fn get_work_queue_handler(
     let mut blocked: Vec<work_queue::BlockedWork> = Vec::new();
 
     for issue in open_issues {
-        // Check dependency blocking.
-        let open_dep_titles: Vec<String> = issue.depends_on.iter()
-            .filter_map(|dep_id| {
-                issue_status_map.get(dep_id).map(|status| (dep_id, *status))
+        // Check link-based blocking: issue is blocked if any open issue has a
+        // `blocks` link targeting it.
+        let issue_links = ctx.storage.links()
+            .list_links(&ctx.repo_id, &issue.id)
+            .await
+            .unwrap_or_default();
+
+        let open_blocker_ids: Vec<uuid::Uuid> = issue_links.iter()
+            .filter(|l| {
+                l.relationship == crate::storage::IssueLinkRelationship::Blocks
+                    && l.target_id == issue.id
             })
-            .filter(|(_, status)| {
-                **status != crate::issue::IssueStatus::Closed
-                    && **status != crate::issue::IssueStatus::Resolved
+            .map(|l| l.source_id)
+            .filter(|blocker_id| {
+                issue_status_map.get(blocker_id).map_or(false, |s| {
+                    *s != crate::issue::IssueStatus::Closed
+                        && *s != crate::issue::IssueStatus::Resolved
+                })
             })
-            .filter_map(|(dep_id, _)| issue_title_map.get(dep_id).map(|t| t.to_string()))
             .collect();
 
-        if !open_dep_titles.is_empty() {
+        if !open_blocker_ids.is_empty() {
+            let open_blocker_titles: Vec<String> = open_blocker_ids.iter()
+                .filter_map(|id| issue_title_map.get(id).cloned())
+                .collect();
             blocked.push(work_queue::BlockedWork {
                 issue_id: issue.id.to_string(),
                 title: issue.title.clone(),
                 priority: issue.priority.as_str().to_string(),
-                blocked_by: issue.depends_on.iter().map(|id| id.to_string()).collect(),
-                reason: format!("Blocked by: {}", open_dep_titles.join(", ")),
+                blocked_by: open_blocker_ids.iter().map(|id| id.to_string()).collect(),
+                reason: format!("Blocked by: {}", open_blocker_titles.join(", ")),
             });
             continue;
         }
@@ -6128,26 +6173,14 @@ async fn get_work_queue_handler(
         }
     }
 
-    // Secondary sort keys: issues that unblock the most work come first; within
-    // that, issues with acceptance criteria are preferred (they have a clear
-    // definition of done, so agents can work more autonomously).
-    let dep_count_map: std::collections::HashMap<uuid::Uuid, usize> = {
-        let mut map: std::collections::HashMap<uuid::Uuid, usize> = std::collections::HashMap::new();
-        for issue in &all_issues_for_deps {
-            for dep_id in &issue.depends_on {
-                *map.entry(*dep_id).or_insert(0) += 1;
-            }
-        }
-        map
-    };
+    // Secondary sort: issues with acceptance criteria come first (clear definition of done).
     let has_criteria_map: std::collections::HashMap<uuid::Uuid, bool> =
         all_issues_for_deps.iter().map(|i| (i.id, !i.acceptance_criteria.is_empty())).collect();
     available.sort_by_key(|w| {
         let issue_id = uuid::Uuid::parse_str(&w.issue_id).unwrap_or_default();
-        let dep_count = dep_count_map.get(&issue_id).copied().unwrap_or(0);
         // Lower value = higher priority. Negate has_criteria so true (1) → 0, false (0) → 1.
         let no_criteria = if has_criteria_map.get(&issue_id).copied().unwrap_or(false) { 0u8 } else { 1u8 };
-        (work_queue::priority_rank(&w.priority), no_criteria, std::cmp::Reverse(dep_count))
+        (work_queue::priority_rank(&w.priority), no_criteria)
     });
     blocked.sort_by_key(|w| work_queue::priority_rank(&w.priority));
 
@@ -6595,7 +6628,6 @@ async fn submit_discovery_handler(
                     labels: vec![event_type.clone(), "watcher".to_string()],
                     creator: body.agent_id.clone(),
                     agent_source: agent_source_val,
-                    depends_on: vec![],
                     acceptance_criteria: vec![],
                 },
             )

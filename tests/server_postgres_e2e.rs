@@ -1333,3 +1333,193 @@ async fn test_sequential_submits_current_reflects_both() {
 
     shutdown_tx.send(()).ok();
 }
+
+// ── Work queue blocking via issue links ───────────────────────────────────────
+
+/// Verifies the link-based blocking chain: A blocks B blocks C.
+///
+/// Flow:
+/// 1. Create three issues A, B, C
+/// 2. Create link: A blocks B  (via POST /issues/:b/links)
+/// 3. Create link: B blocks C
+/// 4. GET /work-queue → only A is available; B and C are blocked
+/// 5. Close A
+/// 6. GET /work-queue → A gone, B available, C still blocked
+/// 7. Close B
+/// 8. GET /work-queue → C now available
+#[tokio::test(flavor = "multi_thread")]
+async fn test_work_queue_link_blocking() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start_for_testing_pg_multi_repo failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": "link-blocking-test" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // Create issue A.
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "title": "Issue A", "priority": "high" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue_a: serde_json::Value = resp.json().await.unwrap();
+    let id_a = issue_a["id"].as_str().unwrap().to_string();
+
+    // Create issue B (blocked_by A using the new field).
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "Issue B",
+            "priority": "medium",
+            "blocked_by": [id_a]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create B: {}", resp.text().await.unwrap_or_default());
+    let issue_b: serde_json::Value = resp.json().await.unwrap();
+    let id_b = issue_b["id"].as_str().unwrap().to_string();
+    // Verify blocked_by field in response.
+    assert!(
+        issue_b["blocked_by"].as_array().unwrap().iter().any(|v| v.as_str() == Some(&id_a)),
+        "B.blocked_by must contain A"
+    );
+
+    // Create issue C (blocked_by B).
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "Issue C",
+            "priority": "low",
+            "blocked_by": [id_b]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create C: {}", resp.text().await.unwrap_or_default());
+    let issue_c: serde_json::Value = resp.json().await.unwrap();
+    let id_c = issue_c["id"].as_str().unwrap().to_string();
+
+    // Work queue: only A available, B and C blocked.
+    let resp = client
+        .get(format!("{rp}/work-queue"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let wq: serde_json::Value = resp.json().await.unwrap();
+    let available: Vec<&str> = wq["available_work"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["issue_id"].as_str().unwrap())
+        .collect();
+    let blocked_ids: Vec<&str> = wq["blocked_work"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["issue_id"].as_str().unwrap())
+        .collect();
+    assert!(available.contains(&id_a.as_str()), "A must be available");
+    assert!(blocked_ids.contains(&id_b.as_str()), "B must be blocked");
+    assert!(blocked_ids.contains(&id_c.as_str()), "C must be blocked");
+
+    // Close A → B should become available.
+    let resp = client
+        .post(format!("{rp}/issues/{id_a}/close"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "resolution": "resolved" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "close A: {}", resp.text().await.unwrap_or_default());
+
+    let resp = client
+        .get(format!("{rp}/work-queue"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let wq: serde_json::Value = resp.json().await.unwrap();
+    let available: Vec<&str> = wq["available_work"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["issue_id"].as_str().unwrap())
+        .collect();
+    let blocked_ids: Vec<&str> = wq["blocked_work"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["issue_id"].as_str().unwrap())
+        .collect();
+    assert!(!available.contains(&id_a.as_str()), "A must not be in available (it's closed)");
+    assert!(available.contains(&id_b.as_str()), "B must be available after A is closed");
+    assert!(blocked_ids.contains(&id_c.as_str()), "C must still be blocked (B not closed yet)");
+
+    // Close B → C should become available.
+    let resp = client
+        .post(format!("{rp}/issues/{id_b}/close"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "resolution": "resolved" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "close B: {}", resp.text().await.unwrap_or_default());
+
+    let resp = client
+        .get(format!("{rp}/work-queue"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let wq: serde_json::Value = resp.json().await.unwrap();
+    let available: Vec<&str> = wq["available_work"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["issue_id"].as_str().unwrap())
+        .collect();
+    assert!(available.contains(&id_c.as_str()), "C must be available after B is closed");
+
+    // Verify IssueResponse blocking/blocked_by fields via GET /issues/:id.
+    let resp = client
+        .get(format!("{rp}/issues/{id_c}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let c_detail: serde_json::Value = resp.json().await.unwrap();
+    // B is closed but still linked — blocked_by should still list B as the blocker.
+    assert!(
+        c_detail["blocked_by"].as_array().unwrap().iter().any(|v| v.as_str() == Some(&id_b)),
+        "C.blocked_by must contain B"
+    );
+
+    shutdown_tx.send(()).ok();
+}

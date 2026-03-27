@@ -187,14 +187,6 @@ impl IssueStore for SqliteStorage {
             created.agent_source = serde_json::from_value(src.clone()).ok();
         }
 
-        // Insert dependency relationships.
-        if !issue.depends_on.is_empty() {
-            store
-                .add_dependencies(created.id, &issue.depends_on)
-                .map_err(|e| StorageError::Database(e.to_string()))?;
-            created.depends_on = issue.depends_on.clone();
-        }
-
         // Persist acceptance criteria if provided.
         if !issue.acceptance_criteria.is_empty() {
             store
@@ -1117,7 +1109,6 @@ mod tests {
                     labels: vec!["bug".to_string()],
                     creator: "agent-1".to_string(),
                     agent_source: None,
-                    depends_on: vec![],
                     acceptance_criteria: vec![],
                 },
             )
@@ -1150,7 +1141,6 @@ mod tests {
                     labels: vec![],
                     creator: "agent".to_string(),
                     agent_source: None,
-                    depends_on: vec![],
                     acceptance_criteria: vec![],
                 },
             )
