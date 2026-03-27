@@ -343,7 +343,13 @@ impl CommentStore for SqliteStorage {
     ) -> Result<IssueComment, StorageError> {
         let store = self.open_issue_store()?;
         store
-            .create_comment(*issue_id, &comment.author, &comment.body)
+            .create_comment(
+                *issue_id,
+                &comment.author,
+                &comment.body,
+                &comment.author_type,
+                comment.author_id.as_deref(),
+            )
             .map_err(|e| StorageError::Database(e.to_string()))
     }
 

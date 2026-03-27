@@ -5554,6 +5554,15 @@ struct CreateCommentRequest {
     author: String,
     /// Comment body (Markdown supported).
     body: String,
+    /// Whether the author is a `"human"` or `"agent"`. Defaults to `"human"`.
+    #[serde(default = "default_author_type")]
+    author_type: String,
+    /// Optional structured author identifier (e.g. agent instance ID).
+    author_id: Option<String>,
+}
+
+fn default_author_type() -> String {
+    "human".to_string()
 }
 
 /// Response body for a single issue comment.
@@ -5563,6 +5572,10 @@ struct CommentResponse {
     issue_id: String,
     author: String,
     body: String,
+    /// Whether the author is a `"human"` or `"agent"`.
+    author_type: String,
+    /// Optional structured author identifier.
+    author_id: Option<String>,
     created_at: String,
 }
 
@@ -5573,6 +5586,8 @@ impl From<crate::issue::IssueComment> for CommentResponse {
             issue_id: c.issue_id.to_string(),
             author: c.author,
             body: c.body,
+            author_type: c.author_type,
+            author_id: c.author_id,
             created_at: c.created_at.to_rfc3339(),
         }
     }
@@ -5617,6 +5632,8 @@ async fn create_issue_comment_handler(
         .create_comment(&ctx.repo_id, &issue_id, crate::storage::NewIssueComment {
             author: body.author,
             body: body.body,
+            author_type: body.author_type,
+            author_id: body.author_id,
         })
         .await
         .map_err(ApiError::from)?;

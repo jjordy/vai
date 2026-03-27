@@ -320,6 +320,10 @@ pub struct NewIssueComment {
     pub author: String,
     /// Comment body.
     pub body: String,
+    /// Whether the author is a `"human"` or `"agent"`. Defaults to `"human"`.
+    pub author_type: String,
+    /// Optional structured author identifier (e.g. agent instance ID).
+    pub author_id: Option<String>,
 }
 
 // ── CommentStore ──────────────────────────────────────────────────────────────

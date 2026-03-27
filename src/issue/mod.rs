@@ -157,6 +157,10 @@ pub struct IssueComment {
     pub author: String,
     /// Comment body (Markdown supported).
     pub body: String,
+    /// Whether the author is a `"human"` or `"agent"`.
+    pub author_type: String,
+    /// Optional structured author identifier (e.g. agent instance ID).
+    pub author_id: Option<String>,
     /// When the comment was created.
     pub created_at: DateTime<Utc>,
 }
@@ -302,6 +306,15 @@ impl IssueStore {
         // Migrate existing databases that lack the acceptance_criteria column.
         let _ = self.conn.execute(
             "ALTER TABLE issues ADD COLUMN acceptance_criteria TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        // Migrate existing databases that lack author_type / author_id on comments.
+        let _ = self.conn.execute(
+            "ALTER TABLE issue_comments ADD COLUMN author_type TEXT NOT NULL DEFAULT 'human'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE issue_comments ADD COLUMN author_id TEXT",
             [],
         );
         Ok(())
@@ -805,27 +818,39 @@ impl IssueStore {
         issue_id: Uuid,
         author: &str,
         body: &str,
+        author_type: &str,
+        author_id: Option<&str>,
     ) -> Result<IssueComment, IssueError> {
         let id = Uuid::new_v4();
         let now = Utc::now();
         self.conn.execute(
-            "INSERT INTO issue_comments (id, issue_id, author, body, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO issue_comments (id, issue_id, author, body, created_at, author_type, author_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 id.to_string(),
                 issue_id.to_string(),
                 author,
                 body,
                 now.to_rfc3339(),
+                author_type,
+                author_id,
             ],
         )?;
-        Ok(IssueComment { id, issue_id, author: author.to_string(), body: body.to_string(), created_at: now })
+        Ok(IssueComment {
+            id,
+            issue_id,
+            author: author.to_string(),
+            body: body.to_string(),
+            author_type: author_type.to_string(),
+            author_id: author_id.map(|s| s.to_string()),
+            created_at: now,
+        })
     }
 
     /// List all comments for an issue, ordered by `created_at` ascending.
     pub fn list_comments(&self, issue_id: Uuid) -> Result<Vec<IssueComment>, IssueError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, issue_id, author, body, created_at \
+            "SELECT id, issue_id, author, body, created_at, author_type, author_id \
              FROM issue_comments WHERE issue_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![issue_id.to_string()], |row| {
@@ -834,12 +859,14 @@ impl IssueStore {
             let author: String = row.get(2)?;
             let body: String = row.get(3)?;
             let ts: String = row.get(4)?;
-            Ok((id_str, iid_str, author, body, ts))
+            let author_type: String = row.get(5)?;
+            let author_id: Option<String> = row.get(6)?;
+            Ok((id_str, iid_str, author, body, ts, author_type, author_id))
         })?;
 
         let mut comments = Vec::new();
         for row in rows {
-            let (id_str, iid_str, author, body, ts) = row?;
+            let (id_str, iid_str, author, body, ts, author_type, author_id) = row?;
             let id = Uuid::parse_str(&id_str)
                 .map_err(|_| IssueError::Sqlite(rusqlite::Error::InvalidColumnType(0, "id".into(), rusqlite::types::Type::Text)))?;
             let iid = Uuid::parse_str(&iid_str)
@@ -847,7 +874,7 @@ impl IssueStore {
             let created_at = chrono::DateTime::parse_from_rfc3339(&ts)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| IssueError::Sqlite(rusqlite::Error::InvalidColumnType(4, "created_at".into(), rusqlite::types::Type::Text)))?;
-            comments.push(IssueComment { id, issue_id: iid, author, body, created_at });
+            comments.push(IssueComment { id, issue_id: iid, author, body, author_type, author_id, created_at });
         }
         Ok(comments)
     }

@@ -2116,3 +2116,104 @@ async fn test_complete_agent_workflow_readonly_repo_root() {
     restore_dir_write(&repo_dir);
     shutdown_tx.send(()).ok();
 }
+
+// ── Comment author_type / author_id ──────────────────────────────────────────
+
+/// Verify that `author_type` and `author_id` are stored and returned correctly.
+#[tokio::test]
+async fn test_comment_author_type() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start server");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // ── Create repo ───────────────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": "comment-author-type-test" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // ── Create issue ──────────────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "comment author type test",
+            "description": "test issue",
+            "priority": "low"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    let issue_id = issue["id"].as_str().unwrap();
+
+    // ── Post human comment (no author_type → defaults to "human") ─────────────
+    let resp = client
+        .post(format!("{rp}/issues/{issue_id}/comments"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "author": "alice",
+            "body": "Human comment here."
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create human comment: {}", resp.text().await.unwrap_or_default());
+    let c: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(c["author_type"].as_str().unwrap(), "human");
+    assert!(c["author_id"].is_null(), "author_id should be null");
+
+    // ── Post agent comment with author_id ─────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues/{issue_id}/comments"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "author": "ralph",
+            "body": "Agent comment with structured ID.",
+            "author_type": "agent",
+            "author_id": "ralph-instance-42"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create agent comment: {}", resp.text().await.unwrap_or_default());
+    let c: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(c["author_type"].as_str().unwrap(), "agent");
+    assert_eq!(c["author_id"].as_str().unwrap(), "ralph-instance-42");
+
+    // ── List comments → verify both present with correct author_type ──────────
+    let resp = client
+        .get(format!("{rp}/issues/{issue_id}/comments"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let comments: serde_json::Value = resp.json().await.unwrap();
+    let arr = comments.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "expected 2 comments");
+
+    let human = arr.iter().find(|c| c["author"].as_str() == Some("alice")).expect("human comment");
+    assert_eq!(human["author_type"].as_str().unwrap(), "human");
+    assert!(human["author_id"].is_null());
+
+    let agent = arr.iter().find(|c| c["author"].as_str() == Some("ralph")).expect("agent comment");
+    assert_eq!(agent["author_type"].as_str().unwrap(), "agent");
+    assert_eq!(agent["author_id"].as_str().unwrap(), "ralph-instance-42");
+
+    shutdown_tx.send(()).ok();
+}

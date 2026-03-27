@@ -605,15 +605,17 @@ impl CommentStore for PostgresStorage {
     ) -> Result<IssueComment, StorageError> {
         let row = sqlx::query(
             r#"
-            INSERT INTO issue_comments (repo_id, issue_id, author, body)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, issue_id, author, body, created_at
+            INSERT INTO issue_comments (repo_id, issue_id, author, body, author_type, author_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, issue_id, author, body, created_at, author_type, author_id
             "#,
         )
         .bind(repo_id)
         .bind(issue_id)
         .bind(&comment.author)
         .bind(&comment.body)
+        .bind(&comment.author_type)
+        .bind(&comment.author_id)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -623,6 +625,8 @@ impl CommentStore for PostgresStorage {
             issue_id: row.get("issue_id"),
             author: row.get("author"),
             body: row.get("body"),
+            author_type: row.get("author_type"),
+            author_id: row.get("author_id"),
             created_at: row.get("created_at"),
         })
     }
@@ -633,7 +637,7 @@ impl CommentStore for PostgresStorage {
         issue_id: &Uuid,
     ) -> Result<Vec<IssueComment>, StorageError> {
         let rows = sqlx::query(
-            "SELECT id, issue_id, author, body, created_at \
+            "SELECT id, issue_id, author, body, created_at, author_type, author_id \
              FROM issue_comments \
              WHERE repo_id = $1 AND issue_id = $2 \
              ORDER BY created_at ASC",
@@ -651,6 +655,8 @@ impl CommentStore for PostgresStorage {
                 issue_id: row.get("issue_id"),
                 author: row.get("author"),
                 body: row.get("body"),
+                author_type: row.get("author_type"),
+                author_id: row.get("author_id"),
                 created_at: row.get("created_at"),
             })
             .collect())
