@@ -1257,6 +1257,57 @@ impl IssueResponse {
     }
 }
 
+/// Enriched link entry used in the issue detail response.
+#[derive(Debug, Serialize, ToSchema)]
+struct IssueLinkDetailResponse {
+    /// UUID of the other issue in the relationship.
+    other_issue_id: String,
+    /// Relationship from this issue's perspective (e.g. `"blocks"`, `"is-blocked-by"`,
+    /// `"relates-to"`, `"duplicates"`, `"is-duplicated-by"`).
+    relationship: String,
+    /// Title of the linked issue.
+    title: String,
+    /// Current status of the linked issue (e.g. `"open"`, `"closed"`).
+    status: String,
+}
+
+/// Full issue detail response returned by `GET /api/issues/:id`.
+///
+/// Extends the basic issue fields with linked issues (including status),
+/// file attachments, and the 50 most recent comments.
+#[derive(Debug, Serialize, ToSchema)]
+struct IssueDetailResponse {
+    id: String,
+    title: String,
+    description: String,
+    status: String,
+    priority: String,
+    labels: Vec<String>,
+    creator: String,
+    resolution: Option<String>,
+    /// Present when the issue was created by an agent.
+    #[schema(value_type = Option<Object>)]
+    agent_source: Option<serde_json::Value>,
+    /// Set on creation responses when a similar open issue was detected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    possible_duplicate_of: Option<String>,
+    linked_workspace_ids: Vec<String>,
+    /// IDs of issues that block this one (source blocks this issue).
+    blocked_by: Vec<String>,
+    /// IDs of issues that this issue blocks (this issue is source, others are target).
+    blocking: Vec<String>,
+    /// Testable conditions that define when the issue is complete.
+    acceptance_criteria: Vec<String>,
+    created_at: String,
+    updated_at: String,
+    /// All links from/to this issue with relationship type, title, and status of the other issue.
+    links: Vec<IssueLinkDetailResponse>,
+    /// File attachments on this issue.
+    attachments: Vec<AttachmentResponse>,
+    /// The 50 most recent comments on this issue.
+    comments: Vec<CommentResponse>,
+}
+
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 #[utoipa::path(
@@ -5381,21 +5432,23 @@ async fn list_issues_handler(
         ("id" = String, Path, description = "Issue ID"),
     ),
     responses(
-        (status = 200, description = "Issue details", body = IssueResponse),
+        (status = 200, description = "Issue details", body = IssueDetailResponse),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Issue not found", body = ErrorBody),
     ),
     security(("bearer_auth" = [])),
     tag = "issues"
 )]
-/// `GET /api/issues/:id` — issue details with linked workspaces.
+/// `GET /api/issues/:id` — full issue detail with links, attachments, and comments.
 ///
-/// Returns 404 if the issue does not exist.
+/// Returns a single enriched response containing the issue's metadata, all linked
+/// issues (with relationship type and current status), file attachments, and the
+/// 50 most recent comments.  Returns 404 if the issue does not exist.
 async fn get_issue_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     PathId(id): PathId,
-) -> Result<Json<IssueResponse>, ApiError> {
+) -> Result<Json<IssueDetailResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let issue_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
@@ -5408,7 +5461,70 @@ async fn get_issue_handler(
     let linked = linked_workspace_ids(&ctx, issue_id).await;
     let (blocked_by, blocking) = links_for_issue(&ctx, issue_id).await;
 
-    Ok(Json(IssueResponse::from_issue(issue, linked, blocked_by, blocking)))
+    // Fetch raw links, attachments, and comments concurrently.
+    let links_store = ctx.storage.links();
+    let attachments_store = ctx.storage.attachments();
+    let comments_store = ctx.storage.comments();
+    let (raw_links, attachments, all_comments) = tokio::join!(
+        links_store.list_links(&ctx.repo_id, &issue_id),
+        attachments_store.list_attachments(&ctx.repo_id, &issue_id),
+        comments_store.list_comments(&ctx.repo_id, &issue_id),
+    );
+    let raw_links = raw_links.map_err(ApiError::from)?;
+    let attachments = attachments.map_err(ApiError::from)?;
+    let mut all_comments = all_comments.map_err(ApiError::from)?;
+
+    // Enrich links: fetch status + title of the other issue in each link.
+    let mut links: Vec<IssueLinkDetailResponse> = Vec::with_capacity(raw_links.len());
+    for link in &raw_links {
+        let (other_id, relationship_str) = if link.source_id == issue_id {
+            (link.target_id, link.relationship.as_str().to_string())
+        } else {
+            (link.source_id, link.relationship.inverse_str().to_string())
+        };
+        // Best-effort: if the linked issue can't be fetched, skip it.
+        if let Ok(other) = ctx.storage.issues().get_issue(&ctx.repo_id, &other_id).await {
+            links.push(IssueLinkDetailResponse {
+                other_issue_id: other_id.to_string(),
+                relationship: relationship_str,
+                title: other.title,
+                status: other.status.as_str().to_string(),
+            });
+        }
+    }
+
+    // Return the 50 most recent comments (list_comments returns oldest-first).
+    let comments_start = all_comments.len().saturating_sub(50);
+    let recent_comments: Vec<CommentResponse> = all_comments
+        .drain(comments_start..)
+        .map(CommentResponse::from)
+        .collect();
+
+    let agent_source = issue.agent_source.as_ref().map(|s| {
+        serde_json::to_value(s).unwrap_or(serde_json::Value::Null)
+    });
+
+    Ok(Json(IssueDetailResponse {
+        id: issue.id.to_string(),
+        title: issue.title,
+        description: issue.description,
+        status: issue.status.as_str().to_string(),
+        priority: issue.priority.as_str().to_string(),
+        labels: issue.labels,
+        creator: issue.creator,
+        resolution: issue.resolution,
+        agent_source,
+        possible_duplicate_of: None,
+        linked_workspace_ids: linked.iter().map(|u| u.to_string()).collect(),
+        blocked_by: blocked_by.iter().map(|id| id.to_string()).collect(),
+        blocking: blocking.iter().map(|id| id.to_string()).collect(),
+        acceptance_criteria: issue.acceptance_criteria,
+        created_at: issue.created_at.to_rfc3339(),
+        updated_at: issue.updated_at.to_rfc3339(),
+        links,
+        attachments: attachments.into_iter().map(AttachmentResponse::from).collect(),
+        comments: recent_comments,
+    }))
 }
 
 #[utoipa::path(
@@ -8762,6 +8878,8 @@ impl utoipa::Modify for SecurityAddon {
             UpdateIssueRequest,
             CloseIssueRequest,
             IssueResponse,
+            IssueDetailResponse,
+            IssueLinkDetailResponse,
             CreateCommentRequest,
             CommentResponse,
             CreateIssueLinkRequest,
@@ -11540,6 +11658,90 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let closed_temp: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(closed_temp["resolution"], "resolved in v5");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// `GET /api/repos/:repo/issues/:id` returns enriched detail with `links`,
+    /// `attachments`, and `comments` fields.  Comments round-trip correctly.
+    /// Links and attachments are empty in SQLite mode (write-path not supported).
+    #[tokio::test]
+    async fn issue_detail_response_is_enriched() {
+        let tmp = TempDir::new().unwrap();
+        let storage_tmp = TempDir::new().unwrap();
+        fs::create_dir_all(storage_tmp.path()).unwrap();
+
+        let (addr, shutdown_tx, key) =
+            start_test_server_multi_repo(tmp.path(), storage_tmp.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+
+        // Register a repo.
+        let resp = client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "name": "detail-repo" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        let base = format!("http://{addr}/api/repos/detail-repo");
+
+        // Create an issue.
+        let resp = client
+            .post(format!("{base}/issues"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "title": "Issue A", "description": "desc", "priority": "high", "creator": "alice"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let issue_a: serde_json::Value = resp.json().await.unwrap();
+        let id_a = issue_a["id"].as_str().unwrap().to_string();
+
+        // Add two comments to verify they appear in the detail response.
+        for body in ["First comment", "Second comment"] {
+            let resp = client
+                .post(format!("{base}/issues/{id_a}/comments"))
+                .bearer_auth(&key)
+                .json(&serde_json::json!({
+                    "author": "alice", "body": body, "author_type": "human"
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 201);
+        }
+
+        // Fetch issue detail — should include enriched fields.
+        let resp = client
+            .get(format!("{base}/issues/{id_a}"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let detail: serde_json::Value = resp.json().await.unwrap();
+
+        assert_eq!(detail["id"], id_a.as_str());
+        assert_eq!(detail["title"], "Issue A");
+
+        // `comments` field contains the two comments we added (in order).
+        let comments = detail["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0]["body"], "First comment");
+        assert_eq!(comments[1]["body"], "Second comment");
+        assert_eq!(comments[0]["author_type"], "human");
+
+        // `attachments` field is present (empty — no attachments uploaded).
+        let attachments = detail["attachments"].as_array().unwrap();
+        assert_eq!(attachments.len(), 0);
+
+        // `links` field is present (empty — SQLite write-path not supported).
+        let links = detail["links"].as_array().unwrap();
+        assert_eq!(links.len(), 0);
 
         shutdown_tx.send(()).ok();
     }
