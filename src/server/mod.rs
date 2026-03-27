@@ -3451,9 +3451,26 @@ async fn list_repo_files_handler(
         .map_err(|e| ApiError::internal(format!("read head: {e}")))?
         .unwrap_or_else(|| "v0".to_string());
 
-    let vai_toml_ignore = read_vai_toml_ignore(&ctx.repo_root);
-    let mut files =
-        crate::ignore_rules::collect_all_files_relative(&ctx.repo_root, &vai_toml_ignore);
+    // Primary: list from storage `current/` prefix — works in Postgres/S3 mode
+    // with no local `.vai/` directory.
+    let storage_files = ctx.storage.files()
+        .list(&ctx.repo_id, "current/")
+        .await
+        .unwrap_or_default();
+
+    let mut files: Vec<String> = if !storage_files.is_empty() {
+        storage_files
+            .into_iter()
+            .filter_map(|fm| {
+                let rel = fm.path.strip_prefix("current/")?.to_string();
+                if rel.is_empty() { None } else { Some(rel) }
+            })
+            .collect()
+    } else {
+        // Fallback: enumerate local disk (SQLite/local-CLI mode).
+        let vai_toml_ignore = read_vai_toml_ignore(&ctx.repo_root);
+        crate::ignore_rules::collect_all_files_relative(&ctx.repo_root, &vai_toml_ignore)
+    };
     files.sort();
 
     let count = files.len();
@@ -3553,9 +3570,15 @@ async fn upload_source_files_handler(
 
         // Store content-addressably so diffs can be computed for migrated versions.
         let hash = sha256_hex(&content);
-        let _ = ctx.storage.files().put(&ctx.repo_id, &format!("blobs/{hash}"), &content).await;
+        let file_store = ctx.storage.files();
+        let _ = file_store.put(&ctx.repo_id, &format!("blobs/{hash}"), &content).await;
 
-        uploaded_paths.push(rel.to_string_lossy().replace('\\', "/"));
+        // Also write to `current/` prefix so list/download handlers can serve
+        // these files in Postgres/S3 mode without needing a local `.vai/` directory.
+        let path_str = rel.to_string_lossy().replace('\\', "/");
+        let _ = file_store.put(&ctx.repo_id, &format!("current/{path_str}"), &content).await;
+
+        uploaded_paths.push(path_str);
     }
 
     Ok((
@@ -3854,58 +3877,65 @@ async fn files_download_handler(
         .flatten()
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Build the current repo state: start with local disk as base, then
-    // overlay all merged workspace files from S3 in chronological order.
-    // This reconstructs the true current state even though the local disk
-    // may be stale (it was only written during migration).
-    let vai_toml_ignore = read_vai_toml_ignore(&ctx.repo_root);
-    let rel_paths =
-        crate::ignore_rules::collect_all_files_relative(&ctx.repo_root, &vai_toml_ignore);
-
-    // Start with base files from local disk.
-    let mut file_map: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
-    for rel in &rel_paths {
-        let full = ctx.repo_root.join(rel);
-        if let Ok(content) = std::fs::read(&full) {
-            file_map.insert(rel.clone(), content);
-        }
-    }
-
-    // Layer merged workspace overlays on top, in chronological order.
     let file_store = ctx.storage.files();
-    let mut all_workspaces = ctx.storage.workspaces()
-        .list_workspaces(&ctx.repo_id, true)
-        .await
-        .unwrap_or_default();
-    // Keep only merged, sort by created_at ascending.
-    all_workspaces.retain(|w| w.status == crate::workspace::WorkspaceStatus::Merged);
-    all_workspaces.sort_by_key(|w| w.created_at);
-    let merged_workspaces: Vec<uuid::Uuid> = all_workspaces.iter().map(|w| w.id).collect();
 
-    for ws_id in &merged_workspaces {
-        let prefix = format!("workspaces/{ws_id}/");
-        if let Ok(ws_files) = file_store.list(&ctx.repo_id, &prefix).await {
-            for fm in ws_files {
-                let rel = fm
-                    .path
-                    .strip_prefix(&prefix)
-                    .unwrap_or(&fm.path)
-                    .to_string();
-                if rel.is_empty() || rel == ".vai-deleted" {
-                    continue;
-                }
-                if let Ok(content) = file_store.get(&ctx.repo_id, &fm.path).await {
-                    file_map.insert(rel, content);
-                }
+    // Primary: build the file map from the `current/` storage prefix which is
+    // maintained by the submit handler and reflects the fully-merged repo state.
+    // This path works in Postgres/S3 mode with no local `.vai/` directory.
+    let current_entries = file_store.list(&ctx.repo_id, "current/").await.unwrap_or_default();
+    let mut file_map: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+
+    if !current_entries.is_empty() {
+        for fm in current_entries {
+            let rel = fm.path.strip_prefix("current/").unwrap_or(&fm.path).to_string();
+            if rel.is_empty() {
+                continue;
+            }
+            if let Ok(content) = file_store.get(&ctx.repo_id, &fm.path).await {
+                file_map.insert(rel, content);
+            }
+        }
+    } else {
+        // Fallback: build from local disk and layer merged workspace overlays on top.
+        // Used in SQLite/local-CLI mode and for repos that have not been submitted yet.
+        let vai_toml_ignore = read_vai_toml_ignore(&ctx.repo_root);
+        let rel_paths =
+            crate::ignore_rules::collect_all_files_relative(&ctx.repo_root, &vai_toml_ignore);
+
+        for rel in &rel_paths {
+            let full = ctx.repo_root.join(rel);
+            if let Ok(content) = std::fs::read(&full) {
+                file_map.insert(rel.clone(), content);
             }
         }
 
-        // Apply deletion manifest: remove files that were deleted in this workspace.
-        let manifest_key = format!("workspaces/{ws_id}/.vai-deleted");
-        if let Ok(bytes) = file_store.get(&ctx.repo_id, &manifest_key).await {
-            if let Ok(deleted_paths) = serde_json::from_slice::<Vec<String>>(&bytes) {
-                for path in deleted_paths {
-                    file_map.remove(&path);
+        let mut all_workspaces = ctx.storage.workspaces()
+            .list_workspaces(&ctx.repo_id, true)
+            .await
+            .unwrap_or_default();
+        all_workspaces.retain(|w| w.status == crate::workspace::WorkspaceStatus::Merged);
+        all_workspaces.sort_by_key(|w| w.created_at);
+
+        for ws_id in all_workspaces.iter().map(|w| w.id) {
+            let prefix = format!("workspaces/{ws_id}/");
+            if let Ok(ws_files) = file_store.list(&ctx.repo_id, &prefix).await {
+                for fm in ws_files {
+                    let rel = fm.path.strip_prefix(&prefix).unwrap_or(&fm.path).to_string();
+                    if rel.is_empty() || rel == ".vai-deleted" {
+                        continue;
+                    }
+                    if let Ok(content) = file_store.get(&ctx.repo_id, &fm.path).await {
+                        file_map.insert(rel, content);
+                    }
+                }
+            }
+
+            let manifest_key = format!("workspaces/{ws_id}/.vai-deleted");
+            if let Ok(bytes) = file_store.get(&ctx.repo_id, &manifest_key).await {
+                if let Ok(deleted_paths) = serde_json::from_slice::<Vec<String>>(&bytes) {
+                    for path in deleted_paths {
+                        file_map.remove(&path);
+                    }
                 }
             }
         }
