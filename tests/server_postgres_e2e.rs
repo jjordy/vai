@@ -1884,3 +1884,235 @@ async fn test_deletion_round_trip() {
 
     shutdown_tx.send(()).ok();
 }
+
+// ── Read-only repo_root enforcement ───────────────────────────────────────────
+
+/// Recursively removes the write bit from every file and directory under
+/// `path`.  Used to simulate a server-mode `repo_root` that has only
+/// `.vai/config.toml` written and is then locked to prevent any further
+/// filesystem writes.
+#[cfg(unix)]
+fn make_dir_readonly(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if path.is_dir() {
+        // Descend before changing the dir itself so we can still list it.
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                make_dir_readonly(&entry.path());
+            }
+        }
+    }
+
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        // Clear the write bits for owner, group, and others (mask off 0o222).
+        perms.set_mode(perms.mode() & !0o222);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+/// Recursively restores write permissions to `path` so that `TempDir` can
+/// delete the tree after the test.
+#[cfg(unix)]
+fn restore_dir_write(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if path.is_dir() {
+        // Restore the dir first so we can descend into it.
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                restore_dir_write(&entry.path());
+            }
+        }
+    } else if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o644);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+/// Verifies the full agent workflow — create workspace, upload files, submit,
+/// download — succeeds even when the on-disk `repo_root` directory is
+/// **read-only** after the initial `POST /api/repos` call writes
+/// `.vai/config.toml`.
+///
+/// This is the regression guard for issue #165: any server handler that still
+/// attempts a `std::fs::write` (or create-file) against `repo_root` after
+/// initial creation will receive an `EACCES` error from the OS and fail the
+/// test, proving the filesystem leak exists.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_complete_agent_workflow_readonly_repo_root() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    // Use the in-memory file store variant so workspace overlays and current/
+    // are stored in memory rather than on disk.  After locking the repo
+    // directory all subsequent operations must succeed via Postgres + MemFs.
+    let (addr, shutdown_tx) = start_for_testing_pg_with_mem_fs(tmp.path(), &url)
+        .await
+        .expect("start_for_testing_pg_with_mem_fs failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // ── 1. Create repo ────────────────────────────────────────────────────────
+    // This is the ONLY step allowed to write to disk (.vai/config.toml).
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": "e2e-readonly-root" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create repo: {}", resp.text().await.unwrap_or_default());
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let repo_name = repo["name"].as_str().unwrap().to_string();
+    let rp = format!("{base}/api/repos/{repo_name}");
+
+    // Lock the repo directory to read-only.  Any handler that tries to write
+    // source files to disk from this point on will get EACCES.
+    let repo_dir = tmp.path().join(&repo_name);
+    make_dir_readonly(&repo_dir);
+
+    // ── 2. Create issue ───────────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "readonly-root test issue",
+            "description": "Must work without filesystem writes",
+            "priority": "high"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create issue: {}", resp.text().await.unwrap_or_default());
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    let issue_id = issue["id"].as_str().unwrap().to_string();
+
+    // ── 3. Claim work ─────────────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim work: {}", resp.text().await.unwrap_or_default());
+    let claim: serde_json::Value = resp.json().await.unwrap();
+    let ws_id = claim["workspace_id"].as_str().unwrap().to_string();
+
+    // ── 4. Upload files ───────────────────────────────────────────────────────
+    let file_content = b"pub fn readonly_test() -> &'static str { \"ok\" }\n";
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws_id}/files"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "files": [{
+                "path": "src/readonly_test.rs",
+                "content_base64": b64(file_content)
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload files: {}", resp.text().await.unwrap_or_default());
+    let upload_resp: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(upload_resp["uploaded"].as_u64().unwrap(), 1);
+
+    // ── 5. Submit workspace ───────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "add readonly_test function" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit workspace: {}", resp.text().await.unwrap_or_default());
+    let submit_resp: serde_json::Value = resp.json().await.unwrap();
+    let new_version = submit_resp["version"].as_str().unwrap().to_string();
+    assert!(!new_version.is_empty(), "submit must return the new version label");
+
+    // ── 6. Version appears in list ────────────────────────────────────────────
+    let resp = client.get(format!("{rp}/versions")).bearer_auth(admin).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let versions: serde_json::Value = resp.json().await.unwrap();
+    let version_arr = versions.as_array().unwrap();
+    assert!(
+        version_arr.iter().any(|v| v["label"].as_str() == Some(&new_version)),
+        "submitted version must appear in version list"
+    );
+
+    let version_id = version_arr
+        .iter()
+        .find(|v| v["label"].as_str() == Some(&new_version))
+        .and_then(|v| v["id"].as_str())
+        .unwrap()
+        .to_string();
+
+    // ── 7. Version detail has file_changes ────────────────────────────────────
+    let resp = client
+        .get(format!("{rp}/versions/{version_id}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let version_detail: serde_json::Value = resp.json().await.unwrap();
+    let file_changes = version_detail["file_changes"].as_array().unwrap();
+    assert!(!file_changes.is_empty(), "version detail must have file_changes");
+    assert!(
+        file_changes
+            .iter()
+            .any(|fc| fc["path"].as_str() == Some("src/readonly_test.rs")),
+        "file_changes must include src/readonly_test.rs"
+    );
+
+    // ── 8. Download tarball succeeds (reads from MemFs, not disk) ─────────────
+    let resp = client
+        .get(format!("{rp}/files/download"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "files download: {}", resp.text().await.unwrap_or_default());
+    let download_body = resp.bytes().await.unwrap();
+    assert!(!download_body.is_empty(), "download tarball must be non-empty");
+
+    // ── 9. Graph refresh passes with read-only repo_root ─────────────────────
+    // In server mode, graph refresh reads from S3/MemFs current/ prefix, not
+    // from the local filesystem.
+    let resp = client
+        .post(format!("{rp}/graph/refresh"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "graph refresh must succeed with read-only repo_root: status={}",
+        resp.status()
+    );
+
+    // ── 10. Close issue ───────────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues/{issue_id}/close"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "resolution": "verified read-only disk safety" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "close issue: {}", resp.text().await.unwrap_or_default());
+
+    // Restore write permissions so TempDir can delete the directory tree.
+    restore_dir_write(&repo_dir);
+    shutdown_tx.send(()).ok();
+}
