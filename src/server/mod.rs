@@ -1612,14 +1612,21 @@ async fn submit_workspace_handler(
 
             // Update "current/" prefix in S3 with the full repo state.
             // The download handler and diff engine use this as the base.
-            // Apply overlay files on top of the existing current/ state.
+            // Read from repo_root (post-merge disk state) so that semantic merges
+            // write the combined result, not just the workspace's raw overlay.
             {
                 let overlay = workspace::overlay_dir(&ctx.vai_dir, &id);
                 let file_store = ctx.storage.files();
                 if overlay.exists() {
-                    for (rel, bytes) in collect_dir_files_with_content(&overlay) {
-                        let key = format!("current/{rel}");
-                        let _ = file_store.put(&ctx.repo_id, &key, &bytes).await;
+                    for (rel, _) in collect_dir_files_with_content(&overlay) {
+                        // Read merged content from repo_root rather than overlay.
+                        // For fast-forward merges this is identical to the overlay;
+                        // for semantic merges it contains the auto-resolved result.
+                        let merged_path = ctx.repo_root.join(&rel);
+                        if let Ok(bytes) = std::fs::read(&merged_path) {
+                            let key = format!("current/{rel}");
+                            let _ = file_store.put(&ctx.repo_id, &key, &bytes).await;
+                        }
                     }
                 }
 
