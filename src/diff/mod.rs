@@ -16,6 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -52,6 +53,8 @@ pub enum FileChangeType {
     Added,
     /// File exists in both places but content differs.
     Modified,
+    /// File existed in the project root but was deleted by the agent.
+    Deleted,
 }
 
 /// File-level change recorded for a workspace.
@@ -174,6 +177,50 @@ pub fn compute(vai_dir: &Path, repo_root: &Path) -> Result<WorkspaceDiff, DiffEr
         }
     }
 
+    // Check the deletion manifest for files that were explicitly deleted.
+    // The manifest lives at `.vai/workspaces/<id>/.vai-deleted` (sibling of overlay/).
+    let ws_dir = vai_dir
+        .join("workspaces")
+        .join(meta.id.to_string());
+    let manifest_path = ws_dir.join(".vai-deleted");
+    if manifest_path.exists() {
+        let bytes = fs::read(&manifest_path)?;
+        if let Ok(deleted_paths) = serde_json::from_slice::<Vec<String>>(&bytes) {
+            for path in deleted_paths {
+                // Only record as Deleted if the file actually exists in the base.
+                let base_file = repo_root.join(&path);
+                if base_file.exists() {
+                    file_diffs.push(FileDiff {
+                        path: path.clone(),
+                        change_type: FileChangeType::Deleted,
+                        lines: 0,
+                        content_hash: String::new(),
+                    });
+
+                    // Entity-level: mark all entities in the deleted file as removed.
+                    if path.ends_with(".rs") {
+                        if let Ok(base_content) = fs::read(&base_file) {
+                            if let Ok((entities, _)) =
+                                crate::graph::parse_rust_source(&path, &base_content)
+                            {
+                                for entity in entities {
+                                    entity_changes.push(EntityChange {
+                                        entity_id: entity.id.clone(),
+                                        qualified_name: entity.qualified_name.clone(),
+                                        kind: entity.kind.clone(),
+                                        file_path: path.clone(),
+                                        change_type: EntityChangeType::Removed,
+                                        line_range: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(WorkspaceDiff {
         workspace_id: meta.id,
         base_version: meta.base_version,
@@ -217,6 +264,12 @@ pub fn record_events(
                     path: fd.path.clone(),
                     old_hash: String::new(), // base hash not stored; acceptable placeholder
                     new_hash: fd.content_hash.clone(),
+                })?;
+            }
+            FileChangeType::Deleted => {
+                log.append(EventKind::FileRemoved {
+                    workspace_id: diff.workspace_id,
+                    path: fd.path.clone(),
                 })?;
             }
         }

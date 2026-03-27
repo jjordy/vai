@@ -31,6 +31,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde_json;
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1143,6 +1145,24 @@ fn apply_overlay(overlay: &Path, repo_root: &Path) -> Result<usize, MergeError> 
         }
         fs::copy(&abs_path, &dest)?;
     }
+
+    // Apply deletion manifest if present in the workspace directory.
+    // The manifest lives at `<workspace_dir>/.vai-deleted` (sibling of `overlay/`).
+    if let Some(ws_dir) = overlay.parent() {
+        let manifest_path = ws_dir.join(".vai-deleted");
+        if manifest_path.exists() {
+            let bytes = fs::read(&manifest_path)?;
+            if let Ok(deleted_paths) = serde_json::from_slice::<Vec<String>>(&bytes) {
+                for rel_str in deleted_paths {
+                    let dest = repo_root.join(&rel_str);
+                    if dest.exists() {
+                        let _ = fs::remove_file(&dest);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(count)
 }
 

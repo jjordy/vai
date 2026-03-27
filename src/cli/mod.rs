@@ -827,6 +827,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                                 let sigil = match fd.change_type {
                                     diff::FileChangeType::Added => "+".green(),
                                     diff::FileChangeType::Modified => "M".yellow(),
+                                    diff::FileChangeType::Deleted => "-".red(),
                                 };
                                 println!("  {} {} ({} lines)", sigil, fd.path, fd.lines);
                             }
