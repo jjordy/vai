@@ -31,8 +31,9 @@ use super::{
     GraphStore, IssueAttachment, IssueComment, IssueLink, IssueLinkStore, IssueStore, IssueUpdate,
     NewEscalation, NewIssue, NewIssueAttachment, NewIssueComment, NewIssueLink, NewOrg, NewUser,
     NewVersion, NewWorkspace, OrgMember, OrgRole, OrgStore, Organization, RepoCollaborator,
-    RepoRole, StorageError, User, VersionStore, WorkspaceStore, WorkspaceUpdate,
+    RepoRole, StorageError, User, VersionStore, WatcherRegistryStore, WorkspaceStore, WorkspaceUpdate,
 };
+use crate::watcher::{DiscoveryEventKind, DiscoveryPreparation, DiscoveryRecord, Watcher, WatcherStore};
 use crate::auth::ApiKey;
 use crate::escalation::{Escalation, ResolutionOption};
 use crate::event_log::{Event, EventKind};
@@ -1066,6 +1067,140 @@ impl OrgStore for SqliteStorage {
         _repo_id: &Uuid,
     ) -> Result<Option<RepoRole>, StorageError> {
         Err(org_store_unsupported())
+    }
+}
+
+// ── WatcherRegistryStore ──────────────────────────────────────────────────────
+
+#[async_trait]
+impl WatcherRegistryStore for SqliteStorage {
+    async fn register_watcher(
+        &self,
+        _repo_id: &Uuid,
+        watcher: Watcher,
+    ) -> Result<Watcher, StorageError> {
+        let store = WatcherStore::open(&self.vai_dir)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        store.register(&watcher).map_err(|e| {
+            use crate::watcher::WatcherError;
+            match &e {
+                WatcherError::AlreadyExists(id) => {
+                    StorageError::Conflict(format!("watcher '{id}' is already registered"))
+                }
+                _ => StorageError::Database(e.to_string()),
+            }
+        })?;
+        Ok(watcher)
+    }
+
+    async fn get_watcher(
+        &self,
+        _repo_id: &Uuid,
+        agent_id: &str,
+    ) -> Result<Watcher, StorageError> {
+        let store = WatcherStore::open(&self.vai_dir)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        store.get(agent_id).map_err(|e| {
+            use crate::watcher::WatcherError;
+            match &e {
+                WatcherError::NotFound(id) => {
+                    StorageError::NotFound(format!("watcher '{id}' not found"))
+                }
+                _ => StorageError::Database(e.to_string()),
+            }
+        })
+    }
+
+    async fn list_watchers(&self, _repo_id: &Uuid) -> Result<Vec<Watcher>, StorageError> {
+        let store = WatcherStore::open(&self.vai_dir)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        store.list().map_err(|e| StorageError::Database(e.to_string()))
+    }
+
+    async fn pause_watcher(
+        &self,
+        _repo_id: &Uuid,
+        agent_id: &str,
+    ) -> Result<Watcher, StorageError> {
+        let store = WatcherStore::open(&self.vai_dir)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        store.pause(agent_id).map_err(|e| {
+            use crate::watcher::WatcherError;
+            match &e {
+                WatcherError::NotFound(id) => {
+                    StorageError::NotFound(format!("watcher '{id}' not found"))
+                }
+                _ => StorageError::Database(e.to_string()),
+            }
+        })?;
+        store.get(agent_id).map_err(|e| StorageError::Database(e.to_string()))
+    }
+
+    async fn resume_watcher(
+        &self,
+        _repo_id: &Uuid,
+        agent_id: &str,
+    ) -> Result<Watcher, StorageError> {
+        let store = WatcherStore::open(&self.vai_dir)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        store.resume(agent_id).map_err(|e| {
+            use crate::watcher::WatcherError;
+            match &e {
+                WatcherError::NotFound(id) => {
+                    StorageError::NotFound(format!("watcher '{id}' not found"))
+                }
+                _ => StorageError::Database(e.to_string()),
+            }
+        })?;
+        store.get(agent_id).map_err(|e| StorageError::Database(e.to_string()))
+    }
+
+    async fn prepare_discovery(
+        &self,
+        _repo_id: &Uuid,
+        agent_id: &str,
+        event: &DiscoveryEventKind,
+    ) -> Result<DiscoveryPreparation, StorageError> {
+        let store = WatcherStore::open(&self.vai_dir)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        store.prepare_discovery(agent_id, event).map_err(|e| {
+            use crate::watcher::WatcherError;
+            match &e {
+                WatcherError::NotFound(id) => {
+                    StorageError::NotFound(format!("watcher '{id}' not found"))
+                }
+                WatcherError::RateLimitExceeded { .. } => {
+                    StorageError::RateLimitExceeded(e.to_string())
+                }
+                _ => StorageError::Database(e.to_string()),
+            }
+        })
+    }
+
+    async fn record_discovery(
+        &self,
+        _repo_id: &Uuid,
+        agent_id: &str,
+        event: &DiscoveryEventKind,
+        record_id: Uuid,
+        dedup_key: &str,
+        received_at: chrono::DateTime<chrono::Utc>,
+        created_issue_id: Option<Uuid>,
+        suppressed: bool,
+    ) -> Result<DiscoveryRecord, StorageError> {
+        let store = WatcherStore::open(&self.vai_dir)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        store
+            .record_discovery(
+                agent_id,
+                event,
+                record_id,
+                dedup_key,
+                received_at,
+                created_issue_id,
+                suppressed,
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))
     }
 }
 

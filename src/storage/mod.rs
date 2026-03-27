@@ -39,6 +39,7 @@ use crate::event_log::{Event, EventKind};
 use crate::graph::{Entity, Relationship};
 use crate::issue::{Issue, IssueFilter, IssuePriority};
 use crate::version::VersionMeta;
+use crate::watcher::{DiscoveryEventKind, DiscoveryPreparation, DiscoveryRecord, Watcher};
 use crate::workspace::{WorkspaceMeta, WorkspaceStatus};
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -1199,6 +1200,83 @@ impl FileStore for MemFileStore {
     }
 }
 
+// ── WatcherRegistryStore ──────────────────────────────────────────────────────
+
+/// Storage for watcher registration and discovery event records.
+///
+/// In local (SQLite) mode this delegates to `.vai/watchers.db`.
+/// In server (Postgres) mode this uses the `watchers`, `watcher_discoveries`,
+/// and `watcher_rate_limits` tables.
+#[async_trait]
+pub trait WatcherRegistryStore: Send + Sync {
+    /// Register a new watcher agent for a repository.
+    ///
+    /// Returns `StorageError::Conflict` if a watcher with the same `agent_id`
+    /// is already registered for this repo.
+    async fn register_watcher(
+        &self,
+        repo_id: &Uuid,
+        watcher: Watcher,
+    ) -> Result<Watcher, StorageError>;
+
+    /// Fetch a watcher by agent ID.
+    ///
+    /// Returns `StorageError::NotFound` if no watcher with that ID exists.
+    async fn get_watcher(
+        &self,
+        repo_id: &Uuid,
+        agent_id: &str,
+    ) -> Result<Watcher, StorageError>;
+
+    /// List all watchers for a repository, most recently registered first.
+    async fn list_watchers(&self, repo_id: &Uuid) -> Result<Vec<Watcher>, StorageError>;
+
+    /// Set a watcher's status to `Paused` and return the updated record.
+    async fn pause_watcher(
+        &self,
+        repo_id: &Uuid,
+        agent_id: &str,
+    ) -> Result<Watcher, StorageError>;
+
+    /// Set a watcher's status to `Active` and return the updated record.
+    async fn resume_watcher(
+        &self,
+        repo_id: &Uuid,
+        agent_id: &str,
+    ) -> Result<Watcher, StorageError>;
+
+    /// Phase 1 of a two-phase discovery submission.
+    ///
+    /// Validates the watcher is active, increments the per-hour rate-limit
+    /// counter, and checks for an existing open issue with the same dedup key.
+    /// Returns a [`DiscoveryPreparation`] the caller uses to decide whether to
+    /// create an issue (via `ctx.storage.issues()`) and to call
+    /// [`record_discovery`] afterwards.
+    async fn prepare_discovery(
+        &self,
+        repo_id: &Uuid,
+        agent_id: &str,
+        event: &DiscoveryEventKind,
+    ) -> Result<DiscoveryPreparation, StorageError>;
+
+    /// Phase 2 of a two-phase discovery submission: persist the discovery
+    /// record and update watcher statistics.
+    ///
+    /// `record_id`, `dedup_key`, and `received_at` must come from the
+    /// [`DiscoveryPreparation`] returned by [`prepare_discovery`].
+    async fn record_discovery(
+        &self,
+        repo_id: &Uuid,
+        agent_id: &str,
+        event: &DiscoveryEventKind,
+        record_id: Uuid,
+        dedup_key: &str,
+        received_at: DateTime<Utc>,
+        created_issue_id: Option<Uuid>,
+        suppressed: bool,
+    ) -> Result<DiscoveryRecord, StorageError>;
+}
+
 // ── StorageBackend factory ────────────────────────────────────────────────────
 
 /// A constructed, ready-to-use storage backend.
@@ -1431,6 +1509,22 @@ impl StorageBackend {
             StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn FileStore>,
             StorageBackend::ServerWithS3(_, f) => Arc::clone(f) as Arc<dyn FileStore>,
             StorageBackend::ServerWithMemFs(_, f) => Arc::clone(f) as Arc<dyn FileStore>,
+        }
+    }
+
+    /// Returns the watcher registry store.
+    ///
+    /// - [`StorageBackend::Local`]: delegates to `.vai/watchers.db` (SQLite).
+    /// - [`StorageBackend::Server`] / [`StorageBackend::ServerWithS3`] /
+    ///   [`StorageBackend::ServerWithMemFs`]: Postgres-backed.
+    pub fn watchers(&self) -> Arc<dyn WatcherRegistryStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn WatcherRegistryStore>,
+            StorageBackend::Server(s)
+            | StorageBackend::ServerWithS3(s, _)
+            | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn WatcherRegistryStore>
+            }
         }
     }
 }

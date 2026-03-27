@@ -148,7 +148,7 @@ use crate::graph::GraphSnapshot;
 use crate::merge;
 use crate::repo;
 use crate::version;
-use crate::watcher::{DiscoveryEventKind, IssueCreationPolicy, Watcher, WatcherStatus, WatcherStore, WatchType};
+use crate::watcher::{DiscoveryEventKind, IssueCreationPolicy, Watcher, WatcherStatus, WatchType};
 use crate::work_queue;
 use crate::workspace;
 
@@ -6971,7 +6971,6 @@ async fn register_watcher_handler(
 ) -> Result<(StatusCode, Json<WatcherResponse>), ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
-    let store = WatcherStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
     let now = chrono::Utc::now();
     let watcher = Watcher {
         agent_id: body.agent_id,
@@ -6983,13 +6982,15 @@ async fn register_watcher_handler(
         last_discovery_at: None,
         discovery_count: 0,
     };
-    store.register(&watcher).map_err(|e| {
-        use crate::watcher::WatcherError;
-        match &e {
-            WatcherError::AlreadyExists(_) => ApiError::conflict(e.to_string()),
+    let watcher = ctx
+        .storage
+        .watchers()
+        .register_watcher(&ctx.repo_id, watcher)
+        .await
+        .map_err(|e| match &e {
+            crate::storage::StorageError::Conflict(_) => ApiError::conflict(e.to_string()),
             _ => ApiError::internal(e.to_string()),
-        }
-    })?;
+        })?;
     state.broadcast(BroadcastEvent {
         event_type: "WatcherRegistered".to_string(),
         event_id: 0,
@@ -7016,8 +7017,12 @@ async fn list_watchers_handler(
     ctx: RepoCtx,
 ) -> Result<Json<Vec<WatcherResponse>>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    let store = WatcherStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    let watchers = store.list().map_err(|e| ApiError::internal(e.to_string()))?;
+    let watchers = ctx
+        .storage
+        .watchers()
+        .list_watchers(&ctx.repo_id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(watchers.into_iter().map(Into::into).collect()))
 }
 
@@ -7044,15 +7049,15 @@ async fn pause_watcher_handler(
 ) -> Result<Json<WatcherResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
-    let store = WatcherStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    store.pause(&agent_id).map_err(|e| {
-        use crate::watcher::WatcherError;
-        match &e {
-            WatcherError::NotFound(_) => ApiError::not_found(e.to_string()),
+    let watcher = ctx
+        .storage
+        .watchers()
+        .pause_watcher(&ctx.repo_id, &agent_id)
+        .await
+        .map_err(|e| match &e {
+            crate::storage::StorageError::NotFound(_) => ApiError::not_found(e.to_string()),
             _ => ApiError::internal(e.to_string()),
-        }
-    })?;
-    let watcher = store.get(&agent_id).map_err(|e| ApiError::internal(e.to_string()))?;
+        })?;
     Ok(Json(watcher.into()))
 }
 
@@ -7079,15 +7084,15 @@ async fn resume_watcher_handler(
 ) -> Result<Json<WatcherResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
-    let store = WatcherStore::open(&ctx.vai_dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    store.resume(&agent_id).map_err(|e| {
-        use crate::watcher::WatcherError;
-        match &e {
-            WatcherError::NotFound(_) => ApiError::not_found(e.to_string()),
+    let watcher = ctx
+        .storage
+        .watchers()
+        .resume_watcher(&ctx.repo_id, &agent_id)
+        .await
+        .map_err(|e| match &e {
+            crate::storage::StorageError::NotFound(_) => ApiError::not_found(e.to_string()),
             _ => ApiError::internal(e.to_string()),
-        }
-    })?;
-    let watcher = store.get(&agent_id).map_err(|e| ApiError::internal(e.to_string()))?;
+        })?;
     Ok(Json(watcher.into()))
 }
 
@@ -7134,31 +7139,30 @@ async fn submit_discovery_handler(
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
 
-    // WatcherStore uses its own local SQLite database for watcher registrations,
-    // rate limits, and discovery dedup records.  This is acceptable because the
-    // watcher tables are never queried via the Postgres storage trait.
-    let watcher_store = WatcherStore::open(&ctx.vai_dir)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-
     let event_type = body.event.event_type().to_string();
 
-    // Phase 1: validate watcher, apply rate-limit, check for duplicates.
-    // All of this lives in the watcher-local SQLite — no Postgres dependency.
-    let prep = watcher_store
-        .prepare_discovery(&body.agent_id, &body.event)
-        .map_err(|e| {
-            use crate::watcher::WatcherError;
-            match &e {
-                WatcherError::NotFound(_) => ApiError::not_found(e.to_string()),
-                WatcherError::RateLimitExceeded { .. } => ApiError::rate_limited(e.to_string()),
-                _ => ApiError::internal(e.to_string()),
+    // Phase 1: validate watcher, apply rate-limit, check for duplicates via
+    // storage trait — works in both SQLite and Postgres modes.
+    let prep = ctx
+        .storage
+        .watchers()
+        .prepare_discovery(&ctx.repo_id, &body.agent_id, &body.event)
+        .await
+        .map_err(|e| match &e {
+            crate::storage::StorageError::NotFound(_) => ApiError::not_found(e.to_string()),
+            crate::storage::StorageError::RateLimitExceeded(_) => {
+                ApiError::rate_limited(e.to_string())
             }
+            _ => ApiError::internal(e.to_string()),
         })?;
 
     // Suppressed duplicate: just record and return 200.
     if let Some(existing_issue_id) = prep.suppressed_with_issue_id {
-        let record = watcher_store
+        let record = ctx
+            .storage
+            .watchers()
             .record_discovery(
+                &ctx.repo_id,
                 &body.agent_id,
                 &body.event,
                 prep.record_id,
@@ -7167,6 +7171,7 @@ async fn submit_discovery_handler(
                 Some(existing_issue_id),
                 true,
             )
+            .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
         return Ok((
             StatusCode::OK,
@@ -7237,7 +7242,7 @@ async fn submit_discovery_handler(
         }
     }
 
-    // Phase 3: persist discovery record in watcher-local SQLite.
+    // Phase 3: persist discovery record via storage trait.
     let message = if let Some(id) = created_issue_id {
         format!("Discovery recorded; issue {id} created")
     } else if prep.should_create_issue {
@@ -7246,8 +7251,11 @@ async fn submit_discovery_handler(
         "Discovery recorded; auto-create disabled by policy".to_string()
     };
 
-    let record = watcher_store
+    let record = ctx
+        .storage
+        .watchers()
         .record_discovery(
+            &ctx.repo_id,
             &body.agent_id,
             &body.event,
             prep.record_id,
@@ -7256,6 +7264,7 @@ async fn submit_discovery_handler(
             created_issue_id,
             false,
         )
+        .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     if let Some(issue_id) = created_issue_id {
