@@ -4064,8 +4064,6 @@ async fn get_main_file_handler(
 #[derive(Debug, Default, Deserialize, ToSchema)]
 struct FilesDownloadQuery {
     /// Version to download (e.g. `"v42"`). Defaults to the current HEAD.
-    /// Accepted for forward-compatibility; not yet used.
-    #[allow(dead_code)]
     version: Option<String>,
 }
 
@@ -4121,6 +4119,111 @@ fn parse_version_num(version_id: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Reconstructs the full repo file map at a historical version by replaying
+/// file events from the event log. Returns a map of `relative_path -> content`.
+///
+/// Works without a local `.vai/` directory — all data is read via the storage
+/// trait. Files whose content cannot be located (e.g. blobs predating
+/// content-addressable storage) are silently omitted.
+async fn build_file_map_at_version(
+    ctx: &RepoCtx,
+    target_version_num: u64,
+) -> Result<std::collections::HashMap<String, Vec<u8>>, ApiError> {
+    // All versions whose numeric suffix ≤ target.
+    let all_versions = ctx
+        .storage
+        .versions()
+        .list_versions(&ctx.repo_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    let target_versions: Vec<_> = all_versions
+        .into_iter()
+        .filter(|v| parse_version_num(&v.version_id) <= target_version_num)
+        .collect();
+
+    let merge_event_ids: Vec<u64> = target_versions
+        .iter()
+        .filter_map(|v| v.merge_event_id)
+        .collect();
+
+    if merge_event_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    // Resolve workspace_ids from MergeCompleted events.
+    let merge_events = ctx
+        .storage
+        .events()
+        .query_by_type(&ctx.repo_id, "MergeCompleted")
+        .await
+        .map_err(ApiError::from)?;
+
+    let mut workspace_ids: Vec<uuid::Uuid> = merge_event_ids
+        .iter()
+        .filter_map(|mid| {
+            merge_events
+                .iter()
+                .find(|e| e.id == *mid)
+                .and_then(|e| e.kind.workspace_id())
+        })
+        .collect();
+    workspace_ids.sort_unstable();
+    workspace_ids.dedup();
+
+    // Fetch all file events for the relevant workspaces.
+    use crate::storage::EventFilter;
+    let filter = EventFilter {
+        event_types: vec![
+            "FileAdded".to_string(),
+            "FileModified".to_string(),
+            "FileRemoved".to_string(),
+        ],
+        workspace_ids,
+        ..EventFilter::default()
+    };
+    let mut file_events = ctx
+        .storage
+        .events()
+        .query_since_id_filtered(&ctx.repo_id, 0, &filter)
+        .await
+        .map_err(ApiError::from)?;
+
+    // Sort by event id to replay in chronological order.
+    file_events.sort_by_key(|e| e.id);
+
+    // Build path → content-hash map by replaying events.
+    let mut path_hash: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for event in file_events {
+        match event.kind {
+            EventKind::FileAdded { path, hash, .. } => {
+                path_hash.insert(path, hash);
+            }
+            EventKind::FileModified { path, new_hash, .. } => {
+                path_hash.insert(path, new_hash);
+            }
+            EventKind::FileRemoved { path, .. } => {
+                path_hash.remove(&path);
+            }
+            _ => {}
+        }
+    }
+
+    // Fetch file content from content-addressable blob store.
+    let file_store = ctx.storage.files();
+    let mut file_map: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    for (path, hash) in path_hash {
+        if let Ok(content) = file_store.get(&ctx.repo_id, &format!("blobs/{hash}")).await {
+            file_map.insert(path, content);
+        }
+        // Silently skip blobs not found (pre-content-addressable versions).
+    }
+
+    Ok(file_map)
+}
+
 #[utoipa::path(
     get,
     path = "/api/repos/{repo}/files/download",
@@ -4130,6 +4233,7 @@ fn parse_version_num(version_id: &str) -> u64 {
     ),
     responses(
         (status = 200, description = "Tar-gzip archive of all repo files", content_type = "application/gzip"),
+        (status = 400, description = "No files in storage — run migration first", body = ErrorBody),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Repository not found", body = ErrorBody),
         (status = 500, description = "Internal error", body = ErrorBody),
@@ -4145,13 +4249,13 @@ fn parse_version_num(version_id: &str) -> u64 {
 /// excluded.  The `Content-Disposition` header is set to suggest a filename of
 /// the form `<repo>-<version>.tar.gz`.
 ///
-/// The optional `?version=vN` query parameter is accepted for forward
-/// compatibility but currently ignored; files are always read from the
-/// current HEAD state on disk.
+/// Serves files exclusively from storage (`current/` prefix for HEAD,
+/// or event-log replay for historical versions). Returns 400 if the
+/// `current/` prefix is empty — run `vai remote migrate` to seed it.
 async fn files_download_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
-    AxumQuery(_query): AxumQuery<FilesDownloadQuery>,
+    AxumQuery(query): AxumQuery<FilesDownloadQuery>,
 ) -> Result<Response, ApiError> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -4173,66 +4277,44 @@ async fn files_download_handler(
         .flatten()
         .unwrap_or_else(|| "unknown".to_string());
 
-    let file_store = ctx.storage.files();
+    // Determine which version to download.
+    let requested_version = query.version.as_deref().unwrap_or(&head_version);
+    let requested_num = parse_version_num(requested_version);
+    let head_num = parse_version_num(&head_version);
 
-    // Primary: build the file map from the `current/` storage prefix which is
-    // maintained by the submit handler and reflects the fully-merged repo state.
-    // This path works in Postgres/S3 mode with no local `.vai/` directory.
-    let current_entries = file_store.list(&ctx.repo_id, "current/").await.unwrap_or_default();
-    let mut file_map: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    // Build the file map exclusively from storage — no local filesystem fallback.
+    // The `current/` prefix is maintained by the submit handler and migration
+    // uploader; it always reflects the latest merged repo state.
+    let file_map = if requested_num < head_num {
+        // Historical version: reconstruct file state by replaying version events.
+        build_file_map_at_version(&ctx, requested_num).await?
+    } else {
+        // HEAD (or unknown/future version): serve directly from `current/` prefix.
+        let file_store = ctx.storage.files();
+        let current_entries = file_store
+            .list(&ctx.repo_id, "current/")
+            .await
+            .map_err(|e| ApiError::internal(format!("list current/: {e}")))?;
 
-    if !current_entries.is_empty() {
+        if current_entries.is_empty() {
+            return Err(ApiError::bad_request(
+                "repository has no files in current/ — run `vai remote migrate` to seed storage",
+            ));
+        }
+
+        let mut map: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
         for fm in current_entries {
             let rel = fm.path.strip_prefix("current/").unwrap_or(&fm.path).to_string();
             if rel.is_empty() {
                 continue;
             }
             if let Ok(content) = file_store.get(&ctx.repo_id, &fm.path).await {
-                file_map.insert(rel, content);
+                map.insert(rel, content);
             }
         }
-    } else {
-        // Fallback: build from local disk and layer merged workspace overlays on top.
-        // Used in SQLite/local-CLI mode and for repos that have not been submitted yet.
-        let vai_toml_ignore = read_vai_toml_ignore(&ctx.repo_root);
-        let rel_paths =
-            crate::ignore_rules::collect_all_files_relative(&ctx.repo_root, &vai_toml_ignore);
-
-        for rel in &rel_paths {
-            let full = ctx.repo_root.join(rel);
-            if let Ok(content) = std::fs::read(&full) {
-                file_map.insert(rel.clone(), content);
-            }
-        }
-
-        let mut all_workspaces = ctx.storage.workspaces()
-            .list_workspaces(&ctx.repo_id, true)
-            .await
-            .unwrap_or_default();
-        all_workspaces.retain(|w| w.status == crate::workspace::WorkspaceStatus::Merged);
-        all_workspaces.sort_by_key(|w| w.created_at);
-
-        for ws in &all_workspaces {
-            let ws_id = ws.id;
-            let prefix = format!("workspaces/{ws_id}/");
-            if let Ok(ws_files) = file_store.list(&ctx.repo_id, &prefix).await {
-                for fm in ws_files {
-                    let rel = fm.path.strip_prefix(&prefix).unwrap_or(&fm.path).to_string();
-                    if rel.is_empty() {
-                        continue;
-                    }
-                    if let Ok(content) = file_store.get(&ctx.repo_id, &fm.path).await {
-                        file_map.insert(rel, content);
-                    }
-                }
-            }
-
-            // Apply deletions from workspace row's `deleted_paths` column.
-            for path in &ws.deleted_paths {
-                file_map.remove(path);
-            }
-        }
-    }
+        map
+    };
 
     // Build the tarball from the merged file map.
     let mut sorted_paths: Vec<String> = file_map.keys().cloned().collect();
@@ -4449,19 +4531,15 @@ async fn files_pull_handler(
                 });
             }
             ChangeState::Added | ChangeState::Modified => {
-                let rel = sanitize_path(&path).ok_or_else(|| {
-                    ApiError::bad_request(format!("invalid path: '{path}'"))
-                })?;
-                let full = ctx.repo_root.join(&rel);
-                let content_base64 = if full.exists() {
-                    let bytes = std::fs::read(&full)
-                        .map_err(|e| ApiError::internal(format!("read '{path}': {e}")))?;
-                    Some(BASE64.encode(&bytes))
-                } else {
-                    // File may have been merged but not yet written to repo_root
-                    // (e.g. S3-only deployment). Omit content rather than error.
-                    None
-                };
+                // Read from the `current/` storage prefix — works in both
+                // SQLite and Postgres/S3 modes with no local filesystem needed.
+                let content_base64 = ctx
+                    .storage
+                    .files()
+                    .get(&ctx.repo_id, &format!("current/{path}"))
+                    .await
+                    .ok()
+                    .map(|bytes| BASE64.encode(&bytes));
                 let change_type = match state {
                     ChangeState::Added => FileChangeType::Added,
                     _ => FileChangeType::Modified,
