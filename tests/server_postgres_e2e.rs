@@ -773,3 +773,146 @@ async fn test_workspace_file_download_before_submit() {
 
     shutdown_tx.send(()).ok();
 }
+
+// ── Version diff via storage ───────────────────────────────────────────────────
+
+/// Verifies that `GET /api/repos/:repo/versions/:id/diff` returns correct diff
+/// content sourced from the content-addressable blob store (not the local
+/// `.vai/` filesystem snapshot directories).
+///
+/// This is a regression guard for the filesystem fallback described in
+/// issue #154: previously snapshot directories written by
+/// `prepare_workspace_for_submit` were required for the diff to be non-empty.
+/// After the fix, diffs are built from `blobs/{hash}` keys stored in S3/storage
+/// during file upload — no local snapshot needed.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_version_diff_via_storage() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start_for_testing_pg_multi_repo failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": "e2e-version-diff" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // Create an issue and claim it (creates a workspace).
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "add greeter module",
+            "description": "add greeter.rs with a greet function",
+            "priority": "medium"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    let issue_id = issue["id"].as_str().unwrap();
+
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim: {}", resp.text().await.unwrap_or_default());
+    let claim: serde_json::Value = resp.json().await.unwrap();
+    let ws_id = claim["workspace_id"].as_str().unwrap().to_string();
+
+    // Upload a file into the workspace overlay.
+    let file_content = b"pub fn greet(name: &str) -> String {\n    format!(\"Hello, {name}!\")\n}\n";
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws_id}/files"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "files": [{
+                "path": "src/greeter.rs",
+                "content_base64": b64(file_content)
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload files: {}", resp.text().await.unwrap_or_default());
+
+    // Submit the workspace to create a version.
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "add greeter module" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit: {}", resp.text().await.unwrap_or_default());
+    let submit_resp: serde_json::Value = resp.json().await.unwrap();
+    let version_label = submit_resp["version"].as_str().unwrap().to_string();
+    assert!(!version_label.is_empty(), "submit must return a version label");
+
+    // Look up the version UUID from the version list.
+    let resp = client.get(format!("{rp}/versions")).bearer_auth(admin).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let versions: serde_json::Value = resp.json().await.unwrap();
+    let version_id = versions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["label"].as_str() == Some(&version_label))
+        .and_then(|v| v["id"].as_str())
+        .expect("submitted version must appear in version list")
+        .to_string();
+
+    // GET /versions/:id/diff — must return a non-empty diff for src/greeter.rs,
+    // sourced from the content-addressable blob store (not snapshot directories).
+    let resp = client
+        .get(format!("{rp}/versions/{version_id}/diff"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "version diff failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let diff_resp: serde_json::Value = resp.json().await.unwrap();
+    let diffs = diff_resp["diffs"].as_array().expect("diffs must be an array");
+    assert!(!diffs.is_empty(), "version diff must be non-empty");
+
+    let greeter_diff = diffs
+        .iter()
+        .find(|d| d["path"].as_str() == Some("src/greeter.rs"))
+        .expect("diff must include src/greeter.rs");
+
+    assert_eq!(
+        greeter_diff["change_type"].as_str().unwrap_or(""),
+        "added",
+        "src/greeter.rs must be an added file"
+    );
+    let diff_text = greeter_diff["diff"].as_str().unwrap_or("");
+    assert!(!diff_text.is_empty(), "diff text for src/greeter.rs must be non-empty");
+    assert!(
+        diff_text.contains("greet"),
+        "diff must contain content from the uploaded file"
+    );
+
+    shutdown_tx.send(()).ok();
+}

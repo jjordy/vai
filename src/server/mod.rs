@@ -139,7 +139,7 @@ use crate::auth;
 use crate::conflict;
 use crate::storage::{EventFilter, EventStore as _};
 use crate::escalation::EscalationStatus;
-use crate::event_log::{EventKind, EventLog};
+use crate::event_log::EventKind;
 use crate::graph::GraphSnapshot;
 use crate::merge;
 use crate::repo;
@@ -6318,16 +6318,19 @@ async fn submit_discovery_handler(
 ) -> Result<(StatusCode, Json<DiscoveryOutcomeResponse>), ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
+
+    // WatcherStore uses its own local SQLite database for watcher registrations,
+    // rate limits, and discovery dedup records.  This is acceptable because the
+    // watcher tables are never queried via the Postgres storage trait.
     let watcher_store = WatcherStore::open(&ctx.vai_dir)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    let issue_store = crate::issue::IssueStore::open(&ctx.vai_dir)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut event_log = EventLog::open(&ctx.vai_dir)
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let event_type = body.event.event_type().to_string();
-    let outcome = watcher_store
-        .submit_discovery(&body.agent_id, body.event, &issue_store, &mut event_log)
+
+    // Phase 1: validate watcher, apply rate-limit, check for duplicates.
+    // All of this lives in the watcher-local SQLite — no Postgres dependency.
+    let prep = watcher_store
+        .prepare_discovery(&body.agent_id, &body.event)
         .map_err(|e| {
             use crate::watcher::WatcherError;
             match &e {
@@ -6337,12 +6340,116 @@ async fn submit_discovery_handler(
             }
         })?;
 
-    if let Some(issue_id) = outcome.issue_id {
+    // Suppressed duplicate: just record and return 200.
+    if let Some(existing_issue_id) = prep.suppressed_with_issue_id {
+        let record = watcher_store
+            .record_discovery(
+                &body.agent_id,
+                &body.event,
+                prep.record_id,
+                &prep.dedup_key,
+                prep.received_at,
+                Some(existing_issue_id),
+                true,
+            )
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        return Ok((
+            StatusCode::OK,
+            Json(DiscoveryOutcomeResponse {
+                record_id: record.id.to_string(),
+                agent_id: record.agent_id,
+                event_type,
+                received_at: record.received_at.to_rfc3339(),
+                created_issue_id: record.created_issue_id.map(|id| id.to_string()),
+                suppressed: true,
+                message: format!(
+                    "Suppressed duplicate: issue {existing_issue_id} already tracks this problem"
+                ),
+            }),
+        ));
+    }
+
+    // Phase 2: create issue via storage trait — works in both SQLite and Postgres
+    // modes without touching the local filesystem.
+    let mut created_issue_id: Option<uuid::Uuid> = None;
+    if prep.should_create_issue {
+        let title = body.event.default_title();
+        let description = format!(
+            "Automatically created by watcher `{}`.\n\n**Event type:** {}\n\n**Details:**\n```json\n{}\n```",
+            &body.agent_id,
+            body.event.event_type(),
+            serde_json::to_string_pretty(&body.event).unwrap_or_default(),
+        );
+        let agent_source_val = serde_json::to_value(&serde_json::json!({
+            "source_type": body.event.event_type(),
+            "details": &body.event,
+        }))
+        .ok();
+
+        let create_result = ctx
+            .storage
+            .issues()
+            .create_issue(
+                &ctx.repo_id,
+                crate::storage::NewIssue {
+                    title: title.clone(),
+                    description,
+                    priority: prep.priority.clone(),
+                    labels: vec![event_type.clone(), "watcher".to_string()],
+                    creator: body.agent_id.clone(),
+                    agent_source: agent_source_val,
+                    depends_on: vec![],
+                    acceptance_criteria: vec![],
+                },
+            )
+            .await;
+
+        if let Ok(issue) = create_result {
+            // Append IssueCreated event via storage trait.
+            let _ = ctx
+                .storage
+                .events()
+                .append(
+                    &ctx.repo_id,
+                    EventKind::IssueCreated {
+                        issue_id: issue.id,
+                        title: issue.title.clone(),
+                        creator: body.agent_id.clone(),
+                        priority: issue.priority.as_str().to_string(),
+                    },
+                )
+                .await;
+            created_issue_id = Some(issue.id);
+        }
+    }
+
+    // Phase 3: persist discovery record in watcher-local SQLite.
+    let message = if let Some(id) = created_issue_id {
+        format!("Discovery recorded; issue {id} created")
+    } else if prep.should_create_issue {
+        "Discovery recorded; issue creation failed or rate-limited".to_string()
+    } else {
+        "Discovery recorded; auto-create disabled by policy".to_string()
+    };
+
+    let record = watcher_store
+        .record_discovery(
+            &body.agent_id,
+            &body.event,
+            prep.record_id,
+            &prep.dedup_key,
+            prep.received_at,
+            created_issue_id,
+            false,
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    if let Some(issue_id) = created_issue_id {
         state.broadcast(BroadcastEvent {
             event_type: "IssueCreated".to_string(),
             event_id: 0,
             workspace_id: None,
-            timestamp: outcome.record.received_at.to_rfc3339(),
+            timestamp: record.received_at.to_rfc3339(),
             data: serde_json::json!({
                 "issue_id": issue_id.to_string(),
                 "source": "watcher_discovery",
@@ -6351,22 +6458,16 @@ async fn submit_discovery_handler(
         });
     }
 
-    let status = if outcome.suppressed {
-        StatusCode::OK
-    } else {
-        StatusCode::CREATED
-    };
-
     Ok((
-        status,
+        StatusCode::CREATED,
         Json(DiscoveryOutcomeResponse {
-            record_id: outcome.record.id.to_string(),
-            agent_id: outcome.record.agent_id,
+            record_id: record.id.to_string(),
+            agent_id: record.agent_id,
             event_type,
-            received_at: outcome.record.received_at.to_rfc3339(),
-            created_issue_id: outcome.record.created_issue_id.map(|id| id.to_string()),
-            suppressed: outcome.suppressed,
-            message: outcome.message,
+            received_at: record.received_at.to_rfc3339(),
+            created_issue_id: record.created_issue_id.map(|id| id.to_string()),
+            suppressed: false,
+            message,
         }),
     ))
 }

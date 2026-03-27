@@ -342,6 +342,31 @@ pub struct DiscoveryOutcome {
     pub message: String,
 }
 
+/// Result of the first phase of discovery processing (validate + rate-limit + dedup).
+///
+/// Returned by [`WatcherStore::prepare_discovery`].  The caller is responsible
+/// for creating the issue (if `should_create_issue` is `true`) using the
+/// storage trait, then calling [`WatcherStore::record_discovery`] to persist
+/// the outcome.
+pub struct DiscoveryPreparation {
+    /// ID to use for the new discovery record.
+    pub record_id: Uuid,
+    /// Deduplication key derived from the event.
+    pub dedup_key: String,
+    /// Timestamp at which the discovery was received.
+    pub received_at: DateTime<Utc>,
+    /// If `Some`, this is a suppressed duplicate — the existing open issue ID
+    /// is returned.  The caller should call `record_discovery` with
+    /// `suppressed = true` and skip issue creation.
+    pub suppressed_with_issue_id: Option<Uuid>,
+    /// Whether the watcher policy calls for auto-creating a new issue.
+    /// Only meaningful when `suppressed_with_issue_id` is `None`.
+    pub should_create_issue: bool,
+    /// Priority to assign to the auto-created issue.
+    /// Only meaningful when `should_create_issue` is `true`.
+    pub priority: IssuePriority,
+}
+
 // ── WatcherStore ──────────────────────────────────────────────────────────────
 
 /// SQLite-backed storage for watcher registrations and discovery events.
@@ -693,6 +718,98 @@ impl WatcherStore {
             issue_id: created_issue_id,
             suppressed: false,
             message,
+        })
+    }
+
+    /// Phase 1 of a two-phase discovery submission: validate the watcher,
+    /// apply rate-limiting, and check for duplicates.
+    ///
+    /// The caller is responsible for creating the issue (if
+    /// `prep.should_create_issue` is `true`) using the storage trait, then
+    /// calling [`record_discovery`] to persist the outcome.  This split
+    /// allows server handlers to use `ctx.storage.issues()` and
+    /// `ctx.storage.events()` for issue creation instead of the local
+    /// filesystem-based [`crate::issue::IssueStore`].
+    pub fn prepare_discovery(
+        &self,
+        agent_id: &str,
+        event: &DiscoveryEventKind,
+    ) -> Result<DiscoveryPreparation, WatcherError> {
+        // Step 1: validate watcher.
+        let watcher = self.get(agent_id)?;
+        if watcher.status == WatcherStatus::Paused {
+            return Err(WatcherError::NotFound(format!(
+                "{agent_id} is paused — resume before submitting discoveries"
+            )));
+        }
+
+        // Step 2: rate-limit check.
+        let count = self.increment_rate_limit(agent_id)?;
+        if count > watcher.issue_creation_policy.max_per_hour {
+            let _ = self.decrement_rate_limit(agent_id);
+            return Err(WatcherError::RateLimitExceeded {
+                agent_id: agent_id.to_string(),
+                count,
+                max: watcher.issue_creation_policy.max_per_hour,
+            });
+        }
+
+        let dedup_key = event.dedup_key();
+        let now = Utc::now();
+
+        // Step 3: duplicate suppression.
+        let existing_issue_id = self.find_active_discovery(&dedup_key, agent_id)?;
+        let priority = event.default_priority();
+        let should_create = watcher.issue_creation_policy.should_auto_create(&priority);
+
+        Ok(DiscoveryPreparation {
+            record_id: Uuid::new_v4(),
+            dedup_key,
+            received_at: now,
+            suppressed_with_issue_id: existing_issue_id,
+            should_create_issue: should_create,
+            priority,
+        })
+    }
+
+    /// Phase 2 of a two-phase discovery submission: persist the discovery
+    /// record and update watcher statistics.
+    ///
+    /// `record_id`, `dedup_key`, and `received_at` must come from the
+    /// [`DiscoveryPreparation`] returned by [`prepare_discovery`].
+    pub fn record_discovery(
+        &self,
+        agent_id: &str,
+        event: &DiscoveryEventKind,
+        record_id: Uuid,
+        dedup_key: &str,
+        received_at: DateTime<Utc>,
+        created_issue_id: Option<Uuid>,
+        suppressed: bool,
+    ) -> Result<DiscoveryRecord, WatcherError> {
+        let event_json = serde_json::to_string(event)?;
+        self.conn.execute(
+            "INSERT INTO discovery_records (id, agent_id, event_type, event_json, dedup_key, received_at, created_issue_id, suppressed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                record_id.to_string(),
+                agent_id,
+                event.event_type(),
+                &event_json,
+                dedup_key,
+                received_at.to_rfc3339(),
+                created_issue_id.as_ref().map(|id| id.to_string()),
+                suppressed as i32,
+            ],
+        )?;
+        self.update_watcher_stats(agent_id, &received_at)?;
+        Ok(DiscoveryRecord {
+            id: record_id,
+            agent_id: agent_id.to_string(),
+            event: event.clone(),
+            received_at,
+            created_issue_id,
+            suppressed,
         })
     }
 
