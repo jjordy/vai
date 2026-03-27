@@ -868,22 +868,30 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         let linked_issue_id = active_ws_meta.issue_id;
                         let overlay = workspace::overlay_dir(&vai_dir, &active_id);
 
-                        // 2. Upload overlay files to server workspace.
+                        // 2. Upload workspace snapshot to server.
+                        //    upload_snapshot auto-selects full vs delta mode based on
+                        //    repo size: repos > 50 MiB use a delta tarball (overlay
+                        //    files only); smaller repos send the full working tree.
                         let rt = tokio::runtime::Runtime::new()
                             .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?;
 
-                        let uploaded = rt.block_on(remote_workspace::upload_overlay_files(
+                        let snapshot_result = rt.block_on(remote_workspace::upload_snapshot(
                             &remote,
                             &active_id,
+                            &root,
                             &overlay,
+                            &active_ws_meta.base_version,
+                            &active_ws_meta.deleted_paths,
                         ))?;
 
                         if !cli.quiet && !cli.json {
-                            if uploaded.is_empty() {
-                                println!("No files in workspace overlay — nothing to upload.");
-                            } else {
-                                println!("  Uploaded : {} file(s)", uploaded.len());
-                            }
+                            let mode = if snapshot_result.is_delta { "delta" } else { "full" };
+                            println!(
+                                "  Snapshot : {} added, {} modified, {} deleted ({mode} mode)",
+                                snapshot_result.added,
+                                snapshot_result.modified,
+                                snapshot_result.deleted,
+                            );
                         }
 
                         // 3. Trigger server-side merge.
