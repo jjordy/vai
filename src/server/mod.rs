@@ -17,6 +17,7 @@
 //!   - `GET /api/versions/:id/diff` — unified diffs for all files changed in a version (`?base=<version_id>`)
 //!   - `POST /api/versions/rollback` — rollback to a prior version
 //!   - `POST /api/workspaces/:id/files` — upload files into a workspace overlay (base64 JSON)
+//!   - `POST /api/workspaces/:id/upload-snapshot` — upload gzip tarball, diff against `current/`, store as overlay
 //!   - `GET /api/workspaces/:id/files/*path` — download a file from workspace (overlay or base)
 //!   - `GET /api/files/*path` — download a file from the current main version
 //!   - `GET /api/graph/entities` — list entities with optional filters (`?kind=`, `?file=`, `?name=`)
@@ -72,6 +73,7 @@
 //!   - `POST /api/repos/:repo/workspaces/:id/submit` — submit workspace for merge
 //!   - `DELETE /api/repos/:repo/workspaces/:id` — discard workspace
 //!   - `POST /api/repos/:repo/workspaces/:id/files` — upload files into workspace overlay
+//!   - `POST /api/repos/:repo/workspaces/:id/upload-snapshot` — upload gzip tarball, diff against `current/`, store as overlay
 //!   - `GET /api/repos/:repo/workspaces/:id/files/*path` — download file from workspace
 //!   - `GET /api/repos/:repo/files` — list files in repo root
 //!   - `POST /api/repos/:repo/files` — upload source files into repo root (migration, PRD 12.3)
@@ -777,6 +779,13 @@ impl ApiError {
     fn forbidden(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
+            message: msg.into(),
+        }
+    }
+
+    fn payload_too_large(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
             message: msg.into(),
         }
     }
@@ -3028,6 +3037,19 @@ struct UploadFilesResponse {
     paths: Vec<String>,
 }
 
+/// Response body for `POST /api/workspaces/:id/upload-snapshot`.
+#[derive(Debug, Serialize, ToSchema)]
+struct UploadSnapshotResponse {
+    /// Files in the tarball that were not present in `current/`.
+    added: usize,
+    /// Files with different content from `current/`.
+    modified: usize,
+    /// Files present in `current/` but absent from the tarball.
+    deleted: usize,
+    /// Files identical in both tarball and `current/`.
+    unchanged: usize,
+}
+
 /// Response body for file download endpoints.
 #[derive(Debug, Serialize, ToSchema)]
 struct FileDownloadResponse {
@@ -3063,6 +3085,71 @@ fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
     format!("{:x}", h.finalize())
+}
+
+/// Extracts a gzip-compressed tarball into an in-memory `{path → content}` map.
+///
+/// Paths are normalised by stripping any leading `./` prefix and skipping
+/// directory entries.  Returns an error if the bytes are not a valid
+/// gzip-compressed tar archive.
+fn extract_snapshot_tarball(gz_bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, ApiError> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+    use std::io::Read;
+
+    let decoder = GzDecoder::new(gz_bytes);
+    let mut archive = Archive::new(decoder);
+    let mut files = HashMap::new();
+
+    let entries = archive
+        .entries()
+        .map_err(|e| ApiError::bad_request(format!("invalid tarball: {e}")))?;
+
+    for entry in entries {
+        let mut entry = entry
+            .map_err(|e| ApiError::bad_request(format!("invalid tarball entry: {e}")))?;
+
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+
+        let raw_path = entry
+            .path()
+            .map_err(|e| ApiError::bad_request(format!("invalid path in tarball: {e}")))?
+            .to_string_lossy()
+            .to_string();
+
+        // Normalise: strip leading "./" and validate.
+        let path = raw_path.trim_start_matches("./").to_string();
+        let rel = match sanitize_path(&path) {
+            Some(p) => p.to_string_lossy().replace('\\', "/"),
+            None => continue, // skip unsafe paths silently
+        };
+        if rel.is_empty() {
+            continue;
+        }
+
+        let mut content = Vec::new();
+        entry
+            .read_to_end(&mut content)
+            .map_err(|e| ApiError::bad_request(format!("read tarball entry '{rel}': {e}")))?;
+
+        files.insert(rel, content);
+    }
+
+    Ok(files)
+}
+
+/// Returns `true` for paths that should be excluded from snapshot uploads.
+///
+/// Always excludes `.vai/` and `.git/` trees which are internal to the
+/// version-control tooling and must never be stored as workspace overlay
+/// files.
+fn is_snapshot_path_ignored(path: &str) -> bool {
+    path.starts_with(".vai/")
+        || path.starts_with(".git/")
+        || path == ".vai"
+        || path == ".git"
 }
 
 #[utoipa::path(
@@ -3307,6 +3394,234 @@ async fn upload_workspace_files_handler(
         Json(UploadFilesResponse {
             uploaded: count,
             paths: uploaded_paths,
+        }),
+    ))
+}
+
+/// Maximum uncompressed tarball payload accepted by the snapshot upload endpoint.
+const MAX_SNAPSHOT_SIZE_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
+
+#[utoipa::path(
+    post,
+    path = "/api/workspaces/{id}/upload-snapshot",
+    params(
+        ("id" = String, Path, description = "Workspace ID"),
+    ),
+    request_body(
+        content = String,
+        description = "Gzip-compressed tarball of the working directory (Content-Type: application/gzip). Maximum 100 MiB.",
+        content_type = "application/gzip"
+    ),
+    responses(
+        (status = 200, description = "Snapshot diffed and stored", body = UploadSnapshotResponse),
+        (status = 400, description = "Bad request or invalid tarball", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Workspace not found", body = ErrorBody),
+        (status = 413, description = "Tarball exceeds 100 MiB limit", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
+/// `POST /api/workspaces/:id/upload-snapshot` — accepts a gzip-compressed
+/// tarball of the agent's working directory, diffs it against the current
+/// repository state in `current/`, and stores the delta as a workspace
+/// overlay.
+///
+/// The endpoint compares each file in the tarball to `current/` using
+/// SHA-256 content hashes:
+/// - **added** — present in tarball, absent from `current/`
+/// - **modified** — present in both, but with a different hash
+/// - **deleted** — present in `current/`, absent from tarball
+/// - **unchanged** — identical hash in both; skipped
+///
+/// Added and modified files are written to the workspace overlay under
+/// `workspaces/{id}/{path}` in the file store.  Deleted paths are recorded
+/// in the `.vai-deleted` manifest used by the submit and download handlers.
+///
+/// Tarballs larger than 100 MiB (compressed) are rejected with **413**.
+async fn upload_snapshot_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    State(state): State<Arc<AppState>>,
+    ctx: RepoCtx,
+    PathId(id): PathId,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<UploadSnapshotResponse>), ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
+    let _lock = state.repo_lock.lock().await;
+
+    // Reject tarballs above the size limit.
+    if body.len() > MAX_SNAPSHOT_SIZE_BYTES {
+        return Err(ApiError::payload_too_large(format!(
+            "tarball exceeds 100 MiB limit ({} bytes)",
+            body.len()
+        )));
+    }
+
+    // Parse workspace metadata.
+    let ws_uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::not_found(format!("workspace `{id}` not found")))?;
+    let meta = ctx
+        .storage
+        .workspaces()
+        .get_workspace(&ctx.repo_id, &ws_uuid)
+        .await
+        .map_err(ApiError::from)?;
+
+    // Extract the tarball to an in-memory map, filtering ignored paths.
+    let raw_files = extract_snapshot_tarball(&body)?;
+    let tarball_files: HashMap<String, Vec<u8>> = raw_files
+        .into_iter()
+        .filter(|(path, _)| !is_snapshot_path_ignored(path))
+        .collect();
+
+    // Build a map of the current repository state: path → content_hash.
+    let file_store = ctx.storage.files();
+    let current_entries = file_store
+        .list(&ctx.repo_id, "current/")
+        .await
+        .unwrap_or_default();
+    let current_map: HashMap<String, String> = current_entries
+        .into_iter()
+        .filter_map(|fm| {
+            let rel = fm.path.strip_prefix("current/")?.to_string();
+            if rel.is_empty() {
+                None
+            } else {
+                Some((rel, fm.content_hash))
+            }
+        })
+        .collect();
+
+    // Diff tarball against current state.
+    let mut added = 0usize;
+    let mut modified = 0usize;
+    let mut unchanged = 0usize;
+    let mut uploaded_paths: Vec<String> = Vec::new();
+
+    for (path, content) in &tarball_files {
+        let new_hash = sha256_hex(content);
+
+        let event_kind = match current_map.get(path) {
+            Some(current_hash) if current_hash == &new_hash => {
+                unchanged += 1;
+                continue;
+            }
+            Some(current_hash) => {
+                modified += 1;
+                EventKind::FileModified {
+                    workspace_id: ws_uuid,
+                    path: path.clone(),
+                    old_hash: current_hash.clone(),
+                    new_hash: new_hash.clone(),
+                }
+            }
+            None => {
+                added += 1;
+                EventKind::FileAdded {
+                    workspace_id: ws_uuid,
+                    path: path.clone(),
+                    hash: new_hash.clone(),
+                }
+            }
+        };
+
+        // Write to workspace overlay in file store.
+        let store_key = format!("workspaces/{id}/{path}");
+        file_store
+            .put(&ctx.repo_id, &store_key, content)
+            .await
+            .map_err(|e| ApiError::internal(format!("write overlay file: {e}")))?;
+        // Also store content-addressably for diffs.
+        let _ = file_store
+            .put(&ctx.repo_id, &format!("blobs/{new_hash}"), content)
+            .await;
+
+        // Record event via storage trait.
+        let _ = ctx.storage.events().append(&ctx.repo_id, event_kind).await;
+
+        uploaded_paths.push(path.clone());
+    }
+
+    // Compute deletions: files in current/ that are absent from the tarball.
+    let deleted_paths: Vec<String> = current_map
+        .keys()
+        .filter(|p| !tarball_files.contains_key(*p))
+        .cloned()
+        .collect();
+    let deleted = deleted_paths.len();
+
+    if !deleted_paths.is_empty() {
+        let manifest_key = format!("workspaces/{id}/.vai-deleted");
+
+        // Merge with any existing deletion manifest.
+        let mut existing: Vec<String> = file_store
+            .get(&ctx.repo_id, &manifest_key)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+
+        for path in &deleted_paths {
+            if !existing.contains(path) {
+                existing.push(path.clone());
+            }
+            let _ = ctx
+                .storage
+                .events()
+                .append(
+                    &ctx.repo_id,
+                    EventKind::FileRemoved {
+                        workspace_id: ws_uuid,
+                        path: path.clone(),
+                    },
+                )
+                .await;
+        }
+
+        let manifest_bytes = serde_json::to_vec(&existing)
+            .map_err(|e| ApiError::internal(format!("serialize deletion manifest: {e}")))?;
+        file_store
+            .put(&ctx.repo_id, &manifest_key, &manifest_bytes)
+            .await
+            .map_err(|e| ApiError::internal(format!("write deletion manifest: {e}")))?;
+    }
+
+    // Transition workspace from Created → Active on first content upload.
+    if meta.status == workspace::WorkspaceStatus::Created
+        && (!uploaded_paths.is_empty() || !deleted_paths.is_empty())
+    {
+        let update = crate::storage::WorkspaceUpdate {
+            status: Some(workspace::WorkspaceStatus::Active),
+            issue_id: None,
+        };
+        let _ = ctx
+            .storage
+            .workspaces()
+            .update_workspace(&ctx.repo_id, &ws_uuid, update)
+            .await;
+    }
+
+    // Broadcast WebSocket notification.
+    state.broadcast(BroadcastEvent {
+        event_type: "SnapshotUploaded".to_string(),
+        event_id: 0,
+        workspace_id: Some(id.clone()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        data: serde_json::json!({
+            "added": added,
+            "modified": modified,
+            "deleted": deleted,
+            "unchanged": unchanged,
+        }),
+    });
+
+    Ok((
+        StatusCode::OK,
+        Json(UploadSnapshotResponse {
+            added,
+            modified,
+            deleted,
+            unchanged,
         }),
     ))
 }
@@ -7349,6 +7664,7 @@ impl utoipa::Modify for SecurityAddon {
         submit_workspace_handler,
         discard_workspace_handler,
         upload_workspace_files_handler,
+        upload_snapshot_handler,
         get_workspace_file_handler,
         list_versions_handler,
         get_version_handler,
@@ -7434,6 +7750,7 @@ impl utoipa::Modify for SecurityAddon {
             FileUploadEntry,
             UploadFilesRequest,
             UploadFilesResponse,
+            UploadSnapshotResponse,
             FileDownloadResponse,
             RepoFileListResponse,
             ServerGraphRefreshResponse,
@@ -7569,6 +7886,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/workspaces/:id", get(get_workspace_handler))
         .route("/api/workspaces/:id/submit", post(submit_workspace_handler))
         .route("/api/workspaces/:id/files", post(upload_workspace_files_handler))
+        .route("/api/workspaces/:id/upload-snapshot", post(upload_snapshot_handler))
         .route("/api/workspaces/:id/files/*path", get(get_workspace_file_handler))
         .route("/api/workspaces/:id", delete(discard_workspace_handler))
         .route("/api/repo/files", get(list_repo_files_handler))
@@ -7669,6 +7987,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/workspaces/:id", get(get_workspace_handler))
         .route("/workspaces/:id/submit", post(submit_workspace_handler))
         .route("/workspaces/:id/files", post(upload_workspace_files_handler))
+        .route("/workspaces/:id/upload-snapshot", post(upload_snapshot_handler))
         .route("/workspaces/:id/files/*path", get(get_workspace_file_handler))
         .route("/workspaces/:id", delete(discard_workspace_handler))
         .route("/files", get(list_repo_files_handler))
