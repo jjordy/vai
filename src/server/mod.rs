@@ -3172,10 +3172,29 @@ struct UploadSnapshotResponse {
     added: usize,
     /// Files with different content from `current/`.
     modified: usize,
-    /// Files present in `current/` but absent from the tarball.
+    /// Files present in `current/` but absent from the tarball (full mode) or
+    /// listed in `.vai-delta.json` (delta mode).
     deleted: usize,
     /// Files identical in both tarball and `current/`.
     unchanged: usize,
+    /// `true` when the upload was processed as a delta (`.vai-delta.json` was present).
+    is_delta: bool,
+}
+
+/// Manifest embedded inside a delta tarball as `.vai-delta.json`.
+///
+/// When this file is present in the uploaded archive the server switches to
+/// delta mode: only the files actually present in the tarball are compared
+/// against `current/`, and `deleted_paths` is taken verbatim from this struct
+/// rather than derived from absent files.
+#[derive(Debug, Deserialize, ToSchema)]
+struct DeltaManifest {
+    /// The version identifier the delta was built on top of (informational).
+    #[allow(dead_code)]
+    base_version: String,
+    /// Repository-relative paths that were deleted relative to `base_version`.
+    #[serde(default)]
+    deleted_paths: Vec<String>,
 }
 
 /// Response body for file download endpoints.
@@ -3567,12 +3586,26 @@ const MAX_SNAPSHOT_SIZE_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 /// repository state in `current/`, and stores the delta as a workspace
 /// overlay.
 ///
+/// ## Full mode (default)
+///
 /// The endpoint compares each file in the tarball to `current/` using
 /// SHA-256 content hashes:
 /// - **added** — present in tarball, absent from `current/`
 /// - **modified** — present in both, but with a different hash
 /// - **deleted** — present in `current/`, absent from tarball
 /// - **unchanged** — identical hash in both; skipped
+///
+/// ## Delta mode
+///
+/// If the tarball contains a `.vai-delta.json` manifest at its root the
+/// upload is processed in delta mode.  The manifest has the form:
+/// ```json
+/// { "base_version": "v42", "deleted_paths": ["src/old.ts"] }
+/// ```
+/// In delta mode only the files actually present in the archive are compared
+/// against `current/`; absent files are **not** treated as deletions.
+/// Instead the explicit `deleted_paths` list from the manifest is used.
+/// This allows agents to upload only changed files for large repositories.
 ///
 /// Added and modified files are written to the workspace overlay under
 /// `workspaces/{id}/{path}` in the file store.  Deleted paths are recorded
@@ -3608,7 +3641,24 @@ async fn upload_snapshot_handler(
         .map_err(ApiError::from)?;
 
     // Extract the tarball to an in-memory map, filtering ignored paths.
-    let raw_files = extract_snapshot_tarball(&body)?;
+    let mut raw_files = extract_snapshot_tarball(&body)?;
+
+    // Detect delta mode: presence of `.vai-delta.json` in the archive switches
+    // from full-snapshot semantics to delta semantics.
+    let delta_manifest: Option<DeltaManifest> = if let Some(manifest_bytes) = raw_files.remove(".vai-delta.json") {
+        match serde_json::from_slice::<DeltaManifest>(&manifest_bytes) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                return Err(ApiError::bad_request(format!(
+                    "invalid .vai-delta.json: {e}"
+                )));
+            }
+        }
+    } else {
+        None
+    };
+    let is_delta = delta_manifest.is_some();
+
     let tarball_files: HashMap<String, Vec<u8>> = raw_files
         .into_iter()
         .filter(|(path, _)| !is_snapshot_path_ignored(path))
@@ -3682,12 +3732,23 @@ async fn upload_snapshot_handler(
         uploaded_paths.push(path.clone());
     }
 
-    // Compute deletions: files in current/ that are absent from the tarball.
-    let deleted_paths: Vec<String> = current_map
-        .keys()
-        .filter(|p| !tarball_files.contains_key(*p))
-        .cloned()
-        .collect();
+    // Compute deletions.
+    // - Full mode: any file in current/ that is absent from the tarball is deleted.
+    // - Delta mode: only files explicitly listed in the manifest are deleted.
+    let deleted_paths: Vec<String> = if let Some(ref manifest) = delta_manifest {
+        manifest
+            .deleted_paths
+            .iter()
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .collect()
+    } else {
+        current_map
+            .keys()
+            .filter(|p| !tarball_files.contains_key(*p))
+            .cloned()
+            .collect()
+    };
     let deleted = deleted_paths.len();
 
     // Merge snapshot deletions into workspace row and transition Created → Active.
@@ -3753,6 +3814,7 @@ async fn upload_snapshot_handler(
             modified,
             deleted,
             unchanged,
+            is_delta,
         }),
     ))
 }
@@ -9017,6 +9079,7 @@ impl utoipa::Modify for SecurityAddon {
             UploadFilesRequest,
             UploadFilesResponse,
             UploadSnapshotResponse,
+            DeltaManifest,
             FileDownloadResponse,
             RepoFileListResponse,
             ServerGraphRefreshResponse,
