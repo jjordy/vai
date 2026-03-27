@@ -3408,54 +3408,67 @@ async fn upload_workspace_files_handler(
         data: serde_json::json!({ "paths": uploaded_paths }),
     });
 
+    // Fetch the complete overlay path list from the FileStore so the conflict
+    // engine always sees the authoritative current state of the workspace,
+    // not just the files uploaded in this request.
+    //
+    // Files are stored as `workspaces/{id}/{rel_path}` (e.g. `workspaces/{id}/src/auth.rs`).
+    // We also exclude content-addressed blobs stored under `blobs/` which share
+    // no prefix with workspace paths and therefore won't appear here.
+    let ws_prefix = format!("workspaces/{id}/");
+    let overlay_paths: Vec<String> = ctx
+        .storage
+        .files()
+        .list(&ctx.repo_id, &ws_prefix)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|fm| fm.path.strip_prefix(&ws_prefix).map(|s| s.to_string()))
+        .filter(|p| !p.is_empty())
+        .collect();
+
     // Run conflict overlap detection and notify affected workspaces.
     {
         let mut engine = state.conflict_engine.lock().await;
-        match engine.update_scope(workspace_uuid, &meta.intent, &uploaded_paths, &ctx.vai_dir) {
-            Ok(overlaps) => {
-                for overlap in overlaps {
-                    let ts = chrono::Utc::now().to_rfc3339();
-                    let payload = serde_json::json!({
-                        "type": "overlap_detected",
-                        "severity": overlap.level.as_str(),
-                        "your_workspace": overlap.your_workspace.to_string(),
-                        "other_workspace": overlap.other_workspace.to_string(),
-                        "other_intent": overlap.other_intent,
-                        "overlapping_files": overlap.overlapping_files,
-                        "overlapping_entities": overlap.overlapping_entities,
-                        "recommendation": overlap.recommendation,
-                    });
-                    // Notify the workspace whose scope was just updated.
-                    state.broadcast(BroadcastEvent {
-                        event_type: "OverlapDetected".to_string(),
-                        event_id: 0,
-                        workspace_id: Some(overlap.your_workspace.to_string()),
-                        timestamp: ts.clone(),
-                        data: payload.clone(),
-                    });
-                    // Also notify the other overlapping workspace.
-                    let mirrored = serde_json::json!({
-                        "type": "overlap_detected",
-                        "severity": overlap.level.as_str(),
-                        "your_workspace": overlap.other_workspace.to_string(),
-                        "other_workspace": overlap.your_workspace.to_string(),
-                        "other_intent": meta.intent,
-                        "overlapping_files": overlap.overlapping_files,
-                        "overlapping_entities": overlap.overlapping_entities,
-                        "recommendation": overlap.recommendation,
-                    });
-                    state.broadcast(BroadcastEvent {
-                        event_type: "OverlapDetected".to_string(),
-                        event_id: 0,
-                        workspace_id: Some(overlap.other_workspace.to_string()),
-                        timestamp: ts,
-                        data: mirrored,
-                    });
-                }
-            }
-            Err(e) => {
-                tracing::warn!("conflict engine error: {e}");
-            }
+        let overlaps = engine.update_scope(workspace_uuid, &meta.intent, &overlay_paths);
+        for overlap in overlaps {
+            let ts = chrono::Utc::now().to_rfc3339();
+            let payload = serde_json::json!({
+                "type": "overlap_detected",
+                "severity": overlap.level.as_str(),
+                "your_workspace": overlap.your_workspace.to_string(),
+                "other_workspace": overlap.other_workspace.to_string(),
+                "other_intent": overlap.other_intent,
+                "overlapping_files": overlap.overlapping_files,
+                "overlapping_entities": overlap.overlapping_entities,
+                "recommendation": overlap.recommendation,
+            });
+            // Notify the workspace whose scope was just updated.
+            state.broadcast(BroadcastEvent {
+                event_type: "OverlapDetected".to_string(),
+                event_id: 0,
+                workspace_id: Some(overlap.your_workspace.to_string()),
+                timestamp: ts.clone(),
+                data: payload.clone(),
+            });
+            // Also notify the other overlapping workspace.
+            let mirrored = serde_json::json!({
+                "type": "overlap_detected",
+                "severity": overlap.level.as_str(),
+                "your_workspace": overlap.other_workspace.to_string(),
+                "other_workspace": overlap.your_workspace.to_string(),
+                "other_intent": meta.intent,
+                "overlapping_files": overlap.overlapping_files,
+                "overlapping_entities": overlap.overlapping_entities,
+                "recommendation": overlap.recommendation,
+            });
+            state.broadcast(BroadcastEvent {
+                event_type: "OverlapDetected".to_string(),
+                event_id: 0,
+                workspace_id: Some(overlap.other_workspace.to_string()),
+                timestamp: ts,
+                data: mirrored,
+            });
         }
     }
 

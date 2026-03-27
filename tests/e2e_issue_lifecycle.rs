@@ -223,9 +223,7 @@ fn test_full_issue_lifecycle() {
     );
     fs::write(ws1_src.join("auth.rs"), &auth_v2).unwrap();
 
-    let overlaps = engine
-        .update_scope(ws1_id, &ws1_meta.intent, &["src/auth.rs".into()], &vai_dir)
-        .unwrap();
+    let overlaps = engine.update_scope(ws1_id, &ws1_meta.intent, &["src/auth.rs".into()]);
     assert!(
         overlaps.is_empty(),
         "no conflicts expected with only one active workspace"
@@ -247,9 +245,8 @@ fn test_full_issue_lifecycle() {
     fs::write(ws2_src.join("auth.rs"), &auth_v3).unwrap();
 
     // Register ws2's scope — expect an overlap with ws1.
-    let ws2_overlaps = engine
-        .update_scope(ws2_id, &ws2_meta.intent, &["src/auth.rs".into()], &vai_dir)
-        .unwrap();
+    let ws2_overlaps =
+        engine.update_scope(ws2_id, &ws2_meta.intent, &["src/auth.rs".into()]);
     assert!(
         !ws2_overlaps.is_empty(),
         "ws2 should conflict with ws1 on auth.rs"
@@ -439,9 +436,7 @@ fn test_claim_conflicting_issue_fails() {
     let ws1_overlay = workspace::overlay_dir(&vai_dir, &claim1.workspace_id);
     fs::create_dir_all(ws1_overlay.join("src")).unwrap();
     fs::write(ws1_overlay.join("src/auth.rs"), AUTH_RS).unwrap();
-    engine
-        .update_scope(ws1_id, "fix auth token", &["src/auth.rs".into()], &vai_dir)
-        .unwrap();
+    engine.update_scope(ws1_id, "fix auth token", &["src/auth.rs".into()]);
 
     // Claiming i2 (also auth-related) should be blocked.
     // Note: scope prediction is keyword-based and may or may not classify i2

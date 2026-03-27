@@ -20,22 +20,16 @@
 //! | Critical | Multiple shared entities (high coordination risk)    |
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-
-use crate::graph::GraphSnapshot;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors from conflict engine operations.
 #[derive(Debug, Error)]
 pub enum ConflictError {
-    #[error("Graph error: {0}")]
-    Graph(#[from] crate::graph::GraphError),
-
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -140,25 +134,22 @@ impl ConflictEngine {
 
     /// Updates the write scope for `workspace_id` and returns all overlaps.
     ///
-    /// Loads entities for every file currently in the workspace's write scope
-    /// from the semantic graph, computes the blast radius (2 hops), then
-    /// checks all other tracked workspaces for overlap.
+    /// `path_list` is the **complete** current file list for this workspace,
+    /// obtained from [`FileStore::list`] by the caller. It replaces the
+    /// previously stored write set rather than appending to it, so the engine
+    /// always reflects the authoritative current overlay state.
     ///
     /// Returns one [`OverlapResult`] per overlapping workspace, sorted by
     /// severity descending (Critical first). Results with level `None` are
     /// omitted.
-    ///
-    /// If the graph snapshot does not exist yet (e.g., the repo was just
-    /// cloned and has not been initialised), scope tracking proceeds without
-    /// entity-level resolution and only file-level overlap is detected.
     pub fn update_scope(
         &mut self,
         workspace_id: Uuid,
         intent: &str,
-        new_write_files: &[String],
-        vai_dir: &Path,
-    ) -> Result<Vec<OverlapResult>, ConflictError> {
-        // Update (or insert) the scope entry for this workspace.
+        path_list: &[String],
+    ) -> Vec<OverlapResult> {
+        // Replace (or insert) the scope entry for this workspace with the
+        // authoritative path list supplied by the caller.
         let scope = self
             .scopes
             .entry(workspace_id)
@@ -171,32 +162,12 @@ impl ConflictEngine {
             });
 
         scope.intent = intent.to_string();
-        for f in new_write_files {
-            scope.write_files.insert(f.clone());
-        }
+        scope.write_files = path_list.iter().cloned().collect();
 
-        // Refresh entity-level scope from the graph snapshot.
-        let graph_path = vai_dir.join("graph").join("snapshot.db");
-        if graph_path.exists() {
-            let graph = GraphSnapshot::open(&graph_path)?;
-
-            let mut write_entities: HashSet<String> = HashSet::new();
-            for file in &scope.write_files {
-                for entity in graph.get_entities_in_file(file)? {
-                    write_entities.insert(entity.id);
-                }
-            }
-            scope.write_entities = write_entities;
-
-            // Compute blast radius (2 hops from write entities).
-            let seeds: Vec<&str> = scope.write_entities.iter().map(String::as_str).collect();
-            if !seeds.is_empty() {
-                let (reachable, _) = graph.reachable_entities(&seeds, 2)?;
-                scope.blast_radius = reachable.into_iter().map(|e| e.id).collect();
-            } else {
-                scope.blast_radius = scope.write_entities.clone();
-            }
-        }
+        // Entity-level scope is populated externally (e.g., via GraphStore in
+        // server mode). For now, we perform file-level overlap detection only.
+        // The write_entities and blast_radius fields remain available for
+        // callers that pre-resolve entity data.
 
         // Snapshot the updated scope before borrowing `self.scopes` for iteration.
         let updated = scope.clone();
@@ -212,7 +183,7 @@ impl ConflictEngine {
 
         // Highest severity first.
         results.sort_by(|a, b| b.level.cmp(&a.level));
-        Ok(results)
+        results
     }
 
     /// Removes a workspace from scope tracking.
@@ -376,9 +347,6 @@ fn classify_overlap(a: &WorkspaceScope, b: &WorkspaceScope) -> OverlapResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-
-    use crate::repo;
 
     /// Builds a [`WorkspaceScope`] directly from pre-computed sets (no graph).
     fn make_scope(
@@ -465,42 +433,25 @@ mod tests {
 
     // ── ConflictEngine integration tests ──────────────────────────────────────
 
-    fn init_repo_with_file(content: &[u8]) -> (TempDir, std::path::PathBuf) {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), content).unwrap();
-        repo::init(&root).unwrap();
-        let vai_dir = root.join(".vai");
-        (tmp, vai_dir)
-    }
-
     #[test]
     fn engine_no_overlap_on_first_workspace() {
-        let (_tmp, vai_dir) = init_repo_with_file(b"pub fn foo() {}\n");
         let mut engine = ConflictEngine::new();
 
-        let overlaps = engine
-            .update_scope(Uuid::new_v4(), "add feature", &["src/lib.rs".to_string()], &vai_dir)
-            .unwrap();
+        let overlaps =
+            engine.update_scope(Uuid::new_v4(), "add feature", &["src/lib.rs".to_string()]);
         assert!(overlaps.is_empty(), "single workspace — no other to overlap with");
     }
 
     #[test]
     fn engine_detects_file_overlap_between_two_workspaces() {
-        let (_tmp, vai_dir) = init_repo_with_file(b"pub fn foo() {}\n");
         let mut engine = ConflictEngine::new();
 
         let ws_a = Uuid::new_v4();
         let ws_b = Uuid::new_v4();
 
-        engine
-            .update_scope(ws_a, "refactor foo", &["src/lib.rs".to_string()], &vai_dir)
-            .unwrap();
+        engine.update_scope(ws_a, "refactor foo", &["src/lib.rs".to_string()]);
 
-        let overlaps = engine
-            .update_scope(ws_b, "fix foo", &["src/lib.rs".to_string()], &vai_dir)
-            .unwrap();
+        let overlaps = engine.update_scope(ws_b, "fix foo", &["src/lib.rs".to_string()]);
 
         assert!(!overlaps.is_empty(), "ws_b should detect overlap with ws_a");
         let r = overlaps.iter().find(|r| r.other_workspace == ws_a).unwrap();
@@ -509,22 +460,13 @@ mod tests {
 
     #[test]
     fn engine_no_overlap_on_disjoint_files() {
-        let (_tmp, vai_dir) = init_repo_with_file(b"pub fn foo() {}\n");
-        // Add a second file.
-        std::fs::write(vai_dir.parent().unwrap().join("src/other.rs"), b"pub fn bar() {}\n")
-            .unwrap();
-
         let mut engine = ConflictEngine::new();
         let ws_a = Uuid::new_v4();
         let ws_b = Uuid::new_v4();
 
-        engine
-            .update_scope(ws_a, "edit lib", &["src/lib.rs".to_string()], &vai_dir)
-            .unwrap();
+        engine.update_scope(ws_a, "edit lib", &["src/lib.rs".to_string()]);
 
-        let overlaps = engine
-            .update_scope(ws_b, "edit other", &["src/other.rs".to_string()], &vai_dir)
-            .unwrap();
+        let overlaps = engine.update_scope(ws_b, "edit other", &["src/other.rs".to_string()]);
 
         assert!(
             overlaps.iter().all(|r| r.level == OverlapLevel::None),
@@ -534,38 +476,33 @@ mod tests {
 
     #[test]
     fn engine_remove_workspace_ends_tracking() {
-        let (_tmp, vai_dir) = init_repo_with_file(b"pub fn foo() {}\n");
         let mut engine = ConflictEngine::new();
         let ws_id = Uuid::new_v4();
 
-        engine
-            .update_scope(ws_id, "test", &["src/lib.rs".to_string()], &vai_dir)
-            .unwrap();
+        engine.update_scope(ws_id, "test", &["src/lib.rs".to_string()]);
         assert_eq!(engine.tracked_count(), 1);
 
         engine.remove_workspace(&ws_id);
         assert_eq!(engine.tracked_count(), 0);
 
         // After removal, a new workspace touching the same file sees no overlap.
-        let overlaps = engine
-            .update_scope(Uuid::new_v4(), "other", &["src/lib.rs".to_string()], &vai_dir)
-            .unwrap();
+        let overlaps = engine.update_scope(Uuid::new_v4(), "other", &["src/lib.rs".to_string()]);
         assert!(overlaps.is_empty());
     }
 
     #[test]
-    fn engine_scope_accumulates_across_calls() {
-        let (_tmp, vai_dir) = init_repo_with_file(b"pub fn foo() {}\n");
+    fn engine_scope_replaced_on_each_call() {
         let mut engine = ConflictEngine::new();
         let ws_id = Uuid::new_v4();
 
-        engine
-            .update_scope(ws_id, "work", &["src/a.rs".to_string()], &vai_dir)
-            .unwrap();
-        engine
-            .update_scope(ws_id, "work", &["src/b.rs".to_string()], &vai_dir)
-            .unwrap();
+        // First call: only a.rs
+        engine.update_scope(ws_id, "work", &["src/a.rs".to_string()]);
+        let scope = engine.get_scope(&ws_id).unwrap();
+        assert!(scope.write_files.contains("src/a.rs"));
+        assert!(!scope.write_files.contains("src/b.rs"));
 
+        // Second call: complete list now includes both — caller fetched full overlay.
+        engine.update_scope(ws_id, "work", &["src/a.rs".to_string(), "src/b.rs".to_string()]);
         let scope = engine.get_scope(&ws_id).unwrap();
         assert!(scope.write_files.contains("src/a.rs"));
         assert!(scope.write_files.contains("src/b.rs"));
