@@ -1676,6 +1676,7 @@ async fn submit_workspace_handler(
                 // The download handler and diff engine use this as the base.
                 // Read from repo_root (post-merge disk state) so that semantic merges
                 // write the combined result, not just the workspace's raw overlay.
+                // ALLOW_FS: local SQLite mode only — guarded by `if !using_s3_merge`
                 let overlay = workspace::overlay_dir(&ctx.vai_dir, &id);
                 if overlay.exists() {
                     for (rel, _) in collect_dir_files_with_content(&overlay) {
@@ -1683,6 +1684,7 @@ async fn submit_workspace_handler(
                         // For fast-forward merges this is identical to the overlay;
                         // for semantic merges it contains the auto-resolved result.
                         let merged_path = ctx.repo_root.join(&rel);
+                        // ALLOW_FS: local SQLite mode only — guarded by `if !using_s3_merge`
                         if let Ok(bytes) = std::fs::read(&merged_path) {
                             let key = format!("current/{rel}");
                             let _ = file_store.put(&ctx.repo_id, &key, &bytes).await;
@@ -2217,6 +2219,7 @@ async fn get_version_diff_handler(
     // Fallback paths for pre-blob-storage versions (local/SQLite mode or versions
     // created before content-addressable storage was introduced).
     let snapshot_dir = ctx.vai_dir.join("versions").join(&id).join("snapshot");
+    // ALLOW_FS: fallback for pre-blob local/SQLite mode versions
     let overlay_dir = workspace::overlay_dir(&ctx.vai_dir, &workspace_id.to_string());
     let file_store = ctx.storage.files();
 
@@ -2241,6 +2244,7 @@ async fn get_version_diff_handler(
                 .and_then(|b| String::from_utf8(b).ok())
                 .or_else(|| {
                     let p = snapshot_dir.join(&fc.path);
+                    // ALLOW_FS: fallback for pre-blob local/SQLite mode versions
                     if p.exists() { std::fs::read_to_string(&p).ok() } else { None }
                 })
         } else {
@@ -2266,6 +2270,7 @@ async fn get_version_diff_handler(
                 .and_then(|b| String::from_utf8(b).ok())
                 .or_else(|| {
                     let p = overlay_dir.join(&fc.path);
+                    // ALLOW_FS: fallback for pre-blob local/SQLite mode versions
                     if p.exists() { std::fs::read_to_string(&p).ok() } else { None }
                 })
         } else {
@@ -3292,11 +3297,14 @@ async fn upload_workspace_files_handler(
         }
 
         // Also write to local filesystem overlay as cache (best-effort for local mode).
+        // ALLOW_FS: local filesystem cache for SQLite mode; best-effort, errors ignored
         let overlay = workspace::overlay_dir(&ctx.vai_dir, &id);
         let dest = overlay.join(&rel);
         if let Some(parent) = dest.parent() {
+            // ALLOW_FS: local filesystem cache for SQLite mode; best-effort, errors ignored
             let _ = std::fs::create_dir_all(parent);
         }
+        // ALLOW_FS: local filesystem cache for SQLite mode; best-effort, errors ignored
         let _ = std::fs::write(&dest, &content);
 
         // Append event via storage trait (Postgres pg_notify + local event log).
@@ -3726,8 +3734,10 @@ async fn get_workspace_file_handler(
     }
 
     // 2. Try overlay from local filesystem (fallback for SQLite/local mode).
+    // ALLOW_FS: fallback for local/SQLite mode when FileStore has no overlay entry
     let overlay_path = workspace::overlay_dir(&ctx.vai_dir, &id).join(&rel);
     if overlay_path.exists() {
+        // ALLOW_FS: fallback for local/SQLite mode when FileStore has no overlay entry
         let bytes = std::fs::read(&overlay_path)
             .map_err(|e| ApiError::internal(format!("read overlay file: {e}")))?;
         let size = bytes.len();
@@ -3756,6 +3766,7 @@ async fn get_workspace_file_handler(
     if !base_path.exists() {
         return Err(ApiError::not_found(format!("file not found: '{path}'")));
     }
+    // ALLOW_FS: final fallback for local/SQLite mode and migration-seeded repos
     let bytes = std::fs::read(&base_path)
         .map_err(|e| ApiError::internal(format!("read base file: {e}")))?;
     let size = bytes.len();
@@ -3843,6 +3854,7 @@ fn read_vai_toml_ignore(repo_root: &std::path::Path) -> Vec<String> {
     if !path.exists() {
         return Vec::new();
     }
+    // ALLOW_FS: reads vai.toml config from repo root; valid in both local and server mode
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -4039,6 +4051,7 @@ async fn server_graph_refresh_handler(
     // Read ignore patterns from vai.toml (defaults if absent).
     let vai_toml_path = ctx.repo_root.join("vai.toml");
     let vai_toml: crate::repo::VaiToml = if vai_toml_path.exists() {
+        // ALLOW_FS: reads vai.toml config; tracked by issue #171 to also read from S3
         let raw = std::fs::read_to_string(&vai_toml_path)
             .map_err(|e| ApiError::internal(format!("read vai.toml: {e}")))?;
         toml::from_str(&raw)
@@ -4062,6 +4075,7 @@ async fn server_graph_refresh_handler(
             .to_string_lossy()
             .into_owned();
 
+        // ALLOW_FS: reads source files from disk; tracked by issue #171 to read from S3 in server mode
         let source = match std::fs::read(file_path) {
             Ok(b) => b,
             Err(_) => continue, // best-effort: skip unreadable files
@@ -4153,6 +4167,7 @@ async fn get_main_file_handler(
         return Err(ApiError::not_found(format!("file not found: '{path}'")));
     }
 
+    // ALLOW_FS: final fallback for local/SQLite mode and migration-seeded repos
     let content = std::fs::read(&file_path)
         .map_err(|e| ApiError::internal(format!("read file: {e}")))?;
 
@@ -6555,6 +6570,7 @@ impl RepoRegistry {
         if !path.exists() {
             return Ok(Self::default());
         }
+        // ALLOW_FS: multi-repo registry is a JSON file in storage_root; intentional disk storage
         let raw = std::fs::read_to_string(&path)?;
         serde_json::from_str(&raw).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
@@ -6564,6 +6580,7 @@ impl RepoRegistry {
         let path = storage_root.join("registry.json");
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // ALLOW_FS: multi-repo registry is a JSON file in storage_root; intentional disk storage
         std::fs::write(path, json)
     }
 
@@ -6600,6 +6617,7 @@ struct RepoResponse {
 impl RepoResponse {
     fn from_entry(entry: &RepoRegistryEntry) -> Self {
         let vai_dir = entry.path.join(".vai");
+        // ALLOW_FS: local mode repo listing; tracked by issue #173 to use Postgres in server mode
         let head_version = repo::read_head(&vai_dir).unwrap_or_else(|_| "unknown".to_string());
         let workspace_count = workspace::list(&vai_dir).map(|w| w.len()).unwrap_or(0);
         RepoResponse {
@@ -6669,6 +6687,7 @@ async fn create_repo_handler(
 
     // Create the directory and initialise the vai repo.
     let repo_root = storage_root.join(&body.name);
+    // ALLOW_FS: creates repo directory in storage_root; tracked by issue #173 to strip to config-only
     std::fs::create_dir_all(&repo_root).map_err(|e| ApiError::internal(e.to_string()))?;
 
     // repo::init is synchronous and may do significant I/O; run on the
@@ -7884,6 +7903,7 @@ async fn migration_stats_handler(
             .await
             .map_err(|e| ApiError::internal(format!("failed to count escalations: {e}")))?;
 
+    // ALLOW_FS: local mode fallback; best-effort, returns None in server mode
     let head_version = repo::read_head(&ctx.vai_dir).ok();
 
     Ok(Json(MigrationStatsResponse {
@@ -8730,6 +8750,7 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
     // Write PID file if requested.
     if let Some(ref pid_path) = config.pid_file {
         let pid = std::process::id();
+        // ALLOW_FS: PID file management for server process lifecycle
         std::fs::write(pid_path, format!("{}\n", pid))
             .map_err(ServerError::Io)?;
         tracing::info!("PID {} written to {}", pid, pid_path.display());
@@ -8762,6 +8783,7 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
 
     // Remove PID file on clean shutdown.
     if let Some(ref pid_path) = config.pid_file {
+        // ALLOW_FS: PID file management for server process lifecycle
         if let Err(e) = std::fs::remove_file(pid_path) {
             tracing::warn!("failed to remove PID file {}: {}", pid_path.display(), e);
         }
@@ -8813,6 +8835,7 @@ impl TmpDir {
 
 impl Drop for TmpDir {
     fn drop(&mut self) {
+        // ALLOW_FS: tmpdir cleanup for S3 submit merge engine scaffold
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -8841,30 +8864,37 @@ fn setup_tmpdir_for_s3_submit(
     current_head: &str,
 ) -> Result<TmpDir, ApiError> {
     let tmp_path = std::env::temp_dir().join(format!("vai-submit-{}", uuid::Uuid::new_v4()));
+    // ALLOW_FS: tmpdir scaffold required by the merge engine for S3 server-mode submit
     std::fs::create_dir_all(&tmp_path)
         .map_err(|e| ApiError::internal(format!("create tmpdir for submit: {e}")))?;
     let tmp = TmpDir(tmp_path);
     let vai = tmp.path().join(".vai");
 
     // HEAD file.
+    // ALLOW_FS: tmpdir scaffold required by the merge engine for S3 server-mode submit
     std::fs::create_dir_all(&vai)
         .map_err(|e| ApiError::internal(format!("create tmpdir/.vai: {e}")))?;
+    // ALLOW_FS: tmpdir scaffold required by the merge engine for S3 server-mode submit
     std::fs::write(vai.join("head"), format!("{current_head}\n"))
         .map_err(|e| ApiError::internal(format!("write tmpdir head: {e}")))?;
 
     // Workspace dir + meta.toml.
     let ws_dir = vai.join("workspaces").join(ws_meta.id.to_string());
+    // ALLOW_FS: tmpdir scaffold required by the merge engine for S3 server-mode submit
     std::fs::create_dir_all(&ws_dir)
         .map_err(|e| ApiError::internal(format!("create tmpdir workspace dir: {e}")))?;
+    // ALLOW_FS: tmpdir scaffold required by the merge engine for S3 server-mode submit
     workspace::update_meta(&vai, ws_meta)
         .map_err(|e| ApiError::internal(format!("write tmpdir workspace meta: {e}")))?;
 
     // Active workspace pointer (needed by diff::record_events → workspace::active).
+    // ALLOW_FS: tmpdir scaffold required by the merge engine for S3 server-mode submit
     std::fs::write(vai.join("workspaces").join("active"), ws_meta.id.to_string())
         .map_err(|e| ApiError::internal(format!("set tmpdir active workspace: {e}")))?;
 
     // Version TOML stub for current HEAD so next_version_id returns the right value.
     let versions_dir = vai.join("versions");
+    // ALLOW_FS: tmpdir scaffold required by the merge engine for S3 server-mode submit
     std::fs::create_dir_all(&versions_dir)
         .map_err(|e| ApiError::internal(format!("create tmpdir versions dir: {e}")))?;
     let stub_toml = format!(
@@ -8872,6 +8902,7 @@ fn setup_tmpdir_for_s3_submit(
          created_by = \"server\"\ncreated_at = \"{}\"\n",
         chrono::Utc::now().to_rfc3339()
     );
+    // ALLOW_FS: tmpdir scaffold required by the merge engine for S3 server-mode submit
     std::fs::write(versions_dir.join(format!("{current_head}.toml")), stub_toml)
         .map_err(|e| ApiError::internal(format!("write tmpdir version toml: {e}")))?;
 
@@ -8894,6 +8925,7 @@ fn collect_dir_recursive(
     cur: &std::path::Path,
     out: &mut Vec<(String, Vec<u8>)>,
 ) {
+    // ALLOW_FS: disk traversal helper used only by local SQLite mode path in submit handler
     let entries = match std::fs::read_dir(cur) {
         Ok(e) => e,
         Err(_) => return,
@@ -8910,6 +8942,7 @@ fn collect_dir_recursive(
             if rel.is_empty() {
                 continue;
             }
+            // ALLOW_FS: disk traversal helper used only by local SQLite mode path in submit handler
             if let Ok(bytes) = std::fs::read(&path) {
                 out.push((rel.to_owned(), bytes));
             }
