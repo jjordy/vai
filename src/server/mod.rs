@@ -6845,49 +6845,106 @@ async fn create_repo_handler(
         )));
     }
 
-    // Create the directory and initialise the vai repo.
     let repo_root = storage_root.join(&body.name);
-    // ALLOW_FS: creates repo directory in storage_root; tracked by issue #173 to strip to config-only
-    std::fs::create_dir_all(&repo_root).map_err(|e| ApiError::internal(e.to_string()))?;
+    let (repo_id, created_at) = match &state.storage {
+        // ── Server mode (Postgres / S3) ───────────────────────────────────────
+        // In server mode repo_root contains only .vai/config.toml.  All other
+        // state (event log, graph, workspace metadata, versions, HEAD) lives in
+        // Postgres/S3.  We avoid running the full `repo::init()` so that
+        // server-mode repos don't write source-file artefacts to disk.
+        crate::storage::StorageBackend::Server(ref pg)
+        | crate::storage::StorageBackend::ServerWithS3(ref pg, _)
+        | crate::storage::StorageBackend::ServerWithMemFs(ref pg, _) => {
+            let vai_dir = repo_root.join(".vai");
+            // ALLOW_FS: creates {storage_root}/{name}/.vai/ and writes config.toml only
+            std::fs::create_dir_all(&vai_dir)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    // repo::init is synchronous and may do significant I/O; run on the
-    // blocking thread pool so we don't stall the async executor.
-    let repo_root_clone = repo_root.clone();
-    let init_result = tokio::task::spawn_blocking(move || repo::init(&repo_root_clone))
-        .await
-        .map_err(|e| ApiError::internal(format!("task join error: {e}")))?
-        .map_err(|e| ApiError::internal(format!("vai init failed: {e}")))?;
+            let repo_id = uuid::Uuid::new_v4();
+            let created_at = chrono::Utc::now();
+            let config = crate::repo::RepoConfig {
+                repo_id,
+                name: body.name.clone(),
+                created_at,
+                vai_version: env!("CARGO_PKG_VERSION").to_string(),
+                remote: None,
+                server: None,
+            };
+            // ALLOW_FS: writes .vai/config.toml only — sole on-disk artefact in server mode
+            crate::repo::write_config(&vai_dir, &config)
+                .map_err(|e| ApiError::internal(format!("failed to write config.toml: {e}")))?;
 
-    let repo_id = init_result.config.repo_id;
+            // Insert repo row into Postgres.
+            sqlx::query("INSERT INTO repos (id, name, created_at) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING")
+                .bind(repo_id)
+                .bind(&body.name)
+                .bind(created_at)
+                .execute(pg.pool())
+                .await
+                .map_err(|e| ApiError::internal(format!("failed to insert repo into Postgres: {e}")))?;
+            tracing::debug!(repo_id = %repo_id, name = %body.name, "repo inserted into Postgres");
 
-    // If a Postgres backend is configured, insert the repo row so FK
-    // constraints on events, issues, versions, and workspaces are satisfied.
-    if let crate::storage::StorageBackend::Server(ref pg)
-    | crate::storage::StorageBackend::ServerWithS3(ref pg, _)
-    | crate::storage::StorageBackend::ServerWithMemFs(ref pg, _) = state.storage
-    {
-        sqlx::query("INSERT INTO repos (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
-            .bind(repo_id)
-            .bind(&body.name)
-            .execute(pg.pool())
-            .await
-            .map_err(|e| ApiError::internal(format!("failed to insert repo into Postgres: {e}")))?;
-        tracing::debug!(repo_id = %repo_id, name = %body.name, "repo inserted into Postgres");
-    }
+            // Seed the initial v1 version and HEAD in Postgres so version
+            // queries never return empty for a brand-new repo.
+            let v1 = crate::storage::NewVersion {
+                version_id: "v1".to_string(),
+                parent_version_id: None,
+                intent: "initial repository".to_string(),
+                created_by: "system".to_string(),
+                merge_event_id: None,
+            };
+            state
+                .storage
+                .versions()
+                .create_version(&repo_id, v1)
+                .await
+                .map_err(|e| ApiError::internal(format!("failed to create initial version: {e}")))?;
+            state
+                .storage
+                .versions()
+                .advance_head(&repo_id, "v1")
+                .await
+                .map_err(|e| ApiError::internal(format!("failed to advance head: {e}")))?;
+
+            (repo_id, created_at)
+        }
+
+        // ── Local mode (SQLite + filesystem) ──────────────────────────────────
+        // Run the full vai init so that the SQLite storage and filesystem-backed
+        // helpers (read_head, workspace::list) find the expected directory layout.
+        crate::storage::StorageBackend::Local(_) => {
+            // ALLOW_FS: local-mode repo init writes full .vai/ directory structure
+            let repo_root_clone = repo_root.clone();
+            let init_result = tokio::task::spawn_blocking(move || repo::init(&repo_root_clone))
+                .await
+                .map_err(|e| ApiError::internal(format!("task join error: {e}")))?
+                .map_err(|e| ApiError::internal(format!("vai init failed: {e}")))?;
+            let created_at = init_result.config.created_at;
+            (init_result.config.repo_id, created_at)
+        }
+    };
 
     let entry = RepoRegistryEntry {
         name: body.name.clone(),
         path: repo_root,
-        created_at: chrono::Utc::now(),
+        created_at,
     };
 
-    // Persist the updated registry.
+    // Persist the updated registry (used by repo_resolve_middleware to map name → path).
     registry.repos.push(entry.clone());
     registry.save(storage_root).map_err(|e| ApiError::internal(e.to_string()))?;
 
     tracing::info!(repo_id = %repo_id, name = %entry.name, path = %entry.path.display(), "repo registered");
 
-    Ok((StatusCode::CREATED, Json(RepoResponse::from_entry(&entry))))
+    // Build the response without additional filesystem reads.
+    let response = RepoResponse {
+        name: entry.name.clone(),
+        path: entry.path.display().to_string(),
+        created_at: entry.created_at.to_rfc3339(),
+        head_version: "v1".to_string(),
+        workspace_count: 0,
+    };
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 #[utoipa::path(
@@ -6909,6 +6966,59 @@ async fn list_repos_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<RepoResponse>>, ApiError> {
     require_server_admin(&identity)?;
+
+    // In server mode (Postgres), read repo list and stats from Postgres so that
+    // this handler works without touching the filesystem.
+    if let crate::storage::StorageBackend::Server(ref pg)
+    | crate::storage::StorageBackend::ServerWithS3(ref pg, _)
+    | crate::storage::StorageBackend::ServerWithMemFs(ref pg, _) = state.storage
+    {
+        use sqlx::Row as _;
+        let rows = sqlx::query("SELECT id, name, created_at FROM repos ORDER BY created_at ASC")
+            .fetch_all(pg.pool())
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to query repos: {e}")))?;
+
+        let mut responses = Vec::with_capacity(rows.len());
+        for row in rows {
+            let repo_id: uuid::Uuid = row.get("id");
+            let name: String = row.get("name");
+            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+
+            let head_version = state
+                .storage
+                .versions()
+                .read_head(&repo_id)
+                .await
+                .unwrap_or(None)
+                .unwrap_or_else(|| "v1".to_string());
+
+            let workspace_count = state
+                .storage
+                .workspaces()
+                .list_workspaces(&repo_id, false)
+                .await
+                .unwrap_or_default()
+                .len();
+
+            let path = state
+                .storage_root
+                .as_ref()
+                .map(|sr| sr.join(&name))
+                .unwrap_or_default();
+
+            responses.push(RepoResponse {
+                name,
+                path: path.display().to_string(),
+                created_at: created_at.to_rfc3339(),
+                head_version,
+                workspace_count,
+            });
+        }
+        return Ok(Json(responses));
+    }
+
+    // Local mode: read from the on-disk registry and filesystem.
     let storage_root = match state.storage_root.as_ref() {
         Some(sr) => sr,
         None => return Ok(Json(vec![])),
