@@ -165,6 +165,29 @@ pub struct IssueComment {
     pub created_at: DateTime<Utc>,
 }
 
+// ── Issue attachment ──────────────────────────────────────────────────────────
+
+/// A file attached to an issue.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct IssueAttachment {
+    /// Unique attachment identifier.
+    pub id: Uuid,
+    /// The issue this attachment belongs to.
+    pub issue_id: Uuid,
+    /// Original filename as uploaded.
+    pub filename: String,
+    /// MIME content type (e.g. `"image/png"`, `"text/plain"`).
+    pub content_type: String,
+    /// File size in bytes.
+    pub size_bytes: i64,
+    /// Storage key used to retrieve content from S3.
+    pub s3_key: String,
+    /// Username or agent ID that uploaded the file.
+    pub uploaded_by: String,
+    /// When the attachment was uploaded.
+    pub created_at: DateTime<Utc>,
+}
+
 // ── Agent source metadata ─────────────────────────────────────────────────────
 
 /// Source metadata attached to issues created by an agent.

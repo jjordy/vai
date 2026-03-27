@@ -27,11 +27,11 @@ use crate::version;
 use crate::workspace;
 
 use super::{
-    AuthStore, CommentStore, EscalationStore, EventStore, FileMetadata, FileStore, GraphStore,
-    IssueComment, IssueLink, IssueLinkStore, IssueStore, IssueUpdate, NewEscalation, NewIssue,
-    NewIssueComment, NewIssueLink, NewOrg,
-    NewUser, NewVersion, NewWorkspace, OrgMember, OrgRole, OrgStore, Organization,
-    RepoCollaborator, RepoRole, StorageError, User, VersionStore, WorkspaceStore, WorkspaceUpdate,
+    AttachmentStore, AuthStore, CommentStore, EscalationStore, EventStore, FileMetadata, FileStore,
+    GraphStore, IssueAttachment, IssueComment, IssueLink, IssueLinkStore, IssueStore, IssueUpdate,
+    NewEscalation, NewIssue, NewIssueAttachment, NewIssueComment, NewIssueLink, NewOrg, NewUser,
+    NewVersion, NewWorkspace, OrgMember, OrgRole, OrgStore, Organization, RepoCollaborator,
+    RepoRole, StorageError, User, VersionStore, WorkspaceStore, WorkspaceUpdate,
 };
 use crate::auth::ApiKey;
 use crate::escalation::{Escalation, ResolutionOption};
@@ -393,6 +393,50 @@ impl IssueLinkStore for SqliteStorage {
         _repo_id: &Uuid,
         _source_id: &Uuid,
         _target_id: &Uuid,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+// ── AttachmentStore ───────────────────────────────────────────────────────────
+
+#[async_trait]
+impl AttachmentStore for SqliteStorage {
+    async fn create_attachment(
+        &self,
+        _repo_id: &Uuid,
+        _issue_id: &Uuid,
+        _attachment: NewIssueAttachment,
+    ) -> Result<IssueAttachment, StorageError> {
+        Err(StorageError::Database(
+            "Issue attachments are not supported in local SQLite mode".into(),
+        ))
+    }
+
+    async fn list_attachments(
+        &self,
+        _repo_id: &Uuid,
+        _issue_id: &Uuid,
+    ) -> Result<Vec<IssueAttachment>, StorageError> {
+        Ok(vec![])
+    }
+
+    async fn get_attachment(
+        &self,
+        _repo_id: &Uuid,
+        _issue_id: &Uuid,
+        filename: &str,
+    ) -> Result<IssueAttachment, StorageError> {
+        Err(StorageError::NotFound(format!(
+            "attachment '{filename}' not found (SQLite mode)"
+        )))
+    }
+
+    async fn delete_attachment(
+        &self,
+        _repo_id: &Uuid,
+        _issue_id: &Uuid,
+        _filename: &str,
     ) -> Result<(), StorageError> {
         Ok(())
     }

@@ -8385,6 +8385,7 @@ impl utoipa::Modify for SecurityAddon {
             FileChangeType,
             PullFileEntry,
             FilesPullResponse,
+            crate::issue::IssueAttachment,
         )
     ),
     modifiers(&SecurityAddon),

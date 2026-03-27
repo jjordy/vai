@@ -444,6 +444,69 @@ pub trait IssueLinkStore: Send + Sync {
     ) -> Result<(), StorageError>;
 }
 
+// ── AttachmentStore ───────────────────────────────────────────────────────────
+
+/// Re-exported from `crate::issue` for use by storage trait consumers.
+pub use crate::issue::IssueAttachment;
+
+/// Input for creating a new issue attachment record.
+#[derive(Debug, Clone)]
+pub struct NewIssueAttachment {
+    /// Original filename as uploaded.
+    pub filename: String,
+    /// MIME content type.
+    pub content_type: String,
+    /// File size in bytes.
+    pub size_bytes: i64,
+    /// Storage key used to retrieve content from S3.
+    pub s3_key: String,
+    /// Username or agent ID that uploaded the file.
+    pub uploaded_by: String,
+}
+
+/// Storage for issue file attachments.
+///
+/// Metadata only — actual file bytes live in S3.
+#[async_trait]
+pub trait AttachmentStore: Send + Sync {
+    /// Persists attachment metadata and returns the stored record.
+    ///
+    /// Returns `StorageError::Conflict` if a file with the same filename
+    /// already exists on the issue.
+    async fn create_attachment(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+        attachment: NewIssueAttachment,
+    ) -> Result<IssueAttachment, StorageError>;
+
+    /// Lists all attachments for an issue, ordered by `created_at` ascending.
+    async fn list_attachments(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+    ) -> Result<Vec<IssueAttachment>, StorageError>;
+
+    /// Fetches a single attachment by filename.
+    async fn get_attachment(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+        filename: &str,
+    ) -> Result<IssueAttachment, StorageError>;
+
+    /// Deletes an attachment record.
+    ///
+    /// The caller is responsible for also deleting the S3 object.
+    /// Succeeds even if the attachment did not exist.
+    async fn delete_attachment(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+        filename: &str,
+    ) -> Result<(), StorageError>;
+}
+
 // ── IssueStore ────────────────────────────────────────────────────────────────
 
 /// CRUD storage for issues.
@@ -1340,6 +1403,19 @@ impl StorageBackend {
             StorageBackend::Server(s)
             | StorageBackend::ServerWithS3(s, _)
             | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn OrgStore>,
+        }
+    }
+
+    /// Returns the issue attachment metadata store.
+    ///
+    /// Only meaningful for Postgres-backed variants — the local SQLite backend
+    /// returns a stub that errors on write and returns empty lists on read.
+    pub fn attachments(&self) -> Arc<dyn AttachmentStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn AttachmentStore>,
+            StorageBackend::Server(s)
+            | StorageBackend::ServerWithS3(s, _)
+            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn AttachmentStore>,
         }
     }
 

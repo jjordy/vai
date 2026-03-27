@@ -35,16 +35,17 @@ use crate::escalation::{
 };
 use crate::event_log::{Event, EventKind};
 use crate::graph::{Entity, EntityKind, Relationship, RelationshipKind};
-use crate::issue::{AgentSource, Issue, IssueFilter, IssuePriority, IssueStatus};
+use crate::issue::{AgentSource, Issue, IssueAttachment, IssueFilter, IssuePriority, IssueStatus};
 use crate::version::VersionMeta;
 use crate::workspace::{WorkspaceMeta, WorkspaceStatus};
 
 use super::{
-    AuthStore, CommentStore, EscalationStore, EventFilter, EventStore, FileMetadata, FileStore,
-    GraphStore, IssueComment, IssueLink, IssueLinkRelationship, IssueLinkStore, IssueStore,
-    IssueUpdate, NewEscalation, NewIssue, NewIssueComment, NewIssueLink,
-    NewOrg, NewUser, NewVersion, NewWorkspace, OrgMember, OrgRole, OrgStore, Organization,
-    RepoCollaborator, RepoRole, StorageError, User, VersionStore, WorkspaceStore, WorkspaceUpdate,
+    AttachmentStore, AuthStore, CommentStore, EscalationStore, EventFilter, EventStore,
+    FileMetadata, FileStore, GraphStore, IssueComment, IssueLink, IssueLinkRelationship,
+    IssueLinkStore, IssueStore, IssueUpdate, NewEscalation, NewIssue, NewIssueAttachment,
+    NewIssueComment, NewIssueLink, NewOrg, NewUser, NewVersion, NewWorkspace, OrgMember, OrgRole,
+    OrgStore, Organization, RepoCollaborator, RepoRole, StorageError, User, VersionStore,
+    WorkspaceStore, WorkspaceUpdate,
 };
 
 // ── PostgresStorage ───────────────────────────────────────────────────────────
@@ -2084,5 +2085,139 @@ impl OrgStore for PostgresStorage {
             (Some(r), None) | (None, Some(r)) => Some(r),
             (None, None) => None,
         })
+    }
+}
+
+// ── AttachmentStore ───────────────────────────────────────────────────────────
+
+#[async_trait]
+impl AttachmentStore for PostgresStorage {
+    async fn create_attachment(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+        attachment: NewIssueAttachment,
+    ) -> Result<IssueAttachment, StorageError> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO issue_attachments
+                (repo_id, issue_id, filename, content_type, size_bytes, s3_key, uploaded_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, issue_id, filename, content_type, size_bytes, s3_key, uploaded_by, created_at
+            "#,
+        )
+        .bind(repo_id)
+        .bind(issue_id)
+        .bind(&attachment.filename)
+        .bind(&attachment.content_type)
+        .bind(attachment.size_bytes)
+        .bind(&attachment.s3_key)
+        .bind(&attachment.uploaded_by)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("unique") || msg.contains("duplicate") {
+                StorageError::Conflict(format!(
+                    "attachment '{}' already exists on this issue",
+                    attachment.filename
+                ))
+            } else {
+                StorageError::Database(msg)
+            }
+        })?;
+
+        Ok(IssueAttachment {
+            id: row.get("id"),
+            issue_id: row.get("issue_id"),
+            filename: row.get("filename"),
+            content_type: row.get("content_type"),
+            size_bytes: row.get("size_bytes"),
+            s3_key: row.get("s3_key"),
+            uploaded_by: row.get("uploaded_by"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn list_attachments(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+    ) -> Result<Vec<IssueAttachment>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT id, issue_id, filename, content_type, size_bytes, s3_key, uploaded_by, created_at \
+             FROM issue_attachments \
+             WHERE repo_id = $1 AND issue_id = $2 \
+             ORDER BY created_at ASC",
+        )
+        .bind(repo_id)
+        .bind(issue_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| IssueAttachment {
+                id: row.get("id"),
+                issue_id: row.get("issue_id"),
+                filename: row.get("filename"),
+                content_type: row.get("content_type"),
+                size_bytes: row.get("size_bytes"),
+                s3_key: row.get("s3_key"),
+                uploaded_by: row.get("uploaded_by"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
+    }
+
+    async fn get_attachment(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+        filename: &str,
+    ) -> Result<IssueAttachment, StorageError> {
+        let row = sqlx::query(
+            "SELECT id, issue_id, filename, content_type, size_bytes, s3_key, uploaded_by, created_at \
+             FROM issue_attachments \
+             WHERE repo_id = $1 AND issue_id = $2 AND filename = $3",
+        )
+        .bind(repo_id)
+        .bind(issue_id)
+        .bind(filename)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .ok_or_else(|| StorageError::NotFound(format!("attachment '{filename}' not found")))?;
+
+        Ok(IssueAttachment {
+            id: row.get("id"),
+            issue_id: row.get("issue_id"),
+            filename: row.get("filename"),
+            content_type: row.get("content_type"),
+            size_bytes: row.get("size_bytes"),
+            s3_key: row.get("s3_key"),
+            uploaded_by: row.get("uploaded_by"),
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn delete_attachment(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+        filename: &str,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "DELETE FROM issue_attachments WHERE repo_id = $1 AND issue_id = $2 AND filename = $3",
+        )
+        .bind(repo_id)
+        .bind(issue_id)
+        .bind(filename)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(())
     }
 }
