@@ -1572,7 +1572,39 @@ async fn submit_workspace_handler(
     // Make it the active workspace so merge::submit can find it.
     workspace::switch(&ctx.vai_dir, &id).map_err(ApiError::from)?;
 
-    match merge::submit(&ctx.vai_dir, &ctx.repo_root) {
+    // In ServerWithS3 mode use S3MergeFs so the merge engine reads files
+    // directly from S3 and buffers writes in memory.  flush() is called after
+    // a successful merge to persist the merged base state and snapshots.
+    // In all other modes fall back to the disk-based merge::submit path.
+    let using_s3_merge = matches!(
+        &ctx.storage,
+        crate::storage::StorageBackend::ServerWithS3(_, _)
+    );
+    let submit_result = if using_s3_merge {
+        let s3_fs = crate::merge_fs::S3MergeFs::new(
+            ctx.storage.files(),
+            ctx.repo_id,
+            format!("workspaces/{id}/"),
+            "current/".to_string(),
+        );
+        let result = merge::submit_with_fs(
+            &s3_fs,
+            &ctx.vai_dir,
+            &meta,
+            meta.deleted_paths.clone(),
+        );
+        if result.is_ok() {
+            s3_fs
+                .flush()
+                .await
+                .map_err(|e| ApiError::internal(format!("S3MergeFs flush: {e}")))?;
+        }
+        result
+    } else {
+        merge::submit(&ctx.vai_dir, &ctx.repo_root)
+    };
+
+    match submit_result {
         Ok(result) => {
             // Remove from conflict engine — workspace is no longer active.
             state.conflict_engine.lock().await.remove_workspace(&workspace_uuid);
@@ -1605,9 +1637,18 @@ async fn submit_workspace_handler(
                 )
                 .await;
 
-            // Persist pre-change snapshot to FileStore so diffs survive container
-            // restarts and cross-server migrations.
-            {
+            // Persist pre-change snapshot and update "current/" in S3.
+            //
+            // In S3MergeFs mode both are already handled by flush() above:
+            // - save_pre_change_snapshot wrote snapshot files to pending_writes
+            //   which were flushed to `versions/{ver}/snapshot/` in S3.
+            // - apply_overlay wrote merged base files to pending_writes which
+            //   were flushed to `current/` in S3.
+            //
+            // In disk mode we read from the local vai_dir tree and repo_root.
+            if !using_s3_merge {
+                // Persist pre-change snapshot to FileStore so diffs survive container
+                // restarts and cross-server migrations.
                 let snap_dir = ctx.vai_dir
                     .join("versions")
                     .join(&result.version.version_id)
@@ -1617,15 +1658,12 @@ async fn submit_workspace_handler(
                     let key = format!("versions/{}/snapshot/{rel}", result.version.version_id);
                     let _ = file_store.put(&ctx.repo_id, &key, &bytes).await;
                 }
-            }
 
-            // Update "current/" prefix in S3 with the full repo state.
-            // The download handler and diff engine use this as the base.
-            // Read from repo_root (post-merge disk state) so that semantic merges
-            // write the combined result, not just the workspace's raw overlay.
-            {
+                // Update "current/" prefix in S3 with the full repo state.
+                // The download handler and diff engine use this as the base.
+                // Read from repo_root (post-merge disk state) so that semantic merges
+                // write the combined result, not just the workspace's raw overlay.
                 let overlay = workspace::overlay_dir(&ctx.vai_dir, &id);
-                let file_store = ctx.storage.files();
                 if overlay.exists() {
                     for (rel, _) in collect_dir_files_with_content(&overlay) {
                         // Read merged content from repo_root rather than overlay.
