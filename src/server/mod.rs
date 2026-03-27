@@ -1610,6 +1610,20 @@ async fn submit_workspace_handler(
                 }
             }
 
+            // Update "current/" prefix in S3 with the full repo state.
+            // The download handler and diff engine use this as the base.
+            // Apply overlay files on top of the existing current/ state.
+            {
+                let overlay = workspace::overlay_dir(&ctx.vai_dir, &id);
+                let file_store = ctx.storage.files();
+                if overlay.exists() {
+                    for (rel, bytes) in collect_dir_files_with_content(&overlay) {
+                        let key = format!("current/{rel}");
+                        let _ = file_store.put(&ctx.repo_id, &key, &bytes).await;
+                    }
+                }
+            }
+
             // Append event to event store — triggers pg_notify in Postgres mode.
             let _ = ctx.storage.events()
                 .append(&ctx.repo_id, EventKind::WorkspaceSubmitted {
@@ -3058,9 +3072,14 @@ async fn upload_workspace_files_handler(
 ) -> Result<(StatusCode, Json<UploadFilesResponse>), ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
     let _lock = state.repo_lock.lock().await;
-    let mut meta = workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
-    let overlay = workspace::overlay_dir(&ctx.vai_dir, &id);
-    let log_dir = ctx.vai_dir.join("event_log");
+
+    // Read workspace metadata from storage (works in both local SQLite and Postgres modes).
+    let ws_uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::not_found(format!("workspace `{id}` not found")))?;
+    let meta = ctx.storage.workspaces()
+        .get_workspace(&ctx.repo_id, &ws_uuid)
+        .await
+        .map_err(ApiError::from)?;
     let workspace_uuid = meta.id;
 
     let mut uploaded_paths: Vec<String> = Vec::new();
@@ -3084,74 +3103,65 @@ async fn upload_workspace_files_handler(
         let rel = sanitize_path(&entry.path)
             .ok_or_else(|| ApiError::bad_request(format!("invalid path: '{}'", entry.path)))?;
 
-        let dest = overlay.join(&rel);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ApiError::internal(format!("create dirs: {e}")))?;
-        }
+        let path_str = rel.to_string_lossy().replace('\\', "/");
 
-        // Determine whether this is an add or a modify.
+        // Determine whether this is an add or a modify by checking the FileStore.
         let new_hash = sha256_hex(&content);
-        let is_new = !dest.exists();
-        let (old_hash, old_content) = if !is_new {
-            let bytes = std::fs::read(&dest)
-                .map_err(|e| ApiError::internal(format!("read existing overlay file: {e}")))?;
-            let hash = sha256_hex(&bytes);
-            (hash, Some(bytes))
-        } else {
-            (String::new(), None)
-        };
+        let store_key = format!("workspaces/{}/{}", id, path_str);
+        let file_store = ctx.storage.files();
+        let existing = file_store.get(&ctx.repo_id, &store_key).await.ok();
+        let is_new = existing.is_none();
+        let old_hash = existing.as_ref().map(|bytes| sha256_hex(bytes)).unwrap_or_default();
 
-        // Clone hashes before they are moved into the event log record.
         let new_hash_blob = new_hash.clone();
         let old_hash_blob = old_hash.clone();
 
-        std::fs::write(&dest, &content)
-            .map_err(|e| ApiError::internal(format!("write overlay file: {e}")))?;
+        // Write to FileStore (primary storage — works in both S3 and local modes).
+        file_store.put(&ctx.repo_id, &store_key, &content).await
+            .map_err(|e| ApiError::internal(format!("write overlay file to store: {e}")))?;
+        // Also store content-addressably by hash for diffs.
+        let _ = file_store.put(&ctx.repo_id, &format!("blobs/{new_hash_blob}"), &content).await;
+        if let Some(old_bytes) = existing {
+            let _ = file_store.put(&ctx.repo_id, &format!("blobs/{old_hash_blob}"), &old_bytes).await;
+        }
 
-        // Append to event log.
-        let path_str = rel.to_string_lossy().replace('\\', "/");
-        let mut log = EventLog::open(&log_dir)
-            .map_err(|e| ApiError::internal(format!("event log: {e}")))?;
-        if is_new {
-            log.append(EventKind::FileAdded {
+        // Also write to local filesystem overlay as cache (best-effort for local mode).
+        let overlay = workspace::overlay_dir(&ctx.vai_dir, &id);
+        let dest = overlay.join(&rel);
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&dest, &content);
+
+        // Append event via storage trait (Postgres pg_notify + local event log).
+        let event_kind = if is_new {
+            EventKind::FileAdded {
                 workspace_id: workspace_uuid,
                 path: path_str.clone(),
                 hash: new_hash,
-            })
-            .map_err(|e| ApiError::internal(format!("event log append: {e}")))?;
+            }
         } else {
-            log.append(EventKind::FileModified {
+            EventKind::FileModified {
                 workspace_id: workspace_uuid,
                 path: path_str.clone(),
                 old_hash,
                 new_hash,
-            })
-            .map_err(|e| ApiError::internal(format!("event log append: {e}")))?;
-        }
-
-        // Persist to FileStore for durable diff generation (server/S3 deployments).
-        {
-            let file_store = ctx.storage.files();
-            let store_key = format!("workspaces/{}/{}", id, path_str);
-            let _ = file_store.put(&ctx.repo_id, &store_key, &content).await;
-            // Also store content-addressably by hash so diffs can be computed for
-            // all versions (including migrated ones) without relying on snapshots.
-            let _ = file_store.put(&ctx.repo_id, &format!("blobs/{new_hash_blob}"), &content).await;
-            if let Some(old_bytes) = old_content {
-                let _ = file_store.put(&ctx.repo_id, &format!("blobs/{old_hash_blob}"), &old_bytes).await;
             }
-        }
+        };
+        let _ = ctx.storage.events().append(&ctx.repo_id, event_kind).await;
 
         uploaded_paths.push(path_str);
     }
 
     // Transition workspace to Active on first file upload.
     if meta.status == workspace::WorkspaceStatus::Created && !uploaded_paths.is_empty() {
-        meta.status = workspace::WorkspaceStatus::Active;
-        meta.updated_at = chrono::Utc::now();
-        workspace::update_meta(&ctx.vai_dir, &meta)
-            .map_err(|e| ApiError::internal(format!("update workspace meta: {e}")))?;
+        let update = crate::storage::WorkspaceUpdate {
+            status: Some(workspace::WorkspaceStatus::Active),
+            issue_id: None,
+        };
+        let _ = ctx.storage.workspaces()
+            .update_workspace(&ctx.repo_id, &workspace_uuid, update)
+            .await;
     }
 
     // Broadcast a WebSocket notification.
@@ -3258,34 +3268,72 @@ async fn get_workspace_file_handler(
         .cloned()
         .ok_or_else(|| ApiError::bad_request("missing `*path` wildcard"))?;
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    // Verify workspace exists.
-    workspace::get(&ctx.vai_dir, &id).map_err(ApiError::from)?;
+
+    // Verify workspace exists via storage trait (works in both SQLite and Postgres modes).
+    let ws_uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::not_found(format!("workspace `{id}` not found")))?;
+    ctx.storage.workspaces()
+        .get_workspace(&ctx.repo_id, &ws_uuid)
+        .await
+        .map_err(ApiError::from)?;
 
     let rel = sanitize_path(&path)
         .ok_or_else(|| ApiError::bad_request(format!("invalid path: '{path}'")))?;
+    let path_str = rel.to_string_lossy().replace('\\', "/");
 
-    // Try overlay first.
+    let file_store = ctx.storage.files();
+
+    // 1. Try overlay from storage (primary path for Postgres/S3 mode).
+    let overlay_key = format!("workspaces/{id}/{path_str}");
+    if let Ok(bytes) = file_store.get(&ctx.repo_id, &overlay_key).await {
+        let size = bytes.len();
+        return Ok(Json(FileDownloadResponse {
+            path: path_str,
+            content_base64: BASE64.encode(&bytes),
+            size,
+            found_in: "overlay".to_string(),
+        }));
+    }
+
+    // 2. Try overlay from local filesystem (fallback for SQLite/local mode).
     let overlay_path = workspace::overlay_dir(&ctx.vai_dir, &id).join(&rel);
-    let (content, found_in) = if overlay_path.exists() {
+    if overlay_path.exists() {
         let bytes = std::fs::read(&overlay_path)
             .map_err(|e| ApiError::internal(format!("read overlay file: {e}")))?;
-        (bytes, "overlay".to_string())
-    } else {
-        let base_path = ctx.repo_root.join(&rel);
-        if !base_path.exists() {
-            return Err(ApiError::not_found(format!("file not found: '{path}'")));
-        }
-        let bytes = std::fs::read(&base_path)
-            .map_err(|e| ApiError::internal(format!("read base file: {e}")))?;
-        (bytes, "base".to_string())
-    };
+        let size = bytes.len();
+        return Ok(Json(FileDownloadResponse {
+            path: path_str,
+            content_base64: BASE64.encode(&bytes),
+            size,
+            found_in: "overlay".to_string(),
+        }));
+    }
 
-    let size = content.len();
+    // 3. Try base from storage `current/` prefix (set by submit handler after each merge).
+    let current_key = format!("current/{path_str}");
+    if let Ok(bytes) = file_store.get(&ctx.repo_id, &current_key).await {
+        let size = bytes.len();
+        return Ok(Json(FileDownloadResponse {
+            path: path_str,
+            content_base64: BASE64.encode(&bytes),
+            size,
+            found_in: "base".to_string(),
+        }));
+    }
+
+    // 4. Final fallback: read from repo root on disk (local/SQLite mode, migration).
+    let base_path = ctx.repo_root.join(&rel);
+    if !base_path.exists() {
+        return Err(ApiError::not_found(format!("file not found: '{path}'")));
+    }
+    let bytes = std::fs::read(&base_path)
+        .map_err(|e| ApiError::internal(format!("read base file: {e}")))?;
+    let size = bytes.len();
     Ok(Json(FileDownloadResponse {
-        path: rel.to_string_lossy().replace('\\', "/"),
-        content_base64: BASE64.encode(&content),
+        path: path_str,
+        content_base64: BASE64.encode(&bytes),
         size,
-        found_in,
+        found_in: "base".to_string(),
     }))
 }
 
@@ -3319,10 +3367,12 @@ async fn list_repo_files_handler(
     ctx: RepoCtx,
 ) -> Result<Json<RepoFileListResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    let head_version = std::fs::read_to_string(ctx.vai_dir.join("head"))
+    // Read HEAD from storage trait (works in both SQLite and Postgres modes).
+    let head_version = ctx.storage.versions()
+        .read_head(&ctx.repo_id)
+        .await
         .map_err(|e| ApiError::internal(format!("read head: {e}")))?
-        .trim()
-        .to_string();
+        .unwrap_or_else(|| "v0".to_string());
 
     let vai_toml_ignore = read_vai_toml_ignore(&ctx.repo_root);
     let mut files =
@@ -3580,7 +3630,21 @@ async fn get_main_file_handler(
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let rel = sanitize_path(&path)
         .ok_or_else(|| ApiError::bad_request(format!("invalid path: '{path}'")))?;
+    let path_str = rel.to_string_lossy().replace('\\', "/");
 
+    // Try storage `current/` prefix first (populated by submit handler — works in Postgres mode).
+    let current_key = format!("current/{path_str}");
+    if let Ok(bytes) = ctx.storage.files().get(&ctx.repo_id, &current_key).await {
+        let size = bytes.len();
+        return Ok(Json(FileDownloadResponse {
+            path: path_str,
+            content_base64: BASE64.encode(&bytes),
+            size,
+            found_in: "base".to_string(),
+        }));
+    }
+
+    // Fallback: read from repo root on disk (local mode and migration-seeded servers).
     let file_path = ctx.repo_root.join(&rel);
     if !file_path.exists() {
         return Err(ApiError::not_found(format!("file not found: '{path}'")));
@@ -3591,7 +3655,7 @@ async fn get_main_file_handler(
 
     let size = content.len();
     Ok(Json(FileDownloadResponse {
-        path: rel.to_string_lossy().replace('\\', "/"),
+        path: path_str,
         content_base64: BASE64.encode(&content),
         size,
         found_in: "base".to_string(),
@@ -3713,20 +3777,62 @@ async fn files_download_handler(
         .flatten()
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Collect file paths to include in the archive (respects .gitignore, .vaignore, vai.toml).
+    // Build the current repo state: start with local disk as base, then
+    // overlay all merged workspace files from S3 in chronological order.
+    // This reconstructs the true current state even though the local disk
+    // may be stale (it was only written during migration).
     let vai_toml_ignore = read_vai_toml_ignore(&ctx.repo_root);
-    let mut rel_paths =
+    let rel_paths =
         crate::ignore_rules::collect_all_files_relative(&ctx.repo_root, &vai_toml_ignore);
-    rel_paths.sort();
 
-    // Build an in-memory tar.gz archive.
+    // Start with base files from local disk.
+    let mut file_map: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for rel in &rel_paths {
+        let full = ctx.repo_root.join(rel);
+        if let Ok(content) = std::fs::read(&full) {
+            file_map.insert(rel.clone(), content);
+        }
+    }
+
+    // Layer merged workspace overlays on top, in chronological order.
+    let file_store = ctx.storage.files();
+    let mut all_workspaces = ctx.storage.workspaces()
+        .list_workspaces(&ctx.repo_id, true)
+        .await
+        .unwrap_or_default();
+    // Keep only merged, sort by created_at ascending.
+    all_workspaces.retain(|w| w.status == crate::workspace::WorkspaceStatus::Merged);
+    all_workspaces.sort_by_key(|w| w.created_at);
+    let merged_workspaces: Vec<uuid::Uuid> = all_workspaces.iter().map(|w| w.id).collect();
+
+    for ws_id in &merged_workspaces {
+        let prefix = format!("workspaces/{ws_id}/");
+        if let Ok(ws_files) = file_store.list(&ctx.repo_id, &prefix).await {
+            for fm in ws_files {
+                let rel = fm
+                    .path
+                    .strip_prefix(&prefix)
+                    .unwrap_or(&fm.path)
+                    .to_string();
+                if rel.is_empty() {
+                    continue;
+                }
+                if let Ok(content) = file_store.get(&ctx.repo_id, &fm.path).await {
+                    file_map.insert(rel, content);
+                }
+            }
+        }
+    }
+
+    // Build the tarball from the merged file map.
+    let mut sorted_paths: Vec<String> = file_map.keys().cloned().collect();
+    sorted_paths.sort();
+
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     {
         let mut archive = tar::Builder::new(&mut encoder);
-        for rel in &rel_paths {
-            let full = ctx.repo_root.join(rel);
-            let content = std::fs::read(&full)
-                .map_err(|e| ApiError::internal(format!("read file '{rel}': {e}")))?;
+        for rel in &sorted_paths {
+            let content = &file_map[rel];
             let mut header = tar::Header::new_gnu();
             header.set_size(content.len() as u64);
             header.set_mode(0o644);
@@ -7770,13 +7876,13 @@ async fn prepare_workspace_for_submit(
     let ws_dir = ctx.vai_dir.join("workspaces").join(&ws_id);
     let overlay_dir = ws_dir.join("overlay");
 
-    // ── 1. Create workspace directory and meta.toml if missing ────────────────
-    if !ws_dir.exists() {
-        std::fs::create_dir_all(&overlay_dir)
-            .map_err(|e| ApiError::internal(format!("create workspace dir: {e}")))?;
-        workspace::update_meta(&ctx.vai_dir, ws_meta)
-            .map_err(|e| ApiError::internal(format!("write workspace meta: {e}")))?;
-    }
+    // ── 1. Create workspace directory and meta.toml ────────────────────────────
+    // Always ensure both exist — the directory may have been created by a prior
+    // failed attempt without the meta.toml, or the meta.toml may be stale.
+    std::fs::create_dir_all(&overlay_dir)
+        .map_err(|e| ApiError::internal(format!("create workspace dir: {e}")))?;
+    workspace::update_meta(&ctx.vai_dir, ws_meta)
+        .map_err(|e| ApiError::internal(format!("write workspace meta: {e}")))?;
 
     // ── 2. Download overlay files from FileStore if the overlay is empty ──────
     let overlay_is_empty = std::fs::read_dir(&overlay_dir)

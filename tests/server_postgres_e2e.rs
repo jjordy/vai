@@ -654,3 +654,122 @@ async fn test_concurrent_agents() {
 
     shutdown_tx.send(()).ok();
 }
+
+// ── Workspace file download before submit ─────────────────────────────────────
+
+/// Verifies that `GET /api/repos/:repo/workspaces/:id/files/*path` returns the
+/// uploaded overlay content via the storage trait **before** submit — i.e. it
+/// must not require a `.vai/` directory on disk.
+///
+/// This is a regression guard for the filesystem fallback bug described in
+/// issue #154, where the handler used `workspace::get()` + `std::fs::read()`
+/// which silently failed in Postgres-only mode.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_workspace_file_download_before_submit() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start_for_testing_pg_multi_repo failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": "e2e-file-download" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // Create an issue and claim it (creates a workspace).
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "file download test",
+            "description": "test workspace file download via storage",
+            "priority": "medium"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    let issue_id = issue["id"].as_str().unwrap();
+
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim: {}", resp.text().await.unwrap_or_default());
+    let claim: serde_json::Value = resp.json().await.unwrap();
+    let ws_id = claim["workspace_id"].as_str().unwrap().to_string();
+
+    // Upload a file into the workspace overlay.
+    let file_content = b"fn main() { println!(\"hello\"); }\n";
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws_id}/files"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "files": [{
+                "path": "src/main.rs",
+                "content_base64": b64(file_content)
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload: {}", resp.text().await.unwrap_or_default());
+
+    // Download the file BEFORE submit — must succeed using storage trait, not filesystem.
+    let resp = client
+        .get(format!("{rp}/workspaces/{ws_id}/files/src/main.rs"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "workspace file download before submit failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let download: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        download["found_in"].as_str().unwrap_or(""),
+        "overlay",
+        "file must be found in overlay"
+    );
+    let decoded = BASE64
+        .decode(download["content_base64"].as_str().unwrap())
+        .expect("base64 decode");
+    assert_eq!(decoded, file_content, "downloaded content must match uploaded content");
+
+    // Also verify list_repo_files returns head_version from storage (not filesystem).
+    // HEAD is "v0" when no versions exist yet, not an error.
+    let resp = client
+        .get(format!("{rp}/files"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "list repo files: {}", resp.text().await.unwrap_or_default());
+    let files_resp: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        files_resp["head_version"].as_str().is_some(),
+        "head_version must be present in repo files response"
+    );
+
+    shutdown_tx.send(()).ok();
+}
