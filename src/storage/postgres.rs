@@ -42,7 +42,8 @@ use crate::workspace::{WorkspaceMeta, WorkspaceStatus};
 
 use super::{
     AuthStore, CommentStore, EscalationStore, EventFilter, EventStore, FileMetadata, FileStore,
-    GraphStore, IssueComment, IssueStore, IssueUpdate, NewEscalation, NewIssue, NewIssueComment,
+    GraphStore, IssueComment, IssueLink, IssueLinkRelationship, IssueLinkStore, IssueStore,
+    IssueUpdate, NewEscalation, NewIssue, NewIssueComment, NewIssueLink,
     NewOrg, NewUser, NewVersion, NewWorkspace, OrgMember, OrgRole, OrgStore, Organization,
     RepoCollaborator, RepoRole, StorageError, User, VersionStore, WorkspaceStore, WorkspaceUpdate,
 };
@@ -703,6 +704,94 @@ impl CommentStore for PostgresStorage {
                 created_at: row.get("created_at"),
             })
             .collect())
+    }
+}
+
+// ── IssueLinkStore ────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl IssueLinkStore for PostgresStorage {
+    async fn create_link(
+        &self,
+        repo_id: &Uuid,
+        source_id: &Uuid,
+        link: NewIssueLink,
+    ) -> Result<IssueLink, StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO issue_links (repo_id, source_id, target_id, relationship)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (source_id, target_id) DO UPDATE SET relationship = $4
+            "#,
+        )
+        .bind(repo_id)
+        .bind(source_id)
+        .bind(&link.target_id)
+        .bind(link.relationship.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(IssueLink {
+            source_id: *source_id,
+            target_id: link.target_id,
+            relationship: link.relationship,
+        })
+    }
+
+    async fn list_links(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+    ) -> Result<Vec<IssueLink>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT source_id, target_id, relationship
+            FROM issue_links
+            WHERE repo_id = $1 AND (source_id = $2 OR target_id = $2)
+            "#,
+        )
+        .bind(repo_id)
+        .bind(issue_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let source_id: Uuid = row.get("source_id");
+                let target_id: Uuid = row.get("target_id");
+                let rel_str: String = row.get("relationship");
+                let relationship =
+                    IssueLinkRelationship::from_str(&rel_str).unwrap_or(IssueLinkRelationship::RelatesTo);
+                // Return raw direction so API handlers can apply correct inverse strings.
+                IssueLink {
+                    source_id,
+                    target_id,
+                    relationship,
+                }
+            })
+            .collect())
+    }
+
+    async fn delete_link(
+        &self,
+        repo_id: &Uuid,
+        source_id: &Uuid,
+        target_id: &Uuid,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "DELETE FROM issue_links WHERE repo_id = $1 AND source_id = $2 AND target_id = $3",
+        )
+        .bind(repo_id)
+        .bind(source_id)
+        .bind(target_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(())
     }
 }
 

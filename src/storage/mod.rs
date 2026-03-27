@@ -341,6 +341,103 @@ pub trait CommentStore: Send + Sync {
     ) -> Result<Vec<IssueComment>, StorageError>;
 }
 
+// ── IssueLinkStore ────────────────────────────────────────────────────────────
+
+/// The directional relationship type between two issues.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IssueLinkRelationship {
+    /// Source issue blocks target issue.
+    Blocks,
+    /// Source and target issues are related (symmetric).
+    RelatesTo,
+    /// Source issue duplicates target issue.
+    Duplicates,
+}
+
+impl IssueLinkRelationship {
+    /// Parse from the string stored in the database.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "blocks" => Some(Self::Blocks),
+            "relates-to" => Some(Self::RelatesTo),
+            "duplicates" => Some(Self::Duplicates),
+            _ => None,
+        }
+    }
+
+    /// Serialize to the string stored in the database.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Blocks => "blocks",
+            Self::RelatesTo => "relates-to",
+            Self::Duplicates => "duplicates",
+        }
+    }
+
+    /// The inverse relationship label (used for bidirectional responses).
+    pub fn inverse_str(&self) -> &'static str {
+        match self {
+            Self::Blocks => "is-blocked-by",
+            Self::RelatesTo => "relates-to",
+            Self::Duplicates => "is-duplicated-by",
+        }
+    }
+}
+
+/// A directional link between two issues.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueLink {
+    /// The issue that owns this link (the "from" side).
+    pub source_id: Uuid,
+    /// The related issue (the "to" side).
+    pub target_id: Uuid,
+    /// The nature of the relationship, from source to target.
+    pub relationship: IssueLinkRelationship,
+}
+
+/// Input for creating a new issue link.
+#[derive(Debug, Clone)]
+pub struct NewIssueLink {
+    /// The target issue to link to.
+    pub target_id: Uuid,
+    /// The relationship from the caller's issue to the target.
+    pub relationship: IssueLinkRelationship,
+}
+
+/// Storage for issue links.
+#[async_trait]
+pub trait IssueLinkStore: Send + Sync {
+    /// Creates a directional link between `source_id` and `target_id`.
+    ///
+    /// Returns `StorageError::AlreadyExists` if the link already exists.
+    async fn create_link(
+        &self,
+        repo_id: &Uuid,
+        source_id: &Uuid,
+        link: NewIssueLink,
+    ) -> Result<IssueLink, StorageError>;
+
+    /// Returns all links where `issue_id` is either source or target,
+    /// in canonical DB direction (source_id is who created the link, target_id is the other end).
+    /// Callers must compare source_id/target_id against issue_id to determine direction.
+    async fn list_links(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+    ) -> Result<Vec<IssueLink>, StorageError>;
+
+    /// Removes the link between `source_id` and `target_id`.
+    ///
+    /// Succeeds even if the link did not exist.
+    async fn delete_link(
+        &self,
+        repo_id: &Uuid,
+        source_id: &Uuid,
+        target_id: &Uuid,
+    ) -> Result<(), StorageError>;
+}
+
 // ── IssueStore ────────────────────────────────────────────────────────────────
 
 /// CRUD storage for issues.
@@ -1051,6 +1148,16 @@ impl StorageBackend {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn CommentStore>,
             StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
                 Arc::clone(s) as Arc<dyn CommentStore>
+            }
+        }
+    }
+
+    /// Returns the issue link store.
+    pub fn links(&self) -> Arc<dyn IssueLinkStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn IssueLinkStore>,
+            StorageBackend::Server(s) | StorageBackend::ServerWithS3(s, _) => {
+                Arc::clone(s) as Arc<dyn IssueLinkStore>
             }
         }
     }

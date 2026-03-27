@@ -28,7 +28,8 @@ use crate::workspace;
 
 use super::{
     AuthStore, CommentStore, EscalationStore, EventStore, FileMetadata, FileStore, GraphStore,
-    IssueComment, IssueStore, IssueUpdate, NewEscalation, NewIssue, NewIssueComment, NewOrg,
+    IssueComment, IssueLink, IssueLinkStore, IssueStore, IssueUpdate, NewEscalation, NewIssue,
+    NewIssueComment, NewIssueLink, NewOrg,
     NewUser, NewVersion, NewWorkspace, OrgMember, OrgRole, OrgStore, Organization,
     RepoCollaborator, RepoRole, StorageError, User, VersionStore, WorkspaceStore, WorkspaceUpdate,
 };
@@ -363,6 +364,39 @@ impl CommentStore for SqliteStorage {
         store
             .list_comments(*issue_id)
             .map_err(|e| StorageError::Database(e.to_string()))
+    }
+}
+
+// ── IssueLinkStore ────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl IssueLinkStore for SqliteStorage {
+    async fn create_link(
+        &self,
+        _repo_id: &Uuid,
+        _source_id: &Uuid,
+        _link: NewIssueLink,
+    ) -> Result<IssueLink, StorageError> {
+        Err(StorageError::Database(
+            "Issue links are not supported in local SQLite mode".into(),
+        ))
+    }
+
+    async fn list_links(
+        &self,
+        _repo_id: &Uuid,
+        _issue_id: &Uuid,
+    ) -> Result<Vec<IssueLink>, StorageError> {
+        Ok(vec![])
+    }
+
+    async fn delete_link(
+        &self,
+        _repo_id: &Uuid,
+        _source_id: &Uuid,
+        _target_id: &Uuid,
+    ) -> Result<(), StorageError> {
+        Ok(())
     }
 }
 

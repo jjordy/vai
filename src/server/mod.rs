@@ -4893,6 +4893,166 @@ async fn list_issue_comments_handler(
     Ok(Json(comments.into_iter().map(CommentResponse::from).collect()))
 }
 
+// ── Issue link handlers ───────────────────────────────────────────────────────
+
+/// Request body for `POST /api/repos/:repo/issues/:id/links`.
+#[derive(Debug, Deserialize, ToSchema)]
+struct CreateIssueLinkRequest {
+    /// UUID of the issue to link to.
+    target_id: String,
+    /// Relationship from this issue to the target: `"blocks"`, `"relates-to"`, or `"duplicates"`.
+    relationship: String,
+}
+
+/// Response body for a single issue link as seen from one issue's perspective.
+#[derive(Debug, Serialize, ToSchema)]
+struct IssueLinkResponse {
+    /// The other issue in the relationship.
+    other_issue_id: String,
+    /// Relationship from this issue's perspective (e.g. `"blocks"`, `"is-blocked-by"`,
+    /// `"relates-to"`, `"duplicates"`, `"is-duplicated-by"`).
+    relationship: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/repos/{repo}/issues/{id}/links",
+    params(
+        ("repo" = String, Path, description = "Repository slug"),
+        ("id" = String, Path, description = "Issue UUID"),
+    ),
+    request_body = CreateIssueLinkRequest,
+    responses(
+        (status = 201, description = "Link created", body = IssueLinkResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Issue not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
+/// `POST /api/repos/:repo/issues/:id/links` — create a link from this issue to another.
+async fn create_issue_link_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    PathId(id): PathId,
+    Json(body): Json<CreateIssueLinkRequest>,
+) -> Result<(StatusCode, Json<IssueLinkResponse>), ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
+
+    let source_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
+    let target_id = uuid::Uuid::parse_str(&body.target_id)
+        .map_err(|_| ApiError::bad_request(format!("invalid target_id `{}`", body.target_id)))?;
+
+    let relationship = crate::storage::IssueLinkRelationship::from_str(&body.relationship)
+        .ok_or_else(|| ApiError::bad_request(format!(
+            "invalid relationship `{}`, must be one of: blocks, relates-to, duplicates",
+            body.relationship
+        )))?;
+
+    // Verify both issues exist.
+    ctx.storage.issues().get_issue(&ctx.repo_id, &source_id).await.map_err(ApiError::from)?;
+    ctx.storage.issues().get_issue(&ctx.repo_id, &target_id).await.map_err(ApiError::from)?;
+
+    ctx.storage.links().create_link(
+        &ctx.repo_id,
+        &source_id,
+        crate::storage::NewIssueLink { target_id, relationship: relationship.clone() },
+    ).await.map_err(ApiError::from)?;
+
+    Ok((StatusCode::CREATED, Json(IssueLinkResponse {
+        other_issue_id: target_id.to_string(),
+        relationship: relationship.as_str().to_string(),
+    })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/repos/{repo}/issues/{id}/links",
+    params(
+        ("repo" = String, Path, description = "Repository slug"),
+        ("id" = String, Path, description = "Issue UUID"),
+    ),
+    responses(
+        (status = 200, description = "List of issue links", body = Vec<IssueLinkResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Issue not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
+/// `GET /api/repos/:repo/issues/:id/links` — list all links for an issue.
+async fn list_issue_links_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    PathId(id): PathId,
+) -> Result<Json<Vec<IssueLinkResponse>>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
+
+    let issue_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
+
+    ctx.storage.issues().get_issue(&ctx.repo_id, &issue_id).await.map_err(ApiError::from)?;
+
+    let links = ctx.storage.links().list_links(&ctx.repo_id, &issue_id).await.map_err(ApiError::from)?;
+
+    let resp: Vec<IssueLinkResponse> = links.into_iter().map(|link| {
+        // Determine direction: if this issue is the source, use the forward relationship;
+        // if it's the target, express the inverse from this issue's perspective.
+        if link.source_id == issue_id {
+            IssueLinkResponse {
+                other_issue_id: link.target_id.to_string(),
+                relationship: link.relationship.as_str().to_string(),
+            }
+        } else {
+            IssueLinkResponse {
+                other_issue_id: link.source_id.to_string(),
+                relationship: link.relationship.inverse_str().to_string(),
+            }
+        }
+    }).collect();
+
+    Ok(Json(resp))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/repos/{repo}/issues/{id}/links/{target_id}",
+    params(
+        ("repo" = String, Path, description = "Repository slug"),
+        ("id" = String, Path, description = "Issue UUID"),
+        ("target_id" = String, Path, description = "Target issue UUID"),
+    ),
+    responses(
+        (status = 204, description = "Link removed"),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
+/// `DELETE /api/repos/:repo/issues/:id/links/:target_id` — remove a link.
+async fn delete_issue_link_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    AxumPath(params): AxumPath<HashMap<String, String>>,
+) -> Result<StatusCode, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
+
+    let id = params.get("id").cloned().unwrap_or_default();
+    let target_id_str = params.get("target_id").cloned().unwrap_or_default();
+
+    let source_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
+    let target_id_parsed = uuid::Uuid::parse_str(&target_id_str)
+        .map_err(|_| ApiError::bad_request(format!("invalid target_id `{target_id_str}`")))?;
+
+    ctx.storage.links().delete_link(&ctx.repo_id, &source_id, &target_id_parsed).await.map_err(ApiError::from)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Escalation handlers ───────────────────────────────────────────────────────
 
 /// Response body for a single escalation.
@@ -7093,6 +7253,9 @@ impl utoipa::Modify for SecurityAddon {
         close_issue_handler,
         create_issue_comment_handler,
         list_issue_comments_handler,
+        create_issue_link_handler,
+        list_issue_links_handler,
+        delete_issue_link_handler,
         list_escalations_handler,
         get_escalation_handler,
         resolve_escalation_handler,
@@ -7149,6 +7312,8 @@ impl utoipa::Modify for SecurityAddon {
             IssueResponse,
             CreateCommentRequest,
             CommentResponse,
+            CreateIssueLinkRequest,
+            IssueLinkResponse,
             FileUploadEntry,
             UploadFilesRequest,
             UploadFilesResponse,
@@ -7409,6 +7574,9 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/issues/:id/close", post(close_issue_handler))
         .route("/issues/:id/comments", post(create_issue_comment_handler))
         .route("/issues/:id/comments", get(list_issue_comments_handler))
+        .route("/issues/:id/links", post(create_issue_link_handler))
+        .route("/issues/:id/links", get(list_issue_links_handler))
+        .route("/issues/:id/links/:target_id", axum::routing::delete(delete_issue_link_handler))
         .route("/issues/:id", get(get_issue_handler))
         .route("/issues/:id", axum::routing::patch(update_issue_handler))
         .route("/escalations", get(list_escalations_handler))
