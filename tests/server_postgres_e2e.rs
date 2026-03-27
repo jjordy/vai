@@ -260,7 +260,7 @@ async fn test_complete_agent_workflow() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let diff_resp: serde_json::Value = resp.json().await.unwrap();
-    let diffs = diff_resp["diffs"].as_array().unwrap();
+    let diffs = diff_resp["files"].as_array().unwrap();
     assert!(!diffs.is_empty(), "version diff must be non-empty");
 
     // ── 12. Files download ────────────────────────────────────────────────────
@@ -894,7 +894,7 @@ async fn test_version_diff_via_storage() {
         resp.text().await.unwrap_or_default()
     );
     let diff_resp: serde_json::Value = resp.json().await.unwrap();
-    let diffs = diff_resp["diffs"].as_array().expect("diffs must be an array");
+    let diffs = diff_resp["files"].as_array().expect("files must be an array");
     assert!(!diffs.is_empty(), "version diff must be non-empty");
 
     let greeter_diff = diffs
@@ -1519,6 +1519,367 @@ async fn test_work_queue_link_blocking() {
     assert!(
         c_detail["blocked_by"].as_array().unwrap().iter().any(|v| v.as_str() == Some(&id_b)),
         "C.blocked_by must contain B"
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
+// ── Deletion round-trip ───────────────────────────────────────────────────────
+
+/// Builds a gzip-compressed tar archive containing the provided files.
+///
+/// `files` is a slice of `(path, content)` pairs.  All entries use mode 0o644.
+fn make_tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut ar = tar::Builder::new(&mut enc);
+        for (path, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            ar.append_data(&mut header, path, *content).unwrap();
+        }
+        ar.finish().unwrap();
+    }
+    enc.finish().unwrap()
+}
+
+/// Collects all file paths from a gzip-compressed tar archive.
+fn tarball_paths(bytes: &[u8]) -> Vec<String> {
+    use flate2::read::GzDecoder;
+    let decoder = GzDecoder::new(std::io::Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .entries()
+        .unwrap()
+        .filter_map(|e| {
+            let e = e.ok()?;
+            Some(e.path().ok()?.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+/// Full deletion round-trip: seed A, B, C → delete B + modify A → re-add B + delete C.
+///
+/// Verifies that deleted files are absent from downloads and that version diffs
+/// record the correct change types at each step.
+///
+/// Flow:
+/// 1.  Seed repo: upload src/a.rs, src/b.rs, src/c.rs via workspace → v2
+/// 2.  Download → verify A, B, C present
+/// 3.  upload-snapshot with modified A + unchanged C (B absent) → B detected as deleted
+/// 4.  Submit → v3
+/// 5.  Download → A (modified), C present, B absent
+/// 6.  GET /versions/:v3_id/diff → A modified, B removed
+/// 7.  upload-snapshot with unchanged A + B re-added (C absent) → C detected as deleted
+/// 8.  Submit → v4
+/// 9.  Download → A, B present, C absent
+/// 10. GET /versions/:v4_id/diff → B added, C removed
+#[tokio::test(flavor = "multi_thread")]
+async fn test_deletion_round_trip() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_with_mem_fs(tmp.path(), &url)
+        .await
+        .expect("start_for_testing_pg_with_mem_fs failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // ── Create repo ───────────────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": "e2e-deletion-roundtrip" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create repo: {}", resp.text().await.unwrap_or_default());
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // ── Step 1: seed A, B, C via workspace upload + submit ────────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "seed files A B C",
+            "description": "initial file set",
+            "priority": "low"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue1: serde_json::Value = resp.json().await.unwrap();
+    let issue1_id = issue1["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue1_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim1: {}", resp.text().await.unwrap_or_default());
+    let claim1: serde_json::Value = resp.json().await.unwrap();
+    let ws1_id = claim1["workspace_id"].as_str().unwrap().to_string();
+
+    let a_v1 = b"fn a_v1() {}\n";
+    let b_content = b"fn b() {}\n";
+    let c_content = b"fn c() {}\n";
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws1_id}/files"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "files": [
+                { "path": "src/a.rs", "content_base64": b64(a_v1) },
+                { "path": "src/b.rs", "content_base64": b64(b_content) },
+                { "path": "src/c.rs", "content_base64": b64(c_content) }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload seed files: {}", resp.text().await.unwrap_or_default());
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws1_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "seed A B C" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit seed: {}", resp.text().await.unwrap_or_default());
+
+    // ── Step 2: download → verify A, B, C present ────────────────────────────
+    let resp = client
+        .get(format!("{rp}/files/download"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "download after seed: {}", resp.text().await.unwrap_or_default());
+    let tarball = resp.bytes().await.unwrap();
+    let paths = tarball_paths(&tarball);
+    assert!(paths.iter().any(|p| p.contains("src/a.rs")), "A must be present after seed; got: {paths:?}");
+    assert!(paths.iter().any(|p| p.contains("src/b.rs")), "B must be present after seed; got: {paths:?}");
+    assert!(paths.iter().any(|p| p.contains("src/c.rs")), "C must be present after seed; got: {paths:?}");
+
+    // ── Step 3: workspace 2 — modify A, delete B (C unchanged) ───────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "modify A, delete B",
+            "description": "second iteration",
+            "priority": "low"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue2: serde_json::Value = resp.json().await.unwrap();
+    let issue2_id = issue2["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue2_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim2: {}", resp.text().await.unwrap_or_default());
+    let claim2: serde_json::Value = resp.json().await.unwrap();
+    let ws2_id = claim2["workspace_id"].as_str().unwrap().to_string();
+
+    // Snapshot contains A (modified) and C (unchanged); B is absent → detected as deleted.
+    let a_v2 = b"fn a_v2() { /* modified */ }\n";
+    let tarball2 = make_tarball(&[("src/a.rs", a_v2), ("src/c.rs", c_content)]);
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws2_id}/upload-snapshot"))
+        .bearer_auth(admin)
+        .header("content-type", "application/gzip")
+        .body(tarball2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload-snapshot2: {}", resp.text().await.unwrap_or_default());
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws2_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "modify A, delete B" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit2: {}", resp.text().await.unwrap_or_default());
+    let submit2: serde_json::Value = resp.json().await.unwrap();
+    let v2_label = submit2["version"].as_str().unwrap().to_string();
+
+    // ── Step 4: download → verify A (modified), C present, B absent ──────────
+    let resp = client
+        .get(format!("{rp}/files/download"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let tarball = resp.bytes().await.unwrap();
+    let paths = tarball_paths(&tarball);
+    assert!(paths.iter().any(|p| p.contains("src/a.rs")), "A must be present after step 2; got: {paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("src/b.rs")), "B must be absent after deletion; got: {paths:?}");
+    assert!(paths.iter().any(|p| p.contains("src/c.rs")), "C must be unchanged after step 2; got: {paths:?}");
+
+    // ── Step 5: version diff for the step-2 version → A modified, B removed ──
+    let resp = client.get(format!("{rp}/versions")).bearer_auth(admin).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let versions: serde_json::Value = resp.json().await.unwrap();
+    let v2_id = versions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["label"].as_str() == Some(&v2_label))
+        .and_then(|v| v["id"].as_str())
+        .expect("step-2 version must appear in version list")
+        .to_string();
+
+    let resp = client
+        .get(format!("{rp}/versions/{v2_id}/diff"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "step-2 diff: {}", resp.text().await.unwrap_or_default());
+    let diff2: serde_json::Value = resp.json().await.unwrap();
+    let files2 = diff2["files"].as_array().expect("files must be present in step-2 diff");
+
+    let a_diff2 = files2.iter().find(|f| f["path"].as_str() == Some("src/a.rs"));
+    assert!(a_diff2.is_some(), "step-2 diff must include src/a.rs");
+    assert_eq!(
+        a_diff2.unwrap()["change_type"].as_str().unwrap_or(""),
+        "modified",
+        "src/a.rs must be modified in step-2 version"
+    );
+
+    let b_diff2 = files2.iter().find(|f| f["path"].as_str() == Some("src/b.rs"));
+    assert!(b_diff2.is_some(), "step-2 diff must include src/b.rs");
+    assert_eq!(
+        b_diff2.unwrap()["change_type"].as_str().unwrap_or(""),
+        "removed",
+        "src/b.rs must be removed in step-2 version"
+    );
+
+    // ── Step 6: workspace 3 — re-add B, delete C ─────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "re-add B, delete C",
+            "description": "third iteration",
+            "priority": "low"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue3: serde_json::Value = resp.json().await.unwrap();
+    let issue3_id = issue3["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue3_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim3: {}", resp.text().await.unwrap_or_default());
+    let claim3: serde_json::Value = resp.json().await.unwrap();
+    let ws3_id = claim3["workspace_id"].as_str().unwrap().to_string();
+
+    // Snapshot contains A (unchanged from step 2) and B (re-added); C absent → detected as deleted.
+    let tarball3 = make_tarball(&[("src/a.rs", a_v2), ("src/b.rs", b_content)]);
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws3_id}/upload-snapshot"))
+        .bearer_auth(admin)
+        .header("content-type", "application/gzip")
+        .body(tarball3)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload-snapshot3: {}", resp.text().await.unwrap_or_default());
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws3_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "re-add B, delete C" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit3: {}", resp.text().await.unwrap_or_default());
+    let submit3: serde_json::Value = resp.json().await.unwrap();
+    let v3_label = submit3["version"].as_str().unwrap().to_string();
+
+    // ── Step 7: download → verify A, B present, C absent ─────────────────────
+    let resp = client
+        .get(format!("{rp}/files/download"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let tarball = resp.bytes().await.unwrap();
+    let paths = tarball_paths(&tarball);
+    assert!(paths.iter().any(|p| p.contains("src/a.rs")), "A must be present after step 3; got: {paths:?}");
+    assert!(paths.iter().any(|p| p.contains("src/b.rs")), "B must be re-added after step 3; got: {paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("src/c.rs")), "C must be absent after step 3; got: {paths:?}");
+
+    // ── Step 8: version diff for step-3 version → B added, C removed ─────────
+    let resp = client.get(format!("{rp}/versions")).bearer_auth(admin).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let versions: serde_json::Value = resp.json().await.unwrap();
+    let v3_id = versions
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["label"].as_str() == Some(&v3_label))
+        .and_then(|v| v["id"].as_str())
+        .expect("step-3 version must appear in version list")
+        .to_string();
+
+    let resp = client
+        .get(format!("{rp}/versions/{v3_id}/diff"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "step-3 diff: {}", resp.text().await.unwrap_or_default());
+    let diff3: serde_json::Value = resp.json().await.unwrap();
+    let files3 = diff3["files"].as_array().expect("files must be present in step-3 diff");
+
+    let b_diff3 = files3.iter().find(|f| f["path"].as_str() == Some("src/b.rs"));
+    assert!(b_diff3.is_some(), "step-3 diff must include src/b.rs");
+    assert_eq!(
+        b_diff3.unwrap()["change_type"].as_str().unwrap_or(""),
+        "added",
+        "src/b.rs must be added (re-created) in step-3 version"
+    );
+
+    let c_diff3 = files3.iter().find(|f| f["path"].as_str() == Some("src/c.rs"));
+    assert!(c_diff3.is_some(), "step-3 diff must include src/c.rs");
+    assert_eq!(
+        c_diff3.unwrap()["change_type"].as_str().unwrap_or(""),
+        "removed",
+        "src/c.rs must be removed in step-3 version"
     );
 
     shutdown_tx.send(()).ok();
