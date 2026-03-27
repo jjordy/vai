@@ -1726,6 +1726,18 @@ async fn submit_workspace_handler(
                 }),
             });
 
+            // Auto-refresh the semantic graph in server (S3) mode so entities
+            // reflect the newly merged state without requiring a manual call
+            // to POST /api/graph/refresh.
+            if using_s3_merge {
+                let _ = refresh_graph_from_files(
+                    ctx.storage.graph(),
+                    ctx.storage.files(),
+                    ctx.repo_id,
+                )
+                .await;
+            }
+
             Ok(Json(SubmitResponse::from(result)))
         }
         Err(merge::MergeError::SemanticConflicts { count, ref conflicts }) => {
@@ -4016,6 +4028,99 @@ struct ServerGraphRefreshResponse {
     relationships: usize,
 }
 
+/// Parseable file extensions for the semantic graph engine.
+const GRAPH_PARSEABLE_EXTENSIONS: &[&str] = &["rs", "ts", "js", "tsx", "jsx"];
+
+/// Rebuilds the semantic graph by reading source files from the `current/`
+/// prefix in `file_store`.
+///
+/// Reads `current/vai.toml` (if present) for ignore patterns, lists all files
+/// under `current/`, filters to parseable extensions, downloads each file, and
+/// upserts parsed entities and relationships into `graph`.
+///
+/// Returns `(files_scanned, total_entities, total_relationships)`.
+async fn refresh_graph_from_files(
+    graph: Arc<dyn crate::storage::GraphStore>,
+    file_store: Arc<dyn crate::storage::FileStore>,
+    repo_id: uuid::Uuid,
+) -> Result<(usize, usize, usize), ApiError> {
+    // Read ignore patterns from current/vai.toml — fall back to defaults if absent.
+    let ignore: Vec<String> = match file_store.get(&repo_id, "current/vai.toml").await {
+        Ok(bytes) => {
+            let raw = String::from_utf8_lossy(&bytes);
+            toml::from_str::<crate::repo::VaiToml>(&raw)
+                .unwrap_or_default()
+                .ignore
+        }
+        Err(_) => vec![],
+    };
+
+    // List all files under current/ and filter to parseable extensions.
+    let all_files = file_store
+        .list(&repo_id, "current/")
+        .await
+        .map_err(|e| ApiError::internal(format!("list current/ files: {e}")))?;
+
+    let mut files_scanned = 0usize;
+    let mut total_entities = 0usize;
+    let mut total_relationships = 0usize;
+
+    for meta in &all_files {
+        // Strip the "current/" prefix to get the repo-relative path.
+        let rel = meta.path.strip_prefix("current/").unwrap_or(&meta.path);
+
+        // Skip files that match ignore patterns.
+        if ignore.iter().any(|pat| rel.starts_with(pat.as_str())) {
+            continue;
+        }
+
+        // Skip files with non-parseable extensions.
+        let ext = std::path::Path::new(rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !GRAPH_PARSEABLE_EXTENSIONS.contains(&ext) {
+            continue;
+        }
+
+        let source = match file_store.get(&repo_id, &meta.path).await {
+            Ok(b) => b,
+            Err(_) => continue, // best-effort: skip unreadable files
+        };
+
+        let (entities, rels) = match crate::graph::parse_source_file(rel, &source) {
+            Ok(r) => r,
+            Err(_) => continue, // best-effort: skip unparseable files
+        };
+
+        // Clear stale data for this file before upserting fresh entities.
+        graph
+            .clear_file(&repo_id, rel)
+            .await
+            .map_err(|e| ApiError::internal(format!("clear graph for {rel}: {e}")))?;
+
+        total_entities += entities.len();
+        total_relationships += rels.len();
+
+        if !entities.is_empty() {
+            graph
+                .upsert_entities(&repo_id, entities)
+                .await
+                .map_err(|e| ApiError::internal(format!("upsert entities for {rel}: {e}")))?;
+        }
+        if !rels.is_empty() {
+            graph
+                .upsert_relationships(&repo_id, rels)
+                .await
+                .map_err(|e| ApiError::internal(format!("upsert relationships for {rel}: {e}")))?;
+        }
+
+        files_scanned += 1;
+    }
+
+    Ok((files_scanned, total_entities, total_relationships))
+}
+
 #[utoipa::path(
     post,
     path = "/api/graph/refresh",
@@ -4028,8 +4133,12 @@ struct ServerGraphRefreshResponse {
 )]
 /// `POST /api/graph/refresh` — rebuilds the semantic graph from source files.
 ///
+/// In server mode (S3 + Postgres) reads source files from the `current/` prefix
+/// in S3. In local mode reads from the repo root on disk.
+///
 /// Should be called after `POST /api/files` completes to ensure the graph
-/// reflects the uploaded source files (PRD 12.4).
+/// reflects the uploaded source files (PRD 12.4). Also triggered automatically
+/// after each successful workspace submit in server mode.
 ///
 /// Writes entity and relationship data via the configured [`GraphStore`] backend
 /// (Postgres in server mode, SQLite in local mode) so the correct store is
@@ -4048,10 +4157,29 @@ async fn server_graph_refresh_handler(
     .await?;
     let _lock = state.repo_lock.lock().await;
 
-    // Read ignore patterns from vai.toml (defaults if absent).
+    let using_s3 = matches!(
+        &ctx.storage,
+        crate::storage::StorageBackend::ServerWithS3(_, _)
+            | crate::storage::StorageBackend::ServerWithMemFs(_, _)
+    );
+
+    if using_s3 {
+        // Server mode: read source files from the current/ prefix in S3.
+        let (files_scanned, total_entities, total_relationships) =
+            refresh_graph_from_files(ctx.storage.graph(), ctx.storage.files(), ctx.repo_id)
+                .await?;
+
+        return Ok(Json(ServerGraphRefreshResponse {
+            files_scanned,
+            entities: total_entities,
+            relationships: total_relationships,
+        }));
+    }
+
+    // Local disk mode: read ignore patterns from vai.toml and walk repo root.
     let vai_toml_path = ctx.repo_root.join("vai.toml");
     let vai_toml: crate::repo::VaiToml = if vai_toml_path.exists() {
-        // ALLOW_FS: reads vai.toml config; tracked by issue #171 to also read from S3
+        // ALLOW_FS: local SQLite mode only — guarded by `if using_s3` early return above
         let raw = std::fs::read_to_string(&vai_toml_path)
             .map_err(|e| ApiError::internal(format!("read vai.toml: {e}")))?;
         toml::from_str(&raw)
@@ -4075,7 +4203,7 @@ async fn server_graph_refresh_handler(
             .to_string_lossy()
             .into_owned();
 
-        // ALLOW_FS: reads source files from disk; tracked by issue #171 to read from S3 in server mode
+        // ALLOW_FS: local SQLite mode only — guarded by `if using_s3` early return above
         let source = match std::fs::read(file_path) {
             Ok(b) => b,
             Err(_) => continue, // best-effort: skip unreadable files
