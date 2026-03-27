@@ -16,6 +16,7 @@ pub mod event_log;
 pub mod graph;
 pub mod issue;
 pub mod merge;
+pub mod merge_fs;
 pub mod merge_patterns;
 pub mod migration;
 pub mod remote_client;

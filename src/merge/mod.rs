@@ -29,7 +29,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json;
 
@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 use crate::diff::{self, DiffError};
 use crate::event_log::{ConflictInfo, EventKind, EventLog, EventLogError};
+use crate::merge_fs::{DiskMergeFs, MergeFs};
 use crate::merge_patterns::{MergePatternError, MergePatternStore};
 
 /// Re-exported for callers (e.g. CLI) that need to match on severity.
@@ -146,7 +147,10 @@ pub struct SubmitResult {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Submits the active workspace for merging.
+/// Submits the active workspace for merging (local mode).
+///
+/// Reads workspace metadata and the deletion manifest from disk, constructs a
+/// [`DiskMergeFs`], and delegates to [`submit_with_fs`].
 ///
 /// If HEAD has not advanced since the workspace was created, performs a
 /// fast-forward merge (apply changes directly). If HEAD has advanced,
@@ -155,8 +159,40 @@ pub struct SubmitResult {
 pub fn submit(vai_dir: &Path, repo_root: &Path) -> Result<SubmitResult, MergeError> {
     let ws_meta = workspace::active(vai_dir)?;
 
+    // Read deletion manifest (workspace metadata, not a source file).
+    let manifest_path = vai_dir
+        .join("workspaces")
+        .join(ws_meta.id.to_string())
+        .join(".vai-deleted");
+    let deleted_paths: Vec<String> = if manifest_path.exists() {
+        let bytes = fs::read(&manifest_path)?;
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let disk_fs = DiskMergeFs::new(vai_dir, &ws_meta.id.to_string(), repo_root);
+    submit_with_fs(&disk_fs, vai_dir, &ws_meta, deleted_paths)
+}
+
+/// Submits a workspace for merging using the provided [`MergeFs`] for source
+/// file I/O and `vai_dir` for metadata (event log, workspace status, versions).
+///
+/// This is the core implementation shared by local mode ([`DiskMergeFs`]) and
+/// future server mode (`S3MergeFs`).
+pub fn submit_with_fs(
+    merge_fs: &dyn MergeFs,
+    vai_dir: &Path,
+    ws_meta: &workspace::WorkspaceMeta,
+    deleted_paths: Vec<String>,
+) -> Result<SubmitResult, MergeError> {
     // 1. Compute diff and reject if empty.
-    let workspace_diff = diff::compute(vai_dir, repo_root)?;
+    let workspace_diff = diff::compute_with_fs(
+        merge_fs,
+        ws_meta.id,
+        ws_meta.base_version.clone(),
+        deleted_paths.clone(),
+    )?;
     if workspace_diff.is_empty() {
         return Err(MergeError::EmptyWorkspace);
     }
@@ -180,11 +216,11 @@ pub fn submit(vai_dir: &Path, repo_root: &Path) -> Result<SubmitResult, MergeErr
 
     if current_head == ws_meta.base_version {
         // Fast-forward path.
-        return fast_forward_merge(vai_dir, repo_root, &ws_meta, workspace_diff, log);
+        return fast_forward_merge(merge_fs, vai_dir, ws_meta, workspace_diff, &deleted_paths, log);
     }
 
     // Semantic merge path.
-    semantic_merge(vai_dir, repo_root, &ws_meta, workspace_diff, log)
+    semantic_merge(merge_fs, vai_dir, ws_meta, workspace_diff, &deleted_paths, log)
 }
 
 /// Lists all conflict records from `.vai/merge/conflicts/`.
@@ -265,22 +301,22 @@ pub fn record_pattern_rollback(
 // ── Private — fast-forward merge ──────────────────────────────────────────────
 
 fn fast_forward_merge(
+    merge_fs: &dyn MergeFs,
     vai_dir: &Path,
-    repo_root: &Path,
     ws_meta: &workspace::WorkspaceMeta,
     workspace_diff: diff::WorkspaceDiff,
+    deleted_paths: &[String],
     mut log: EventLog,
 ) -> Result<SubmitResult, MergeError> {
     // Save pre-change snapshot for rollback support.
     let new_version_id = version::next_version_id(vai_dir)?;
-    save_pre_change_snapshot(vai_dir, &new_version_id, &workspace_diff, repo_root)?;
+    save_pre_change_snapshot(merge_fs, &new_version_id, &workspace_diff)?;
 
-    // Apply overlay files to the project root.
-    let overlay = workspace::overlay_dir(vai_dir, &ws_meta.id.to_string());
-    let files_applied = apply_overlay(&overlay, repo_root)?;
+    // Apply overlay files to the project root via MergeFs.
+    let files_applied = apply_overlay(merge_fs, deleted_paths)?;
 
     // Update semantic graph for changed Rust files.
-    update_graph_for_diff(vai_dir, repo_root, &workspace_diff)?;
+    update_graph_for_diff(merge_fs, vai_dir, &workspace_diff)?;
 
     // Record MergeCompleted and VersionCreated.
     let merge_event = log.append(EventKind::MergeCompleted {
@@ -323,34 +359,30 @@ fn fast_forward_merge(
 // ── Private — three-level semantic merge ──────────────────────────────────────
 
 fn semantic_merge(
+    merge_fs: &dyn MergeFs,
     vai_dir: &Path,
-    repo_root: &Path,
     ws_meta: &workspace::WorkspaceMeta,
     workspace_diff: diff::WorkspaceDiff,
+    deleted_paths: &[String],
     mut log: EventLog,
 ) -> Result<SubmitResult, MergeError> {
-    let overlay_dir = workspace::overlay_dir(vai_dir, &ws_meta.id.to_string());
-
     // Build map: file_path → base-version content for each file changed by HEAD.
-    let head_changed = collect_head_changed_files(vai_dir, &ws_meta.base_version)?;
+    let head_changed = collect_head_changed_files(merge_fs, vai_dir, &ws_meta.base_version)?;
 
     let mut merged_files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut auto_resolved: u32 = 0;
     let mut conflicts: Vec<ConflictRecord> = Vec::new();
 
     for fd in &workspace_diff.file_diffs {
-        let overlay_path = overlay_dir.join(&fd.path);
-        let ws_content = fs::read(&overlay_path)?;
+        let ws_content = merge_fs.read_file(&format!("overlay/{}", fd.path))?;
 
         if let Some(base_content) = head_changed.get(&fd.path) {
             // File changed by both workspace and HEAD — run 3-level analysis.
-            let head_content = {
-                let p = repo_root.join(&fd.path);
-                if p.exists() {
-                    fs::read(&p)?
-                } else {
-                    Vec::new()
-                }
+            let base_key = format!("base/{}", fd.path);
+            let head_content = if merge_fs.exists(&base_key)? {
+                merge_fs.read_file(&base_key)?
+            } else {
+                Vec::new()
             };
 
             match try_merge_file(
@@ -396,22 +428,23 @@ fn semantic_merge(
         });
     }
 
-    // All files merged successfully — apply to disk.
+    // All files merged successfully — apply via MergeFs.
     let new_version_id = version::next_version_id(vai_dir)?;
-    save_pre_change_snapshot(vai_dir, &new_version_id, &workspace_diff, repo_root)?;
+    save_pre_change_snapshot(merge_fs, &new_version_id, &workspace_diff)?;
 
     let mut files_applied = 0;
     for (rel_path, content) in &merged_files {
-        let dest = repo_root.join(rel_path);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&dest, content)?;
+        merge_fs.write_file(&format!("base/{rel_path}"), content)?;
         files_applied += 1;
     }
 
+    // Apply deletions.
+    for path in deleted_paths {
+        merge_fs.delete_file(&format!("base/{path}"))?;
+    }
+
     // Update graph for changed Rust files.
-    update_graph_for_diff(vai_dir, repo_root, &workspace_diff)?;
+    update_graph_for_diff(merge_fs, vai_dir, &workspace_diff)?;
 
     // Record events and create version.
     let merge_event = log.append(EventKind::MergeCompleted {
@@ -1000,10 +1033,10 @@ fn store_all_conflicts(vai_dir: &Path, records: &[ConflictRecord]) -> Result<(),
 /// were modified by versions between `base_version` (exclusive) and the
 /// current HEAD (inclusive).
 ///
-/// The content is read from the pre-change snapshots stored under
-/// `.vai/versions/<id>/snapshot/` by the merge engine when each version was
-/// created.
+/// Reads pre-change snapshots via `merge_fs` using the `snapshot/{ver}/{path}`
+/// key namespace.
 fn collect_head_changed_files(
+    merge_fs: &dyn MergeFs,
     vai_dir: &Path,
     base_version: &str,
 ) -> Result<HashMap<String, Vec<u8>>, MergeError> {
@@ -1015,52 +1048,20 @@ fn collect_head_changed_files(
 
     for n in (base_n + 1)..=(head_n) {
         let version_id = format!("v{n}");
-        let snapshot_dir = vai_dir
-            .join("versions")
-            .join(&version_id)
-            .join("snapshot");
-        if !snapshot_dir.exists() {
-            continue;
-        }
-        let files = collect_snapshot_files(&snapshot_dir)?;
-        for (rel_path, content) in files {
-            // First snapshot after base_version has the base-version content.
+        let prefix = format!("snapshot/{version_id}/");
+        let keys = merge_fs.list_files(&prefix)?;
+        for key in keys {
+            let rel_path = key
+                .strip_prefix(&prefix)
+                .expect("list_files returns keys with prefix")
+                .to_string();
+            let content = merge_fs.read_file(&key)?;
+            // First snapshot after base_version carries the base-version content.
             result.entry(rel_path).or_insert(content);
         }
     }
 
     Ok(result)
-}
-
-/// Recursively collects all files under a snapshot directory, returning
-/// `(relative_path, content)` pairs.
-fn collect_snapshot_files(snapshot_dir: &Path) -> Result<Vec<(String, Vec<u8>)>, MergeError> {
-    let mut files = Vec::new();
-    collect_snapshot_recursive(snapshot_dir, snapshot_dir, &mut files)?;
-    Ok(files)
-}
-
-fn collect_snapshot_recursive(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<(String, Vec<u8>)>,
-) -> Result<(), MergeError> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_snapshot_recursive(root, &path, out)?;
-        } else {
-            let rel = path
-                .strip_prefix(root)
-                .expect("path inside snapshot dir")
-                .to_string_lossy()
-                .to_string();
-            let content = fs::read(&path)?;
-            out.push((rel, content));
-        }
-    }
-    Ok(())
 }
 
 /// Parses a version string like `"v3"` into the integer `3`.
@@ -1083,17 +1084,18 @@ fn is_supported_source_file(path: &str) -> bool {
 }
 
 /// Updates the semantic graph for all supported source files in `workspace_diff`.
+///
+/// Reads merged file content via `merge_fs` using `base/{path}` keys.
 fn update_graph_for_diff(
+    merge_fs: &dyn MergeFs,
     vai_dir: &Path,
-    repo_root: &Path,
     workspace_diff: &diff::WorkspaceDiff,
 ) -> Result<(), MergeError> {
     let snapshot_path = vai_dir.join("graph").join("snapshot.db");
     let snapshot = GraphSnapshot::open(&snapshot_path)?;
     for fd in &workspace_diff.file_diffs {
         if is_supported_source_file(&fd.path) {
-            let abs_path = repo_root.join(&fd.path);
-            if let Ok(content) = fs::read(&abs_path) {
+            if let Ok(content) = merge_fs.read_file(&format!("base/{}", fd.path)) {
                 let _ = snapshot.update_file(&fd.path, &content);
             }
         }
@@ -1102,87 +1104,46 @@ fn update_graph_for_diff(
 }
 
 /// Saves the pre-change content of files about to be overwritten.
+///
+/// Reads current (base) content via `merge_fs` and writes snapshot files using
+/// the `snapshot/{version_id}/{path}` key namespace.
 fn save_pre_change_snapshot(
-    vai_dir: &Path,
+    merge_fs: &dyn MergeFs,
     new_version_id: &str,
     workspace_diff: &diff::WorkspaceDiff,
-    repo_root: &Path,
 ) -> Result<(), MergeError> {
-    let snapshot_dir = vai_dir
-        .join("versions")
-        .join(new_version_id)
-        .join("snapshot");
-
     for fd in &workspace_diff.file_diffs {
-        let src = repo_root.join(&fd.path);
-        if src.exists() {
-            let dest = snapshot_dir.join(&fd.path);
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&src, &dest)?;
+        let base_key = format!("base/{}", fd.path);
+        if merge_fs.exists(&base_key)? {
+            let content = merge_fs.read_file(&base_key)?;
+            merge_fs.write_file(&format!("snapshot/{new_version_id}/{}", fd.path), &content)?;
         }
     }
-
     Ok(())
 }
 
-/// Copies all files from an overlay directory into the project root.
-fn apply_overlay(overlay: &Path, repo_root: &Path) -> Result<usize, MergeError> {
-    if !overlay.exists() {
-        return Ok(0);
-    }
-    let files = collect_overlay_files(overlay)?;
-    let count = files.len();
-    for abs_path in files {
-        let rel = abs_path
-            .strip_prefix(overlay)
-            .expect("path inside overlay")
-            .to_path_buf();
-        let dest = repo_root.join(&rel);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(&abs_path, &dest)?;
+/// Applies all overlay files to the base (project root) via `merge_fs`, then
+/// applies explicit deletions.
+///
+/// Returns the number of files copied from the overlay.
+fn apply_overlay(merge_fs: &dyn MergeFs, deleted_paths: &[String]) -> Result<usize, MergeError> {
+    let overlay_keys = merge_fs.list_files("overlay/")?;
+    let count = overlay_keys.len();
+
+    for key in &overlay_keys {
+        let rel_path = key
+            .strip_prefix("overlay/")
+            .expect("list_files returns keys with prefix");
+        let content = merge_fs.read_file(key)?;
+        merge_fs.write_file(&format!("base/{rel_path}"), &content)?;
     }
 
-    // Apply deletion manifest if present in the workspace directory.
-    // The manifest lives at `<workspace_dir>/.vai-deleted` (sibling of `overlay/`).
-    if let Some(ws_dir) = overlay.parent() {
-        let manifest_path = ws_dir.join(".vai-deleted");
-        if manifest_path.exists() {
-            let bytes = fs::read(&manifest_path)?;
-            if let Ok(deleted_paths) = serde_json::from_slice::<Vec<String>>(&bytes) {
-                for rel_str in deleted_paths {
-                    let dest = repo_root.join(&rel_str);
-                    if dest.exists() {
-                        let _ = fs::remove_file(&dest);
-                    }
-                }
-            }
-        }
+    // Apply explicit deletions.
+    for path in deleted_paths {
+        merge_fs.delete_file(&format!("base/{path}"))?;
     }
 
     Ok(count)
-}
-
-fn collect_overlay_files(dir: &Path) -> Result<Vec<PathBuf>, MergeError> {
-    let mut files = Vec::new();
-    collect_overlay_recursive(dir, &mut files)?;
-    Ok(files)
-}
-
-fn collect_overlay_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), MergeError> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_overlay_recursive(&path, files)?;
-        } else {
-            files.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// Advances HEAD to `new_version_id` and marks the workspace as `Merged`.
@@ -1210,6 +1171,7 @@ fn advance_head_and_close_workspace(
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn setup_repo(source_files: &[(&str, &str)]) -> (TempDir, PathBuf) {

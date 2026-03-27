@@ -10,10 +10,14 @@
 //! root. Any file present there has been added or modified by the agent. We walk
 //! the overlay, compare content against the project root, and re-parse Rust files
 //! with tree-sitter to get entity-level changes.
+//!
+//! [`compute_with_fs`] is the core implementation that operates through the
+//! [`MergeFs`] abstraction. [`compute`] is a thin wrapper for local mode that
+//! reads workspace metadata from disk and constructs a [`DiskMergeFs`].
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -23,6 +27,7 @@ use uuid::Uuid;
 
 use crate::event_log::{EntitySummary, EventKind, EventLog, EventLogError};
 use crate::graph::{Entity, EntityKind, GraphError, parse_rust_source};
+use crate::merge_fs::{DiskMergeFs, MergeFs};
 use crate::workspace::{self, WorkspaceError, WorkspaceStatus};
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -121,99 +126,90 @@ impl WorkspaceDiff {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Computes the diff for the currently active workspace.
+/// Computes the workspace diff through the [`MergeFs`] abstraction.
 ///
-/// Walks the overlay directory, compares files against the project root,
-/// and re-parses Rust source files to detect entity-level changes.
-/// Does **not** write events or update workspace state.
-pub fn compute(vai_dir: &Path, repo_root: &Path) -> Result<WorkspaceDiff, DiffError> {
-    let meta = workspace::active(vai_dir)?;
-    let overlay = workspace::overlay_dir(vai_dir, &meta.id.to_string());
-
+/// This is the core implementation used by both local mode (via [`DiskMergeFs`])
+/// and server mode (via `S3MergeFs`). It reads overlay and base files through
+/// `fs`, compares them, and builds a full [`WorkspaceDiff`].
+///
+/// `deleted_paths` — paths the agent explicitly deleted, sourced from workspace
+/// metadata (the `.vai-deleted` manifest in local mode or the `deleted_paths`
+/// column in server mode).
+pub fn compute_with_fs(
+    fs: &dyn MergeFs,
+    workspace_id: Uuid,
+    base_version: String,
+    deleted_paths: Vec<String>,
+) -> Result<WorkspaceDiff, DiffError> {
     let mut file_diffs = Vec::new();
     let mut entity_changes = Vec::new();
 
-    if overlay.exists() {
-        let overlay_files = collect_files(&overlay)?;
-        for abs_path in overlay_files {
-            let rel_path = abs_path
-                .strip_prefix(&overlay)
-                .expect("path inside overlay")
-                .to_string_lossy()
-                .to_string();
+    // Walk overlay files.
+    let overlay_keys = fs.list_files("overlay/")?;
+    for key in &overlay_keys {
+        let rel_path = key
+            .strip_prefix("overlay/")
+            .expect("list_files returns keys with prefix")
+            .to_string();
 
-            let overlay_content = fs::read(&abs_path)?;
-            let content_hash = sha256_hex(&overlay_content);
-            let lines = count_lines(&overlay_content);
+        let overlay_content = fs.read_file(key)?;
+        let content_hash = sha256_hex(&overlay_content);
+        let lines = count_lines(&overlay_content);
 
-            let base_file = repo_root.join(&rel_path);
-            let change_type = if base_file.exists() {
-                FileChangeType::Modified
+        let base_key = format!("base/{rel_path}");
+        let change_type = if fs.exists(&base_key)? {
+            FileChangeType::Modified
+        } else {
+            FileChangeType::Added
+        };
+
+        file_diffs.push(FileDiff {
+            path: rel_path.clone(),
+            change_type,
+            lines,
+            content_hash,
+        });
+
+        // Entity-level diff for Rust files.
+        if rel_path.ends_with(".rs") {
+            let base_content = if fs.exists(&base_key)? {
+                Some(fs.read_file(&base_key)?)
             } else {
-                FileChangeType::Added
+                None
             };
-
-            file_diffs.push(FileDiff {
-                path: rel_path.clone(),
-                change_type,
-                lines,
-                content_hash,
-            });
-
-            // Entity-level diff for Rust files.
-            if rel_path.ends_with(".rs") {
-                let base_content = if base_file.exists() {
-                    Some(fs::read(&base_file)?)
-                } else {
-                    None
-                };
-                compute_entity_diff(
-                    &rel_path,
-                    &overlay_content,
-                    base_content.as_deref(),
-                    &mut entity_changes,
-                )?;
-            }
+            compute_entity_diff(
+                &rel_path,
+                &overlay_content,
+                base_content.as_deref(),
+                &mut entity_changes,
+            )?;
         }
     }
 
-    // Check the deletion manifest for files that were explicitly deleted.
-    // The manifest lives at `.vai/workspaces/<id>/.vai-deleted` (sibling of overlay/).
-    let ws_dir = vai_dir
-        .join("workspaces")
-        .join(meta.id.to_string());
-    let manifest_path = ws_dir.join(".vai-deleted");
-    if manifest_path.exists() {
-        let bytes = fs::read(&manifest_path)?;
-        if let Ok(deleted_paths) = serde_json::from_slice::<Vec<String>>(&bytes) {
-            for path in deleted_paths {
-                // Only record as Deleted if the file actually exists in the base.
-                let base_file = repo_root.join(&path);
-                if base_file.exists() {
-                    file_diffs.push(FileDiff {
-                        path: path.clone(),
-                        change_type: FileChangeType::Deleted,
-                        lines: 0,
-                        content_hash: String::new(),
-                    });
+    // Apply explicit deletions.
+    for path in deleted_paths {
+        let base_key = format!("base/{path}");
+        if fs.exists(&base_key)? {
+            file_diffs.push(FileDiff {
+                path: path.clone(),
+                change_type: FileChangeType::Deleted,
+                lines: 0,
+                content_hash: String::new(),
+            });
 
-                    // Entity-level: mark all entities in the deleted file as removed.
-                    if path.ends_with(".rs") {
-                        if let Ok(base_content) = fs::read(&base_file) {
-                            if let Ok((entities, _)) =
-                                crate::graph::parse_rust_source(&path, &base_content)
-                            {
-                                for entity in entities {
-                                    entity_changes.push(EntityChange {
-                                        entity_id: entity.id.clone(),
-                                        qualified_name: entity.qualified_name.clone(),
-                                        kind: entity.kind.clone(),
-                                        file_path: path.clone(),
-                                        change_type: EntityChangeType::Removed,
-                                        line_range: None,
-                                    });
-                                }
-                            }
+            // Entity-level: mark all entities in the deleted file as removed.
+            if path.ends_with(".rs") {
+                if let Ok(base_content) = fs.read_file(&base_key) {
+                    if let Ok((entities, _)) = parse_rust_source(&path, &base_content) {
+                        for entity in entities {
+                            entity_changes.push(EntityChange {
+                                entity_id: entity.id.clone(),
+                                qualified_name: entity.qualified_name.clone(),
+                                kind: entity.kind.clone(),
+                                file_path: path.clone(),
+                                change_type: EntityChangeType::Removed,
+                                line_range: None,
+                            });
                         }
                     }
                 }
@@ -222,11 +218,36 @@ pub fn compute(vai_dir: &Path, repo_root: &Path) -> Result<WorkspaceDiff, DiffEr
     }
 
     Ok(WorkspaceDiff {
-        workspace_id: meta.id,
-        base_version: meta.base_version,
+        workspace_id,
+        base_version,
         file_diffs,
         entity_changes,
     })
+}
+
+/// Computes the diff for the currently active workspace (local mode).
+///
+/// Reads workspace metadata and the deletion manifest from disk, constructs a
+/// [`DiskMergeFs`], and delegates to [`compute_with_fs`].
+///
+/// Does **not** write events or update workspace state.
+pub fn compute(vai_dir: &Path, repo_root: &Path) -> Result<WorkspaceDiff, DiffError> {
+    let meta = workspace::active(vai_dir)?;
+
+    // Read the deletion manifest (workspace metadata, not a source file).
+    let manifest_path = vai_dir
+        .join("workspaces")
+        .join(meta.id.to_string())
+        .join(".vai-deleted");
+    let deleted_paths: Vec<String> = if manifest_path.exists() {
+        let bytes = fs::read(&manifest_path)?;
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let disk_fs = DiskMergeFs::new(vai_dir, &meta.id.to_string(), repo_root);
+    compute_with_fs(&disk_fs, meta.id, meta.base_version, deleted_paths)
 }
 
 /// Records file and entity change events to the event log for a computed diff.
@@ -409,26 +430,6 @@ fn compute_entity_diff(
     Ok(())
 }
 
-/// Recursively collects all file paths under `dir`.
-fn collect_files(dir: &Path) -> Result<Vec<PathBuf>, DiffError> {
-    let mut files = Vec::new();
-    collect_files_recursive(dir, &mut files)?;
-    Ok(files)
-}
-
-fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), DiffError> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, files)?;
-        } else {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
 /// Counts the number of lines in `content`.
 fn count_lines(content: &[u8]) -> usize {
     if content.is_empty() {
@@ -450,6 +451,7 @@ fn sha256_hex(data: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn setup_repo(source_files: &[(&str, &str)]) -> (TempDir, PathBuf) {
