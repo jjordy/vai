@@ -1639,18 +1639,12 @@ async fn submit_workspace_handler(
                     }
                 }
 
-                // Remove deleted files from the "current/" prefix.
-                let manifest_key = format!("workspaces/{id}/.vai-deleted");
-                if let Ok(manifest_bytes) = file_store.get(&ctx.repo_id, &manifest_key).await {
-                    if let Ok(deleted_paths) =
-                        serde_json::from_slice::<Vec<String>>(&manifest_bytes)
-                    {
-                        for path in deleted_paths {
-                            let _ = file_store
-                                .delete(&ctx.repo_id, &format!("current/{path}"))
-                                .await;
-                        }
-                    }
+                // Remove deleted files from the "current/" prefix using the
+                // workspace's `deleted_paths` column (set by upload handlers).
+                for path in &meta.deleted_paths {
+                    let _ = file_store
+                        .delete(&ctx.repo_id, &format!("current/{path}"))
+                        .await;
                 }
             }
 
@@ -3021,9 +3015,10 @@ struct UploadFilesRequest {
     files: Vec<FileUploadEntry>,
     /// Paths (relative to repo root) that the agent deleted during this session.
     ///
-    /// These are merged into the workspace's deletion manifest stored in the
-    /// FileStore under `workspaces/{id}/.vai-deleted`. The download handler
-    /// and submit handler apply this manifest when reconstructing repo state.
+    /// These are accumulated into the workspace row's `deleted_paths` column
+    /// via the storage trait. The submit handler removes them from `current/`
+    /// and emits `FileRemoved` events; the download handler excludes them from
+    /// tarballs built from merged workspace overlays.
     #[serde(default)]
     deleted_paths: Vec<String>,
 }
@@ -3268,17 +3263,6 @@ async fn upload_workspace_files_handler(
         uploaded_paths.push(path_str);
     }
 
-    // Transition workspace to Active on first file upload.
-    if meta.status == workspace::WorkspaceStatus::Created && !uploaded_paths.is_empty() {
-        let update = crate::storage::WorkspaceUpdate {
-            status: Some(workspace::WorkspaceStatus::Active),
-            issue_id: None,
-        };
-        let _ = ctx.storage.workspaces()
-            .update_workspace(&ctx.repo_id, &workspace_uuid, update)
-            .await;
-    }
-
     // Broadcast a WebSocket notification.
     state.broadcast(BroadcastEvent {
         event_type: "FilesUploaded".to_string(),
@@ -3339,18 +3323,12 @@ async fn upload_workspace_files_handler(
         }
     }
 
-    // ── Process deleted_paths ──────────────────────────────────────────────────
-    if !body.deleted_paths.is_empty() {
-        let file_store = ctx.storage.files();
-        let manifest_key = format!("workspaces/{id}/.vai-deleted");
-
-        // Load existing deletion manifest (if any) and merge with new paths.
-        let mut existing: Vec<String> = file_store
-            .get(&ctx.repo_id, &manifest_key)
-            .await
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+    // ── Process deleted_paths and status transition ────────────────────────────
+    //
+    // Merge new deletions into the workspace row's `deleted_paths` column.
+    // Also transition workspace from Created → Active on first content upload.
+    {
+        let mut merged_deleted = meta.deleted_paths.clone();
 
         for raw_path in &body.deleted_paths {
             let rel = match sanitize_path(raw_path) {
@@ -3361,10 +3339,9 @@ async fn upload_workspace_files_handler(
                     )));
                 }
             };
-            if !existing.contains(&rel) {
-                existing.push(rel.clone());
+            if !merged_deleted.contains(&rel) {
+                merged_deleted.push(rel.clone());
             }
-
             // Emit FileRemoved event via storage trait.
             let _ = ctx
                 .storage
@@ -3379,13 +3356,26 @@ async fn upload_workspace_files_handler(
                 .await;
         }
 
-        // Persist the merged manifest.
-        let manifest_bytes = serde_json::to_vec(&existing)
-            .map_err(|e| ApiError::internal(format!("serialize deletion manifest: {e}")))?;
-        file_store
-            .put(&ctx.repo_id, &manifest_key, &manifest_bytes)
-            .await
-            .map_err(|e| ApiError::internal(format!("write deletion manifest: {e}")))?;
+        let new_status = if meta.status == workspace::WorkspaceStatus::Created
+            && (!uploaded_paths.is_empty() || !body.deleted_paths.is_empty())
+        {
+            Some(workspace::WorkspaceStatus::Active)
+        } else {
+            None
+        };
+        let deleted_changed = merged_deleted != meta.deleted_paths;
+        if new_status.is_some() || deleted_changed {
+            let update = crate::storage::WorkspaceUpdate {
+                status: new_status,
+                deleted_paths: if deleted_changed { Some(merged_deleted) } else { None },
+                ..Default::default()
+            };
+            let _ = ctx
+                .storage
+                .workspaces()
+                .update_workspace(&ctx.repo_id, &workspace_uuid, update)
+                .await;
+        }
     }
 
     let count = uploaded_paths.len();
@@ -3436,7 +3426,7 @@ const MAX_SNAPSHOT_SIZE_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 ///
 /// Added and modified files are written to the workspace overlay under
 /// `workspaces/{id}/{path}` in the file store.  Deleted paths are recorded
-/// in the `.vai-deleted` manifest used by the submit and download handlers.
+/// via the workspace row's `deleted_paths` column used by submit and download handlers.
 ///
 /// Tarballs larger than 100 MiB (compressed) are rejected with **413**.
 async fn upload_snapshot_handler(
@@ -3550,20 +3540,12 @@ async fn upload_snapshot_handler(
         .collect();
     let deleted = deleted_paths.len();
 
-    if !deleted_paths.is_empty() {
-        let manifest_key = format!("workspaces/{id}/.vai-deleted");
-
-        // Merge with any existing deletion manifest.
-        let mut existing: Vec<String> = file_store
-            .get(&ctx.repo_id, &manifest_key)
-            .await
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-
+    // Merge snapshot deletions into workspace row and transition Created → Active.
+    {
+        let mut merged_deleted = meta.deleted_paths.clone();
         for path in &deleted_paths {
-            if !existing.contains(path) {
-                existing.push(path.clone());
+            if !merged_deleted.contains(path) {
+                merged_deleted.push(path.clone());
             }
             let _ = ctx
                 .storage
@@ -3578,27 +3560,26 @@ async fn upload_snapshot_handler(
                 .await;
         }
 
-        let manifest_bytes = serde_json::to_vec(&existing)
-            .map_err(|e| ApiError::internal(format!("serialize deletion manifest: {e}")))?;
-        file_store
-            .put(&ctx.repo_id, &manifest_key, &manifest_bytes)
-            .await
-            .map_err(|e| ApiError::internal(format!("write deletion manifest: {e}")))?;
-    }
-
-    // Transition workspace from Created → Active on first content upload.
-    if meta.status == workspace::WorkspaceStatus::Created
-        && (!uploaded_paths.is_empty() || !deleted_paths.is_empty())
-    {
-        let update = crate::storage::WorkspaceUpdate {
-            status: Some(workspace::WorkspaceStatus::Active),
-            issue_id: None,
+        let new_status = if meta.status == workspace::WorkspaceStatus::Created
+            && (!uploaded_paths.is_empty() || !deleted_paths.is_empty())
+        {
+            Some(workspace::WorkspaceStatus::Active)
+        } else {
+            None
         };
-        let _ = ctx
-            .storage
-            .workspaces()
-            .update_workspace(&ctx.repo_id, &ws_uuid, update)
-            .await;
+        let deleted_changed = merged_deleted != meta.deleted_paths;
+        if new_status.is_some() || deleted_changed {
+            let update = crate::storage::WorkspaceUpdate {
+                status: new_status,
+                deleted_paths: if deleted_changed { Some(merged_deleted) } else { None },
+                ..Default::default()
+            };
+            let _ = ctx
+                .storage
+                .workspaces()
+                .update_workspace(&ctx.repo_id, &ws_uuid, update)
+                .await;
+        }
     }
 
     // Broadcast WebSocket notification.
@@ -4231,12 +4212,13 @@ async fn files_download_handler(
         all_workspaces.retain(|w| w.status == crate::workspace::WorkspaceStatus::Merged);
         all_workspaces.sort_by_key(|w| w.created_at);
 
-        for ws_id in all_workspaces.iter().map(|w| w.id) {
+        for ws in &all_workspaces {
+            let ws_id = ws.id;
             let prefix = format!("workspaces/{ws_id}/");
             if let Ok(ws_files) = file_store.list(&ctx.repo_id, &prefix).await {
                 for fm in ws_files {
                     let rel = fm.path.strip_prefix(&prefix).unwrap_or(&fm.path).to_string();
-                    if rel.is_empty() || rel == ".vai-deleted" {
+                    if rel.is_empty() {
                         continue;
                     }
                     if let Ok(content) = file_store.get(&ctx.repo_id, &fm.path).await {
@@ -4245,13 +4227,9 @@ async fn files_download_handler(
                 }
             }
 
-            let manifest_key = format!("workspaces/{ws_id}/.vai-deleted");
-            if let Ok(bytes) = file_store.get(&ctx.repo_id, &manifest_key).await {
-                if let Ok(deleted_paths) = serde_json::from_slice::<Vec<String>>(&bytes) {
-                    for path in deleted_paths {
-                        file_map.remove(&path);
-                    }
-                }
+            // Apply deletions from workspace row's `deleted_paths` column.
+            for path in &ws.deleted_paths {
+                file_map.remove(path);
             }
         }
     }
@@ -8531,11 +8509,15 @@ async fn prepare_workspace_for_submit(
         }
     }
 
-    // ── 2b. Download deletion manifest if present ─────────────────────────────
-    let manifest_key = format!("workspaces/{ws_id}/.vai-deleted");
-    if let Ok(manifest_bytes) = ctx.storage.files().get(&ctx.repo_id, &manifest_key).await {
+    // ── 2b. Write deletion manifest from workspace row ────────────────────────
+    // The merge engine reads `.vai-deleted` from the workspace directory.
+    // Write it from the `deleted_paths` column on the workspace row rather
+    // than downloading it from FileStore, so this works in Postgres-only mode.
+    if !ws_meta.deleted_paths.is_empty() {
         let manifest_path = ws_dir.join(".vai-deleted");
-        let _ = std::fs::write(&manifest_path, &manifest_bytes);
+        if let Ok(manifest_bytes) = serde_json::to_vec(&ws_meta.deleted_paths) {
+            let _ = std::fs::write(&manifest_path, &manifest_bytes);
+        }
     }
 
     // ── 3. Sync HEAD from storage to local filesystem ─────────────────────────

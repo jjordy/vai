@@ -1135,7 +1135,8 @@ impl WorkspaceStore for PostgresStorage {
         id: &Uuid,
     ) -> Result<WorkspaceMeta, StorageError> {
         let row = sqlx::query(
-            "SELECT id, intent, base_version, status, issue_id, created_at, updated_at \
+            "SELECT id, intent, base_version, status, issue_id, deleted_paths, \
+             created_at, updated_at \
              FROM workspaces WHERE repo_id = $1 AND id = $2",
         )
         .bind(repo_id)
@@ -1155,7 +1156,8 @@ impl WorkspaceStore for PostgresStorage {
     ) -> Result<Vec<WorkspaceMeta>, StorageError> {
         let rows = if include_inactive {
             sqlx::query(
-                "SELECT id, intent, base_version, status, issue_id, created_at, updated_at \
+                "SELECT id, intent, base_version, status, issue_id, deleted_paths, \
+                 created_at, updated_at \
                  FROM workspaces WHERE repo_id = $1 ORDER BY created_at",
             )
             .bind(repo_id)
@@ -1163,7 +1165,8 @@ impl WorkspaceStore for PostgresStorage {
             .await
         } else {
             sqlx::query(
-                "SELECT id, intent, base_version, status, issue_id, created_at, updated_at \
+                "SELECT id, intent, base_version, status, issue_id, deleted_paths, \
+                 created_at, updated_at \
                  FROM workspaces WHERE repo_id = $1 \
                  AND status NOT IN ('Discarded', 'Merged') ORDER BY created_at",
             )
@@ -1188,13 +1191,15 @@ impl WorkspaceStore for PostgresStorage {
             .map(|s| s.as_str().to_string())
             .unwrap_or_else(|| current.status.as_str().to_string());
         let issue_id = update.issue_id.or(current.issue_id);
+        let deleted_paths = update.deleted_paths.unwrap_or(current.deleted_paths);
 
         sqlx::query(
-            "UPDATE workspaces SET status = $1, issue_id = $2, updated_at = now() \
-             WHERE repo_id = $3 AND id = $4",
+            "UPDATE workspaces SET status = $1, issue_id = $2, deleted_paths = $3, \
+             updated_at = now() WHERE repo_id = $4 AND id = $5",
         )
         .bind(&status)
         .bind(issue_id)
+        .bind(&deleted_paths)
         .bind(repo_id)
         .bind(id)
         .execute(&self.pool)
@@ -1225,6 +1230,7 @@ fn row_to_workspace(row: sqlx::postgres::PgRow) -> Result<WorkspaceMeta, Storage
     let base_version: String = row.get("base_version");
     let status_str: String = row.get("status");
     let issue_id: Option<Uuid> = row.get("issue_id");
+    let deleted_paths: Vec<String> = row.try_get("deleted_paths").unwrap_or_default();
     let created_at: DateTime<Utc> = row.get("created_at");
     let updated_at: DateTime<Utc> = row.get("updated_at");
 
@@ -1242,6 +1248,7 @@ fn row_to_workspace(row: sqlx::postgres::PgRow) -> Result<WorkspaceMeta, Storage
         base_version,
         status,
         issue_id,
+        deleted_paths,
         created_at,
         updated_at,
     })

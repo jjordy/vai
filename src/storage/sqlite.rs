@@ -684,6 +684,9 @@ impl WorkspaceStore for SqliteStorage {
         if let Some(issue_id) = update.issue_id {
             meta.issue_id = Some(issue_id);
         }
+        if let Some(deleted_paths) = update.deleted_paths {
+            meta.deleted_paths = deleted_paths;
+        }
         meta.updated_at = Utc::now();
 
         workspace::update_meta(&self.vai_dir, &meta)

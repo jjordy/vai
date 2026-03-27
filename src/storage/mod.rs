@@ -161,6 +161,9 @@ pub struct NewWorkspace {
 pub struct WorkspaceUpdate {
     pub status: Option<WorkspaceStatus>,
     pub issue_id: Option<Uuid>,
+    /// Replaces the workspace's full deletion list with this value when `Some`.
+    /// Pass the merged list (existing + new entries) rather than just new ones.
+    pub deleted_paths: Option<Vec<String>>,
 }
 
 /// Metadata about a stored file.

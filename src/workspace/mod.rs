@@ -97,6 +97,12 @@ pub struct WorkspaceMeta {
     /// Optional issue ID this workspace was created to address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_id: Option<Uuid>,
+    /// Paths (relative to repo root) that have been deleted in this workspace.
+    ///
+    /// Accumulated across all upload calls; applied during submit to remove
+    /// files from `current/` and recorded as `FileRemoved` events.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_paths: Vec<String>,
 }
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -149,6 +155,7 @@ pub fn create_with_id(
         created_at: now,
         updated_at: now,
         issue_id: None,
+        deleted_paths: Vec::new(),
     };
 
     write_meta(&ws_dir, &meta)?;

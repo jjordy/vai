@@ -466,6 +466,7 @@ async fn test_workspace_store() {
             WorkspaceUpdate {
                 status: Some(WorkspaceStatus::Active),
                 issue_id: None,
+                deleted_paths: None,
             },
         )
         .await

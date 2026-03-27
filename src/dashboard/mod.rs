@@ -1680,6 +1680,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 issue_id: None,
+                deleted_paths: Vec::new(),
             },
             workspace::WorkspaceMeta {
                 id: Uuid::new_v4(),
@@ -1689,6 +1690,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 issue_id: None,
+                deleted_paths: Vec::new(),
             },
         ];
 
