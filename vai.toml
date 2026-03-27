@@ -1,0 +1,9 @@
+languages = ["auto"]
+ignore = [
+    ".vai/",
+    ".git/",
+    "target/",
+    "node_modules/",
+    "*.o",
+    "*.class",
+]
