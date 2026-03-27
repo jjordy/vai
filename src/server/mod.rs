@@ -1563,24 +1563,27 @@ async fn submit_workspace_handler(
     let workspace_uuid = meta.id;
     let workspace_intent = meta.intent.clone();
 
-    // Ensure the workspace overlay and filesystem state are ready for merge::submit.
-    // In Postgres server mode workspaces live in the database + FileStore; this
-    // step downloads them to the local .vai/ tree that the synchronous merge
-    // engine expects.
-    prepare_workspace_for_submit(&ctx, &meta).await?;
-
-    // Make it the active workspace so merge::submit can find it.
-    workspace::switch(&ctx.vai_dir, &id).map_err(ApiError::from)?;
-
-    // In ServerWithS3 mode use S3MergeFs so the merge engine reads files
-    // directly from S3 and buffers writes in memory.  flush() is called after
-    // a successful merge to persist the merged base state and snapshots.
-    // In all other modes fall back to the disk-based merge::submit path.
+    // Choose merge strategy based on storage backend.
     let using_s3_merge = matches!(
         &ctx.storage,
         crate::storage::StorageBackend::ServerWithS3(_, _)
     );
+
     let submit_result = if using_s3_merge {
+        // S3 mode: read HEAD from storage, set up a minimal temporary .vai/
+        // directory for the merge engine's metadata operations, and use
+        // S3MergeFs for all file I/O.  No writes touch the real repo root.
+        let current_head = ctx
+            .storage
+            .versions()
+            .read_head(&ctx.repo_id)
+            .await
+            .map_err(|e| ApiError::internal(format!("read HEAD from storage: {e}")))?
+            .unwrap_or_else(|| meta.base_version.clone());
+
+        let tmp = setup_tmpdir_for_s3_submit(&meta, &current_head)?;
+        let tmp_vai = tmp.path().join(".vai");
+
         let s3_fs = crate::merge_fs::S3MergeFs::new(
             ctx.storage.files(),
             ctx.repo_id,
@@ -1589,7 +1592,7 @@ async fn submit_workspace_handler(
         );
         let result = merge::submit_with_fs(
             &s3_fs,
-            &ctx.vai_dir,
+            &tmp_vai,
             &meta,
             meta.deleted_paths.clone(),
         );
@@ -1599,8 +1602,12 @@ async fn submit_workspace_handler(
                 .await
                 .map_err(|e| ApiError::internal(format!("S3MergeFs flush: {e}")))?;
         }
+        // tmp is dropped here; the tmpdir is cleaned up automatically.
         result
     } else {
+        // Non-S3 mode (local SQLite): switch to the workspace so merge::submit
+        // can locate the active overlay on disk, then run the disk-based merge.
+        workspace::switch(&ctx.vai_dir, &id).map_err(ApiError::from)?;
         merge::submit(&ctx.vai_dir, &ctx.repo_root)
     };
 
@@ -8708,194 +8715,83 @@ async fn shutdown_signal() {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Ensures the workspace is present on the local filesystem so `merge::submit` can run.
+/// A self-cleaning temporary directory for use with [`setup_tmpdir_for_s3_submit`].
 ///
-/// In Postgres server mode, workspaces are created in the database only; their
-/// overlay files live in FileStore (S3). This function:
-///
-/// 1. Creates the workspace directory and `meta.toml` from storage if missing.
-/// 2. Downloads overlay files from FileStore into the local overlay directory
-///    if it is empty.
-/// 3. Syncs the current HEAD from storage into the local `.vai/head` file.
-/// 4. Creates a version TOML stub for the current HEAD so that
-///    `version::next_version_id` returns the correct next ID.
-/// 5. Downloads version snapshot files needed for the semantic merge path.
-async fn prepare_workspace_for_submit(
-    ctx: &RepoCtx,
-    ws_meta: &workspace::WorkspaceMeta,
-) -> Result<(), ApiError> {
-    let ws_id = ws_meta.id.to_string();
-    let ws_dir = ctx.vai_dir.join("workspaces").join(&ws_id);
-    let overlay_dir = ws_dir.join("overlay");
+/// The inner directory is removed when this value is dropped.
+struct TmpDir(std::path::PathBuf);
 
-    // ── 1. Create workspace directory and meta.toml ────────────────────────────
-    // Always ensure both exist — the directory may have been created by a prior
-    // failed attempt without the meta.toml, or the meta.toml may be stale.
-    std::fs::create_dir_all(&overlay_dir)
-        .map_err(|e| ApiError::internal(format!("create workspace dir: {e}")))?;
-    workspace::update_meta(&ctx.vai_dir, ws_meta)
-        .map_err(|e| ApiError::internal(format!("write workspace meta: {e}")))?;
-
-    // ── 2. Download overlay files from FileStore if the overlay is empty ──────
-    let overlay_is_empty = std::fs::read_dir(&overlay_dir)
-        .map(|mut d| d.next().is_none())
-        .unwrap_or(true);
-
-    if overlay_is_empty {
-        let file_store = ctx.storage.files();
-        let prefix = format!("workspaces/{ws_id}/");
-        // Best-effort — if FileStore is not configured (local SQLite mode) the
-        // list will return an empty vec and we let merge::submit fail naturally.
-        let files = file_store.list(&ctx.repo_id, &prefix).await.unwrap_or_default();
-
-        for file_meta in files {
-            let rel = file_meta
-                .path
-                .strip_prefix(&prefix)
-                .unwrap_or(&file_meta.path)
-                .to_string();
-            if rel.is_empty() {
-                continue;
-            }
-            let content = file_store
-                .get(&ctx.repo_id, &file_meta.path)
-                .await
-                .map_err(|e| ApiError::internal(format!("download overlay file `{rel}`: {e}")))?;
-            let dest = overlay_dir.join(&rel);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| ApiError::internal(format!("create overlay parent dir: {e}")))?;
-            }
-            std::fs::write(&dest, &content)
-                .map_err(|e| ApiError::internal(format!("write overlay file `{rel}`: {e}")))?;
-        }
-
-        // Verify that we have something to merge.
-        let still_empty = std::fs::read_dir(&overlay_dir)
-            .map(|mut d| d.next().is_none())
-            .unwrap_or(true);
-        if still_empty {
-            return Err(ApiError::bad_request("workspace has no overlay files to submit"));
-        }
+impl TmpDir {
+    /// Returns the path to the temporary directory root.
+    fn path(&self) -> &std::path::Path {
+        &self.0
     }
-
-    // ── 2b. Write deletion manifest from workspace row ────────────────────────
-    // The merge engine reads `.vai-deleted` from the workspace directory.
-    // Write it from the `deleted_paths` column on the workspace row rather
-    // than downloading it from FileStore, so this works in Postgres-only mode.
-    if !ws_meta.deleted_paths.is_empty() {
-        let manifest_path = ws_dir.join(".vai-deleted");
-        if let Ok(manifest_bytes) = serde_json::to_vec(&ws_meta.deleted_paths) {
-            let _ = std::fs::write(&manifest_path, &manifest_bytes);
-        }
-    }
-
-    // ── 3. Sync HEAD from storage to local filesystem ─────────────────────────
-    let current_head = ctx
-        .storage
-        .versions()
-        .read_head(&ctx.repo_id)
-        .await
-        .map_err(|e| ApiError::internal(format!("read HEAD from storage: {e}")))?
-        .unwrap_or_else(|| ws_meta.base_version.clone());
-
-    std::fs::write(ctx.vai_dir.join("head"), format!("{current_head}\n"))
-        .map_err(|e| ApiError::internal(format!("write local head file: {e}")))?;
-
-    // ── 4. Ensure a version TOML exists for current HEAD ─────────────────────
-    // `version::next_version_id` scans `.vai/versions/` to find the highest
-    // version number.  In server mode that directory may be empty, so we write
-    // at least a stub for the current HEAD version so the scan returns the
-    // correct next ID.
-    let versions_dir = ctx.vai_dir.join("versions");
-    std::fs::create_dir_all(&versions_dir)
-        .map_err(|e| ApiError::internal(format!("create versions dir: {e}")))?;
-
-    let head_toml_path = versions_dir.join(format!("{current_head}.toml"));
-    if !head_toml_path.exists() {
-        let toml_str = ctx
-            .storage
-            .versions()
-            .get_version(&ctx.repo_id, &current_head)
-            .await
-            .ok()
-            .and_then(|vm| toml::to_string_pretty(&vm).ok())
-            .unwrap_or_else(|| {
-                format!(
-                    "version_id = \"{current_head}\"\nintent = \"placeholder\"\n\
-                     created_by = \"server\"\ncreated_at = \"{}\"\n",
-                    chrono::Utc::now().to_rfc3339()
-                )
-            });
-        std::fs::write(&head_toml_path, toml_str)
-            .map_err(|e| ApiError::internal(format!("write version toml for {current_head}: {e}")))?;
-    }
-
-    // ── 5. Download snapshot files for semantic merge ─────────────────────────
-    // The three-level merge reads pre-change snapshots from
-    // `.vai/versions/<id>/snapshot/` for each version between the workspace
-    // base and the current HEAD.  These were uploaded to FileStore by earlier
-    // submit operations.
-    let base_n = server_parse_version_num(&ws_meta.base_version);
-    let head_n = server_parse_version_num(&current_head);
-
-    if head_n > base_n {
-        let file_store = ctx.storage.files();
-        for n in (base_n + 1)..=head_n {
-            let ver_id = format!("v{n}");
-
-            // Also ensure a version TOML exists for every intermediate version
-            // so the merge engine can scan the versions directory correctly.
-            let ver_toml = versions_dir.join(format!("{ver_id}.toml"));
-            if !ver_toml.exists() {
-                if let Ok(vm) = ctx.storage.versions().get_version(&ctx.repo_id, &ver_id).await {
-                    if let Ok(s) = toml::to_string_pretty(&vm) {
-                        let _ = std::fs::write(&ver_toml, s);
-                    }
-                }
-            }
-
-            let snap_dir = versions_dir.join(&ver_id).join("snapshot");
-
-            // Skip if snapshots are already on disk.
-            if snap_dir.exists()
-                && std::fs::read_dir(&snap_dir)
-                    .map(|mut d| d.next().is_some())
-                    .unwrap_or(false)
-            {
-                continue;
-            }
-
-            let prefix = format!("versions/{ver_id}/snapshot/");
-            if let Ok(snap_files) = file_store.list(&ctx.repo_id, &prefix).await {
-                for sf in snap_files {
-                    let rel = sf
-                        .path
-                        .strip_prefix(&prefix)
-                        .unwrap_or(&sf.path)
-                        .to_string();
-                    if rel.is_empty() {
-                        continue;
-                    }
-                    if let Ok(content) = file_store.get(&ctx.repo_id, &sf.path).await {
-                        let dest = snap_dir.join(&rel);
-                        if let Some(parent) = dest.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        let _ = std::fs::write(&dest, content);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
-/// Parses a version string like `"v3"` into the integer `3`.
-/// Returns `0` for unrecognised formats.
-fn server_parse_version_num(version: &str) -> u64 {
-    version.trim_start_matches('v').parse::<u64>().unwrap_or(0)
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Creates a minimal temporary `.vai/` directory for use with
+/// [`merge::submit_with_fs`] in S3 server mode.
+///
+/// The merge engine expects a `.vai/` directory for metadata operations
+/// (event log, workspace status, HEAD file, version directory).  In S3 mode
+/// the real repo directory may not exist on disk, so this function sets up
+/// the minimal structure in a temporary directory that the merge engine can
+/// operate on.  The caller must keep the returned [`TmpDir`] alive for the
+/// duration of the `submit_with_fs` call; it is automatically cleaned up when
+/// dropped.
+///
+/// # Minimal structure created
+///
+/// | Path                              | Purpose                                      |
+/// |-----------------------------------|----------------------------------------------|
+/// | `.vai/head`                       | Lets `repo::read_head` return `current_head` |
+/// | `.vai/workspaces/<id>/meta.toml`  | Workspace metadata for the merge engine      |
+/// | `.vai/workspaces/active`          | Active workspace pointer for `diff::record_events` |
+/// | `.vai/versions/<head>.toml`       | Stub so `version::next_version_id` is correct |
+fn setup_tmpdir_for_s3_submit(
+    ws_meta: &workspace::WorkspaceMeta,
+    current_head: &str,
+) -> Result<TmpDir, ApiError> {
+    let tmp_path = std::env::temp_dir().join(format!("vai-submit-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp_path)
+        .map_err(|e| ApiError::internal(format!("create tmpdir for submit: {e}")))?;
+    let tmp = TmpDir(tmp_path);
+    let vai = tmp.path().join(".vai");
+
+    // HEAD file.
+    std::fs::create_dir_all(&vai)
+        .map_err(|e| ApiError::internal(format!("create tmpdir/.vai: {e}")))?;
+    std::fs::write(vai.join("head"), format!("{current_head}\n"))
+        .map_err(|e| ApiError::internal(format!("write tmpdir head: {e}")))?;
+
+    // Workspace dir + meta.toml.
+    let ws_dir = vai.join("workspaces").join(ws_meta.id.to_string());
+    std::fs::create_dir_all(&ws_dir)
+        .map_err(|e| ApiError::internal(format!("create tmpdir workspace dir: {e}")))?;
+    workspace::update_meta(&vai, ws_meta)
+        .map_err(|e| ApiError::internal(format!("write tmpdir workspace meta: {e}")))?;
+
+    // Active workspace pointer (needed by diff::record_events → workspace::active).
+    std::fs::write(vai.join("workspaces").join("active"), ws_meta.id.to_string())
+        .map_err(|e| ApiError::internal(format!("set tmpdir active workspace: {e}")))?;
+
+    // Version TOML stub for current HEAD so next_version_id returns the right value.
+    let versions_dir = vai.join("versions");
+    std::fs::create_dir_all(&versions_dir)
+        .map_err(|e| ApiError::internal(format!("create tmpdir versions dir: {e}")))?;
+    let stub_toml = format!(
+        "version_id = \"{current_head}\"\nintent = \"placeholder\"\n\
+         created_by = \"server\"\ncreated_at = \"{}\"\n",
+        chrono::Utc::now().to_rfc3339()
+    );
+    std::fs::write(versions_dir.join(format!("{current_head}.toml")), stub_toml)
+        .map_err(|e| ApiError::internal(format!("write tmpdir version toml: {e}")))?;
+
+    Ok(tmp)
 }
 
 /// Recursively collects all files under `dir`, returning `(relative_path,
