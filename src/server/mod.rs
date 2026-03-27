@@ -7692,6 +7692,28 @@ impl From<crate::storage::User> for UserResponse {
     }
 }
 
+/// Response body for `GET /api/repos/:repo/me`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeResponse {
+    /// The authenticated user's identifier.
+    ///
+    /// `"admin"` for the bootstrap admin key; a UUID string for scoped keys
+    /// associated with a user account; the key record ID for legacy keys
+    /// without a user association (local mode).
+    pub user_id: String,
+    /// The user's email address, or `null` for admin and legacy keys.
+    pub email: Option<String>,
+    /// Effective role on this repository.
+    ///
+    /// One of `"owner"`, `"admin"`, `"write"`, or `"read"`.
+    /// The bootstrap admin key always returns `"admin"`.
+    pub role: String,
+    /// Authentication method used for this request.
+    ///
+    /// Always `"api_key"` — session auth is not yet implemented.
+    pub auth_type: String,
+}
+
 /// Response body for org membership endpoints.
 #[derive(Debug, Serialize, ToSchema)]
 struct OrgMemberResponse {
@@ -7894,6 +7916,88 @@ async fn get_user_handler(
         orgs.get_user_by_email(&user_ref).await.map_err(ApiError::from)?
     };
     Ok(Json(UserResponse::from(user)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/repos/{repo}/me",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Authenticated user info for this repo", body = MeResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "No access to this repository"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "auth"
+)]
+/// `GET /api/repos/:repo/me` — returns the authenticated caller's identity and
+/// effective role on the named repository.
+///
+/// Reads the [`AgentIdentity`] injected by the auth middleware and resolves:
+/// - Bootstrap admin key → role `"admin"`, no email.
+/// - Scoped key with user → look up email and resolve repo role via [`OrgStore`].
+/// - Legacy/local key without user → role `"owner"` (local mode grants full access).
+async fn get_me_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+) -> Result<Json<MeResponse>, ApiError> {
+    // Bootstrap admin key always has full access.
+    if identity.is_admin {
+        return Ok(Json(MeResponse {
+            user_id: "admin".to_string(),
+            email: None,
+            role: "admin".to_string(),
+            auth_type: "api_key".to_string(),
+        }));
+    }
+
+    // Scoped key associated with a user: resolve effective repo role via OrgStore.
+    if let Some(uid) = &identity.user_id {
+        let user = ctx
+            .storage
+            .orgs()
+            .get_user(uid)
+            .await
+            .map_err(|e| ApiError::internal(format!("user lookup failed: {e}")))?;
+
+        let resolved = ctx
+            .storage
+            .orgs()
+            .resolve_repo_role(uid, &ctx.repo_id)
+            .await
+            .map_err(|e| ApiError::internal(format!("role resolution failed: {e}")))?;
+
+        let effective = match resolved {
+            None => return Err(ApiError::forbidden("no access to this repository")),
+            Some(r) => r,
+        };
+
+        // Apply the key-level role cap if one is set.
+        let effective = if let Some(cap_str) = &identity.role_override {
+            let cap = crate::storage::RepoRole::from_str(cap_str);
+            if effective.rank() > cap.rank() { cap } else { effective }
+        } else {
+            effective
+        };
+
+        return Ok(Json(MeResponse {
+            user_id: uid.to_string(),
+            email: Some(user.email),
+            role: effective.as_str().to_string(),
+            auth_type: "api_key".to_string(),
+        }));
+    }
+
+    // Legacy key with no user association (local SQLite mode).
+    // Any authenticated key has full owner access in local mode.
+    Ok(Json(MeResponse {
+        user_id: identity.key_id.clone(),
+        email: None,
+        role: "owner".to_string(),
+        auth_type: "api_key".to_string(),
+    }))
 }
 
 #[utoipa::path(
@@ -8855,6 +8959,7 @@ impl utoipa::Modify for SecurityAddon {
         delete_org_handler,
         create_user_handler,
         get_user_handler,
+        get_me_handler,
         add_org_member_handler,
         list_org_members_handler,
         update_org_member_handler,
@@ -8928,6 +9033,7 @@ impl utoipa::Modify for SecurityAddon {
             UpdateMemberRequest,
             OrgResponse,
             UserResponse,
+            MeResponse,
             OrgMemberResponse,
             AddCollaboratorRequest,
             UpdateCollaboratorRequest,
@@ -9134,6 +9240,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
     // `repo_resolve_middleware`.  All the same handlers are reused — the
     // `RepoCtx` extractor picks up the per-repo paths from request extensions.
     let repo_scoped = Router::new()
+        .route("/me", get(get_me_handler))
         .route("/status", get(status_handler))
         .route("/workspaces", post(create_workspace_handler))
         .route("/workspaces", get(list_workspaces_handler))
@@ -10042,6 +10149,114 @@ mod tests {
             0,
             "discarded workspace should not appear"
         );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// `GET /api/repos/:repo/me` — admin key returns role "admin".
+    #[tokio::test]
+    async fn me_endpoint_admin_key() {
+        let tmp = TempDir::new().unwrap();
+        let storage_tmp = TempDir::new().unwrap();
+
+        let (addr, shutdown_tx, key) =
+            start_test_server_multi_repo(tmp.path(), storage_tmp.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+
+        // Create a repo first.
+        let resp = client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "name": "my-repo" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // Call /me with the bootstrap admin key.
+        let resp = client
+            .get(format!("http://{addr}/api/repos/my-repo/me"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "admin key /me should succeed");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["user_id"], "admin");
+        assert_eq!(body["role"], "admin");
+        assert_eq!(body["auth_type"], "api_key");
+        assert!(body["email"].is_null());
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// `GET /api/repos/:repo/me` — non-admin key (no user_id) returns role "owner"
+    /// in local SQLite mode.
+    #[tokio::test]
+    async fn me_endpoint_local_key() {
+        let tmp = TempDir::new().unwrap();
+        let storage_tmp = TempDir::new().unwrap();
+
+        let (addr, shutdown_tx, admin_key) =
+            start_test_server_multi_repo(tmp.path(), storage_tmp.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+
+        // Create a repo.
+        let resp = client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&admin_key)
+            .json(&serde_json::json!({ "name": "my-repo" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // Create a regular API key in the server-level key store (root vai_dir).
+        // Auth middleware validates against state.storage which is rooted at root/.vai.
+        let server_vai_dir = tmp.path().join(".vai");
+        let (_, test_key) = crate::auth::create(&server_vai_dir, "local-me-test").unwrap();
+
+        let resp = client
+            .get(format!("http://{addr}/api/repos/my-repo/me"))
+            .bearer_auth(&test_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "local key /me should succeed");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["role"], "owner", "local mode keys get owner role");
+        assert_eq!(body["auth_type"], "api_key");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// `GET /api/repos/:repo/me` — missing key returns 401.
+    #[tokio::test]
+    async fn me_endpoint_unauthorized() {
+        let tmp = TempDir::new().unwrap();
+        let storage_tmp = TempDir::new().unwrap();
+
+        let (addr, shutdown_tx, admin_key) =
+            start_test_server_multi_repo(tmp.path(), storage_tmp.path().to_path_buf()).await;
+        let client = reqwest::Client::new();
+
+        // Create a repo.
+        let resp = client
+            .post(format!("http://{addr}/api/repos"))
+            .bearer_auth(&admin_key)
+            .json(&serde_json::json!({ "name": "my-repo" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // Call /me without auth.
+        let resp = client
+            .get(format!("http://{addr}/api/repos/my-repo/me"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
 
         shutdown_tx.send(()).ok();
     }
