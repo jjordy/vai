@@ -2217,3 +2217,191 @@ async fn test_comment_author_type() {
 
     shutdown_tx.send(()).ok();
 }
+
+// ── Issue attachment CRUD ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_issue_attachments() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start server");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // ── Create repo ───────────────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": "attachment-test-repo" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // ── Create issue ──────────────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "attachment test issue",
+            "description": "testing file attachments",
+            "priority": "low"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    let issue_id = issue["id"].as_str().unwrap();
+
+    // ── List attachments → empty ──────────────────────────────────────────────
+    let resp = client
+        .get(format!("{rp}/issues/{issue_id}/attachments"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 0, "initially no attachments");
+
+    // ── Upload attachment (base64 JSON) ────────────────────────────────────────
+    let file_content = b"hello, world! this is a test file.";
+    let encoded = BASE64.encode(file_content);
+    let resp = client
+        .post(format!("{rp}/issues/{issue_id}/attachments"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "filename": "hello.txt",
+            "content_type": "text/plain",
+            "content": encoded,
+            "uploaded_by": "test-agent"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        201,
+        "upload failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let att: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(att["filename"].as_str().unwrap(), "hello.txt");
+    assert_eq!(att["content_type"].as_str().unwrap(), "text/plain");
+    assert_eq!(att["size_bytes"].as_i64().unwrap(), file_content.len() as i64);
+    assert_eq!(att["uploaded_by"].as_str().unwrap(), "test-agent");
+    assert_eq!(att["issue_id"].as_str().unwrap(), issue_id);
+
+    // ── Upload second attachment ───────────────────────────────────────────────
+    let img_content = b"\x89PNG\r\n\x1a\nfake-png-data";
+    let encoded2 = BASE64.encode(img_content);
+    let resp = client
+        .post(format!("{rp}/issues/{issue_id}/attachments"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "filename": "screenshot.png",
+            "content_type": "image/png",
+            "content": encoded2,
+            "uploaded_by": "test-agent"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // ── List attachments → two items ──────────────────────────────────────────
+    let resp = client
+        .get(format!("{rp}/issues/{issue_id}/attachments"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    let arr = list.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "expected 2 attachments");
+    let filenames: Vec<&str> = arr
+        .iter()
+        .map(|a| a["filename"].as_str().unwrap())
+        .collect();
+    assert!(filenames.contains(&"hello.txt"));
+    assert!(filenames.contains(&"screenshot.png"));
+
+    // ── Download first attachment → verify content matches ────────────────────
+    let resp = client
+        .get(format!("{rp}/issues/{issue_id}/attachments/hello.txt"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ct.contains("text/plain"), "content-type was: {ct}");
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), file_content, "downloaded content mismatch");
+
+    // ── Duplicate filename → 409 ──────────────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues/{issue_id}/attachments"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "filename": "hello.txt",
+            "content_type": "text/plain",
+            "content": BASE64.encode(b"duplicate"),
+            "uploaded_by": "test-agent"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        409,
+        "expected conflict for duplicate filename"
+    );
+
+    // ── Delete first attachment ────────────────────────────────────────────────
+    let resp = client
+        .delete(format!("{rp}/issues/{issue_id}/attachments/hello.txt"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // ── List attachments → one item remains ───────────────────────────────────
+    let resp = client
+        .get(format!("{rp}/issues/{issue_id}/attachments"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let list: serde_json::Value = resp.json().await.unwrap();
+    let arr = list.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "expected 1 attachment after delete");
+    assert_eq!(arr[0]["filename"].as_str().unwrap(), "screenshot.png");
+
+    // ── Download deleted attachment → 404 ─────────────────────────────────────
+    let resp = client
+        .get(format!("{rp}/issues/{issue_id}/attachments/hello.txt"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "deleted attachment should return 404");
+
+    shutdown_tx.send(()).ok();
+}

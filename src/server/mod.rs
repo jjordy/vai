@@ -91,6 +91,10 @@
 //!   - `GET /api/repos/:repo/issues/:id` — issue details
 //!   - `PATCH /api/repos/:repo/issues/:id` — update issue
 //!   - `POST /api/repos/:repo/issues/:id/close` — close issue
+//!   - `POST /api/repos/:repo/issues/:id/attachments` — upload file attachment
+//!   - `GET /api/repos/:repo/issues/:id/attachments` — list attachment metadata
+//!   - `GET /api/repos/:repo/issues/:id/attachments/:filename` — download attachment
+//!   - `DELETE /api/repos/:repo/issues/:id/attachments/:filename` — delete attachment
 //!   - `GET /api/repos/:repo/escalations` — list escalations
 //!   - `GET /api/repos/:repo/escalations/:id` — escalation details
 //!   - `POST /api/repos/:repo/escalations/:id/resolve` — resolve escalation
@@ -120,7 +124,7 @@ use tokio::sync::Mutex;
 use std::time::Instant;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Extension, Path as AxumPath, Query as AxumQuery, Request, State};
+use axum::extract::{Extension, FromRequest as _, Path as AxumPath, Query as AxumQuery, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -5841,6 +5845,441 @@ async fn delete_issue_link_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Attachment handlers ───────────────────────────────────────────────────────
+
+/// Maximum file size for issue attachments (10 MiB).
+const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum number of attachments per issue.
+const MAX_ATTACHMENTS_PER_ISSUE: usize = 10;
+
+/// Request body for `POST .../attachments` — JSON upload with base64 content.
+#[derive(Debug, Deserialize, ToSchema)]
+struct UploadAttachmentRequest {
+    /// Original filename (no path separators allowed).
+    filename: String,
+    /// MIME content type, e.g. `"image/png"`. Defaults to `"application/octet-stream"`.
+    #[serde(default = "default_attachment_content_type")]
+    content_type: String,
+    /// File bytes, Base64-encoded (standard encoding).
+    content: String,
+    /// Username or agent ID uploading the file. Defaults to `"unknown"`.
+    #[serde(default = "default_attachment_uploaded_by")]
+    uploaded_by: String,
+}
+
+fn default_attachment_content_type() -> String {
+    "application/octet-stream".to_string()
+}
+fn default_attachment_uploaded_by() -> String {
+    "unknown".to_string()
+}
+
+/// Metadata response for a single issue attachment.
+#[derive(Debug, Serialize, ToSchema)]
+struct AttachmentResponse {
+    id: String,
+    issue_id: String,
+    filename: String,
+    content_type: String,
+    size_bytes: i64,
+    uploaded_by: String,
+    created_at: String,
+}
+
+impl From<crate::issue::IssueAttachment> for AttachmentResponse {
+    fn from(a: crate::issue::IssueAttachment) -> Self {
+        AttachmentResponse {
+            id: a.id.to_string(),
+            issue_id: a.issue_id.to_string(),
+            filename: a.filename,
+            content_type: a.content_type,
+            size_bytes: a.size_bytes,
+            uploaded_by: a.uploaded_by,
+            created_at: a.created_at.to_rfc3339(),
+        }
+    }
+}
+
+/// Returns `Err` if `filename` contains path separators or starts with `.`.
+fn validate_attachment_filename(filename: &str) -> Result<(), ApiError> {
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.starts_with('.')
+    {
+        Err(ApiError::bad_request(format!("invalid filename: `{filename}`")))
+    } else {
+        Ok(())
+    }
+}
+
+/// Extracts `(filename, content_type, bytes, uploaded_by)` from either a
+/// `multipart/form-data` request or a JSON body with base64-encoded content.
+async fn parse_attachment_body(
+    request: axum::extract::Request,
+) -> Result<(String, String, Vec<u8>, String), ApiError> {
+    let ct = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if ct.contains("multipart/form-data") {
+        let mut mp = axum::extract::Multipart::from_request(request, &())
+            .await
+            .map_err(|e| ApiError::bad_request(format!("multipart error: {e}")))?;
+
+        let mut filename: Option<String> = None;
+        let mut file_ct: Option<String> = None;
+        let mut bytes: Option<Vec<u8>> = None;
+        let mut uploaded_by: Option<String> = None;
+
+        while let Some(field) = mp
+            .next_field()
+            .await
+            .map_err(|e| ApiError::bad_request(format!("multipart field error: {e}")))?
+        {
+            match field.name() {
+                Some("file") => {
+                    if filename.is_none() {
+                        filename = field.file_name().map(String::from);
+                    }
+                    if file_ct.is_none() {
+                        file_ct = field.content_type().map(String::from);
+                    }
+                    let data = field
+                        .bytes()
+                        .await
+                        .map_err(|e| ApiError::bad_request(format!("read field: {e}")))?;
+                    bytes = Some(data.to_vec());
+                }
+                Some("filename") => {
+                    let val = field
+                        .text()
+                        .await
+                        .map_err(|e| ApiError::bad_request(format!("read field: {e}")))?;
+                    filename = Some(val);
+                }
+                Some("content_type") => {
+                    let val = field
+                        .text()
+                        .await
+                        .map_err(|e| ApiError::bad_request(format!("read field: {e}")))?;
+                    file_ct = Some(val);
+                }
+                Some("uploaded_by") => {
+                    let val = field
+                        .text()
+                        .await
+                        .map_err(|e| ApiError::bad_request(format!("read field: {e}")))?;
+                    uploaded_by = Some(val);
+                }
+                _ => {}
+            }
+        }
+
+        Ok((
+            filename.ok_or_else(|| ApiError::bad_request("missing filename in multipart"))?,
+            file_ct.unwrap_or_else(|| "application/octet-stream".to_string()),
+            bytes.ok_or_else(|| ApiError::bad_request("missing file content in multipart"))?,
+            uploaded_by.unwrap_or_else(|| "unknown".to_string()),
+        ))
+    } else {
+        // JSON with base64 content.
+        let body = axum::body::to_bytes(request.into_body(), MAX_ATTACHMENT_BYTES * 2)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("read body: {e}")))?;
+        let req: UploadAttachmentRequest = serde_json::from_slice(&body)
+            .map_err(|e| ApiError::bad_request(format!("invalid JSON: {e}")))?;
+        let data = BASE64
+            .decode(&req.content)
+            .map_err(|e| ApiError::bad_request(format!("invalid base64: {e}")))?;
+        Ok((req.filename, req.content_type, data, req.uploaded_by))
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/repos/{repo}/issues/{id}/attachments",
+    params(
+        ("repo" = String, Path, description = "Repository slug"),
+        ("id" = String, Path, description = "Issue UUID"),
+    ),
+    request_body = UploadAttachmentRequest,
+    responses(
+        (status = 201, description = "Attachment uploaded", body = AttachmentResponse),
+        (status = 400, description = "Bad request (invalid filename, size, or count limit)", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Issue not found", body = ErrorBody),
+        (status = 409, description = "Attachment with this filename already exists", body = ErrorBody),
+        (status = 413, description = "File exceeds 10 MiB limit", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
+/// `POST /api/repos/:repo/issues/:id/attachments` — upload a file attachment.
+///
+/// Accepts either `multipart/form-data` (fields: `file`, optional `uploaded_by`,
+/// `filename`, `content_type`) or a JSON body (`UploadAttachmentRequest`) with
+/// the file bytes base64-encoded in the `content` field.
+///
+/// Limits: 10 MiB per file, 10 attachments per issue.
+async fn upload_attachment_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    PathId(id): PathId,
+    request: axum::extract::Request,
+) -> Result<(StatusCode, Json<AttachmentResponse>), ApiError> {
+    require_repo_permission(
+        &ctx.storage,
+        &identity,
+        &ctx.repo_id,
+        crate::storage::RepoRole::Write,
+    )
+    .await?;
+
+    let issue_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
+
+    // Verify the issue exists.
+    ctx.storage
+        .issues()
+        .get_issue(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    // Enforce per-issue attachment limit.
+    let existing = ctx
+        .storage
+        .attachments()
+        .list_attachments(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(ApiError::from)?;
+    if existing.len() >= MAX_ATTACHMENTS_PER_ISSUE {
+        return Err(ApiError::bad_request(format!(
+            "issue already has {MAX_ATTACHMENTS_PER_ISSUE} attachments (limit reached)"
+        )));
+    }
+
+    let (filename, content_type, bytes, uploaded_by) =
+        parse_attachment_body(request).await?;
+
+    validate_attachment_filename(&filename)?;
+
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(ApiError::payload_too_large(format!(
+            "file exceeds 10 MiB limit ({} bytes)",
+            bytes.len()
+        )));
+    }
+
+    // Store file bytes under a deterministic S3 key.
+    let s3_key = format!("issues/{issue_id}/attachments/{filename}");
+    ctx.storage
+        .files()
+        .put(&ctx.repo_id, &s3_key, &bytes)
+        .await
+        .map_err(|e| ApiError::internal(format!("store attachment: {e}")))?;
+
+    // Persist metadata.
+    let attachment = ctx
+        .storage
+        .attachments()
+        .create_attachment(
+            &ctx.repo_id,
+            &issue_id,
+            crate::storage::NewIssueAttachment {
+                filename,
+                content_type,
+                size_bytes: bytes.len() as i64,
+                s3_key,
+                uploaded_by,
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok((StatusCode::CREATED, Json(AttachmentResponse::from(attachment))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/repos/{repo}/issues/{id}/attachments",
+    params(
+        ("repo" = String, Path, description = "Repository slug"),
+        ("id" = String, Path, description = "Issue UUID"),
+    ),
+    responses(
+        (status = 200, description = "List of attachment metadata", body = Vec<AttachmentResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Issue not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
+/// `GET /api/repos/:repo/issues/:id/attachments` — list attachment metadata for an issue.
+async fn list_attachments_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    PathId(id): PathId,
+) -> Result<Json<Vec<AttachmentResponse>>, ApiError> {
+    require_repo_permission(
+        &ctx.storage,
+        &identity,
+        &ctx.repo_id,
+        crate::storage::RepoRole::Read,
+    )
+    .await?;
+
+    let issue_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
+
+    // Verify the issue exists.
+    ctx.storage
+        .issues()
+        .get_issue(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    let attachments = ctx
+        .storage
+        .attachments()
+        .list_attachments(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(
+        attachments.into_iter().map(AttachmentResponse::from).collect(),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/repos/{repo}/issues/{id}/attachments/{filename}",
+    params(
+        ("repo" = String, Path, description = "Repository slug"),
+        ("id" = String, Path, description = "Issue UUID"),
+        ("filename" = String, Path, description = "Attachment filename"),
+    ),
+    responses(
+        (status = 200, description = "File content (binary)", content_type = "application/octet-stream"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Attachment not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
+/// `GET /api/repos/:repo/issues/:id/attachments/:filename` — download attachment content.
+async fn download_attachment_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    AxumPath(params): AxumPath<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    require_repo_permission(
+        &ctx.storage,
+        &identity,
+        &ctx.repo_id,
+        crate::storage::RepoRole::Read,
+    )
+    .await?;
+
+    let id = params.get("id").cloned().unwrap_or_default();
+    let filename = params.get("filename").cloned().unwrap_or_default();
+
+    let issue_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
+
+    // Load metadata to get content_type and s3_key.
+    let meta = ctx
+        .storage
+        .attachments()
+        .get_attachment(&ctx.repo_id, &issue_id, &filename)
+        .await
+        .map_err(ApiError::from)?;
+
+    // Fetch file bytes from the file store.
+    let bytes = ctx
+        .storage
+        .files()
+        .get(&ctx.repo_id, &meta.s3_key)
+        .await
+        .map_err(|e| ApiError::internal(format!("retrieve attachment: {e}")))?;
+
+    let response = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, meta.content_type)
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(bytes))
+        .map_err(|e| ApiError::internal(format!("build response: {e}")))?;
+
+    Ok(response)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/repos/{repo}/issues/{id}/attachments/{filename}",
+    params(
+        ("repo" = String, Path, description = "Repository slug"),
+        ("id" = String, Path, description = "Issue UUID"),
+        ("filename" = String, Path, description = "Attachment filename"),
+    ),
+    responses(
+        (status = 204, description = "Attachment deleted"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Attachment not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
+/// `DELETE /api/repos/:repo/issues/:id/attachments/:filename` — delete an attachment.
+async fn delete_attachment_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    AxumPath(params): AxumPath<HashMap<String, String>>,
+) -> Result<StatusCode, ApiError> {
+    require_repo_permission(
+        &ctx.storage,
+        &identity,
+        &ctx.repo_id,
+        crate::storage::RepoRole::Write,
+    )
+    .await?;
+
+    let id = params.get("id").cloned().unwrap_or_default();
+    let filename = params.get("filename").cloned().unwrap_or_default();
+
+    let issue_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
+
+    // Load metadata to confirm existence and get s3_key.
+    let meta = ctx
+        .storage
+        .attachments()
+        .get_attachment(&ctx.repo_id, &issue_id, &filename)
+        .await
+        .map_err(ApiError::from)?;
+
+    // Delete file bytes from the file store.
+    let _ = ctx
+        .storage
+        .files()
+        .delete(&ctx.repo_id, &meta.s3_key)
+        .await;
+
+    // Delete metadata record.
+    ctx.storage
+        .attachments()
+        .delete_attachment(&ctx.repo_id, &issue_id, &filename)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── Escalation handlers ───────────────────────────────────────────────────────
 
 /// Response body for a single escalation.
@@ -8265,6 +8704,10 @@ impl utoipa::Modify for SecurityAddon {
         create_issue_link_handler,
         list_issue_links_handler,
         delete_issue_link_handler,
+        upload_attachment_handler,
+        list_attachments_handler,
+        download_attachment_handler,
+        delete_attachment_handler,
         list_escalations_handler,
         get_escalation_handler,
         resolve_escalation_handler,
@@ -8323,6 +8766,8 @@ impl utoipa::Modify for SecurityAddon {
             CommentResponse,
             CreateIssueLinkRequest,
             IssueLinkResponse,
+            UploadAttachmentRequest,
+            AttachmentResponse,
             FileUploadEntry,
             UploadFilesRequest,
             UploadFilesResponse,
@@ -8590,6 +9035,10 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/issues/:id/links", post(create_issue_link_handler))
         .route("/issues/:id/links", get(list_issue_links_handler))
         .route("/issues/:id/links/:target_id", axum::routing::delete(delete_issue_link_handler))
+        .route("/issues/:id/attachments", post(upload_attachment_handler))
+        .route("/issues/:id/attachments", get(list_attachments_handler))
+        .route("/issues/:id/attachments/:filename", get(download_attachment_handler))
+        .route("/issues/:id/attachments/:filename", axum::routing::delete(delete_attachment_handler))
         .route("/issues/:id", get(get_issue_handler))
         .route("/issues/:id", axum::routing::patch(update_issue_handler))
         .route("/escalations", get(list_escalations_handler))
