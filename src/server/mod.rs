@@ -1682,6 +1682,47 @@ async fn submit_workspace_handler(
             // Remove from conflict engine — workspace is no longer active.
             state.conflict_engine.lock().await.remove_workspace(&workspace_uuid);
 
+            // Append a MergeCompleted event to the storage trait so Postgres
+            // has a real event record with the correct sequential ID.  In local
+            // SQLite mode this duplicates the event the merge engine already
+            // wrote to the event-log file, which is harmless.  We use the
+            // returned event ID (the Postgres row ID) as merge_event_id so the
+            // version-detail handler can look it up via query_by_type.
+            let storage_merge_event = ctx
+                .storage
+                .events()
+                .append(
+                    &ctx.repo_id,
+                    EventKind::MergeCompleted {
+                        workspace_id: workspace_uuid,
+                        new_version_id: result.version.version_id.clone(),
+                        auto_resolved_conflicts: result.auto_resolved,
+                    },
+                )
+                .await;
+            let merge_event_id = storage_merge_event
+                .ok()
+                .map(|e| e.id)
+                .or(result.version.merge_event_id);
+
+            // Write FileRemoved events for deleted paths so the version-detail
+            // handler can include them when reconstructing file_changes.  Upload
+            // handlers already write FileAdded/FileModified to storage; deletions
+            // are only tracked in the workspace metadata column.
+            for path in &meta.deleted_paths {
+                let _ = ctx
+                    .storage
+                    .events()
+                    .append(
+                        &ctx.repo_id,
+                        EventKind::FileRemoved {
+                            workspace_id: workspace_uuid,
+                            path: path.clone(),
+                        },
+                    )
+                    .await;
+            }
+
             // Sync the new version and HEAD to the storage trait.
             // In Postgres server mode these writes go to the database; in local
             // SQLite mode they duplicate what merge::submit already wrote to disk,
@@ -1692,7 +1733,7 @@ async fn submit_workspace_handler(
                     parent_version_id: result.version.parent_version_id.clone(),
                     intent: result.version.intent.clone(),
                     created_by: result.version.created_by.clone(),
-                    merge_event_id: result.version.merge_event_id,
+                    merge_event_id,
                 })
                 .await;
             let _ = ctx.storage.versions()
