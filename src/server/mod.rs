@@ -737,9 +737,20 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let key_str = match auth_header {
-        Some(ref h) if h.starts_with("Bearer ") => h[7..].trim().to_string(),
+    let (key_str, key_prefix_display) = match auth_header {
+        Some(ref h) if h.starts_with("Bearer ") => {
+            let k = h[7..].trim().to_string();
+            let pfx = if k.len() >= 12 { k[..12].to_string() } else { k.clone() };
+            (k, pfx)
+        }
         _ => {
+            let ip = extract_client_ip(&request);
+            tracing::warn!(
+                event = "auth.failure",
+                ip = %ip,
+                reason = "missing_or_invalid_header",
+                "authentication failed: missing or invalid Authorization header"
+            );
             return ApiError::unauthorized(
                 "missing or invalid Authorization header; expected `Bearer <key>`",
             )
@@ -749,7 +760,14 @@ async fn auth_middleware(
 
     // Bootstrap admin key check — takes priority over per-repo API keys.
     if key_str == state.admin_key {
-        tracing::debug!("authenticated request via bootstrap admin key");
+        let ip = extract_client_ip(&request);
+        tracing::info!(
+            event = "auth.success",
+            actor = "admin",
+            key_prefix = "admin",
+            ip = %ip,
+            "authentication succeeded: bootstrap admin key"
+        );
         request.extensions_mut().insert(AgentIdentity {
             key_id: "admin".to_string(),
             name: "admin".to_string(),
@@ -764,7 +782,14 @@ async fn auth_middleware(
     // Postgres (server) key stores are supported.
     match state.storage.auth().validate_key(&key_str).await {
         Ok(api_key) => {
-            tracing::debug!(agent = %api_key.name, "authenticated request");
+            let ip = extract_client_ip(&request);
+            tracing::info!(
+                event = "auth.success",
+                actor = %api_key.name,
+                key_prefix = %api_key.key_prefix,
+                ip = %ip,
+                "authentication succeeded"
+            );
             request.extensions_mut().insert(AgentIdentity {
                 key_id: api_key.id,
                 name: api_key.name,
@@ -775,6 +800,14 @@ async fn auth_middleware(
             next.run(request).await
         }
         Err(crate::storage::StorageError::NotFound(_)) => {
+            let ip = extract_client_ip(&request);
+            tracing::warn!(
+                event = "auth.failure",
+                key_prefix = %key_prefix_display,
+                ip = %ip,
+                reason = "invalid_or_revoked_key",
+                "authentication failed: invalid or revoked API key"
+            );
             ApiError::unauthorized("invalid or revoked API key").into_response()
         }
         Err(e) => ApiError::internal(format!("auth error: {e}")).into_response(),
@@ -1227,6 +1260,14 @@ async fn require_repo_permission(
     let user_id = match &identity.user_id {
         Some(uid) => uid,
         None => {
+            tracing::warn!(
+                event = "permission.denied",
+                actor = %identity.name,
+                repo = %repo_id,
+                required = %required.as_str(),
+                reason = "no_user_association",
+                "permission denied: key not associated with a user"
+            );
             return Err(ApiError::forbidden(
                 "this key is not associated with a user; cannot check repo permissions",
             ));
@@ -1240,7 +1281,18 @@ async fn require_repo_permission(
         .map_err(|e| ApiError::internal(format!("permission check failed: {e}")))?;
 
     let effective = match resolved {
-        None => return Err(ApiError::forbidden("access denied")),
+        None => {
+            tracing::warn!(
+                event = "permission.denied",
+                actor = %identity.name,
+                user_id = %user_id,
+                repo = %repo_id,
+                required = %required.as_str(),
+                reason = "no_role_resolved",
+                "permission denied: no repo access"
+            );
+            return Err(ApiError::forbidden("access denied"));
+        }
         Some(r) => r,
     };
 
@@ -1253,6 +1305,16 @@ async fn require_repo_permission(
     };
 
     if effective.rank() < required.rank() {
+        tracing::warn!(
+            event = "permission.denied",
+            actor = %identity.name,
+            user_id = %user_id,
+            repo = %repo_id,
+            required = %required.as_str(),
+            effective = %effective.as_str(),
+            reason = "insufficient_permissions",
+            "permission denied: effective role below required"
+        );
         return Err(ApiError::forbidden("insufficient permissions"));
     }
 
@@ -1267,6 +1329,12 @@ fn require_server_admin(identity: &AgentIdentity) -> Result<(), ApiError> {
     if identity.is_admin {
         Ok(())
     } else {
+        tracing::warn!(
+            event = "permission.denied",
+            actor = %identity.name,
+            reason = "not_admin",
+            "permission denied: endpoint requires bootstrap admin key"
+        );
         Err(ApiError::forbidden(
             "this endpoint requires the bootstrap admin key",
         ))
@@ -1834,6 +1902,14 @@ async fn create_workspace_handler(
         }),
     });
 
+    tracing::info!(
+        event = "workspace.created",
+        actor = %identity.name,
+        repo = %ctx.repo_id,
+        workspace_id = %ws.id,
+        intent = %ws.intent,
+        "workspace created"
+    );
     Ok((StatusCode::CREATED, Json(WorkspaceResponse::from(ws))))
 }
 
@@ -2146,6 +2222,13 @@ async fn submit_workspace_handler(
                 .await;
             }
 
+            tracing::info!(
+                event = "workspace.submitted",
+                actor = %identity.name,
+                repo = %ctx.repo_id,
+                workspace_id = %workspace_uuid,
+                "workspace submitted successfully"
+            );
             Ok(Json(SubmitResponse::from(result)))
         }
         Err(merge::MergeError::SemanticConflicts { count, ref conflicts }) => {
@@ -2328,6 +2411,13 @@ async fn discard_workspace_handler(
         data: serde_json::json!({ "workspace_id": id }),
     });
 
+    tracing::info!(
+        event = "workspace.discarded",
+        actor = %identity.name,
+        repo = %ctx.repo_id,
+        workspace_id = %ws_uuid,
+        "workspace discarded"
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5881,6 +5971,13 @@ async fn create_issue_handler(
     let mut resp = IssueResponse::from_issue(issue, vec![], blocker_ids, vec![]);
     resp.possible_duplicate_of = possible_duplicate_id.map(|id| id.to_string());
 
+    tracing::info!(
+        event = "issue.created",
+        actor = %identity.name,
+        repo = %ctx.repo_id,
+        issue_id = %issue_id,
+        "issue created"
+    );
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
@@ -6192,6 +6289,13 @@ async fn close_issue_handler(
         }),
     });
 
+    tracing::info!(
+        event = "issue.closed",
+        actor = %identity.name,
+        repo = %ctx.repo_id,
+        issue_id = %issue_id,
+        "issue closed"
+    );
     let linked = linked_workspace_ids(&ctx, issue_id).await;
     let (blocked_by, blocking) = links_for_issue(&ctx, issue_id).await;
     Ok(Json(IssueResponse::from_issue(issue, linked, blocked_by, blocking)))
@@ -7191,6 +7295,14 @@ async fn resolve_escalation_handler(
         }),
     });
 
+    tracing::info!(
+        event = "escalation.resolved",
+        actor = %identity.name,
+        repo = %ctx.repo_id,
+        escalation_id = %esc_id,
+        option = %body.option,
+        "escalation resolved"
+    );
     Ok(Json(EscalationResponse::from(escalation)))
 }
 
@@ -8356,6 +8468,13 @@ async fn create_org_handler(
         .await
         .map_err(ApiError::from)?;
 
+    tracing::info!(
+        event = "admin.org.created",
+        actor = %identity.name,
+        org_id = %org.id,
+        org_slug = %org.slug,
+        "organization created"
+    );
     Ok((StatusCode::CREATED, Json(OrgResponse::from(org))))
 }
 
@@ -8430,6 +8549,13 @@ async fn delete_org_handler(
     require_server_admin(&identity)?;
     let org = state.storage.orgs().get_org_by_slug(&slug).await.map_err(ApiError::from)?;
     state.storage.orgs().delete_org(&org.id).await.map_err(ApiError::from)?;
+    tracing::info!(
+        event = "admin.org.deleted",
+        actor = %identity.name,
+        org_id = %org.id,
+        org_slug = %slug,
+        "organization deleted"
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -8463,6 +8589,13 @@ async fn create_user_handler(
         .await
         .map_err(ApiError::from)?;
 
+    tracing::info!(
+        event = "admin.user.created",
+        actor = %identity.name,
+        user_id = %user.id,
+        user_email = %user.email,
+        "user created"
+    );
     Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
 }
 
@@ -8651,6 +8784,14 @@ async fn add_org_member_handler(
     let orgs = state.storage.orgs();
     let org = orgs.get_org_by_slug(&slug).await.map_err(ApiError::from)?;
     let member = orgs.add_org_member(&org.id, &body.user_id, role).await.map_err(ApiError::from)?;
+    tracing::info!(
+        event = "admin.member.added",
+        actor = %identity.name,
+        org_slug = %slug,
+        user_id = %body.user_id,
+        role = %body.role,
+        "org member added"
+    );
     Ok((StatusCode::CREATED, Json(OrgMemberResponse::from(member))))
 }
 
@@ -8696,6 +8837,14 @@ async fn update_org_member_handler(
     let orgs = state.storage.orgs();
     let org = orgs.get_org_by_slug(&slug).await.map_err(ApiError::from)?;
     let member = orgs.update_org_member(&org.id, &user_id, role).await.map_err(ApiError::from)?;
+    tracing::info!(
+        event = "admin.member.updated",
+        actor = %identity.name,
+        org_slug = %slug,
+        user_id = %user_id,
+        role = %body.role,
+        "org member role updated"
+    );
     Ok(Json(OrgMemberResponse::from(member)))
 }
 
@@ -8725,6 +8874,13 @@ async fn remove_org_member_handler(
     let orgs = state.storage.orgs();
     let org = orgs.get_org_by_slug(&slug).await.map_err(ApiError::from)?;
     orgs.remove_org_member(&org.id, &user_id).await.map_err(ApiError::from)?;
+    tracing::info!(
+        event = "admin.member.removed",
+        actor = %identity.name,
+        org_slug = %slug,
+        user_id = %user_id,
+        "org member removed"
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -8812,6 +8968,15 @@ async fn add_collaborator_handler(
     // Write permission required to add collaborators (invite).
     require_repo_permission(&state.storage, &identity, &repo_id, crate::storage::RepoRole::Write).await?;
     let collaborator = orgs.add_collaborator(&repo_id, &body.user_id, role).await.map_err(ApiError::from)?;
+    tracing::info!(
+        event = "admin.collaborator.added",
+        actor = %identity.name,
+        org_slug = %org_slug,
+        repo = %repo_id,
+        user_id = %body.user_id,
+        role = %body.role,
+        "repo collaborator added"
+    );
     Ok((StatusCode::CREATED, Json(CollaboratorResponse::from(collaborator))))
 }
 
@@ -8875,6 +9040,15 @@ async fn update_collaborator_handler(
     // Admin permission required to change roles.
     require_repo_permission(&state.storage, &identity, &repo_id, crate::storage::RepoRole::Admin).await?;
     let collaborator = orgs.update_collaborator(&repo_id, &user_id, role).await.map_err(ApiError::from)?;
+    tracing::info!(
+        event = "admin.collaborator.updated",
+        actor = %identity.name,
+        org_slug = %org_slug,
+        repo = %repo_id,
+        user_id = %user_id,
+        role = %body.role,
+        "repo collaborator role updated"
+    );
     Ok(Json(CollaboratorResponse::from(collaborator)))
 }
 
@@ -8906,6 +9080,14 @@ async fn remove_collaborator_handler(
     // Admin permission required to remove collaborators.
     require_repo_permission(&state.storage, &identity, &repo_id, crate::storage::RepoRole::Admin).await?;
     orgs.remove_collaborator(&repo_id, &user_id).await.map_err(ApiError::from)?;
+    tracing::info!(
+        event = "admin.collaborator.removed",
+        actor = %identity.name,
+        org_slug = %org_slug,
+        repo = %repo_id,
+        user_id = %user_id,
+        "repo collaborator removed"
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -9035,6 +9217,14 @@ async fn create_key_handler(
         .await
         .map_err(ApiError::from)?;
 
+    tracing::info!(
+        event = "key.created",
+        actor = %identity.name,
+        key_id = %key_meta.id,
+        key_name = %key_meta.name,
+        key_prefix = %key_meta.key_prefix,
+        "API key created"
+    );
     Ok((
         StatusCode::CREATED,
         Json(CreateKeyResponse {
@@ -9123,6 +9313,12 @@ async fn revoke_key_handler(
     }
 
     auth.revoke_key(&key_id).await.map_err(ApiError::from)?;
+    tracing::info!(
+        event = "key.revoked",
+        actor = %identity.name,
+        key_id = %key_id,
+        "API key revoked"
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
