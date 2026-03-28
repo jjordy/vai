@@ -24,6 +24,7 @@ use crate::merge;
 use crate::merge_patterns::MergePatternStore;
 use crate::remote_workspace;
 use crate::repo;
+#[cfg(feature = "server")]
 use crate::server;
 use crate::pull as remote_pull;
 use crate::sync as remote_sync;
@@ -54,6 +55,7 @@ pub enum CliError {
     #[error("Version error: {0}")]
     Version(#[from] version::VersionError),
 
+    #[cfg(feature = "server")]
     #[error("Server error: {0}")]
     Server(#[from] server::ServerError),
 
@@ -171,6 +173,7 @@ pub enum Commands {
     #[command(subcommand)]
     Graph(GraphCommands),
     /// Manage the vai HTTP server.
+    #[cfg(feature = "server")]
     #[command(subcommand)]
     Server(ServerCommands),
     /// Clone a remote vai repository.
@@ -395,6 +398,7 @@ pub enum MergeCommands {
 }
 
 /// Server management subcommands.
+#[cfg(feature = "server")]
 #[derive(Debug, Subcommand)]
 pub enum ServerCommands {
     /// Start the vai HTTP server for this repository.
@@ -1412,6 +1416,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 result.files_restored, result.files_deleted
             );
         }
+        #[cfg(feature = "server")]
         Some(Commands::Server(server_cmd)) => {
             // Load the global server config first so we can detect multi-repo
             // mode before deciding whether `find_root` is required.
@@ -2417,9 +2422,20 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
             let vai_dir = root.join(".vai");
             if let Some(server_url) = server {
-                let api_key = key.unwrap_or_default();
-                crate::dashboard::run_server(&vai_dir, &server_url, &api_key)
-                    .map_err(|e| CliError::Other(e.to_string()))?;
+                #[cfg(feature = "server")]
+                {
+                    let api_key = key.unwrap_or_default();
+                    crate::dashboard::run_server(&vai_dir, &server_url, &api_key)
+                        .map_err(|e| CliError::Other(e.to_string()))?;
+                }
+                #[cfg(not(feature = "server"))]
+                {
+                    let _ = server_url;
+                    let _ = key;
+                    return Err(CliError::Other(
+                        "server dashboard requires the 'server' feature (rebuild with --features server)".to_string()
+                    ));
+                }
             } else {
                 crate::dashboard::run(&vai_dir)
                     .map_err(|e| CliError::Other(e.to_string()))?;
@@ -2494,12 +2510,12 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
 
                             // If migrated, fetch remote stats for verification.
                             let repo_name = &config.name;
-                            let stats: Option<crate::server::MigrationStatsResponse> = if marker.is_some() {
+                            let stats: Option<serde_json::Value> = if marker.is_some() {
                                 rt.block_on(async {
                                     let repo_endpoint =
                                         format!("/api/repos/{repo_name}/migration-stats");
                                     match client
-                                        .get::<crate::server::MigrationStatsResponse>(
+                                        .get::<serde_json::Value>(
                                             &repo_endpoint,
                                         )
                                         .await
@@ -2508,7 +2524,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                                         Err(_) => {
                                             // Fall back to single-repo endpoint.
                                             client
-                                                .get::<crate::server::MigrationStatsResponse>(
+                                                .get::<serde_json::Value>(
                                                     "/api/migration-stats",
                                                 )
                                                 .await
@@ -2538,11 +2554,11 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                                 }
                                 if let Some(ref s) = stats {
                                     obj["remote_counts"] = serde_json::json!({
-                                        "events": s.events,
-                                        "issues": s.issues,
-                                        "versions": s.versions,
-                                        "escalations": s.escalations,
-                                        "head_version": s.head_version,
+                                        "events": s["events"],
+                                        "issues": s["issues"],
+                                        "versions": s["versions"],
+                                        "escalations": s["escalations"],
+                                        "head_version": s["head_version"],
                                     });
                                 }
                                 println!("{}", obj);
@@ -2570,28 +2586,32 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                                     if let Some(ref s) = stats {
                                         println!();
                                         println!("Verification (remote counts):");
-                                        let ev_ok = s.events == m.events_migrated as i64;
-                                        let is_ok = s.issues == m.issues_migrated as i64;
-                                        let ve_ok = s.versions == m.versions_migrated as i64;
-                                        let es_ok = s.escalations == m.escalations_migrated as i64;
+                                        let r_ev = s["events"].as_i64().unwrap_or(0);
+                                        let r_is = s["issues"].as_i64().unwrap_or(0);
+                                        let r_ve = s["versions"].as_i64().unwrap_or(0);
+                                        let r_es = s["escalations"].as_i64().unwrap_or(0);
+                                        let ev_ok = r_ev == m.events_migrated as i64;
+                                        let is_ok = r_is == m.issues_migrated as i64;
+                                        let ve_ok = r_ve == m.versions_migrated as i64;
+                                        let es_ok = r_es == m.escalations_migrated as i64;
                                         let tick = |ok: bool| {
                                             if ok { "OK".green().to_string() } else { "MISMATCH".red().to_string() }
                                         };
                                         println!(
                                             "  Events:      {} (expected {}) [{}]",
-                                            s.events, m.events_migrated, tick(ev_ok)
+                                            r_ev, m.events_migrated, tick(ev_ok)
                                         );
                                         println!(
                                             "  Issues:      {} (expected {}) [{}]",
-                                            s.issues, m.issues_migrated, tick(is_ok)
+                                            r_is, m.issues_migrated, tick(is_ok)
                                         );
                                         println!(
                                             "  Versions:    {} (expected {}) [{}]",
-                                            s.versions, m.versions_migrated, tick(ve_ok)
+                                            r_ve, m.versions_migrated, tick(ve_ok)
                                         );
                                         println!(
                                             "  Escalations: {} (expected {}) [{}]",
-                                            s.escalations, m.escalations_migrated, tick(es_ok)
+                                            r_es, m.escalations_migrated, tick(es_ok)
                                         );
                                         if ev_ok && is_ok && ve_ok && es_ok {
                                             println!("\nMigration verified successfully.");

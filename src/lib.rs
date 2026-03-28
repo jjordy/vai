@@ -24,6 +24,7 @@ pub mod remote_workspace;
 pub mod repo;
 pub mod scope_history;
 pub mod scope_inference;
+#[cfg(feature = "server")]
 pub mod server;
 pub mod pull;
 pub mod sync;

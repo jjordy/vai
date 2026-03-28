@@ -19,6 +19,8 @@
 //! `cargo test` in environments without Postgres (e.g. standard CI) continues
 //! to pass.
 
+#![cfg(feature = "postgres")]
+
 use std::env;
 
 use chrono::Utc;

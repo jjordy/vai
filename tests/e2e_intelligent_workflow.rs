@@ -12,6 +12,8 @@
 //! 9.  Submit a discovery event — verify issue auto-created with correct scope.
 //! 10. Dashboard snapshot (headless) — verify all panels show correct data.
 
+#![cfg(feature = "server")]
+
 use std::fs;
 
 use tempfile::TempDir;

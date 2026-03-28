@@ -29,12 +29,15 @@ use ratatui::{
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(feature = "server")]
 use futures_util::{SinkExt, StreamExt};
+#[cfg(feature = "server")]
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::escalation::{Escalation, EscalationStatus, EscalationStore, ResolutionOption};
 use crate::graph::GraphSnapshot;
 use crate::issue::{Issue, IssueFilter, IssueStatus, IssueStore};
+#[cfg(feature = "server")]
 use crate::server::BroadcastEvent;
 use crate::version;
 use crate::workspace;
@@ -665,6 +668,7 @@ pub fn parse_server_url(server_url: &str, api_key: &str) -> Result<String, Dashb
 /// server, forwarding [`WsNotification`]s to `tx`.
 ///
 /// The thread reconnects with exponential back-off (1 s → 30 s) on failure.
+#[cfg(feature = "server")]
 fn spawn_ws_connection(ws_url: String, tx: mpsc::Sender<WsNotification>) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -676,6 +680,7 @@ fn spawn_ws_connection(ws_url: String, tx: mpsc::Sender<WsNotification>) {
 }
 
 /// Async reconnect loop — runs inside the background thread's tokio runtime.
+#[cfg(feature = "server")]
 async fn ws_connection_loop(ws_url: String, tx: mpsc::Sender<WsNotification>) {
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -782,6 +787,7 @@ pub fn run(vai_dir: &Path) -> Result<(), DashboardError> {
 ///
 /// `server_url` must be in the form `vai://host:port`.
 /// `api_key` is the plaintext API key to authenticate with the server.
+#[cfg(feature = "server")]
 pub fn run_server(vai_dir: &Path, server_url: &str, api_key: &str) -> Result<(), DashboardError> {
     if !vai_dir.exists() {
         return Err(DashboardError::NotInitialised);

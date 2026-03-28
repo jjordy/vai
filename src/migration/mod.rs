@@ -19,6 +19,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+#[cfg(feature = "server")]
 use utoipa::ToSchema;
 
 use crate::escalation::{Escalation, EscalationStore};
@@ -75,7 +76,8 @@ pub struct MigrationPayload {
 // ── Summary ───────────────────────────────────────────────────────────────────
 
 /// Server response from a successful migration.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct MigrationSummary {
     /// Number of events inserted into Postgres.
     pub events_migrated: usize,

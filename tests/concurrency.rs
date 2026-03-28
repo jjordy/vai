@@ -3,6 +3,8 @@
 //! Verifies that the vai server correctly handles concurrent requests from
 //! multiple agents without data corruption or lost writes.
 
+#![cfg(feature = "server")]
+
 use std::fs;
 use std::time::Duration;
 

@@ -140,17 +140,20 @@ pub struct LocalServerConfig {
 /// Applies to all repositories hosted by this server instance.  Per-repo
 /// settings in `.vai/config.toml` take precedence, and CLI flags override
 /// everything.
+#[cfg(feature = "server")]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GlobalServerToml {
     /// Top-level `[server]` table.
     #[serde(default)]
     pub server: GlobalServerSection,
     /// Optional `[s3]` table for S3-compatible file storage.
+    #[cfg(feature = "s3")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s3: Option<crate::storage::s3::S3Config>,
 }
 
 /// Fields within the `[server]` table of `~/.vai/server.toml`.
+#[cfg(feature = "server")]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GlobalServerSection {
     /// IP address to bind to.
@@ -178,6 +181,7 @@ pub struct GlobalServerSection {
     ///
     /// When present and `database_url` is also set, the server uses
     /// `StorageBackend::ServerWithS3` for durable file storage.
+    #[cfg(feature = "s3")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s3: Option<crate::storage::s3::S3Config>,
 }
@@ -186,6 +190,7 @@ pub struct GlobalServerSection {
 ///
 /// Returns `Default` (all fields `None`) if the file does not exist; propagates
 /// I/O and parse errors.
+#[cfg(feature = "server")]
 pub fn read_global_server_config() -> Result<GlobalServerSection, RepoError> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -200,6 +205,7 @@ pub fn read_global_server_config() -> Result<GlobalServerSection, RepoError> {
     let parsed: GlobalServerToml = toml::from_str(&raw)?;
     let mut section = parsed.server;
     // Promote the top-level `[s3]` table into the section so callers see it.
+    #[cfg(feature = "s3")]
     if section.s3.is_none() {
         section.s3 = parsed.s3;
     }
@@ -629,6 +635,7 @@ mod tests {
         assert!(!entities.is_empty(), "expected entity 'hello' in graph");
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn global_server_config_returns_defaults_when_missing() {
         // Point HOME at a temp dir with no server.toml.
@@ -640,6 +647,7 @@ mod tests {
         assert!(cfg.storage_root.is_none());
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn global_server_config_parses_server_toml() {
         let tmp = TempDir::new().unwrap();

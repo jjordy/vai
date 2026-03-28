@@ -20,6 +20,8 @@
 //! Tests are silently skipped when `VAI_TEST_DATABASE_URL` is not set so that
 //! `cargo test` in environments without Postgres continues to pass.
 
+#![cfg(feature = "postgres")]
+
 use std::env;
 use std::fs;
 

@@ -7,6 +7,8 @@
 //! 3. After workspace creation via the REST API the dashboard snapshot
 //!    reflects the new workspace.
 
+#![cfg(feature = "server")]
+
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};

@@ -168,7 +168,8 @@ pub struct IssueComment {
 // ── Issue attachment ──────────────────────────────────────────────────────────
 
 /// A file attached to an issue.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct IssueAttachment {
     /// Unique attachment identifier.
     pub id: Uuid,

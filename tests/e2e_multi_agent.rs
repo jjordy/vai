@@ -4,6 +4,8 @@
 //! `vai init` → server start → two agents create workspaces → overlap detected
 //! → Agent A submits (v2) → Agent B submits with semantic merge (v3) → audit trail verified.
 
+#![cfg(feature = "server")]
+
 use std::fs;
 use std::time::Duration;
 

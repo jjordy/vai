@@ -22,6 +22,8 @@
 //! Tests are silently skipped when `VAI_TEST_DATABASE_URL` is not set so that
 //! `cargo test` in environments without Postgres continues to pass.
 
+#![cfg(all(feature = "postgres", feature = "s3"))]
+
 use std::env;
 use std::time::Duration;
 

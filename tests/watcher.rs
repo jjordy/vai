@@ -9,6 +9,8 @@
 //! 6. Attempt discovery on paused watcher → 404.
 //! 7. Resume watcher → discovery succeeds again.
 
+#![cfg(feature = "server")]
+
 use std::fs;
 use tempfile::TempDir;
 use vai::auth;

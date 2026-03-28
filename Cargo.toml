@@ -13,6 +13,14 @@ path = "src/main.rs"
 name = "vai"
 path = "src/lib.rs"
 
+[features]
+default = ["cli"]
+cli = []
+server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:utoipa", "dep:utoipa-swagger-ui", "dep:utoipa-axum", "dep:tracing", "dep:tracing-subscriber"]
+postgres = ["server", "dep:sqlx"]
+s3 = ["server", "dep:aws-sdk-s3", "dep:aws-config"]
+full = ["cli", "server", "postgres", "s3"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -28,28 +36,29 @@ indicatif = "0.17"
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
-axum = { version = "0.7", features = ["ws", "multipart"] }
+axum = { version = "0.7", features = ["ws", "multipart"], optional = true }
 futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["trace", "cors"], optional = true }
 base64 = "0.22"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 reqwest = { version = "0.12", features = ["json"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio-tungstenite = "0.24"
 async-trait = "0.1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-native-tls", "postgres", "uuid", "chrono", "json", "migrate"] }
-aws-config = "1"
-aws-sdk-s3 = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-native-tls", "postgres", "uuid", "chrono", "json", "migrate"], optional = true }
+aws-config = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
 diffy = "0.4"
 flate2 = "1"
 ignore = "0.4"
 tar = "0.4"
-utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-axum = "0.2"
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"], optional = true }
+utoipa-swagger-ui = { version = "8", optional = true }
+utoipa-axum = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

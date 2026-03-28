@@ -19,7 +19,9 @@
 //! Use [`StorageBackend`] to construct and access the appropriate backend.
 
 pub mod filesystem;
+#[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "s3")]
 pub mod s3;
 pub mod sqlite;
 
@@ -1309,11 +1311,13 @@ pub enum StorageBackend {
     /// File storage falls back to [`postgres::PostgresStorage`]'s stub
     /// `FileStore` impl (returns errors).  Use [`StorageBackend::ServerWithS3`]
     /// for a real file store.
+    #[cfg(feature = "postgres")]
     Server(Arc<postgres::PostgresStorage>),
     /// Hosted server mode with an S3-compatible file store.
     ///
     /// All database traits delegate to the Postgres backend; [`FileStore`]
     /// delegates to the S3 backend.
+    #[cfg(feature = "s3")]
     ServerWithS3(Arc<postgres::PostgresStorage>, Arc<s3::S3FileStore>),
     /// Hosted server mode with an in-memory file store (for testing only).
     ///
@@ -1321,6 +1325,7 @@ pub enum StorageBackend {
     /// delegates to an in-memory [`MemFileStore`].  This variant activates
     /// the same `S3MergeFs` code path as [`ServerWithS3`] so tests exercise
     /// the real server-mode merge/submit logic without requiring real S3.
+    #[cfg(feature = "postgres")]
     ServerWithMemFs(Arc<postgres::PostgresStorage>, Arc<MemFileStore>),
 }
 
@@ -1336,6 +1341,7 @@ impl StorageBackend {
     ///
     /// Run migrations separately via [`postgres::PostgresStorage::migrate`]
     /// before serving requests.
+    #[cfg(feature = "postgres")]
     pub async fn server(database_url: &str, max_connections: u32) -> Result<Self, StorageError> {
         let storage = postgres::PostgresStorage::connect(database_url, max_connections).await?;
         Ok(StorageBackend::Server(Arc::new(storage)))
@@ -1347,6 +1353,7 @@ impl StorageBackend {
     /// The Postgres pool is shared between the database backend and the S3 file
     /// index.  Run migrations (including `20260323000003_file_index.sql`) via
     /// [`postgres::PostgresStorage::migrate`] before serving requests.
+    #[cfg(feature = "s3")]
     pub async fn server_with_s3(
         database_url: &str,
         max_connections: u32,
@@ -1363,6 +1370,7 @@ impl StorageBackend {
     ///
     /// Activates the same `S3MergeFs` submit path as [`StorageBackend::ServerWithS3`]
     /// so integration tests can verify `current/` updates without real S3.
+    #[cfg(feature = "postgres")]
     pub async fn server_with_mem_fs(
         database_url: &str,
         max_connections: u32,
@@ -1374,11 +1382,15 @@ impl StorageBackend {
     }
 
     /// Returns connection pool statistics, or `None` for local (SQLite) backends.
+    #[cfg(feature = "postgres")]
     pub fn pool_stats(&self) -> Option<postgres::PoolStats> {
         match self {
-            StorageBackend::Server(pg)
-            | StorageBackend::ServerWithS3(pg, _)
-            | StorageBackend::ServerWithMemFs(pg, _) => Some(pg.pool_stats()),
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(pg) | StorageBackend::ServerWithMemFs(pg, _) => {
+                Some(pg.pool_stats())
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(pg, _) => Some(pg.pool_stats()),
             StorageBackend::Local(_) => None,
         }
     }
@@ -1387,9 +1399,12 @@ impl StorageBackend {
     pub fn events(&self) -> Arc<dyn EventStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn EventStore>,
-            StorageBackend::Server(s)
-            | StorageBackend::ServerWithS3(s, _)
-            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn EventStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn EventStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn EventStore>,
         }
     }
 
@@ -1397,9 +1412,12 @@ impl StorageBackend {
     pub fn issues(&self) -> Arc<dyn IssueStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn IssueStore>,
-            StorageBackend::Server(s)
-            | StorageBackend::ServerWithS3(s, _)
-            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn IssueStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn IssueStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn IssueStore>,
         }
     }
 
@@ -1407,9 +1425,12 @@ impl StorageBackend {
     pub fn comments(&self) -> Arc<dyn CommentStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn CommentStore>,
-            StorageBackend::Server(s)
-            | StorageBackend::ServerWithS3(s, _)
-            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn CommentStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn CommentStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn CommentStore>,
         }
     }
 
@@ -1417,9 +1438,12 @@ impl StorageBackend {
     pub fn links(&self) -> Arc<dyn IssueLinkStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn IssueLinkStore>,
-            StorageBackend::Server(s)
-            | StorageBackend::ServerWithS3(s, _)
-            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn IssueLinkStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn IssueLinkStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn IssueLinkStore>,
         }
     }
 
@@ -1427,9 +1451,12 @@ impl StorageBackend {
     pub fn escalations(&self) -> Arc<dyn EscalationStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn EscalationStore>,
-            StorageBackend::Server(s)
-            | StorageBackend::ServerWithS3(s, _)
-            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn EscalationStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn EscalationStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn EscalationStore>,
         }
     }
 
@@ -1437,9 +1464,12 @@ impl StorageBackend {
     pub fn graph(&self) -> Arc<dyn GraphStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn GraphStore>,
-            StorageBackend::Server(s)
-            | StorageBackend::ServerWithS3(s, _)
-            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn GraphStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn GraphStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn GraphStore>,
         }
     }
 
@@ -1447,9 +1477,12 @@ impl StorageBackend {
     pub fn versions(&self) -> Arc<dyn VersionStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn VersionStore>,
-            StorageBackend::Server(s)
-            | StorageBackend::ServerWithS3(s, _)
-            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn VersionStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn VersionStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn VersionStore>,
         }
     }
 
@@ -1457,9 +1490,12 @@ impl StorageBackend {
     pub fn workspaces(&self) -> Arc<dyn WorkspaceStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn WorkspaceStore>,
-            StorageBackend::Server(s)
-            | StorageBackend::ServerWithS3(s, _)
-            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn WorkspaceStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn WorkspaceStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn WorkspaceStore>,
         }
     }
 
@@ -1467,9 +1503,12 @@ impl StorageBackend {
     pub fn auth(&self) -> Arc<dyn AuthStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn AuthStore>,
-            StorageBackend::Server(s)
-            | StorageBackend::ServerWithS3(s, _)
-            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn AuthStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn AuthStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn AuthStore>,
         }
     }
 
@@ -1480,9 +1519,12 @@ impl StorageBackend {
     pub fn orgs(&self) -> Arc<dyn OrgStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn OrgStore>,
-            StorageBackend::Server(s)
-            | StorageBackend::ServerWithS3(s, _)
-            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn OrgStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn OrgStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn OrgStore>,
         }
     }
 
@@ -1493,9 +1535,12 @@ impl StorageBackend {
     pub fn attachments(&self) -> Arc<dyn AttachmentStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn AttachmentStore>,
-            StorageBackend::Server(s)
-            | StorageBackend::ServerWithS3(s, _)
-            | StorageBackend::ServerWithMemFs(s, _) => Arc::clone(s) as Arc<dyn AttachmentStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn AttachmentStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn AttachmentStore>,
         }
     }
 
@@ -1508,8 +1553,11 @@ impl StorageBackend {
     pub fn files(&self) -> Arc<dyn FileStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn FileStore>,
+            #[cfg(feature = "postgres")]
             StorageBackend::Server(s) => Arc::clone(s) as Arc<dyn FileStore>,
+            #[cfg(feature = "s3")]
             StorageBackend::ServerWithS3(_, f) => Arc::clone(f) as Arc<dyn FileStore>,
+            #[cfg(feature = "postgres")]
             StorageBackend::ServerWithMemFs(_, f) => Arc::clone(f) as Arc<dyn FileStore>,
         }
     }
@@ -1522,11 +1570,12 @@ impl StorageBackend {
     pub fn watchers(&self) -> Arc<dyn WatcherRegistryStore> {
         match self {
             StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn WatcherRegistryStore>,
-            StorageBackend::Server(s)
-            | StorageBackend::ServerWithS3(s, _)
-            | StorageBackend::ServerWithMemFs(s, _) => {
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
                 Arc::clone(s) as Arc<dyn WatcherRegistryStore>
             }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn WatcherRegistryStore>,
         }
     }
 }
