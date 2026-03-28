@@ -124,7 +124,7 @@ use tokio::sync::Mutex;
 use std::time::Instant;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Extension, FromRequest as _, Path as AxumPath, Query as AxumQuery, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, FromRequest as _, Path as AxumPath, Query as AxumQuery, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -252,6 +252,71 @@ const BUFFER_MAX_EVENTS: usize = 10_000;
 
 /// Maximum age (seconds) of events kept in the replay buffer (1 hour).
 const BUFFER_MAX_AGE_SECS: i64 = 3600;
+
+// ── Input validation limits ────────────────────────────────────────────────────
+
+/// Maximum length for issue titles (characters).
+const MAX_ISSUE_TITLE_LEN: usize = 500;
+/// Maximum length for issue/workspace description bodies (bytes).
+const MAX_ISSUE_BODY_LEN: usize = 50 * 1024; // 50 KB
+/// Maximum length for workspace intent (characters).
+const MAX_INTENT_LEN: usize = 1000;
+/// Maximum length for a single label (characters).
+const MAX_LABEL_LEN: usize = 100;
+/// Maximum number of labels per issue.
+const MAX_LABELS_PER_ISSUE: usize = 20;
+/// Maximum length for a file path (characters).
+const MAX_PATH_LEN: usize = 1000;
+/// Maximum number of files per upload request.
+const MAX_FILES_PER_REQUEST: usize = 100;
+/// Maximum pagination page size.
+const MAX_PAGE_SIZE: usize = 1000;
+/// Default JSON body size limit (10 MiB) — applies to all endpoints.
+const DEFAULT_BODY_LIMIT: usize = 10 * 1024 * 1024;
+/// Body size limit for file-upload endpoints (50 MiB).
+const UPLOAD_BODY_LIMIT: usize = 50 * 1024 * 1024;
+/// Body size limit for the migration endpoint (50 MiB).
+const MIGRATE_BODY_LIMIT: usize = 50 * 1024 * 1024;
+/// Body size limit for tarball snapshot uploads (100 MiB).
+const SNAPSHOT_BODY_LIMIT: usize = 100 * 1024 * 1024;
+
+// ── Input validation helpers ───────────────────────────────────────────────────
+
+/// Returns `Err(ApiError::bad_request(...))` when `value` exceeds `max` bytes.
+fn validate_str_len(value: &str, max: usize, field: &str) -> Result<(), ApiError> {
+    if value.len() > max {
+        return Err(ApiError::bad_request(format!(
+            "`{field}` exceeds maximum length of {max} bytes (got {} bytes)",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Validates a list of labels: at most `MAX_LABELS_PER_ISSUE`, each at most
+/// `MAX_LABEL_LEN` characters.
+fn validate_labels(labels: &[String]) -> Result<(), ApiError> {
+    if labels.len() > MAX_LABELS_PER_ISSUE {
+        return Err(ApiError::bad_request(format!(
+            "too many labels: {}, maximum is {MAX_LABELS_PER_ISSUE}",
+            labels.len()
+        )));
+    }
+    for label in labels {
+        validate_str_len(label, MAX_LABEL_LEN, "label")?;
+    }
+    Ok(())
+}
+
+/// Returns `Err(ApiError::bad_request(...))` when `limit` exceeds `MAX_PAGE_SIZE`.
+fn validate_page_limit(limit: usize) -> Result<(), ApiError> {
+    if limit > MAX_PAGE_SIZE {
+        return Err(ApiError::bad_request(format!(
+            "page size {limit} exceeds maximum of {MAX_PAGE_SIZE}"
+        )));
+    }
+    Ok(())
+}
 
 // ── Replay buffer ─────────────────────────────────────────────────────────────
 
@@ -1487,6 +1552,7 @@ async fn create_workspace_handler(
     Json(body): Json<CreateWorkspaceRequest>,
 ) -> Result<(StatusCode, Json<WorkspaceResponse>), ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
+    validate_str_len(&body.intent, MAX_INTENT_LEN, "intent")?;
     let _lock = state.repo_lock.lock().await;
     let head = ctx.storage.versions()
         .read_head(&ctx.repo_id)
@@ -2048,6 +2114,9 @@ async fn list_versions_handler(
     AxumQuery(params): AxumQuery<ListVersionsQuery>,
 ) -> Result<Json<Vec<version::VersionMeta>>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
+    if let Some(limit) = params.limit {
+        validate_page_limit(limit)?;
+    }
     let mut versions = ctx
         .storage
         .versions()
@@ -3289,6 +3358,10 @@ struct FileDownloadResponse {
 /// Returns `None` if the path is absolute or contains any parent-directory
 /// (`..`) components, preventing directory-traversal attacks.
 fn sanitize_path(raw: &str) -> Option<std::path::PathBuf> {
+    // Reject null bytes — they can be used to truncate paths at the OS level.
+    if raw.contains('\0') {
+        return None;
+    }
     let trimmed = raw.trim_start_matches('/');
     let pb = std::path::PathBuf::from(trimmed);
     if pb.is_absolute() {
@@ -3407,6 +3480,21 @@ async fn upload_workspace_files_handler(
     Json(body): Json<UploadFilesRequest>,
 ) -> Result<(StatusCode, Json<UploadFilesResponse>), ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
+
+    // Validate file count and path lengths before acquiring the lock.
+    if body.files.len() > MAX_FILES_PER_REQUEST {
+        return Err(ApiError::bad_request(format!(
+            "too many files: {}, maximum is {MAX_FILES_PER_REQUEST}",
+            body.files.len()
+        )));
+    }
+    for entry in &body.files {
+        validate_str_len(&entry.path, MAX_PATH_LEN, "file path")?;
+    }
+    for path in &body.deleted_paths {
+        validate_str_len(path, MAX_PATH_LEN, "deleted_path")?;
+    }
+
     let _lock = state.repo_lock.lock().await;
 
     // Read workspace metadata from storage (works in both local SQLite and Postgres modes).
@@ -4137,6 +4225,18 @@ async fn upload_source_files_handler(
         crate::storage::RepoRole::Write,
     )
     .await?;
+
+    // Validate file count and path lengths before acquiring the lock.
+    if body.files.len() > MAX_FILES_PER_REQUEST {
+        return Err(ApiError::bad_request(format!(
+            "too many files: {}, maximum is {MAX_FILES_PER_REQUEST}",
+            body.files.len()
+        )));
+    }
+    for entry in &body.files {
+        validate_str_len(&entry.path, MAX_PATH_LEN, "file path")?;
+    }
+
     let _lock = state.repo_lock.lock().await;
 
     // Extract Postgres pool for migration_state tracking (Postgres mode only).
@@ -5388,6 +5488,9 @@ async fn create_issue_handler(
     Json(body): Json<CreateIssueRequest>,
 ) -> Result<(StatusCode, Json<IssueResponse>), ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
+    validate_str_len(&body.title, MAX_ISSUE_TITLE_LEN, "title")?;
+    validate_str_len(&body.description, MAX_ISSUE_BODY_LEN, "description")?;
+    validate_labels(&body.labels)?;
     use crate::issue::{AgentSource, IssueFilter, IssuePriority};
     use crate::storage::NewIssue;
 
@@ -5707,6 +5810,15 @@ async fn update_issue_handler(
     Json(body): Json<UpdateIssueRequest>,
 ) -> Result<Json<IssueResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
+    if let Some(ref title) = body.title {
+        validate_str_len(title, MAX_ISSUE_TITLE_LEN, "title")?;
+    }
+    if let Some(ref desc) = body.description {
+        validate_str_len(desc, MAX_ISSUE_BODY_LEN, "description")?;
+    }
+    if let Some(ref labels) = body.labels {
+        validate_labels(labels)?;
+    }
     use crate::issue::IssuePriority;
     use crate::storage::IssueUpdate;
 
@@ -9350,12 +9462,12 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/workspaces", get(list_workspaces_handler))
         .route("/api/workspaces/:id", get(get_workspace_handler))
         .route("/api/workspaces/:id/submit", post(submit_workspace_handler))
-        .route("/api/workspaces/:id/files", post(upload_workspace_files_handler))
-        .route("/api/workspaces/:id/upload-snapshot", post(upload_snapshot_handler))
+        .route("/api/workspaces/:id/files", post(upload_workspace_files_handler).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)))
+        .route("/api/workspaces/:id/upload-snapshot", post(upload_snapshot_handler).layer(DefaultBodyLimit::max(SNAPSHOT_BODY_LIMIT)))
         .route("/api/workspaces/:id/files/*path", get(get_workspace_file_handler))
         .route("/api/workspaces/:id", delete(discard_workspace_handler))
         .route("/api/repo/files", get(list_repo_files_handler))
-        .route("/api/files", post(upload_source_files_handler))
+        .route("/api/files", post(upload_source_files_handler).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)))
         .route("/api/files/*path", get(get_main_file_handler))
         .route("/api/graph/refresh", post(server_graph_refresh_handler))
         .route("/api/versions", get(list_versions_handler))
@@ -9395,7 +9507,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/watchers/:id/resume", post(resume_watcher_handler))
         .route("/api/discoveries", post(submit_discovery_handler))
         // Migration endpoints (PRD 12.2, 12.5) — single-repo mode.
-        .route("/api/migrate", post(migrate_handler))
+        .route("/api/migrate", post(migrate_handler).layer(DefaultBodyLimit::max(MIGRATE_BODY_LIMIT)))
         .route("/api/migration-stats", get(migration_stats_handler))
         // Multi-repo management endpoints.
         .route("/api/repos", post(create_repo_handler))
@@ -9452,12 +9564,12 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/workspaces", get(list_workspaces_handler))
         .route("/workspaces/:id", get(get_workspace_handler))
         .route("/workspaces/:id/submit", post(submit_workspace_handler))
-        .route("/workspaces/:id/files", post(upload_workspace_files_handler))
-        .route("/workspaces/:id/upload-snapshot", post(upload_snapshot_handler))
+        .route("/workspaces/:id/files", post(upload_workspace_files_handler).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)))
+        .route("/workspaces/:id/upload-snapshot", post(upload_snapshot_handler).layer(DefaultBodyLimit::max(SNAPSHOT_BODY_LIMIT)))
         .route("/workspaces/:id/files/*path", get(get_workspace_file_handler))
         .route("/workspaces/:id", delete(discard_workspace_handler))
         .route("/files", get(list_repo_files_handler))
-        .route("/files", post(upload_source_files_handler))
+        .route("/files", post(upload_source_files_handler).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)))
         // Static sub-routes must come before the wildcard `/files/*path`.
         .route("/files/download", get(files_download_handler))
         .route("/files/pull", get(files_pull_handler))
@@ -9497,7 +9609,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/discoveries", post(submit_discovery_handler))
         .route("/ws/events", get(ws_events_handler))
         // Migration endpoints (PRD 12.2, 12.5) — multi-repo mode.
-        .route("/migrate", post(migrate_handler))
+        .route("/migrate", post(migrate_handler).layer(DefaultBodyLimit::max(MIGRATE_BODY_LIMIT)))
         .route("/migration-stats", get(migration_stats_handler))
         // Apply repo resolution first (outermost = runs last).
         .layer(middleware::from_fn_with_state(
@@ -9523,6 +9635,10 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .merge(protected)
         .nest("/api/repos/:repo", repo_scoped)
         .layer(cors)
+        // Global JSON body size limit — per-route overrides on large-upload
+        // endpoints (upload-snapshot: 100 MiB, file-upload/migrate: 50 MiB)
+        // are applied as inner layers and take precedence over this default.
+        .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT))
         .with_state(state)
 }
 
