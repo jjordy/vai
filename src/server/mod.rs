@@ -433,6 +433,60 @@ enum ClientMessage {
     Subscribe { subscribe: SubscriptionFilter },
 }
 
+// ── Rate limiter ──────────────────────────────────────────────────────────────
+
+/// Result of a rate-limit check.
+enum RateLimitResult {
+    Allowed,
+    Denied { retry_after_secs: u64 },
+}
+
+/// In-memory sliding-window rate limiter.
+///
+/// Keys are arbitrary strings (IP address, "key:<id>:<category>", etc.).
+/// Each entry records the timestamps of recent requests; entries older than the
+/// window are pruned on every check, keeping memory usage bounded.
+struct RateLimiter {
+    windows: StdMutex<HashMap<String, VecDeque<std::time::Instant>>>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            windows: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns [`RateLimitResult::Allowed`] when the request is within limits
+    /// and records it, or [`RateLimitResult::Denied`] when the bucket is full.
+    ///
+    /// `max` is the maximum number of requests allowed per `window`.
+    fn check(&self, key: &str, max: usize, window: std::time::Duration) -> RateLimitResult {
+        let now = std::time::Instant::now();
+        // Saturating sub so we don't panic on very short windows in tests.
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+        let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = windows.entry(key.to_string()).or_default();
+
+        // Drop timestamps older than the window.
+        while matches!(entry.front(), Some(&ts) if ts <= cutoff) {
+            entry.pop_front();
+        }
+
+        if entry.len() >= max {
+            let oldest = *entry.front().expect("non-empty after capacity check");
+            let elapsed = now.duration_since(oldest);
+            let retry_after = window.saturating_sub(elapsed);
+            RateLimitResult::Denied {
+                retry_after_secs: retry_after.as_secs().max(1),
+            }
+        } else {
+            entry.push_back(now);
+            RateLimitResult::Allowed
+        }
+    }
+}
+
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 /// State shared across all request handlers.
@@ -473,6 +527,8 @@ pub(crate) struct AppState {
     /// startup and printed to stdout.  A request bearing this key bypasses
     /// normal API-key validation and receives full server-admin access.
     admin_key: String,
+    /// In-memory sliding-window rate limiter shared across all requests.
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl AppState {
@@ -709,6 +765,175 @@ async fn auth_middleware(
         }
         Err(e) => ApiError::internal(format!("auth error: {e}")).into_response(),
     }
+}
+
+// ── Rate-limit middleware ──────────────────────────────────────────────────────
+
+/// Extracts the best-effort client IP from the request.
+///
+/// Checks `X-Forwarded-For` (proxy) then `X-Real-IP` then falls back to the
+/// TCP `ConnectInfo` socket address injected by axum.  Returns `"unknown"` if
+/// none is available (e.g. in tests that do not set these headers).
+fn extract_client_ip(request: &Request) -> String {
+    if let Some(xff) = request.headers().get("x-forwarded-for") {
+        if let Ok(val) = xff.to_str() {
+            if let Some(ip) = val.split(',').next().map(str::trim) {
+                if !ip.is_empty() {
+                    return ip.to_string();
+                }
+            }
+        }
+    }
+    if let Some(xri) = request.headers().get("x-real-ip") {
+        if let Ok(ip) = xri.to_str() {
+            let ip = ip.trim();
+            if !ip.is_empty() {
+                return ip.to_string();
+            }
+        }
+    }
+    if let Some(info) = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+    {
+        return info.0.ip().to_string();
+    }
+    "unknown".to_string()
+}
+
+/// Rate limit category determined from HTTP method + request path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateLimitCategory {
+    /// Key-creation and other auth-adjacent endpoints — 10 requests / minute per IP.
+    AuthIp,
+    /// Issue creation — 100 requests / hour per API key.
+    IssueCreate,
+    /// Workspace creation — 50 requests / hour per API key.
+    WorkspaceCreate,
+    /// File upload endpoints — 200 requests / hour per API key.
+    FileUpload,
+    /// No specific rate limit applies.
+    None,
+}
+
+/// Classify a request by method and path into a [`RateLimitCategory`].
+fn classify_rate_limit(method: &axum::http::Method, path: &str) -> RateLimitCategory {
+    use axum::http::Method;
+    // Strip the /api/repos/<name> prefix so the logic below works for both
+    // the single-repo and multi-repo URL shapes.
+    let normalised = if let Some(rest) = path.strip_prefix("/api/repos/") {
+        // Skip the repo name segment.
+        rest.splitn(2, '/').nth(1).map(|s| format!("/{s}")).unwrap_or_default()
+    } else {
+        path.to_string()
+    };
+    let p = normalised.as_str();
+
+    match method {
+        &Method::POST => {
+            if p == "/api/keys" || p == "/keys" {
+                return RateLimitCategory::AuthIp;
+            }
+            if p == "/api/issues" || p == "/issues" {
+                return RateLimitCategory::IssueCreate;
+            }
+            if p == "/api/workspaces" || p == "/workspaces" {
+                return RateLimitCategory::WorkspaceCreate;
+            }
+            // File upload: /api/workspaces/:id/files,
+            //              /api/workspaces/:id/upload-snapshot,
+            //              /api/files, /api/graph/refresh, etc.
+            let upload_patterns = [
+                "/files",
+                "/upload-snapshot",
+                "/attachments",
+            ];
+            if upload_patterns.iter().any(|pat| p.ends_with(pat)) {
+                return RateLimitCategory::FileUpload;
+            }
+            RateLimitCategory::None
+        }
+        _ => RateLimitCategory::None,
+    }
+}
+
+/// Axum middleware that enforces per-IP and per-API-key rate limits.
+///
+/// Limits:
+/// - Key-creation (`POST /api/keys`): **10 / minute** per client IP
+/// - Issue creation: **100 / hour** per API key
+/// - Workspace creation: **50 / hour** per API key
+/// - File uploads: **200 / hour** per API key
+///
+/// Returns **429 Too Many Requests** with a `Retry-After` header on denial.
+async fn rate_limit_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let category = classify_rate_limit(request.method(), request.uri().path());
+
+    match category {
+        RateLimitCategory::None => {}
+
+        RateLimitCategory::AuthIp => {
+            let ip = extract_client_ip(&request);
+            let key = format!("ip_auth:{ip}");
+            if let RateLimitResult::Denied { retry_after_secs } =
+                state.rate_limiter.check(&key, 10, std::time::Duration::from_secs(60))
+            {
+                tracing::warn!(ip = %ip, "rate limit exceeded: key creation");
+                return rate_limited_response(retry_after_secs);
+            }
+        }
+
+        RateLimitCategory::IssueCreate => {
+            if let Some(identity) = request.extensions().get::<AgentIdentity>() {
+                let key = format!("issue_create:{}", identity.key_id);
+                if let RateLimitResult::Denied { retry_after_secs } =
+                    state.rate_limiter.check(&key, 100, std::time::Duration::from_secs(3600))
+                {
+                    tracing::warn!(agent = %identity.name, "rate limit exceeded: issue creation");
+                    return rate_limited_response(retry_after_secs);
+                }
+            }
+        }
+
+        RateLimitCategory::WorkspaceCreate => {
+            if let Some(identity) = request.extensions().get::<AgentIdentity>() {
+                let key = format!("workspace_create:{}", identity.key_id);
+                if let RateLimitResult::Denied { retry_after_secs } =
+                    state.rate_limiter.check(&key, 50, std::time::Duration::from_secs(3600))
+                {
+                    tracing::warn!(agent = %identity.name, "rate limit exceeded: workspace creation");
+                    return rate_limited_response(retry_after_secs);
+                }
+            }
+        }
+
+        RateLimitCategory::FileUpload => {
+            if let Some(identity) = request.extensions().get::<AgentIdentity>() {
+                let key = format!("file_upload:{}", identity.key_id);
+                if let RateLimitResult::Denied { retry_after_secs } =
+                    state.rate_limiter.check(&key, 200, std::time::Duration::from_secs(3600))
+                {
+                    tracing::warn!(agent = %identity.name, "rate limit exceeded: file upload");
+                    return rate_limited_response(retry_after_secs);
+                }
+            }
+        }
+    }
+
+    next.run(request).await
+}
+
+/// Builds the 429 response with a `Retry-After` header.
+fn rate_limited_response(retry_after_secs: u64) -> Response {
+    let mut response = ApiError::rate_limited("rate limit exceeded; try again later").into_response();
+    if let Ok(val) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert("Retry-After", val);
+    }
+    response
 }
 
 // ── Multi-repo resolve middleware ─────────────────────────────────────────────
@@ -9548,6 +9773,14 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
             "/api/orgs/:org/repos/:repo/collaborators/:user",
             delete(remove_collaborator_handler),
         )
+        // Rate limiting is INNER (added first) so it runs AFTER auth and has
+        // access to the AgentIdentity set by auth_middleware for per-key limits.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            rate_limit_middleware,
+        ))
+        // Auth is OUTER (added last) so it runs FIRST, populating AgentIdentity
+        // before rate_limit_middleware sees the request.
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -9616,8 +9849,13 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
             Arc::clone(&state),
             repo_resolve_middleware,
         ))
-        // Auth runs before repo resolution so unauthenticated requests are
-        // rejected cheaply before the registry lookup.
+        // Rate limiting is INNER so it runs AFTER auth and has AgentIdentity.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            rate_limit_middleware,
+        ))
+        // Auth runs before rate limiting (and repo resolution) so unauth
+        // requests are rejected cheaply before the registry lookup.
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -9679,6 +9917,7 @@ pub async fn start_for_testing(
         storage: crate::storage::StorageBackend::local(vai_dir),
         // Tests use a fixed admin key so they can exercise admin-only endpoints.
         admin_key: "vai_admin_test".to_string(),
+        rate_limiter: Arc::new(RateLimiter::new()),
     });
 
     let app = build_app(state);
@@ -9687,7 +9926,7 @@ pub async fn start_for_testing(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
-        axum::serve(listener, app)
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(async {
                 shutdown_rx.await.ok();
             })
@@ -9769,6 +10008,7 @@ pub async fn start_for_testing_pg(
         storage_root: None,
         storage,
         admin_key: "vai_admin_test".to_string(),
+        rate_limiter: Arc::new(RateLimiter::new()),
     });
 
     let app = build_app(state);
@@ -9777,7 +10017,7 @@ pub async fn start_for_testing_pg(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
-        axum::serve(listener, app)
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(async {
                 shutdown_rx.await.ok();
             })
@@ -9850,6 +10090,7 @@ pub async fn start_for_testing_pg_multi_repo(
         storage_root: Some(storage_root.to_path_buf()),
         storage,
         admin_key: "vai_admin_test".to_string(),
+        rate_limiter: Arc::new(RateLimiter::new()),
     });
 
     let app = build_app(state);
@@ -9858,7 +10099,7 @@ pub async fn start_for_testing_pg_multi_repo(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
-        axum::serve(listener, app)
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(async {
                 shutdown_rx.await.ok();
             })
@@ -9917,6 +10158,7 @@ pub async fn start_for_testing_pg_with_mem_fs(
         storage_root: Some(storage_root.to_path_buf()),
         storage,
         admin_key: "vai_admin_test".to_string(),
+        rate_limiter: Arc::new(RateLimiter::new()),
     });
 
     let app = build_app(state);
@@ -9925,7 +10167,7 @@ pub async fn start_for_testing_pg_with_mem_fs(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     tokio::spawn(async move {
-        axum::serve(listener, app)
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(async {
                 shutdown_rx.await.ok();
             })
@@ -10036,6 +10278,7 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         storage_root: config.storage_root.clone(),
         storage,
         admin_key,
+        rate_limiter: Arc::new(RateLimiter::new()),
     });
 
     let app = build_app(state);
@@ -10069,7 +10312,7 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
     println!("repository: {}", repo_name);
     println!("Press Ctrl+C to stop.");
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(ServerError::Io)?;
@@ -10296,13 +10539,14 @@ mod tests {
             storage_root: None,
             storage: crate::storage::StorageBackend::local(&vai_dir),
             admin_key: "vai_admin_test".to_string(),
+            rate_limiter: Arc::new(RateLimiter::new()),
         });
 
         let app = build_app(Arc::clone(&state));
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         tokio::spawn(async move {
-            axum::serve(listener, app)
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
                 .with_graceful_shutdown(async {
                     shutdown_rx.await.ok();
                 })
@@ -12521,12 +12765,13 @@ mod tests {
             storage_root: Some(storage_root),
             storage: crate::storage::StorageBackend::local(&vai_dir),
             admin_key: "vai_admin_test".to_string(),
+            rate_limiter: Arc::new(RateLimiter::new()),
         });
 
         let app = build_app(Arc::clone(&state));
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
-            axum::serve(listener, app)
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
                 .with_graceful_shutdown(async { shutdown_rx.await.ok(); })
                 .await
                 .unwrap();
@@ -12893,6 +13138,173 @@ mod tests {
         let a_issues: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(a_issues.as_array().unwrap().len(), 1);
         assert_eq!(a_issues[0]["title"], "Issue in A");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    // ── Rate limiter unit tests ───────────────────────────────────────────────
+
+    #[test]
+    fn rate_limiter_allows_within_limit() {
+        let rl = RateLimiter::new();
+        for _ in 0..5 {
+            assert!(
+                matches!(rl.check("key", 5, std::time::Duration::from_secs(60)), RateLimitResult::Allowed),
+                "expected Allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limiter_denies_over_limit() {
+        let rl = RateLimiter::new();
+        for _ in 0..3 {
+            rl.check("key", 3, std::time::Duration::from_secs(60));
+        }
+        assert!(
+            matches!(rl.check("key", 3, std::time::Duration::from_secs(60)), RateLimitResult::Denied { .. }),
+            "expected Denied"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_retry_after_is_positive() {
+        let rl = RateLimiter::new();
+        for _ in 0..2 {
+            rl.check("k", 2, std::time::Duration::from_secs(60));
+        }
+        match rl.check("k", 2, std::time::Duration::from_secs(60)) {
+            RateLimitResult::Denied { retry_after_secs } => {
+                assert!(retry_after_secs >= 1, "retry_after_secs should be ≥ 1");
+            }
+            RateLimitResult::Allowed => panic!("expected Denied"),
+        }
+    }
+
+    #[test]
+    fn rate_limiter_independent_keys() {
+        let rl = RateLimiter::new();
+        // Fill key-a to its limit.
+        for _ in 0..2 {
+            rl.check("a", 2, std::time::Duration::from_secs(60));
+        }
+        // key-b should still be allowed.
+        assert!(
+            matches!(rl.check("b", 2, std::time::Duration::from_secs(60)), RateLimitResult::Allowed),
+            "key-b should be allowed independently"
+        );
+        // key-a should now be denied.
+        assert!(
+            matches!(rl.check("a", 2, std::time::Duration::from_secs(60)), RateLimitResult::Denied { .. }),
+            "key-a should be denied"
+        );
+    }
+
+    #[test]
+    fn classify_rate_limit_categories() {
+        use axum::http::Method;
+        assert_eq!(
+            classify_rate_limit(&Method::POST, "/api/keys"),
+            RateLimitCategory::AuthIp
+        );
+        assert_eq!(
+            classify_rate_limit(&Method::POST, "/api/issues"),
+            RateLimitCategory::IssueCreate
+        );
+        assert_eq!(
+            classify_rate_limit(&Method::POST, "/api/repos/my-repo/issues"),
+            RateLimitCategory::IssueCreate
+        );
+        assert_eq!(
+            classify_rate_limit(&Method::POST, "/api/workspaces"),
+            RateLimitCategory::WorkspaceCreate
+        );
+        assert_eq!(
+            classify_rate_limit(&Method::POST, "/api/repos/my-repo/workspaces"),
+            RateLimitCategory::WorkspaceCreate
+        );
+        assert_eq!(
+            classify_rate_limit(&Method::POST, "/api/workspaces/abc/files"),
+            RateLimitCategory::FileUpload
+        );
+        assert_eq!(
+            classify_rate_limit(&Method::POST, "/api/workspaces/abc/upload-snapshot"),
+            RateLimitCategory::FileUpload
+        );
+        assert_eq!(
+            classify_rate_limit(&Method::GET, "/api/issues"),
+            RateLimitCategory::None
+        );
+        assert_eq!(
+            classify_rate_limit(&Method::GET, "/health"),
+            RateLimitCategory::None
+        );
+    }
+
+    // ── Rate limiting HTTP integration tests ─────────────────────────────────
+
+    /// Verify that the key-creation endpoint is rate-limited per IP.
+    /// We use X-Forwarded-For to simulate a consistent client IP.
+    #[tokio::test]
+    async fn test_key_creation_rate_limited_after_10_per_min() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (addr, shutdown_tx, state, _key) = start_test_server(root.path()).await;
+
+        // Set the rate limiter to a very tight limit so the test is fast.
+        // We do this by pre-filling the bucket for our test IP.
+        let test_ip = "10.0.0.99";
+        let rl_key = format!("ip_auth:{test_ip}");
+        // Fill 10 slots.
+        for _ in 0..10 {
+            state.rate_limiter.check(&rl_key, 10, std::time::Duration::from_secs(60));
+        }
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/keys"))
+            .bearer_auth("vai_admin_test")
+            .header("X-Forwarded-For", test_ip)
+            .json(&serde_json::json!({"name": "test-key", "repo_id": null}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            429,
+            "expected 429 Too Many Requests"
+        );
+        assert!(
+            resp.headers().contains_key("Retry-After"),
+            "expected Retry-After header"
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Verify that workspace creation is rate-limited per API key.
+    #[tokio::test]
+    async fn test_workspace_creation_rate_limited() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (addr, shutdown_tx, state, _key) = start_test_server(root.path()).await;
+
+        // Pre-fill the workspace_create bucket for the admin key.
+        let rl_key = "workspace_create:admin";
+        for _ in 0..50 {
+            state.rate_limiter.check(rl_key, 50, std::time::Duration::from_secs(3600));
+        }
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth("vai_admin_test")
+            .json(&serde_json::json!({"name": "ws", "description": null}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 429);
+        assert!(resp.headers().contains_key("Retry-After"));
 
         shutdown_tx.send(()).ok();
     }
