@@ -85,3 +85,7 @@ CI runs both: `cargo test` (CLI-only) and `cargo test --features full` (server w
 - `async-trait` — async trait support
 
 Do not add dependencies outside this list without justification in the commit message.
+
+### Security
+
+Run `cargo audit` periodically to check for known vulnerabilities in dependencies. CI automatically runs `cargo audit --deny warnings` and fails the build on any advisory. If you add a new dependency, run `cargo audit` locally before committing.
