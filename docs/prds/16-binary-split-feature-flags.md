@@ -1,4 +1,4 @@
-# PRD 18: Binary Split via Cargo Feature Flags
+# PRD 16: Binary Split via Cargo Feature Flags
 
 ## Overview
 
@@ -76,4 +76,4 @@ full = ["cli", "server", "postgres", "s3"]
 
 ## Priority
 
-Medium. Not blocking any current work. Do after PRD 15 (storage purity) is complete since the feature gating is easier once the module boundaries are clean.
+Medium. Not blocking any current work. Do after PRD 13 (storage purity) is complete since the feature gating is easier once the module boundaries are clean.

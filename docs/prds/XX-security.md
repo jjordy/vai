@@ -1,5 +1,7 @@
 # Phase 13: Security Hardening
 
+> **Execution order:** This PRD should be implemented AFTER PRD 13 (storage purity), PRD 15 (issue improvements), and PRD 18 (feature flags) are complete. Security hardening is most effective once the feature set is stable.
+
 ## Summary
 
 Ensure the vai platform is secure for multi-tenant hosted deployment. Cover authentication, authorization, data isolation, input validation, secrets management, and protection against common attack vectors.
@@ -53,13 +55,16 @@ Tenant data must be strictly isolated:
 
 ### 13.6: Agent Security
 
-Agents operate autonomously and can create workspaces, submit code, and create issues. Guard against:
+Agents operate autonomously and can create workspaces, submit code, create issues, and upload attachments. Guard against:
 
 - **Malicious file content** — validate that uploaded files don't exceed size limits. Consider scanning for known patterns (e.g., embedded credentials, shell injection in filenames).
-- **Workspace scope enforcement** — agents can only modify files within their workspace overlay. The merge engine must not apply changes outside the repo root.
+- **Tarball upload validation** — the `upload-snapshot` endpoint accepts full tarballs. Validate: max size (100MB), no symlinks, no absolute paths, no path traversal, no files outside repo scope. Reject tarballs with suspicious content types.
+- **Attachment security** — agents can upload attachments to issues. Enforce file type allowlist (images, PDFs, text, JSON, YAML, CSV). Scan for embedded scripts in uploaded images (polyglot files). Max 10MB per attachment.
+- **Workspace scope enforcement** — agents can only modify files within their workspace overlay. The merge engine must not apply changes outside the repo root. The `current/` prefix in S3 must only be writable by the submit handler, never directly by agents.
 - **Issue spam** — rate limit issue creation per agent (configurable per watcher, currently implemented as `max_per_hour` in watcher policy).
 - **Escalation flooding** — rate limit escalation creation to prevent an agent from overwhelming human reviewers.
-- **Graph poisoning** — validate that entity names and relationships extracted from agent-submitted code don't contain injection payloads (e.g., SQL in entity names). The graph engine should parameterize all queries (already using rusqlite params — verify).
+- **Graph poisoning** — validate that entity names and relationships extracted from agent-submitted code don't contain injection payloads. The graph engine should parameterize all queries (already using sqlx params for Postgres, rusqlite params for SQLite — verify).
+- **Comment abuse** — rate limit comments per agent. Validate comment body size (max 50KB). Future: when agent mentions are implemented, prevent agents from triggering infinite mention loops.
 
 ### 13.7: Dependency Security
 

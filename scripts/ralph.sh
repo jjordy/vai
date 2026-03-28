@@ -103,11 +103,19 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
   echo "========================================="
   echo ""
 
-  # Fetch all open issues
+  # Fetch all open issues, sorted by priority label then issue number (lowest first)
   OPEN_ISSUES=$(docker exec "$CONTAINER_NAME" bash -c "
     cd /home/agent/repo
     gh issue list --repo '$REPO' --state open --json number,title,body,labels --limit 50
-  ")
+  " | jq 'sort_by(
+    ((.labels // []) | map(.name) |
+      if any(. == "priority:critical") then 0
+      elif any(. == "priority:high") then 1
+      elif any(. == "priority:medium") then 2
+      elif any(. == "priority:low") then 3
+      else 4 end),
+    .number
+  )')
 
   ISSUE_COUNT=$(echo "$OPEN_ISSUES" | jq length)
 

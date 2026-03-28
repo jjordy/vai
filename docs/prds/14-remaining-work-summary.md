@@ -1,4 +1,4 @@
-# PRD 16: Remaining Work Summary
+# PRD 14: Remaining Work Summary
 
 ## Open Issues by Phase
 
@@ -7,24 +7,24 @@
 - **#152**: Add issue templates API
 - **#154**: Remaining server handlers still use filesystem instead of storage trait
 
-### PRD 15 Phase 1: Foundation (Ready for RALPH)
+### PRD 13 Phase 1: Foundation (Ready for RALPH)
 - **#157**: Add `deleted_paths` to workspace schema and upload endpoint
 - **#158**: Seed `current/` prefix in S3 during migration
 - **#159**: Download handler serves from `current/` in S3 only
 - **#160**: Add tarball upload endpoint for agent workflows
 
-### PRD 15 Phase 2: Merge Engine (Closed, Reopen After Phase 1)
+### PRD 13 Phase 2: Merge Engine (Closed, Reopen After Phase 1)
 - **#161**: Introduce `MergeFs` trait abstraction
 - **#162**: Implement `S3MergeFs` — in-memory buffer backed by S3
 - **#163**: Delete `prepare_workspace_for_submit`
 - **#164**: Submit handler updates `current/` in S3 after merge
 
-### PRD 15 Phase 3: Handler Cleanup (Closed, Reopen After Phase 2)
+### PRD 13 Phase 3: Handler Cleanup (Closed, Reopen After Phase 2)
 - **#165**: E2E tests with read-only `repo_root`
 - **#166**: CI grep check for `std::fs` in server handlers
 - **#167**: Deletion round-trip integration test
 
-### PRD 15 Phase 5: Agent DX (Closed, Reopen After Phase 3)
+### PRD 13 Phase 5: Agent DX (Closed, Reopen After Phase 3)
 - **#168**: Add `WatcherStore` trait and Postgres implementation
 - **#169**: Tarball delta mode for large repos
 

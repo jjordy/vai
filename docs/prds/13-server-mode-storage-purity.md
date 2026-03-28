@@ -1,4 +1,4 @@
-# PRD 15: Server Mode Storage Purity
+# PRD 13: Server Mode Storage Purity
 
 ## Overview
 

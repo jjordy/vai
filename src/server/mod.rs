@@ -3441,11 +3441,15 @@ async fn upload_workspace_files_handler(
 
         let path_str = rel.to_string_lossy().replace('\\', "/");
 
-        // Determine whether this is an add or a modify by checking the FileStore.
+        // Determine whether this is an add or a modify.
+        // Check the workspace overlay first (re-upload), then fall back to
+        // current/ (base repo state) to distinguish new files from modifications.
         let new_hash = sha256_hex(&content);
         let store_key = format!("workspaces/{}/{}", id, path_str);
+        let current_key = format!("current/{}", path_str);
         let file_store = ctx.storage.files();
-        let existing = file_store.get(&ctx.repo_id, &store_key).await.ok();
+        let existing = file_store.get(&ctx.repo_id, &store_key).await.ok()
+            .or(file_store.get(&ctx.repo_id, &current_key).await.ok());
         let is_new = existing.is_none();
         let old_hash = existing.as_ref().map(|bytes| sha256_hex(bytes)).unwrap_or_default();
 
