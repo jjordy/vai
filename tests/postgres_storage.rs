@@ -32,8 +32,9 @@ use vai::graph::{Entity, EntityKind, Relationship, RelationshipKind};
 use vai::issue::{IssueFilter, IssuePriority, IssueStatus};
 use vai::storage::postgres::PostgresStorage;
 use vai::storage::{
-    AuthStore, EscalationStore, EventStore, GraphStore, IssueStore, NewEscalation, NewIssue,
-    NewVersion, NewWorkspace, StorageError, VersionStore, WorkspaceStore, WorkspaceUpdate,
+    AuthStore, CommentStore, EscalationStore, EventStore, GraphStore, IssueStore, NewEscalation,
+    NewIssue, NewIssueComment, NewVersion, NewWorkspace, StorageError, VersionStore,
+    WorkspaceStore, WorkspaceUpdate,
 };
 use vai::workspace::WorkspaceStatus;
 
@@ -1097,4 +1098,323 @@ async fn test_issue_parity_with_sqlite() {
     assert_eq!(pg_closed.status, IssueStatus::Closed);
 
     teardown(&pg, &repo_id).await;
+}
+
+// ── Cross-repo isolation tests ─────────────────────────────────────────────────
+//
+// Each test creates data in repo_a and verifies that repo_b cannot see it.
+// These tests assert the storage layer enforces multi-tenant boundaries.
+
+/// Creates a second isolated repo row and returns its ID.
+async fn create_repo(storage: &PostgresStorage) -> Uuid {
+    let repo_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO repos (id, name) VALUES ($1, $2)")
+        .bind(repo_id)
+        .bind(format!("test-repo-{repo_id}"))
+        .execute(storage.pool())
+        .await
+        .expect("failed to insert second test repo");
+    repo_id
+}
+
+#[tokio::test]
+async fn test_issue_store_cross_repo_isolation() {
+    let Some((storage, repo_a)) = setup().await else {
+        return;
+    };
+    let repo_b = create_repo(&storage).await;
+
+    // Create an issue in repo_a.
+    let issue = storage
+        .create_issue(
+            &repo_a,
+            NewIssue {
+                title: "Repo-A issue".to_string(),
+                description: "Should not be visible from repo_b".to_string(),
+                priority: IssuePriority::Medium,
+                labels: vec![],
+                creator: "alice".to_string(),
+                agent_source: None,
+                acceptance_criteria: vec![],
+            },
+        )
+        .await
+        .expect("create_issue failed");
+
+    // repo_b should see no issues.
+    let list_b = storage
+        .list_issues(&repo_b, &IssueFilter::default())
+        .await
+        .expect("list_issues failed");
+    assert!(list_b.is_empty(), "repo_b should not see repo_a's issues");
+
+    // get_issue from repo_b with repo_a's ID should return NotFound.
+    let result = storage.get_issue(&repo_b, &issue.id).await;
+    assert!(
+        matches!(result, Err(StorageError::NotFound(_))),
+        "get_issue from wrong repo should return NotFound"
+    );
+
+    teardown(&storage, &repo_b).await;
+    teardown(&storage, &repo_a).await;
+}
+
+#[tokio::test]
+async fn test_issue_comment_cross_repo_isolation() {
+    let Some((storage, repo_a)) = setup().await else {
+        return;
+    };
+    let repo_b = create_repo(&storage).await;
+
+    // Create an issue and comment in repo_a.
+    let issue = storage
+        .create_issue(
+            &repo_a,
+            NewIssue {
+                title: "Issue for comment isolation test".to_string(),
+                description: "".to_string(),
+                priority: IssuePriority::Low,
+                labels: vec![],
+                creator: "alice".to_string(),
+                agent_source: None,
+                acceptance_criteria: vec![],
+            },
+        )
+        .await
+        .expect("create_issue failed");
+
+    storage
+        .create_comment(
+            &repo_a,
+            &issue.id,
+            NewIssueComment {
+                author: "alice".to_string(),
+                body: "A comment".to_string(),
+                author_type: "human".to_string(),
+                author_id: None,
+            },
+        )
+        .await
+        .expect("create_comment failed");
+
+    // repo_b should see no comments for the same issue ID.
+    let comments_b = storage
+        .list_comments(&repo_b, &issue.id)
+        .await
+        .expect("list_comments failed");
+    assert!(
+        comments_b.is_empty(),
+        "repo_b should not see repo_a's comments"
+    );
+
+    teardown(&storage, &repo_b).await;
+    teardown(&storage, &repo_a).await;
+}
+
+#[tokio::test]
+async fn test_escalation_store_cross_repo_isolation() {
+    let Some((storage, repo_a)) = setup().await else {
+        return;
+    };
+    let repo_b = create_repo(&storage).await;
+
+    let ws_id = Uuid::new_v4();
+    let escalation = storage
+        .create_escalation(
+            &repo_a,
+            NewEscalation {
+                escalation_type: EscalationType::MergeConflict,
+                severity: EscalationSeverity::High,
+                summary: "Repo-A escalation".to_string(),
+                intents: vec![],
+                agents: vec!["agent-1".to_string()],
+                workspace_ids: vec![ws_id],
+                affected_entities: vec![],
+                conflicts: vec![],
+                resolution_options: vec![ResolutionOption::KeepAgentA],
+            },
+        )
+        .await
+        .expect("create_escalation failed");
+
+    // repo_b should see no escalations.
+    let list_b = storage
+        .list_escalations(&repo_b, false)
+        .await
+        .expect("list_escalations failed");
+    assert!(
+        list_b.is_empty(),
+        "repo_b should not see repo_a's escalations"
+    );
+
+    // get_escalation from repo_b should return NotFound.
+    let result = storage.get_escalation(&repo_b, &escalation.id).await;
+    assert!(
+        matches!(result, Err(StorageError::NotFound(_))),
+        "get_escalation from wrong repo should return NotFound"
+    );
+
+    teardown(&storage, &repo_b).await;
+    teardown(&storage, &repo_a).await;
+}
+
+#[tokio::test]
+async fn test_workspace_store_cross_repo_isolation() {
+    let Some((storage, repo_a)) = setup().await else {
+        return;
+    };
+    let repo_b = create_repo(&storage).await;
+
+    let ws = storage
+        .create_workspace(
+            &repo_a,
+            NewWorkspace {
+                id: None,
+                intent: "Repo-A workspace".to_string(),
+                base_version: "v1".to_string(),
+                issue_id: None,
+            },
+        )
+        .await
+        .expect("create_workspace failed");
+
+    // repo_b should see no workspaces.
+    let list_b = storage
+        .list_workspaces(&repo_b, true)
+        .await
+        .expect("list_workspaces failed");
+    assert!(
+        list_b.is_empty(),
+        "repo_b should not see repo_a's workspaces"
+    );
+
+    // get_workspace from repo_b should return NotFound.
+    let result = storage.get_workspace(&repo_b, &ws.id).await;
+    assert!(
+        matches!(result, Err(StorageError::NotFound(_))),
+        "get_workspace from wrong repo should return NotFound"
+    );
+
+    teardown(&storage, &repo_b).await;
+    teardown(&storage, &repo_a).await;
+}
+
+#[tokio::test]
+async fn test_version_store_cross_repo_isolation() {
+    let Some((storage, repo_a)) = setup().await else {
+        return;
+    };
+    let repo_b = create_repo(&storage).await;
+
+    // Create a version and advance head in repo_a.
+    storage
+        .create_version(
+            &repo_a,
+            NewVersion {
+                version_id: "v1".to_string(),
+                parent_version_id: None,
+                intent: "initial".to_string(),
+                created_by: "alice".to_string(),
+                merge_event_id: None,
+            },
+        )
+        .await
+        .expect("create_version failed");
+    storage
+        .advance_head(&repo_a, "v1")
+        .await
+        .expect("advance_head failed");
+
+    // repo_b should have no versions and no head.
+    let versions_b = storage
+        .list_versions(&repo_b)
+        .await
+        .expect("list_versions failed");
+    assert!(
+        versions_b.is_empty(),
+        "repo_b should not see repo_a's versions"
+    );
+
+    let head_b = storage.read_head(&repo_b).await.expect("read_head failed");
+    assert!(head_b.is_none(), "repo_b should not see repo_a's head");
+
+    // get_version from repo_b should return NotFound.
+    let result = storage.get_version(&repo_b, "v1").await;
+    assert!(
+        matches!(result, Err(StorageError::NotFound(_))),
+        "get_version from wrong repo should return NotFound"
+    );
+
+    teardown(&storage, &repo_b).await;
+    teardown(&storage, &repo_a).await;
+}
+
+#[tokio::test]
+async fn test_graph_store_cross_repo_isolation() {
+    let Some((storage, repo_a)) = setup().await else {
+        return;
+    };
+    let repo_b = create_repo(&storage).await;
+
+    // Insert entities and a relationship in repo_a.
+    let entity_a = Entity {
+        id: Entity::compute_id("src/auth.rs", "validate"),
+        kind: EntityKind::Function,
+        name: "validate".to_string(),
+        qualified_name: "validate".to_string(),
+        file_path: "src/auth.rs".to_string(),
+        byte_range: (100, 300),
+        line_range: (10, 30),
+        parent_entity: None,
+    };
+    let entity_b = Entity {
+        id: Entity::compute_id("src/auth.rs", "login"),
+        kind: EntityKind::Function,
+        name: "login".to_string(),
+        qualified_name: "login".to_string(),
+        file_path: "src/auth.rs".to_string(),
+        byte_range: (350, 500),
+        line_range: (35, 50),
+        parent_entity: None,
+    };
+    storage
+        .upsert_entities(&repo_a, vec![entity_a.clone(), entity_b.clone()])
+        .await
+        .expect("upsert_entities failed");
+
+    let rel = Relationship::new(RelationshipKind::Calls, &entity_b.id, &entity_a.id);
+    storage
+        .upsert_relationships(&repo_a, vec![rel])
+        .await
+        .expect("upsert_relationships failed");
+
+    // repo_b should see no entities.
+    let entities_b = storage
+        .list_entities(&repo_b, None)
+        .await
+        .expect("list_entities failed");
+    assert!(
+        entities_b.is_empty(),
+        "repo_b should not see repo_a's entities"
+    );
+
+    // get_entity from repo_b should return NotFound.
+    let result = storage.get_entity(&repo_b, &entity_a.id).await;
+    assert!(
+        matches!(result, Err(StorageError::NotFound(_))),
+        "get_entity from wrong repo should return NotFound"
+    );
+
+    // repo_b should see no relationships.
+    let rels_b = storage
+        .get_relationships(&repo_b, &entity_b.id)
+        .await
+        .expect("get_relationships failed");
+    assert!(
+        rels_b.is_empty(),
+        "repo_b should not see repo_a's relationships"
+    );
+
+    teardown(&storage, &repo_b).await;
+    teardown(&storage, &repo_a).await;
 }
