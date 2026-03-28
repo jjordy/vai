@@ -26,7 +26,9 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::auth::ApiKey;
@@ -75,6 +77,10 @@ pub struct PostgresStorage {
     /// Configured upper limit for the connection pool (stored so it can be
     /// reported in the server stats endpoint without calling into pool internals).
     max_connections: u32,
+    /// In-memory cache of the last time we wrote `last_used_at` for each key
+    /// ID. Used to debounce writes to once per minute so high-frequency API
+    /// callers don't generate excessive UPDATE traffic.
+    last_used_cache: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl PostgresStorage {
@@ -97,7 +103,7 @@ impl PostgresStorage {
             .connect(database_url)
             .await
             .map_err(|e| StorageError::Database(e.to_string()))?;
-        Ok(Self { pool, max_connections })
+        Ok(Self { pool, max_connections, last_used_cache: Arc::new(Mutex::new(HashMap::new())) })
     }
 
     /// Applies all pending SQL migrations from `migrations/` at `migrations_path`.
@@ -1508,16 +1514,31 @@ impl AuthStore for PostgresStorage {
         .map_err(|e| StorageError::Database(e.to_string()))?
         .ok_or_else(|| StorageError::NotFound("invalid or revoked API key".to_string()))?;
 
-        // Update last_used_at asynchronously (best-effort).
-        let pool = self.pool.clone();
+        // Update last_used_at asynchronously (best-effort), debounced to at
+        // most once per minute per key to avoid write amplification under
+        // high-frequency API traffic.
         let id: String = row.get("id");
-        let id_clone = id.clone();
-        tokio::spawn(async move {
-            let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE id = $1")
-                .bind(&id_clone)
-                .execute(&pool)
-                .await;
-        });
+        let should_update = {
+            let mut cache = self.last_used_cache.lock().unwrap_or_else(|p| p.into_inner());
+            let now = Instant::now();
+            match cache.get(&id) {
+                Some(&last) if now.duration_since(last) < Duration::from_secs(60) => false,
+                _ => {
+                    cache.insert(id.clone(), now);
+                    true
+                }
+            }
+        };
+        if should_update {
+            let pool = self.pool.clone();
+            let id_clone = id.clone();
+            tokio::spawn(async move {
+                let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE id = $1")
+                    .bind(&id_clone)
+                    .execute(&pool)
+                    .await;
+            });
+        }
 
         row_to_api_key(row)
     }
