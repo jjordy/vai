@@ -41,4 +41,9 @@ RUN rustup default stable
 RUN mkdir -p /home/agent/repos
 
 WORKDIR /home/agent
+
+# Note: to build the vai server binary inside a container, use:
+#   cargo build --release --features full
+# The default `cargo build` produces a CLI-only binary without server/Postgres/S3 deps.
+
 ENTRYPOINT ["sleep", "infinity"]

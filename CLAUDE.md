@@ -57,6 +57,14 @@ vai/
 - Autonomous agent commits are prefixed with `RALPH:`
 - Keep commits small and focused
 
+### Build Modes
+
+- `cargo build` — CLI-only binary (default features: `cli`). No server, Postgres, or S3 dependencies.
+- `cargo build --features full` — Full server binary with CLI, HTTP server, Postgres, and S3 support.
+- `cargo build --release --features full` — Production server binary (use this for Docker/server deployments).
+
+CI runs both: `cargo test` (CLI-only) and `cargo test --features full` (server with Postgres).
+
 ### Dependencies (approved)
 - `clap` — CLI framework
 - `serde`, `serde_json`, `toml` — serialization
