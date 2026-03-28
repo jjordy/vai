@@ -215,6 +215,14 @@ pub struct ServerConfig {
     /// `AWS_SECRET_ACCESS_KEY`) via the AWS SDK default credential chain.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s3: Option<crate::storage::s3::S3Config>,
+    /// Allowed CORS origins.
+    ///
+    /// Comma-separated list of allowed origins (e.g. `https://app.example.com`).
+    /// When `None` or empty the server permits all origins (`*`) — suitable for
+    /// development.  In production set this to the exact origin(s) of your
+    /// dashboard.  Can also be supplied via `VAI_CORS_ORIGINS`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cors_origins: Option<Vec<String>>,
 }
 
 impl Default for ServerConfig {
@@ -227,6 +235,7 @@ impl Default for ServerConfig {
             database_url: None,
             db_pool_size: None,
             s3: None,
+            cors_origins: None,
         }
     }
 }
@@ -529,6 +538,11 @@ pub(crate) struct AppState {
     admin_key: String,
     /// In-memory sliding-window rate limiter shared across all requests.
     rate_limiter: Arc<RateLimiter>,
+    /// Parsed CORS allowed origins.
+    ///
+    /// Empty means "allow any origin" (`*`).  Non-empty restricts to the listed
+    /// origins.  Set from `ServerConfig::cors_origins` or `VAI_CORS_ORIGINS`.
+    cors_origins: Vec<axum::http::HeaderValue>,
 }
 
 impl AppState {
@@ -9863,13 +9877,25 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
             auth_middleware,
         ));
 
-    let cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
-        .allow_methods(tower_http::cors::Any)
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-        ]);
+    let cors = if state.cors_origins.is_empty() {
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+            ])
+    } else {
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::list(
+                state.cors_origins.clone(),
+            ))
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+            ])
+    };
 
     public
         .merge(protected)
@@ -9920,6 +9946,7 @@ pub async fn start_for_testing(
         // Tests use a fixed admin key so they can exercise admin-only endpoints.
         admin_key: "vai_admin_test".to_string(),
         rate_limiter: Arc::new(RateLimiter::new()),
+        cors_origins: vec![],
     });
 
     let app = build_app(state);
@@ -10011,6 +10038,7 @@ pub async fn start_for_testing_pg(
         storage,
         admin_key: "vai_admin_test".to_string(),
         rate_limiter: Arc::new(RateLimiter::new()),
+        cors_origins: vec![],
     });
 
     let app = build_app(state);
@@ -10093,6 +10121,7 @@ pub async fn start_for_testing_pg_multi_repo(
         storage,
         admin_key: "vai_admin_test".to_string(),
         rate_limiter: Arc::new(RateLimiter::new()),
+        cors_origins: vec![],
     });
 
     let app = build_app(state);
@@ -10161,6 +10190,7 @@ pub async fn start_for_testing_pg_with_mem_fs(
         storage,
         admin_key: "vai_admin_test".to_string(),
         rate_limiter: Arc::new(RateLimiter::new()),
+        cors_origins: vec![],
     });
 
     let app = build_app(state);
@@ -10180,6 +10210,27 @@ pub async fn start_for_testing_pg_with_mem_fs(
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     Ok((addr, shutdown_tx))
+}
+
+// ── CORS helpers ──────────────────────────────────────────────────────────────
+
+/// Parses a list of origin strings into `HeaderValue`s suitable for `CorsLayer`.
+///
+/// Invalid origin strings are silently skipped with a warning log.
+fn parse_cors_origins(origins: &[String]) -> Vec<axum::http::HeaderValue> {
+    origins
+        .iter()
+        .filter_map(|o| {
+            let trimmed = o.trim();
+            match trimmed.parse::<axum::http::HeaderValue>() {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    tracing::warn!("invalid CORS origin ignored: {}", trimmed);
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 // ── Bootstrap admin key ───────────────────────────────────────────────────────
@@ -10266,6 +10317,21 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
 
     let admin_key = resolve_admin_key();
 
+    // Resolve CORS origins: config takes priority, then VAI_CORS_ORIGINS env var.
+    let cors_origins_raw = config
+        .cors_origins
+        .clone()
+        .or_else(|| {
+            std::env::var("VAI_CORS_ORIGINS").ok().map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    let cors_origins = parse_cors_origins(&cors_origins_raw);
+
     let state = Arc::new(AppState {
         vai_dir: vai_dir.to_owned(),
         repo_root,
@@ -10281,6 +10347,7 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         storage,
         admin_key,
         rate_limiter: Arc::new(RateLimiter::new()),
+        cors_origins,
     });
 
     let app = build_app(state);
@@ -10542,6 +10609,7 @@ mod tests {
             storage: crate::storage::StorageBackend::local(&vai_dir),
             admin_key: "vai_admin_test".to_string(),
             rate_limiter: Arc::new(RateLimiter::new()),
+            cors_origins: vec![],
         });
 
         let app = build_app(Arc::clone(&state));
@@ -12768,6 +12836,7 @@ mod tests {
             storage: crate::storage::StorageBackend::local(&vai_dir),
             admin_key: "vai_admin_test".to_string(),
             rate_limiter: Arc::new(RateLimiter::new()),
+            cors_origins: vec![],
         });
 
         let app = build_app(Arc::clone(&state));
@@ -13309,5 +13378,148 @@ mod tests {
         assert!(resp.headers().contains_key("Retry-After"));
 
         shutdown_tx.send(()).ok();
+    }
+
+    // ── CORS configuration tests ───────────────────────────────────────────────
+
+    /// Helper: spin up a server with specific CORS origins configured.
+    async fn start_test_server_with_cors(
+        root: &Path,
+        cors_origins: Vec<axum::http::HeaderValue>,
+    ) -> (SocketAddr, oneshot::Sender<()>) {
+        repo::init(root).unwrap();
+        let vai_dir = root.join(".vai");
+        let repo_config = repo::read_config(&vai_dir).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
+        let state = Arc::new(AppState {
+            vai_dir: vai_dir.clone(),
+            repo_root: root.to_path_buf(),
+            started_at: Instant::now(),
+            repo_name: repo_config.name.clone(),
+            vai_version: env!("CARGO_PKG_VERSION").to_string(),
+            event_tx,
+            event_seq: Arc::new(AtomicU64::new(0)),
+            event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
+            conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
+            repo_lock: Arc::new(Mutex::new(())),
+            storage_root: None,
+            storage: crate::storage::StorageBackend::local(&vai_dir),
+            admin_key: "vai_admin_test".to_string(),
+            rate_limiter: Arc::new(RateLimiter::new()),
+            cors_origins,
+        });
+
+        let app = build_app(Arc::clone(&state));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+                .with_graceful_shutdown(async { shutdown_rx.await.ok(); })
+                .await
+                .ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (addr, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn cors_allow_any_when_no_origins_configured() {
+        let tmp = TempDir::new().unwrap();
+        let (addr, shutdown_tx) = start_test_server_with_cors(tmp.path(), vec![]).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{addr}/health"),
+            )
+            .header("Origin", "https://attacker.example.com")
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+            .await
+            .unwrap();
+
+        // With no origins configured the server uses Any — the ACAO header
+        // should be present (either "*" or echoed origin).
+        assert!(
+            resp.headers().contains_key("access-control-allow-origin"),
+            "expected ACAO header, got: {:?}",
+            resp.headers()
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[tokio::test]
+    async fn cors_restricts_to_configured_origin() {
+        let tmp = TempDir::new().unwrap();
+        let allowed: axum::http::HeaderValue =
+            "https://app.example.com".parse().unwrap();
+        let (addr, shutdown_tx) =
+            start_test_server_with_cors(tmp.path(), vec![allowed]).await;
+
+        let client = reqwest::Client::new();
+
+        // Allowed origin should receive the ACAO header.
+        let resp = client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{addr}/health"),
+            )
+            .header("Origin", "https://app.example.com")
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+            .await
+            .unwrap();
+        let acao = resp
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(acao, "https://app.example.com");
+
+        // Disallowed origin should NOT receive the ACAO header (tower-http omits it).
+        let resp2 = client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{addr}/health"),
+            )
+            .header("Origin", "https://attacker.example.com")
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            !resp2
+                .headers()
+                .get("access-control-allow-origin")
+                .map(|v| v == "https://attacker.example.com")
+                .unwrap_or(false),
+            "disallowed origin must not appear in ACAO header"
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    #[test]
+    fn parse_cors_origins_skips_invalid() {
+        let origins = vec![
+            "https://valid.example.com".to_string(),
+            "not a valid header\x00value".to_string(),
+            "https://also-valid.example.com".to_string(),
+        ];
+        let parsed = parse_cors_origins(&origins);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], "https://valid.example.com");
+        assert_eq!(parsed[1], "https://also-valid.example.com");
+    }
+
+    #[test]
+    fn parse_cors_origins_empty_input() {
+        let parsed = parse_cors_origins(&[]);
+        assert!(parsed.is_empty());
     }
 }

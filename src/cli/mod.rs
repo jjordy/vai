@@ -426,6 +426,14 @@ pub enum ServerCommands {
         /// under concurrent load (e.g. many agents + dashboard polling).
         #[arg(long)]
         db_pool_size: Option<u32>,
+        /// Comma-separated list of allowed CORS origins (e.g. `https://app.example.com`).
+        ///
+        /// When unset the server allows all origins (`*`), which is suitable for
+        /// development.  In production set this to the exact origin(s) of your
+        /// dashboard.  Overrides `[server].cors_origins` in `~/.vai/server.toml`.
+        /// Can also be set via `VAI_CORS_ORIGINS`.
+        #[arg(long)]
+        cors_origins: Option<String>,
     },
     /// Manage API keys for server authentication.
     #[command(subcommand)]
@@ -1441,7 +1449,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
             };
 
             match server_cmd {
-                ServerCommands::Start { port, host, pid_file, database_url, db_pool_size } => {
+                ServerCommands::Start { port, host, pid_file, database_url, db_pool_size, cors_origins } => {
                     // Config layering (lowest → highest priority):
                     //   1. Built-in defaults (127.0.0.1:7865, no storage_root)
                     //   2. ~/.vai/server.toml [server] section (global, optional)
@@ -1456,6 +1464,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     if let Some(u) = global_cfg.database_url { config.database_url = Some(u); }
                     if let Some(s) = global_cfg.db_pool_size { config.db_pool_size = Some(s); }
                     if let Some(s3) = global_cfg.s3 { config.s3 = Some(s3); }
+                    if let Some(origins) = global_cfg.cors_origins { config.cors_origins = Some(origins); }
 
                     // Layer 3: per-repo config (single-repo mode only).
                     if !is_multi_repo {
@@ -1473,6 +1482,16 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     if let Some(pf) = pid_file { config.pid_file = Some(pf); }
                     if let Some(u) = database_url { config.database_url = Some(u); }
                     if let Some(s) = db_pool_size { config.db_pool_size = Some(s); }
+                    // --cors-origins CLI flag overrides server.toml; VAI_CORS_ORIGINS is
+                    // handled later in server::start() as the lowest-priority env fallback.
+                    if let Some(raw) = cors_origins {
+                        config.cors_origins = Some(
+                            raw.split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect(),
+                        );
+                    }
 
                     tokio::runtime::Runtime::new()
                         .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?

@@ -184,6 +184,13 @@ pub struct GlobalServerSection {
     #[cfg(feature = "s3")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s3: Option<crate::storage::s3::S3Config>,
+    /// Allowed CORS origins.
+    ///
+    /// Comma-separated list of allowed origins.  When absent the server
+    /// defaults to `*` (all origins).  Set this to your dashboard domain in
+    /// production.  Can be overridden by `VAI_CORS_ORIGINS` at runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cors_origins: Option<Vec<String>>,
 }
 
 /// Reads the global server config from `~/.vai/server.toml`.
