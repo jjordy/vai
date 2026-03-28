@@ -22,6 +22,35 @@ use uuid::Uuid;
 
 use crate::event_log::{EventKind, EventLog};
 
+// ── EscalationConflict ────────────────────────────────────────────────────────
+
+/// Detail record for a single conflict within an escalation.
+///
+/// Carries per-file, per-entity conflict information so human reviewers
+/// can make an informed resolution decision without having to locate the
+/// conflict themselves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationConflict {
+    /// Repository-relative path of the file where the conflict was detected.
+    pub file: String,
+    /// Merge level that detected this conflict.
+    ///
+    /// `1` = textual line diff, `2` = structural/AST, `3` = referential.
+    pub merge_level: u8,
+    /// Stable entity IDs involved in the conflict (may be empty for L1).
+    pub entity_ids: Vec<String>,
+    /// Human-readable description of the conflict.
+    pub description: String,
+    /// Content of the file in HEAD (current server version) at conflict time.
+    ///
+    /// `None` when content was not captured (e.g., binary files).
+    pub ours_content: Option<String>,
+    /// Content of the file in the workspace (agent's version) at conflict time.
+    pub theirs_content: Option<String>,
+    /// Content of the file at the common base ancestor.
+    pub base_content: Option<String>,
+}
+
 /// Errors from escalation operations.
 #[derive(Debug, Error)]
 pub enum EscalationError {
@@ -223,6 +252,10 @@ pub struct Escalation {
     pub workspace_ids: Vec<Uuid>,
     /// IDs of the semantic entities affected.
     pub affected_entities: Vec<String>,
+    /// Detailed per-conflict records (file, entity, content snippets).
+    ///
+    /// Populated for `MergeConflict` escalations; empty for other types.
+    pub conflicts: Vec<EscalationConflict>,
     /// Available resolution options for the human operator.
     pub resolution_options: Vec<ResolutionOption>,
     /// The resolution chosen by the human, if resolved.
@@ -275,6 +308,7 @@ impl EscalationStore {
                  agents             TEXT NOT NULL DEFAULT '[]',
                  workspace_ids      TEXT NOT NULL DEFAULT '[]',
                  affected_entities  TEXT NOT NULL DEFAULT '[]',
+                 conflicts          TEXT NOT NULL DEFAULT '[]',
                  resolution_options TEXT NOT NULL DEFAULT '[]',
                  resolution         TEXT,
                  resolved_by        TEXT,
@@ -302,6 +336,7 @@ impl EscalationStore {
         agents: Vec<String>,
         workspace_ids: Vec<Uuid>,
         affected_entities: Vec<String>,
+        conflicts: Vec<EscalationConflict>,
         event_log: &mut EventLog,
     ) -> Result<Escalation, EscalationError> {
         let id = Uuid::new_v4();
@@ -318,6 +353,7 @@ impl EscalationStore {
             agents: agents.clone(),
             workspace_ids: workspace_ids.clone(),
             affected_entities: affected_entities.clone(),
+            conflicts: conflicts.clone(),
             resolution_options: resolution_options.clone(),
             resolution: None,
             resolved_by: None,
@@ -328,9 +364,9 @@ impl EscalationStore {
         self.db.execute(
             "INSERT INTO escalations
              (id, escalation_type, severity, status, summary,
-              intents, agents, workspace_ids, affected_entities,
+              intents, agents, workspace_ids, affected_entities, conflicts,
               resolution_options, created_at)
-             VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 id.to_string(),
                 escalation_type.as_str(),
@@ -343,6 +379,7 @@ impl EscalationStore {
                 )
                 .unwrap_or_default(),
                 serde_json::to_string(&affected_entities).unwrap_or_default(),
+                serde_json::to_string(&conflicts).unwrap_or_default(),
                 serde_json::to_string(&resolution_options).unwrap_or_default(),
                 now.to_rfc3339(),
             ],
@@ -365,7 +402,7 @@ impl EscalationStore {
     pub fn get(&self, id: Uuid) -> Result<Escalation, EscalationError> {
         let mut stmt = self.db.prepare(
             "SELECT id, escalation_type, severity, status, summary,
-                    intents, agents, workspace_ids, affected_entities,
+                    intents, agents, workspace_ids, affected_entities, conflicts,
                     resolution_options, resolution, resolved_by,
                     created_at, resolved_at
              FROM escalations WHERE id = ?1",
@@ -388,7 +425,7 @@ impl EscalationStore {
         if let Some(s) = status {
             let mut stmt = self.db.prepare(
                 "SELECT id, escalation_type, severity, status, summary,
-                        intents, agents, workspace_ids, affected_entities,
+                        intents, agents, workspace_ids, affected_entities, conflicts,
                         resolution_options, resolution, resolved_by,
                         created_at, resolved_at
                  FROM escalations WHERE status = ?1 ORDER BY created_at DESC",
@@ -400,7 +437,7 @@ impl EscalationStore {
         } else {
             let mut stmt = self.db.prepare(
                 "SELECT id, escalation_type, severity, status, summary,
-                        intents, agents, workspace_ids, affected_entities,
+                        intents, agents, workspace_ids, affected_entities, conflicts,
                         resolution_options, resolution, resolved_by,
                         created_at, resolved_at
                  FROM escalations ORDER BY created_at DESC",
@@ -522,11 +559,12 @@ fn row_to_escalation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Escalation> {
     let agents_json: String = row.get(6)?;
     let ws_ids_json: String = row.get(7)?;
     let entities_json: String = row.get(8)?;
-    let options_json: String = row.get(9)?;
-    let resolution_str: Option<String> = row.get(10)?;
-    let resolved_by: Option<String> = row.get(11)?;
-    let created_at_str: String = row.get(12)?;
-    let resolved_at_str: Option<String> = row.get(13)?;
+    let conflicts_json: String = row.get(9)?;
+    let options_json: String = row.get(10)?;
+    let resolution_str: Option<String> = row.get(11)?;
+    let resolved_by: Option<String> = row.get(12)?;
+    let created_at_str: String = row.get(13)?;
+    let resolved_at_str: Option<String> = row.get(14)?;
 
     let id = Uuid::parse_str(&id_str).unwrap_or_default();
     let escalation_type =
@@ -544,6 +582,8 @@ fn row_to_escalation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Escalation> {
         .collect();
     let affected_entities: Vec<String> =
         serde_json::from_str(&entities_json).unwrap_or_default();
+    let conflicts: Vec<EscalationConflict> =
+        serde_json::from_str(&conflicts_json).unwrap_or_default();
     let resolution_options: Vec<ResolutionOption> =
         serde_json::from_str(&options_json).unwrap_or_default();
     let resolution = resolution_str
@@ -565,6 +605,7 @@ fn row_to_escalation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Escalation> {
         agents,
         workspace_ids,
         affected_entities,
+        conflicts,
         resolution_options,
         resolution,
         resolved_by,
@@ -607,6 +648,7 @@ mod tests {
                 vec!["agent-a".to_string(), "agent-b".to_string()],
                 vec![ws_a, ws_b],
                 vec!["fn::authenticate".to_string()],
+                vec![],
                 &mut log,
             )
             .unwrap();
@@ -635,6 +677,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![],
+                vec![],
                 &mut log,
             )
             .unwrap();
@@ -644,6 +687,7 @@ mod tests {
                 EscalationType::ReviewRequest,
                 EscalationSeverity::Critical,
                 "Conflict B".to_string(),
+                vec![],
                 vec![],
                 vec![],
                 vec![],
@@ -679,6 +723,7 @@ mod tests {
                 vec!["agent-a".to_string()],
                 vec![Uuid::new_v4()],
                 vec![],
+                vec![],
                 &mut log,
             )
             .unwrap();
@@ -711,6 +756,7 @@ mod tests {
                 EscalationType::MergeConflict,
                 EscalationSeverity::High,
                 "Conflict".to_string(),
+                vec![],
                 vec![],
                 vec![],
                 vec![],
@@ -758,5 +804,44 @@ mod tests {
         let opts = default_resolution_options(&EscalationType::ValidationFailure, &ids);
         assert!(!opts.contains(&ResolutionOption::KeepAgentB));
         assert!(opts.contains(&ResolutionOption::PauseBoth));
+    }
+
+    #[test]
+    fn escalation_conflicts_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let (store, mut log) = make_store(&tmp);
+
+        let conflict = EscalationConflict {
+            file: "src/auth.rs".to_string(),
+            merge_level: 3,
+            entity_ids: vec!["fn::validate_token".to_string()],
+            description: "Function `validate_token` modified by both workspace and HEAD".to_string(),
+            ours_content: Some("fn validate_token() -> bool { true }".to_string()),
+            theirs_content: Some("fn validate_token() -> Result<bool, Error> { Ok(true) }".to_string()),
+            base_content: Some("fn validate_token() -> bool { false }".to_string()),
+        };
+
+        let e = store
+            .create(
+                EscalationType::MergeConflict,
+                EscalationSeverity::High,
+                "1 conflict in src/auth.rs".to_string(),
+                vec!["add auth".to_string()],
+                vec![],
+                vec![Uuid::new_v4()],
+                vec!["fn::validate_token".to_string()],
+                vec![conflict.clone()],
+                &mut log,
+            )
+            .unwrap();
+
+        assert_eq!(e.conflicts.len(), 1);
+        assert_eq!(e.conflicts[0].file, "src/auth.rs");
+        assert_eq!(e.conflicts[0].merge_level, 3);
+
+        let fetched = store.get(e.id).unwrap();
+        assert_eq!(fetched.conflicts.len(), 1);
+        assert_eq!(fetched.conflicts[0].description, conflict.description);
+        assert_eq!(fetched.conflicts[0].ours_content, conflict.ours_content);
     }
 }

@@ -298,6 +298,7 @@ async fn test_escalation_store_crud() {
         agents: vec!["agent-1".to_string(), "agent-2".to_string()],
         workspace_ids: vec![ws_id],
         affected_entities: vec!["AuthService::validate_token".to_string()],
+        conflicts: vec![],
         resolution_options: vec![ResolutionOption::KeepAgentA, ResolutionOption::KeepAgentB],
     };
 

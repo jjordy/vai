@@ -773,12 +773,17 @@ impl EscalationStore for PostgresStorage {
             serde_json::to_value(&esc.resolution_options)
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
+        let conflicts =
+            serde_json::to_value(&esc.conflicts)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
         sqlx::query(
             r#"
             INSERT INTO escalations
                 (id, repo_id, escalation_type, severity, summary,
-                 intents, agents, workspace_ids, affected_entities, resolution_options)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 intents, agents, workspace_ids, affected_entities,
+                 conflicts, resolution_options)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
         )
         .bind(id)
@@ -790,6 +795,7 @@ impl EscalationStore for PostgresStorage {
         .bind(&esc.agents)
         .bind(&workspace_ids)
         .bind(&esc.affected_entities)
+        .bind(&conflicts)
         .bind(&resolution_options)
         .execute(&self.pool)
         .await
@@ -805,8 +811,8 @@ impl EscalationStore for PostgresStorage {
     ) -> Result<Escalation, StorageError> {
         let row = sqlx::query(
             "SELECT id, escalation_type, severity, summary, intents, agents, workspace_ids, \
-                    affected_entities, resolution_options, resolved, resolution, resolved_by, \
-                    resolved_at, created_at \
+                    affected_entities, conflicts, resolution_options, resolved, resolution, \
+                    resolved_by, resolved_at, created_at \
              FROM escalations WHERE repo_id = $1 AND id = $2",
         )
         .bind(repo_id)
@@ -827,8 +833,8 @@ impl EscalationStore for PostgresStorage {
         let rows = if pending_only {
             sqlx::query(
                 "SELECT id, escalation_type, severity, summary, intents, agents, workspace_ids, \
-                        affected_entities, resolution_options, resolved, resolution, resolved_by, \
-                        resolved_at, created_at \
+                        affected_entities, conflicts, resolution_options, resolved, resolution, \
+                        resolved_by, resolved_at, created_at \
                  FROM escalations WHERE repo_id = $1 AND resolved = false ORDER BY created_at",
             )
             .bind(repo_id)
@@ -837,8 +843,8 @@ impl EscalationStore for PostgresStorage {
         } else {
             sqlx::query(
                 "SELECT id, escalation_type, severity, summary, intents, agents, workspace_ids, \
-                        affected_entities, resolution_options, resolved, resolution, resolved_by, \
-                        resolved_at, created_at \
+                        affected_entities, conflicts, resolution_options, resolved, resolution, \
+                        resolved_by, resolved_at, created_at \
                  FROM escalations WHERE repo_id = $1 ORDER BY created_at",
             )
             .bind(repo_id)
@@ -875,6 +881,8 @@ impl EscalationStore for PostgresStorage {
 }
 
 fn row_to_escalation(row: sqlx::postgres::PgRow) -> Result<Escalation, StorageError> {
+    use crate::escalation::EscalationConflict;
+
     let id: Uuid = row.get("id");
     let esc_type_str: String = row.get("escalation_type");
     let severity_str: String = row.get("severity");
@@ -883,6 +891,7 @@ fn row_to_escalation(row: sqlx::postgres::PgRow) -> Result<Escalation, StorageEr
     let agents: Vec<String> = row.get("agents");
     let workspace_ids: Vec<Uuid> = row.get("workspace_ids");
     let affected_entities: Vec<String> = row.get("affected_entities");
+    let conflicts_val: serde_json::Value = row.get("conflicts");
     let resolution_options_val: serde_json::Value = row.get("resolution_options");
     let resolved: bool = row.get("resolved");
     let resolution_str: Option<String> = row.get("resolution");
@@ -894,6 +903,8 @@ fn row_to_escalation(row: sqlx::postgres::PgRow) -> Result<Escalation, StorageEr
         .unwrap_or(EscalationType::MergeConflict);
     let severity = EscalationSeverity::from_str(&severity_str)
         .unwrap_or(EscalationSeverity::High);
+    let conflicts: Vec<EscalationConflict> =
+        serde_json::from_value(conflicts_val).unwrap_or_default();
     let resolution_options: Vec<ResolutionOption> =
         serde_json::from_value(resolution_options_val)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -915,6 +926,7 @@ fn row_to_escalation(row: sqlx::postgres::PgRow) -> Result<Escalation, StorageEr
         agents,
         workspace_ids,
         affected_entities,
+        conflicts,
         resolution_options,
         resolution,
         resolved_by,

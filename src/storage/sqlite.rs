@@ -463,6 +463,7 @@ impl EscalationStore for SqliteStorage {
                 esc.agents,
                 esc.workspace_ids,
                 esc.affected_entities,
+                esc.conflicts,
                 &mut log,
             )
             .map_err(|e| StorageError::Database(e.to_string()))

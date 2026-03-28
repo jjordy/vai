@@ -315,6 +315,7 @@ fn test_full_issue_lifecycle() {
             vec!["agent-01".into(), "agent-02".into()],
             vec![ws1_id, ws2_id],
             vec!["src/auth.rs".into()],
+            vec![],
             &mut log,
         )
         .unwrap();
@@ -473,6 +474,7 @@ fn test_escalation_crud() {
             vec!["agent-a".into(), "agent-b".into()],
             vec![ws_a, ws_b],
             vec!["src/lib.rs".into()],
+            vec![],
             &mut log,
         )
         .unwrap();

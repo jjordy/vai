@@ -125,6 +125,8 @@ pub struct NewEscalation {
     pub agents: Vec<String>,
     pub workspace_ids: Vec<Uuid>,
     pub affected_entities: Vec<String>,
+    /// Per-conflict detail records (file, entity, content snippets).
+    pub conflicts: Vec<crate::escalation::EscalationConflict>,
     pub resolution_options: Vec<ResolutionOption>,
 }
 

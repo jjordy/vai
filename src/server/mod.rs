@@ -1809,10 +1809,42 @@ async fn submit_workspace_handler(
                 .into_iter()
                 .collect();
 
+            // Build a more specific summary listing the affected files.
+            let unique_files: Vec<String> = {
+                let mut files: Vec<String> = conflicts
+                    .iter()
+                    .map(|c| c.file_path.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                files.sort();
+                files
+            };
+            let files_summary = if unique_files.len() == 1 {
+                format!("in {}", unique_files[0])
+            } else {
+                format!("in {} files", unique_files.len())
+            };
             let summary = format!(
-                "Workspace \"{workspace_intent}\" has {count} unresolvable \
-                 semantic conflict(s) requiring manual resolution"
+                "{count} unresolvable conflict(s) {files_summary} — \
+                 workspace \"{workspace_intent}\" requires manual resolution"
             );
+
+            // Convert ConflictRecord → EscalationConflict for rich detail.
+            let esc_conflicts: Vec<crate::escalation::EscalationConflict> = conflicts
+                .iter()
+                .map(|c| crate::escalation::EscalationConflict {
+                    file: c.file_path.clone(),
+                    merge_level: c.merge_level,
+                    entity_ids: c.entity_ids.clone(),
+                    description: c.description.clone(),
+                    // Content is not captured at merge time; callers can fetch
+                    // files from the file store using the conflict's file path.
+                    ours_content: None,
+                    theirs_content: None,
+                    base_content: None,
+                })
+                .collect();
 
             {
                 use crate::escalation::{EscalationSeverity, EscalationType};
@@ -1829,6 +1861,7 @@ async fn submit_workspace_handler(
                     agents: vec![],
                     workspace_ids: vec![workspace_uuid],
                     affected_entities,
+                    conflicts: esc_conflicts,
                     resolution_options,
                 };
                 if let Ok(escalation) = ctx.storage.escalations()
@@ -6473,6 +6506,34 @@ async fn delete_attachment_handler(
 
 // ── Escalation handlers ───────────────────────────────────────────────────────
 
+/// Per-conflict detail included in an escalation response.
+#[derive(Debug, Serialize, ToSchema)]
+struct EscalationConflictResponse {
+    /// Repository-relative file path.
+    file: String,
+    /// Merge level: 1=textual, 2=structural, 3=referential.
+    merge_level: u8,
+    /// Stable entity IDs involved in this conflict.
+    entity_ids: Vec<String>,
+    /// Human-readable description.
+    description: String,
+    /// HEAD version of the file at conflict time (may be absent for binary files).
+    ours_content: Option<String>,
+    /// Workspace (agent) version of the file at conflict time.
+    theirs_content: Option<String>,
+    /// Common base ancestor content.
+    base_content: Option<String>,
+}
+
+/// A resolution option presented to the operator.
+#[derive(Debug, Serialize, ToSchema)]
+struct ResolutionOptionResponse {
+    /// Machine-readable identifier.
+    id: String,
+    /// Human-readable label.
+    label: String,
+}
+
 /// Response body for a single escalation.
 #[derive(Debug, Serialize, ToSchema)]
 struct EscalationResponse {
@@ -6485,7 +6546,9 @@ struct EscalationResponse {
     agents: Vec<String>,
     workspace_ids: Vec<String>,
     affected_entities: Vec<String>,
-    resolution_options: Vec<String>,
+    /// Detailed per-conflict records for merge conflict escalations.
+    conflicts: Vec<EscalationConflictResponse>,
+    resolution_options: Vec<ResolutionOptionResponse>,
     resolution: Option<String>,
     resolved_by: Option<String>,
     created_at: String,
@@ -6494,6 +6557,29 @@ struct EscalationResponse {
 
 impl From<crate::escalation::Escalation> for EscalationResponse {
     fn from(e: crate::escalation::Escalation) -> Self {
+        let conflicts = e
+            .conflicts
+            .into_iter()
+            .map(|c| EscalationConflictResponse {
+                file: c.file,
+                merge_level: c.merge_level,
+                entity_ids: c.entity_ids,
+                description: c.description,
+                ours_content: c.ours_content,
+                theirs_content: c.theirs_content,
+                base_content: c.base_content,
+            })
+            .collect();
+
+        let resolution_options = e
+            .resolution_options
+            .iter()
+            .map(|o| ResolutionOptionResponse {
+                id: o.as_str().to_string(),
+                label: o.label().to_string(),
+            })
+            .collect();
+
         EscalationResponse {
             id: e.id.to_string(),
             escalation_type: e.escalation_type.as_str().to_string(),
@@ -6504,7 +6590,8 @@ impl From<crate::escalation::Escalation> for EscalationResponse {
             agents: e.agents,
             workspace_ids: e.workspace_ids.iter().map(|u| u.to_string()).collect(),
             affected_entities: e.affected_entities,
-            resolution_options: e.resolution_options.iter().map(|o| o.as_str().to_string()).collect(),
+            conflicts,
+            resolution_options,
             resolution: e.resolution.as_ref().map(|r| r.as_str().to_string()),
             resolved_by: e.resolved_by,
             created_at: e.created_at.to_rfc3339(),
@@ -9091,6 +9178,8 @@ impl utoipa::Modify for SecurityAddon {
             EntityDepsResponse,
             BlastRadiusResponse,
             EscalationResponse,
+            EscalationConflictResponse,
+            ResolutionOptionResponse,
             ResolveEscalationRequest,
             ClaimWorkRequest,
             RegisterWatcherRequest,
