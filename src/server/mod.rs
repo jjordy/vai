@@ -1045,9 +1045,11 @@ impl ApiError {
     }
 
     fn internal(msg: impl Into<String>) -> Self {
+        // Log full details server-side; never return them to the client.
+        tracing::error!("internal server error: {}", msg.into());
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: msg.into(),
+            message: "Internal server error".to_string(),
         }
     }
 
