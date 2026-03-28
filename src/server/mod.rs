@@ -3624,9 +3624,12 @@ fn sha256_hex(data: &[u8]) -> String {
 
 /// Extracts a gzip-compressed tarball into an in-memory `{path → content}` map.
 ///
-/// Paths are normalised by stripping any leading `./` prefix and skipping
-/// directory entries.  Returns an error if the bytes are not a valid
-/// gzip-compressed tar archive.
+/// Paths are normalised by stripping any leading `./` prefix.  Directory
+/// entries are silently skipped.  Symlinks and hard links are rejected
+/// outright — they could be used to escape the workspace root.  Each file is
+/// limited to `MAX_FILE_SIZE_BYTES`; the overall tarball limit is enforced by
+/// the caller.  Returns an error if the bytes are not a valid gzip-compressed
+/// tar archive.
 fn extract_snapshot_tarball(gz_bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, ApiError> {
     use flate2::read::GzDecoder;
     use tar::Archive;
@@ -3644,7 +3647,18 @@ fn extract_snapshot_tarball(gz_bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>,
         let mut entry = entry
             .map_err(|e| ApiError::bad_request(format!("invalid tarball entry: {e}")))?;
 
-        if !entry.header().entry_type().is_file() {
+        let entry_type = entry.header().entry_type();
+
+        // Reject symlinks and hard links — they can be used to traverse outside
+        // the workspace root or reference paths the agent does not own.
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            return Err(ApiError::bad_request(
+                "tarball contains a symlink or hard link, which is not permitted",
+            ));
+        }
+
+        // Skip directories and other non-regular-file entries.
+        if !entry_type.is_file() {
             continue;
         }
 
@@ -3654,11 +3668,15 @@ fn extract_snapshot_tarball(gz_bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>,
             .to_string_lossy()
             .to_string();
 
-        // Normalise: strip leading "./" and validate.
+        // Normalise: strip leading "./" and validate for path traversal.
         let path = raw_path.trim_start_matches("./").to_string();
         let rel = match sanitize_path(&path) {
             Some(p) => p.to_string_lossy().replace('\\', "/"),
-            None => continue, // skip unsafe paths silently
+            None => {
+                return Err(ApiError::bad_request(format!(
+                    "tarball contains an unsafe path: '{path}'"
+                )));
+            }
         };
         if rel.is_empty() {
             continue;
@@ -3668,6 +3686,14 @@ fn extract_snapshot_tarball(gz_bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>,
         entry
             .read_to_end(&mut content)
             .map_err(|e| ApiError::bad_request(format!("read tarball entry '{rel}': {e}")))?;
+
+        // Enforce per-file size limit.
+        if content.len() > MAX_FILE_SIZE_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "tarball entry '{rel}' exceeds 10 MiB per-file limit ({} bytes)",
+                content.len()
+            )));
+        }
 
         files.insert(rel, content);
     }
@@ -13521,5 +13547,216 @@ mod tests {
     fn parse_cors_origins_empty_input() {
         let parsed = parse_cors_origins(&[]);
         assert!(parsed.is_empty());
+    }
+
+    // ── Upload validation tests ────────────────────────────────────────────────
+
+    /// Build a minimal in-memory gzip tarball from a list of (path, content) pairs.
+    fn make_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut ar = tar::Builder::new(&mut enc);
+            for (path, content) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                ar.append_data(&mut header, path, *content).unwrap();
+            }
+            ar.finish().unwrap();
+        }
+        enc.finish().unwrap()
+    }
+
+    /// Build a tarball that contains a symlink entry.
+    fn make_tarball_with_symlink(link_name: &str, target: &str) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut ar = tar::Builder::new(&mut enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_link_name(target).unwrap();
+            header.set_cksum();
+            ar.append(&header, link_name.as_bytes()).unwrap();
+            ar.finish().unwrap();
+        }
+        enc.finish().unwrap()
+    }
+
+    /// Verify that upload-snapshot rejects tarballs containing symlinks.
+    #[tokio::test]
+    async fn upload_snapshot_rejects_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        // Create a workspace to upload into.
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "symlink test" }))
+            .send()
+            .await
+            .unwrap();
+        let ws: serde_json::Value = resp.json().await.unwrap();
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        let tarball = make_tarball_with_symlink("evil_link", "/etc/passwd");
+
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces/{ws_id}/upload-snapshot"))
+            .bearer_auth(&key)
+            .header("Content-Type", "application/gzip")
+            .body(tarball)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            400,
+            "tarball with symlink should be rejected with 400"
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Unit tests for `sanitize_path` — the function that protects against path
+    /// traversal in both JSON file uploads and tarball entries.
+    #[test]
+    fn sanitize_path_rejects_traversal() {
+        // Classic traversal patterns.
+        assert!(sanitize_path("../../etc/passwd").is_none(), ".. traversal must be rejected");
+        assert!(sanitize_path("../secret").is_none(), "single .. must be rejected");
+        assert!(sanitize_path("foo/../../etc/passwd").is_none(), "embedded .. must be rejected");
+        // Absolute paths have their leading slash stripped (normalised to relative).
+        // The important thing is they don't escape the workspace root.
+        let abs = sanitize_path("/etc/passwd").expect("absolute path should be normalised");
+        assert_eq!(abs.to_string_lossy(), "etc/passwd", "leading slash must be stripped");
+        // Null byte.
+        assert!(sanitize_path("foo\0bar").is_none(), "null byte must be rejected");
+        // Valid relative paths must be preserved.
+        assert!(sanitize_path("src/main.rs").is_some());
+        assert!(sanitize_path("deeply/nested/file.txt").is_some());
+    }
+
+    /// Verify that upload-snapshot rejects individual files exceeding 10 MiB.
+    #[tokio::test]
+    async fn upload_snapshot_rejects_oversized_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "size test" }))
+            .send()
+            .await
+            .unwrap();
+        let ws: serde_json::Value = resp.json().await.unwrap();
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        // Build a file that is just over the 10 MiB per-file limit.
+        let oversized = vec![0u8; MAX_FILE_SIZE_BYTES + 1];
+        let tarball = make_tarball(&[("big_file.bin", &oversized)]);
+
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces/{ws_id}/upload-snapshot"))
+            .bearer_auth(&key)
+            .header("Content-Type", "application/gzip")
+            .body(tarball)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            400,
+            "tarball entry over 10 MiB should be rejected"
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Verify that JSON file upload rejects individual files exceeding 10 MiB.
+    #[tokio::test]
+    async fn file_upload_rejects_oversized_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({ "intent": "size test" }))
+            .send()
+            .await
+            .unwrap();
+        let ws: serde_json::Value = resp.json().await.unwrap();
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        // Just over the 10 MiB limit.
+        let oversized = vec![0u8; MAX_FILE_SIZE_BYTES + 1];
+        let b64 = BASE64.encode(&oversized);
+
+        let resp = client
+            .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+            .bearer_auth(&key)
+            .json(&serde_json::json!({
+                "files": [{ "path": "big.bin", "content_base64": b64 }]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            400,
+            "file over 10 MiB should be rejected"
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Verify that issue creation is rate-limited per API key.
+    #[tokio::test]
+    async fn test_issue_creation_rate_limited() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (addr, shutdown_tx, state, _key) = start_test_server(root.path()).await;
+
+        // Pre-fill the issue_create bucket for the admin key.
+        let rl_key = "issue_create:admin";
+        for _ in 0..100 {
+            state
+                .rate_limiter
+                .check(rl_key, 100, std::time::Duration::from_secs(3600));
+        }
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/issues"))
+            .bearer_auth("vai_admin_test")
+            .json(&serde_json::json!({ "title": "test issue", "body": "" }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 429, "expected 429 Too Many Requests");
+        assert!(
+            resp.headers().contains_key("Retry-After"),
+            "expected Retry-After header"
+        );
+
+        shutdown_tx.send(()).ok();
     }
 }
