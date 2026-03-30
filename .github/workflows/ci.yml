@@ -129,3 +129,15 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/vai:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Build and push vai-dashboard image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./dashboard
+          file: infra/Dockerfile.dashboard
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/vai-dashboard:latest
+            ghcr.io/${{ github.repository_owner }}/vai-dashboard:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

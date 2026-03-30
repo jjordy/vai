@@ -1,0 +1,44 @@
+# vai-dashboard release image
+#
+# Multi-stage build for the TanStack Start (Node.js) dashboard:
+#   Stage 1 (builder): Install deps with pnpm, build the app
+#   Stage 2 (runtime): Minimal node:22-alpine serving the build output
+#
+# Build (from repo root, where the dashboard source lives):
+#   docker build -f infra/Dockerfile.dashboard -t vai-dashboard ./dashboard
+#
+# Run:
+#   docker run -p 3000:3000 \
+#     -e VITE_VAI_SERVER_URL=https://vai-server.fly.dev \
+#     vai-dashboard
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM node:22-alpine AS builder
+
+WORKDIR /app
+
+# Enable corepack so pnpm is available
+RUN corepack enable
+
+# Copy manifests first for better layer caching
+COPY package.json pnpm-lock.yaml ./
+
+# Install all dependencies (including devDependencies needed for the build)
+RUN pnpm install --frozen-lockfile
+
+# Copy the rest of the source and build
+COPY . .
+RUN pnpm run build
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM node:22-alpine
+
+WORKDIR /app
+
+# Copy only the built output from the builder stage
+# TanStack Start (Nitro) writes its output to .output/
+COPY --from=builder /app/.output ./
+
+EXPOSE 3000
+
+CMD ["node", "server/index.mjs"]
