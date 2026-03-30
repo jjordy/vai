@@ -1395,6 +1395,37 @@ impl StorageBackend {
         }
     }
 
+    /// Checks database connectivity.
+    ///
+    /// Runs `SELECT 1` against Postgres for server-mode backends.  Always
+    /// returns `Ok(())` for the local SQLite backend.
+    pub async fn ping_database(&self) -> Result<(), String> {
+        match self {
+            StorageBackend::Local(_) => Ok(()),
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(pg) | StorageBackend::ServerWithMemFs(pg, _) => {
+                pg.ping().await.map_err(|e| e.to_string())
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(pg, _) => {
+                pg.ping().await.map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    /// Checks S3 connectivity by listing a health-check prefix.
+    ///
+    /// Returns `Ok(())` for backends without an S3 file store.
+    pub async fn ping_s3(&self) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(_, s3) => {
+                s3.ping().await.map_err(|e| e.to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Returns the event log store.
     pub fn events(&self) -> Arc<dyn EventStore> {
         match self {

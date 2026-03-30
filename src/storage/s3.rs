@@ -110,6 +110,19 @@ impl S3FileStore {
         Ok(Self::new(client, config.bucket, pool))
     }
 
+    /// Verifies S3 connectivity by listing at most one object with a health-check prefix.
+    pub async fn ping(&self) -> Result<(), StorageError> {
+        self.client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix("_health_check/")
+            .max_keys(1)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| StorageError::Io(format!("S3 unreachable: {e}")))
+    }
+
     /// Computes the S3 object key for a `(repo_id, content_hash)` pair.
     ///
     /// Convention: `{repo_id}/{sha256hex}`

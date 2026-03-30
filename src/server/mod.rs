@@ -1364,12 +1364,45 @@ pub struct StatusResponse {
     pub entity_count: usize,
 }
 
+/// Per-subsystem health status returned by `GET /health`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SubsystemStatus {
+    /// `true` if the subsystem is reachable and operational.
+    pub healthy: bool,
+    /// Human-readable error message when `healthy` is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl SubsystemStatus {
+    fn ok() -> Self {
+        Self { healthy: true, error: None }
+    }
+    fn err(msg: String) -> Self {
+        Self { healthy: false, error: Some(msg) }
+    }
+}
+
+/// Subsystem health breakdown returned by `GET /health`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SubsystemsHealth {
+    /// Relational database (Postgres in server mode, always healthy for SQLite).
+    pub database: SubsystemStatus,
+    /// Object storage (S3-compatible in server mode, always healthy otherwise).
+    pub storage: SubsystemStatus,
+}
+
 /// Response body for `GET /health`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
-    /// Always `"ok"` when the server is healthy.
-    #[schema(value_type = String)]
-    pub status: &'static str,
+    /// `"ok"` when all subsystems are healthy, `"degraded"` otherwise.
+    pub status: String,
+    /// Seconds since the server process started.
+    pub uptime_secs: u64,
+    /// vai version string (from `Cargo.toml`).
+    pub version: String,
+    /// Per-subsystem health details.
+    pub subsystems: SubsystemsHealth,
 }
 
 /// Response body for `GET /api/server/stats`.
@@ -1787,15 +1820,49 @@ async fn status_handler(
     get,
     path = "/health",
     responses(
-        (status = 200, description = "Success", body = HealthResponse),
+        (status = 200, description = "All subsystems healthy", body = HealthResponse),
+        (status = 503, description = "One or more subsystems degraded", body = HealthResponse),
     ),
     tag = "status"
 )]
-/// `GET /health` — simple liveness probe for load balancers.
+/// `GET /health` — liveness and readiness probe for load balancers.
 ///
-/// Returns `200 OK` with `{ "status": "ok" }`. No authentication required.
-async fn health_handler() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+/// Checks database and object-storage connectivity, then returns:
+/// - `200 OK` with `{ "status": "ok" }` when all subsystems are healthy.
+/// - `503 Service Unavailable` with `{ "status": "degraded", ... }` when any subsystem is down.
+///
+/// No authentication required.
+async fn health_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<HealthResponse>) {
+    let uptime_secs = state.started_at.elapsed().as_secs();
+    let version = state.vai_version.clone();
+
+    let db_result = state.storage.ping_database().await;
+    let s3_result = state.storage.ping_s3().await;
+
+    let database = match db_result {
+        Ok(()) => SubsystemStatus::ok(),
+        Err(e) => SubsystemStatus::err(e),
+    };
+    let storage = match s3_result {
+        Ok(()) => SubsystemStatus::ok(),
+        Err(e) => SubsystemStatus::err(e),
+    };
+
+    let all_healthy = database.healthy && storage.healthy;
+    let status_code = if all_healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let status = if all_healthy { "ok".to_string() } else { "degraded".to_string() };
+
+    (
+        status_code,
+        Json(HealthResponse {
+            status,
+            uptime_secs,
+            version,
+            subsystems: SubsystemsHealth { database, storage },
+        }),
+    )
 }
 
 #[utoipa::path(
@@ -9762,6 +9829,8 @@ impl utoipa::Modify for SecurityAddon {
             ErrorBody,
             StatusResponse,
             HealthResponse,
+            SubsystemStatus,
+            SubsystemsHealth,
             ServerStatsResponse,
             CreateWorkspaceRequest,
             WorkspaceResponse,

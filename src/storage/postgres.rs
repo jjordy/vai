@@ -138,6 +138,12 @@ impl PostgresStorage {
         }
     }
 
+    /// Verifies database connectivity by executing a lightweight `SELECT 1`.
+    pub async fn ping(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// Creates a [`sqlx::postgres::PgListener`] connected via this pool.
     ///
     /// Used by the WebSocket handler to receive `LISTEN/NOTIFY` signals from
