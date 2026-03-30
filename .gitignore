@@ -11,3 +11,10 @@ cargo-build.sh
 # Docker Compose local config (contains secrets)
 infra/configs/server.toml
 infra/.env
+
+# Terraform state and secrets
+infra/terraform/.terraform/
+infra/terraform/.terraform.lock.hcl
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.backup
+infra/terraform/terraform.tfvars
