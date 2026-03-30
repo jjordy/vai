@@ -96,3 +96,36 @@ jobs:
 
       - name: Run cargo audit
         run: cargo audit --deny warnings
+
+  build-image:
+    name: Build and push Docker image
+    needs: [test-cli, test-full]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push vai-server image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: infra/Dockerfile.server
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/vai:latest
+            ghcr.io/${{ github.repository_owner }}/vai:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
