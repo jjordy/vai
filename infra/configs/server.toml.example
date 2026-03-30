@@ -1,0 +1,24 @@
+# vai server configuration for Docker Compose deployment
+#
+# Copy this file to configs/server.toml before starting:
+#   cp configs/server.toml.example configs/server.toml
+#
+# This file is mounted read-only into the vai-server container at
+# /root/.vai/server.toml.  The database URL and S3 credentials are
+# configured via environment variables in docker-compose.yml; only
+# settings that cannot be set via env vars live here.
+
+[server]
+# Bind on all interfaces so Docker port mapping works.
+host = "0.0.0.0"
+port = 7865
+
+[s3]
+# MinIO bucket name (created automatically by the minio-init service).
+bucket = "vai-prod"
+# Region is required by the AWS SDK even for MinIO; any value works.
+region = "us-east-1"
+# Point to the MinIO container using its Docker Compose service name.
+endpoint_url = "http://minio:9000"
+# Path-style addressing is required for MinIO.
+force_path_style = true

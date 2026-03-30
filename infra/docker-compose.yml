@@ -1,0 +1,107 @@
+# vai self-hosted deployment
+#
+# Services:
+#   vai-server  — vai version control server (port 7865)
+#   dashboard   — vai web dashboard (port 3000)
+#   postgres    — PostgreSQL 16 database (port 5432)
+#   minio       — S3-compatible object storage (port 9000, console 9001)
+#
+# Quick start:
+#   cp configs/server.toml.example configs/server.toml
+#   VAI_ADMIN_KEY=<secret> docker compose up -d
+#
+# See README.md for full setup instructions.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vai
+      POSTGRES_PASSWORD: vai
+      POSTGRES_DB: vai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vai -d vai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/vai-prod
+      "
+
+  vai-server:
+    image: ghcr.io/jjordy/vai:latest
+    restart: unless-stopped
+    command:
+      - server
+      - --multi-repo
+      - --database-url
+      - postgres://vai:vai@postgres:5432/vai
+    environment:
+      # S3 credentials for MinIO (uses AWS SDK credential chain)
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      # Set a stable admin key to avoid regeneration on restart.
+      # Generate one with: openssl rand -hex 32
+      VAI_ADMIN_KEY: ${VAI_ADMIN_KEY:-}
+      # Allow requests from the dashboard origin
+      VAI_CORS_ORIGINS: "http://localhost:3000"
+    volumes:
+      # server.toml configures the S3 endpoint and bucket name
+      - ./configs/server.toml:/root/.vai/server.toml:ro
+    ports:
+      - "7865:7865"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:7865/health | grep -q '\"status\":\"ok\"'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  dashboard:
+    image: ghcr.io/jjordy/vai-dashboard:latest
+    restart: unless-stopped
+    environment:
+      VITE_VAI_SERVER_URL: "http://localhost:7865"
+    ports:
+      - "3000:3000"
+    depends_on:
+      vai-server:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  minio_data:

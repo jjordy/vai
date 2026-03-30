@@ -7,3 +7,7 @@ cargo-build.sh
 *.swp
 *.swo
 .DS_Store
+
+# Docker Compose local config (contains secrets)
+infra/configs/server.toml
+infra/.env
