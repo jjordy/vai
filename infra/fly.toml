@@ -1,0 +1,28 @@
+app = "vai-server"
+primary_region = "iad"
+
+[build]
+  dockerfile = "infra/Dockerfile.server"
+
+[env]
+  VAI_PORT = "7865"
+  VAI_LOG_LEVEL = "info"
+
+[http_service]
+  internal_port = 7865
+  force_https = true
+  auto_stop_machines = false
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+[checks]
+  [checks.health]
+    type = "http"
+    port = 7865
+    path = "/health"
+    interval = "10s"
+    timeout = "5s"
