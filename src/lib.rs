@@ -3,6 +3,7 @@
 //! Core library providing the semantic graph, event log, workspace management,
 //! merge engine, and version history for AI-native version control.
 
+pub mod agent;
 pub mod auth;
 pub mod cli;
 pub mod ignore_rules;

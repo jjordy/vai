@@ -10,6 +10,7 @@ use colored::Colorize;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::agent;
 use crate::auth;
 use crate::clone as remote_clone;
 use crate::conflict;
@@ -94,6 +95,9 @@ pub enum CliError {
 
     #[error("Remote client error: {0}")]
     Remote(#[from] crate::remote_client::RemoteClientError),
+
+    #[error("Agent error: {0}")]
+    Agent(#[from] agent::AgentError),
 
     #[error("{0}")]
     Other(String),
@@ -226,6 +230,33 @@ pub enum Commands {
     /// Manage the remote server configuration.
     #[command(subcommand)]
     Remote(RemoteCommands),
+    /// Agent workflow commands for autonomous agent loops.
+    #[command(subcommand)]
+    Agent(AgentCommands),
+}
+
+/// Agent workflow subcommands.
+///
+/// These commands handle all vai server interaction for autonomous agent loops.
+/// They are designed to be composed into a minimal shell loop; see PRD 20.
+#[derive(Debug, Subcommand)]
+pub enum AgentCommands {
+    /// Initialize agent configuration in the current directory.
+    ///
+    /// Creates `.vai/agent.toml` with server URL and repo name.
+    /// Falls back to `VAI_SERVER_URL` / `VAI_REPO` environment variables.
+    /// The API key is **never** written to disk — supply it via `VAI_API_KEY`.
+    Init {
+        /// Base URL of the vai server (e.g. `https://vai.example.com`).
+        #[arg(long)]
+        server: Option<String>,
+        /// Repository name on the server.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Path to the prompt template file (default: `.vai/prompt.md`).
+        #[arg(long)]
+        prompt_template: Option<String>,
+    },
 }
 
 /// Issue management subcommands.
@@ -2870,6 +2901,29 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         println!(
                             "Local .vai/ kept as backup (remove with `vai remote remove` to revert)."
                         );
+                    }
+                }
+            }
+        }
+        Some(Commands::Agent(agent_cmd)) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            match agent_cmd {
+                AgentCommands::Init {
+                    server,
+                    repo,
+                    prompt_template,
+                } => {
+                    let result = agent::init(
+                        &cwd,
+                        server.as_deref(),
+                        repo.as_deref(),
+                        prompt_template.as_deref(),
+                    )?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        agent::print_init_result(&result);
                     }
                 }
             }
