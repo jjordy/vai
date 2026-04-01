@@ -296,6 +296,18 @@ pub enum AgentCommands {
         /// Directory to extract repository files into (created if absent).
         dir: std::path::PathBuf,
     },
+
+    /// Display the details of the currently claimed issue.
+    ///
+    /// Reads the issue ID from `.vai/agent-state.json` and fetches full
+    /// details from `GET /api/issues/:id` on the configured server.
+    ///
+    /// By default prints a human-readable summary (title, status, priority,
+    /// description snippet, acceptance criteria, recent comments).
+    /// With `--json` prints the raw JSON response for piping to agents.
+    ///
+    /// Exits 1 if no issue is currently claimed (no agent state).
+    Issue,
 }
 
 /// Issue management subcommands.
@@ -2991,6 +3003,15 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         println!("{}", serde_json::to_string_pretty(&result).unwrap());
                     } else {
                         agent::print_download_result(&result);
+                    }
+                }
+                AgentCommands::Issue => {
+                    if cli.json {
+                        let raw = agent::fetch_issue_raw(&cwd)?;
+                        println!("{raw}");
+                    } else {
+                        let detail = agent::fetch_issue(&cwd)?;
+                        agent::print_issue_detail(&detail);
                     }
                 }
             }

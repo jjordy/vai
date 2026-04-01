@@ -580,6 +580,194 @@ fn validate_server_reachable(server_url: &str) -> bool {
     })
 }
 
+// ── issue ─────────────────────────────────────────────────────────────────────
+
+/// A single comment on an issue, as returned by `GET /api/issues/:id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueComment {
+    /// Comment author identifier.
+    pub author: String,
+    /// Markdown body of the comment.
+    pub body: String,
+    /// ISO-8601 creation timestamp.
+    pub created_at: String,
+}
+
+/// A link to another issue, as returned by `GET /api/issues/:id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueLinkDetail {
+    /// UUID of the related issue.
+    pub other_issue_id: String,
+    /// Human-readable relationship label (e.g. `"blocks"`, `"duplicates"`).
+    pub relationship: String,
+    /// Title of the related issue.
+    pub title: String,
+    /// Current status of the related issue.
+    pub status: String,
+}
+
+/// Full details of an issue as returned by `GET /api/issues/:id`.
+///
+/// This mirrors the server's `IssueDetailResponse` shape.  Only the fields
+/// needed for human-readable display and agent prompting are declared; the
+/// full JSON body is available via [`fetch_issue_raw`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueDetail {
+    /// Issue UUID.
+    pub id: String,
+    /// Short summary.
+    pub title: String,
+    /// Full Markdown description.
+    pub description: String,
+    /// Status string (e.g. `"open"`, `"in_progress"`, `"resolved"`).
+    pub status: String,
+    /// Priority string (e.g. `"critical"`, `"high"`, `"medium"`, `"low"`).
+    pub priority: String,
+    /// Label strings.
+    pub labels: Vec<String>,
+    /// Creator identifier.
+    pub creator: String,
+    /// Resolution (present when status is `"resolved"` or `"closed"`).
+    pub resolution: Option<String>,
+    /// Testable conditions that define when the issue is complete.
+    pub acceptance_criteria: Vec<String>,
+    /// ISO-8601 creation timestamp.
+    pub created_at: String,
+    /// ISO-8601 last-updated timestamp.
+    pub updated_at: String,
+    /// Linked issues with relationship type and status.
+    pub links: Vec<IssueLinkDetail>,
+    /// The 50 most recent comments.
+    pub comments: Vec<IssueComment>,
+}
+
+/// Fetch the current issue details from the server.
+///
+/// Reads the issue ID from `.vai/agent-state.json` in `dir`, then calls
+/// `GET /api/issues/:id` on the configured server.  The full JSON body is
+/// deserialized into an [`IssueDetail`].
+///
+/// Use [`fetch_issue_raw`] when you need the unmodified JSON string for
+/// passing directly to an agent (e.g. `--json` mode).
+pub fn fetch_issue(dir: &Path) -> Result<IssueDetail, AgentError> {
+    let config = load_config(dir)?;
+    let state = load_state(dir)?;
+    let api_key = AgentConfig::resolve_api_key();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| AgentError::Other(format!("cannot create tokio runtime: {e}")))?;
+
+    rt.block_on(async {
+        let path = format!("api/issues/{}", state.issue_id);
+        agent_get::<IssueDetail>(&config.server, &path, api_key.as_deref()).await
+    })
+}
+
+/// Fetch the current issue as a raw JSON string (for `--json` mode).
+///
+/// Identical to [`fetch_issue`] but returns the unparsed response body so
+/// that the full server payload — including any extra fields — is preserved
+/// for piping to agents.
+pub fn fetch_issue_raw(dir: &Path) -> Result<String, AgentError> {
+    let config = load_config(dir)?;
+    let state = load_state(dir)?;
+    let api_key = AgentConfig::resolve_api_key();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| AgentError::Other(format!("cannot create tokio runtime: {e}")))?;
+
+    rt.block_on(async {
+        let url = format!(
+            "{}/api/issues/{}",
+            config.server.trim_end_matches('/'),
+            state.issue_id
+        );
+        let client = reqwest::Client::new();
+        let mut req = client.get(&url);
+        if let Some(key) = api_key.as_deref() {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = req.send().await.map_err(|e| AgentError::ServerUnreachable {
+            url: url.clone(),
+            reason: e.to_string(),
+        })?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AgentError::Other(format!("server returned {status}: {body}")));
+        }
+        resp.text()
+            .await
+            .map_err(|e| AgentError::Other(format!("failed to read response body: {e}")))
+    })
+}
+
+/// Print a human-readable summary of an [`IssueDetail`].
+///
+/// Outputs: title, status, priority, labels, description snippet (first 300
+/// chars), acceptance criteria, and recent comments.
+pub fn print_issue_detail(detail: &IssueDetail) {
+    println!("{}", detail.title.bold());
+    println!(
+        "  ID       : {}",
+        detail.id[..8.min(detail.id.len())].cyan()
+    );
+    println!("  Status   : {}", detail.status);
+    println!("  Priority : {}", detail.priority);
+    if !detail.labels.is_empty() {
+        println!("  Labels   : {}", detail.labels.join(", "));
+    }
+    if let Some(ref res) = detail.resolution {
+        println!("  Resolution: {res}");
+    }
+    println!();
+
+    // Description snippet: first 300 characters.
+    if !detail.description.is_empty() {
+        let snippet: String = detail.description.chars().take(300).collect();
+        let truncated = detail.description.chars().count() > 300;
+        println!("{}", "Description:".bold());
+        println!("{snippet}");
+        if truncated {
+            println!("{}", "  … (truncated; use --json for full text)".dimmed());
+        }
+        println!();
+    }
+
+    if !detail.acceptance_criteria.is_empty() {
+        println!("{}", "Acceptance Criteria:".bold());
+        for criterion in &detail.acceptance_criteria {
+            println!("  • {criterion}");
+        }
+        println!();
+    }
+
+    if !detail.links.is_empty() {
+        println!("{}", "Linked Issues:".bold());
+        for link in &detail.links {
+            println!(
+                "  {} {} — {} ({})",
+                link.relationship,
+                link.other_issue_id[..8.min(link.other_issue_id.len())].cyan(),
+                link.title,
+                link.status.dimmed()
+            );
+        }
+        println!();
+    }
+
+    if !detail.comments.is_empty() {
+        let recent = detail.comments.iter().rev().take(3).collect::<Vec<_>>();
+        println!("{}", format!("Comments (showing {} most recent):", recent.len()).bold());
+        for comment in recent.into_iter().rev() {
+            let snippet: String = comment.body.chars().take(120).collect();
+            let truncated = comment.body.chars().count() > 120;
+            println!("  [{}] {}: {}{}", comment.created_at, comment.author.bold(), snippet,
+                if truncated { " …" } else { "" });
+        }
+    }
+}
+
 // ── download ──────────────────────────────────────────────────────────────────
 
 /// Result of a [`download`] call.
@@ -1030,6 +1218,75 @@ mod tests {
         let manifest = build_file_manifest(tmp.path()).unwrap();
         assert!(manifest.contains(&"a.txt".to_string()));
         assert!(manifest.iter().any(|p| p.contains("b.txt")));
+    }
+
+    // ── issue helpers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn issue_detail_roundtrip() {
+        // Verify that IssueDetail (de)serializes cleanly — this is the shape
+        // that fetch_issue() will parse from the server response.
+        let json = serde_json::json!({
+            "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "title": "Fix the thing",
+            "description": "Long description here.",
+            "status": "open",
+            "priority": "high",
+            "labels": ["bug", "urgent"],
+            "creator": "alice",
+            "resolution": null,
+            "acceptance_criteria": ["All tests pass", "No regressions"],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z",
+            "links": [
+                {
+                    "other_issue_id": "11111111-0000-0000-0000-000000000000",
+                    "relationship": "blocks",
+                    "title": "Other issue",
+                    "status": "open"
+                }
+            ],
+            "comments": [
+                {
+                    "author": "bob",
+                    "body": "Looks good",
+                    "created_at": "2026-01-01T12:00:00Z"
+                }
+            ]
+        });
+        let detail: IssueDetail = serde_json::from_value(json).unwrap();
+        assert_eq!(detail.title, "Fix the thing");
+        assert_eq!(detail.status, "open");
+        assert_eq!(detail.priority, "high");
+        assert_eq!(detail.labels, vec!["bug", "urgent"]);
+        assert_eq!(detail.acceptance_criteria.len(), 2);
+        assert_eq!(detail.links.len(), 1);
+        assert_eq!(detail.links[0].relationship, "blocks");
+        assert_eq!(detail.comments.len(), 1);
+        assert_eq!(detail.comments[0].author, "bob");
+    }
+
+    #[test]
+    fn fetch_issue_requires_state() {
+        // fetch_issue() should return NoState when no agent state exists.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // Write a config but no state file.
+        init(dir, Some("https://vai.example.com"), Some("myrepo"), None).unwrap();
+        let err = fetch_issue(dir).unwrap_err();
+        assert!(
+            matches!(err, AgentError::NoState),
+            "expected NoState, got {err}"
+        );
+    }
+
+    #[test]
+    fn fetch_issue_raw_requires_state() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        init(dir, Some("https://vai.example.com"), Some("myrepo"), None).unwrap();
+        let err = fetch_issue_raw(dir).unwrap_err();
+        assert!(matches!(err, AgentError::NoState), "expected NoState, got {err}");
     }
 
     /// RAII guard that removes an env var on drop (for cleanup in tests).
