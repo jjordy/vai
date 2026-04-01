@@ -308,6 +308,25 @@ pub enum AgentCommands {
     ///
     /// Exits 1 if no issue is currently claimed (no agent state).
     Issue,
+
+    /// Upload work, submit the workspace, close the issue, and clear state.
+    ///
+    /// Steps performed in order:
+    /// 1. Build a gzip tarball of `<dir>` (excluding `.vai/`, `.git/`, `target/`,
+    ///    `node_modules/`, `dist/`, `__pycache__/`, and any patterns configured
+    ///    under `[ignore]` in `.vai/agent.toml`).
+    /// 2. `POST /api/workspaces/:id/upload-snapshot` — upload the tarball.
+    /// 3. `POST /api/workspaces/:id/submit` — trigger server-side merge.
+    /// 4. `POST /api/issues/:id/close` — close the issue as `resolved`.
+    /// 5. Clear `.vai/agent-state.json`.
+    ///
+    /// Agent state is preserved if any step fails so you can retry.
+    ///
+    /// Exits 0 on success, 1 on any error (state preserved for retry).
+    Submit {
+        /// Directory containing the agent's modified working tree.
+        dir: std::path::PathBuf,
+    },
 }
 
 /// Issue management subcommands.
@@ -3012,6 +3031,14 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     } else {
                         let detail = agent::fetch_issue(&cwd)?;
                         agent::print_issue_detail(&detail);
+                    }
+                }
+                AgentCommands::Submit { dir } => {
+                    let result = agent::submit(&cwd, &dir)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        agent::print_submit_result(&result);
                     }
                 }
             }

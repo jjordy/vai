@@ -965,6 +965,231 @@ pub fn print_download_result(result: &DownloadResult) {
     }
 }
 
+// ── submit ────────────────────────────────────────────────────────────────────
+
+/// Directory names always excluded from the submission tarball.
+const EXCLUDED_DIRS: &[&str] =
+    &[".vai", ".git", "target", "node_modules", "dist", "__pycache__"];
+
+/// Result of a [`submit`] call.
+#[derive(Debug, Serialize)]
+pub struct SubmitResult {
+    /// Files added relative to the server's current snapshot.
+    pub added: usize,
+    /// Files modified relative to the server's current snapshot.
+    pub modified: usize,
+    /// Files deleted relative to the server's current snapshot.
+    pub deleted: usize,
+    /// New version identifier created by the server.
+    pub version_id: Option<String>,
+    /// Human-readable issue title that was closed.
+    pub issue_title: String,
+}
+
+/// Upload the contents of `work_dir`, submit the workspace, close the issue,
+/// and clear agent state.
+///
+/// Steps:
+/// 1. Build a gzipped tarball of `work_dir` (excluding standard build
+///    artefacts and any extra patterns configured under `[ignore]` in
+///    `agent.toml`).
+/// 2. `POST /api/workspaces/:id/upload-snapshot` — uploads the tarball.
+/// 3. `POST /api/workspaces/:id/submit` — triggers the server-side merge.
+/// 4. `POST /api/issues/:id/close` — closes the issue as `resolved`.
+/// 5. Clears `.vai/agent-state.json`.
+///
+/// State is preserved if any step fails so the caller can retry.
+pub fn submit(dir: &Path, work_dir: &Path) -> Result<SubmitResult, AgentError> {
+    let config = load_config(dir)?;
+    let state = load_state(dir)?;
+    let api_key = AgentConfig::resolve_api_key();
+    let api_key_ref = api_key.as_deref();
+
+    let ignore_patterns = config
+        .ignore
+        .as_ref()
+        .map(|i| i.patterns.clone())
+        .unwrap_or_default();
+
+    let tarball = build_agent_tarball(work_dir, &ignore_patterns)?;
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| AgentError::Other(format!("cannot create tokio runtime: {e}")))?;
+
+    let (added, modified, deleted, version_id) = rt.block_on(async {
+        // Step 1: Upload snapshot.
+        let upload_url = format!(
+            "{}/api/workspaces/{}/upload-snapshot",
+            config.server.trim_end_matches('/'),
+            state.workspace_id
+        );
+        let client = reqwest::Client::new();
+        let mut req = client
+            .post(&upload_url)
+            .header("Content-Type", "application/gzip")
+            .body(tarball);
+        if let Some(key) = api_key_ref {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = req.send().await.map_err(|e| AgentError::ServerUnreachable {
+            url: upload_url.clone(),
+            reason: e.to_string(),
+        })?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AgentError::Other(format!(
+                "upload-snapshot returned {status}: {body}"
+            )));
+        }
+        let upload: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AgentError::Other(format!("upload-snapshot JSON parse error: {e}")))?;
+        let added = upload["added"].as_u64().unwrap_or(0) as usize;
+        let modified = upload["modified"].as_u64().unwrap_or(0) as usize;
+        let deleted = upload["deleted"].as_u64().unwrap_or(0) as usize;
+
+        // Step 2: Submit workspace.
+        let submit_path = format!("api/workspaces/{}/submit", state.workspace_id);
+        let submit_val: serde_json::Value =
+            agent_post(&config.server, &submit_path, api_key_ref, &serde_json::json!({}))
+                .await?;
+        let version_id = submit_val["version"].as_str().map(|s| s.to_string());
+
+        // Step 3: Close issue.
+        let close_path = format!("api/issues/{}/close", state.issue_id);
+        let _: serde_json::Value = agent_post(
+            &config.server,
+            &close_path,
+            api_key_ref,
+            &serde_json::json!({ "resolution": "resolved" }),
+        )
+        .await?;
+
+        Ok::<_, AgentError>((added, modified, deleted, version_id))
+    })?;
+
+    // Step 4: Clear state — only reached on full success.
+    clear_state(dir)?;
+
+    Ok(SubmitResult {
+        added,
+        modified,
+        deleted,
+        version_id,
+        issue_title: state.issue_title,
+    })
+}
+
+/// Build a gzip-compressed tarball of `dir`, excluding standard build
+/// artefact directories and any additional `ignore_patterns`.
+fn build_agent_tarball(dir: &Path, ignore_patterns: &[String]) -> Result<Vec<u8>, AgentError> {
+    use flate2::{write::GzEncoder, Compression};
+
+    let buf = Vec::new();
+    let gz = GzEncoder::new(buf, Compression::default());
+    let mut tar = tar::Builder::new(gz);
+
+    append_dir_to_agent_tar(&mut tar, dir, dir, ignore_patterns)?;
+
+    let gz = tar
+        .into_inner()
+        .map_err(|e| AgentError::Other(format!("tar finalization error: {e}")))?;
+    gz.finish()
+        .map_err(|e| AgentError::Other(format!("gzip finalization error: {e}")))
+}
+
+/// Recursively appends files under `current` (rooted at `base`) to `tar`.
+///
+/// Skips [`EXCLUDED_DIRS`] and any path component matching an entry in
+/// `ignore_patterns`.  Patterns may be exact names or simple prefix globs
+/// ending with `*`.
+fn append_dir_to_agent_tar<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
+    current: &Path,
+    base: &Path,
+    ignore_patterns: &[String],
+) -> Result<(), AgentError> {
+    let entries = match fs::read_dir(current) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(AgentError::Io(e)),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        if path.is_dir() {
+            if EXCLUDED_DIRS.contains(&name_str.as_ref()) {
+                continue;
+            }
+            if ignore_patterns.iter().any(|p| matches_ignore_pattern(p, &name_str)) {
+                continue;
+            }
+            append_dir_to_agent_tar(tar, &path, base, ignore_patterns)?;
+        } else {
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if ignore_patterns.iter().any(|p| matches_ignore_pattern(p, &rel)) {
+                continue;
+            }
+            let data = fs::read(&path)
+                .map_err(|e| AgentError::Other(format!("cannot read '{}': {e}", path.display())))?;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, &rel, data.as_slice())
+                .map_err(|e| AgentError::Other(format!("tar append error for '{rel}': {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// Returns `true` if `path` matches `pattern`.
+///
+/// Supports:
+/// - Exact match: `"dist"` matches any component named `dist` or the full path.
+/// - Suffix glob: `"*.log"` matches any path component ending with `.log`.
+/// - Prefix glob: `"build*"` matches any path component starting with `build`.
+fn matches_ignore_pattern(pattern: &str, path: &str) -> bool {
+    if pattern.starts_with('*') {
+        // Suffix pattern: *.log → any segment ending with ".log".
+        let suffix = &pattern[1..];
+        path.split('/').any(|seg| seg.ends_with(suffix))
+    } else if pattern.ends_with('*') {
+        // Prefix pattern: build* → any segment starting with "build".
+        let prefix = &pattern[..pattern.len() - 1];
+        path.split('/').any(|seg| seg.starts_with(prefix))
+    } else {
+        // Exact match against the full relative path or any single component.
+        path == pattern || path.split('/').any(|seg| seg == pattern)
+    }
+}
+
+/// Print a human-readable summary of a [`SubmitResult`].
+pub fn print_submit_result(result: &SubmitResult) {
+    println!(
+        "{} Submitted — {}",
+        "✓".green().bold(),
+        result.issue_title
+    );
+    if let Some(ref ver) = result.version_id {
+        println!("  Version  : {ver}");
+    }
+    println!(
+        "  Changes  : {} added, {} modified, {} deleted",
+        result.added, result.modified, result.deleted
+    );
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1286,6 +1511,103 @@ mod tests {
         let dir = tmp.path();
         init(dir, Some("https://vai.example.com"), Some("myrepo"), None).unwrap();
         let err = fetch_issue_raw(dir).unwrap_err();
+        assert!(matches!(err, AgentError::NoState), "expected NoState, got {err}");
+    }
+
+    // ── submit helpers ────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_agent_tarball_excludes_standard_dirs() {
+        use flate2::read::GzDecoder;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Create files that should be included.
+        fs::write(dir.join("main.rs"), b"fn main() {}").unwrap();
+        fs::create_dir(dir.join("src")).unwrap();
+        fs::write(dir.join("src").join("lib.rs"), b"pub fn foo() {}").unwrap();
+
+        // Create excluded directories.
+        for excl in &[".vai", ".git", "target", "node_modules", "dist", "__pycache__"] {
+            fs::create_dir(dir.join(excl)).unwrap();
+            fs::write(dir.join(excl).join("junk.txt"), b"skip me").unwrap();
+        }
+
+        let tarball = build_agent_tarball(dir, &[]).unwrap();
+
+        // Decompress and collect entry names.
+        let gz = GzDecoder::new(tarball.as_slice());
+        let mut archive = tar::Archive::new(gz);
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(names.iter().any(|n| n == "main.rs"), "main.rs must be included");
+        assert!(names.iter().any(|n| n.contains("lib.rs")), "src/lib.rs must be included");
+
+        for excl in &[".vai", ".git", "target", "node_modules", "dist", "__pycache__"] {
+            assert!(
+                !names.iter().any(|n| n.contains(excl)),
+                "excluded dir '{excl}' content must not appear in tarball"
+            );
+        }
+    }
+
+    #[test]
+    fn build_agent_tarball_respects_extra_ignore_patterns() {
+        use flate2::read::GzDecoder;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        fs::write(dir.join("keep.rs"), b"keep").unwrap();
+        fs::write(dir.join("skip.log"), b"skip").unwrap();
+        fs::create_dir(dir.join("build-output")).unwrap();
+        fs::write(dir.join("build-output").join("file.bin"), b"bin").unwrap();
+
+        let patterns = vec!["*.log".to_string(), "build*".to_string()];
+        let tarball = build_agent_tarball(dir, &patterns).unwrap();
+
+        let gz = GzDecoder::new(tarball.as_slice());
+        let mut archive = tar::Archive::new(gz);
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(names.iter().any(|n| n == "keep.rs"));
+        assert!(!names.iter().any(|n| n.contains("skip.log")));
+        assert!(!names.iter().any(|n| n.contains("build-output")));
+    }
+
+    #[test]
+    fn matches_ignore_pattern_exact() {
+        assert!(matches_ignore_pattern("dist", "dist"));
+        assert!(matches_ignore_pattern("dist", "src/dist/file.js"));
+        assert!(!matches_ignore_pattern("dist", "distribution"));
+    }
+
+    #[test]
+    fn matches_ignore_pattern_glob_prefix() {
+        assert!(matches_ignore_pattern("build*", "build-output"));
+        assert!(matches_ignore_pattern("build*", "path/build-output/file"));
+        assert!(!matches_ignore_pattern("build*", "src/main.rs"));
+    }
+
+    #[test]
+    fn submit_requires_state() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        init(dir, Some("https://vai.example.com"), Some("myrepo"), None).unwrap();
+        // No state file — submit should return NoState.
+        let work = TempDir::new().unwrap();
+        let err = submit(dir, work.path()).unwrap_err();
         assert!(matches!(err, AgentError::NoState), "expected NoState, got {err}");
     }
 
