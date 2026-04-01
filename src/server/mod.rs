@@ -1377,7 +1377,7 @@ async fn require_repo_permission(
 
     // Apply key-level role cap if present.
     let effective = if let Some(cap_str) = &identity.role_override {
-        let cap = RepoRole::from_str(cap_str);
+        let cap = RepoRole::from_db_str(cap_str);
         if effective.rank() > cap.rank() { cap } else { effective }
     } else {
         effective
@@ -5999,7 +5999,7 @@ async fn create_issue_handler(
 
     let _lock = state.repo_lock.lock().await;
 
-    let priority = IssuePriority::from_str(&body.priority).ok_or_else(|| {
+    let priority = IssuePriority::from_db_str(&body.priority).ok_or_else(|| {
         ApiError::bad_request(format!("unknown priority `{}`", body.priority))
     })?;
 
@@ -6153,10 +6153,10 @@ async fn list_issues_handler(
     use crate::issue::{IssueFilter, IssueStatus, IssuePriority};
 
     let status = query.status.as_deref()
-        .map(|s| IssueStatus::from_str(s).ok_or_else(|| ApiError::bad_request(format!("unknown status `{s}`"))))
+        .map(|s| IssueStatus::from_db_str(s).ok_or_else(|| ApiError::bad_request(format!("unknown status `{s}`"))))
         .transpose()?;
     let priority = query.priority.as_deref()
-        .map(|p| IssuePriority::from_str(p).ok_or_else(|| ApiError::bad_request(format!("unknown priority `{p}`"))))
+        .map(|p| IssuePriority::from_db_str(p).ok_or_else(|| ApiError::bad_request(format!("unknown priority `{p}`"))))
         .transpose()?;
 
     let filter = IssueFilter {
@@ -6338,7 +6338,7 @@ async fn update_issue_handler(
         .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{id}`")))?;
 
     let priority = body.priority.as_deref()
-        .map(|p| IssuePriority::from_str(p).ok_or_else(|| ApiError::bad_request(format!("unknown priority `{p}`"))))
+        .map(|p| IssuePriority::from_db_str(p).ok_or_else(|| ApiError::bad_request(format!("unknown priority `{p}`"))))
         .transpose()?;
 
     // Collect changed field names before moving body fields into update.
@@ -6635,7 +6635,7 @@ async fn create_issue_link_handler(
     let target_id = uuid::Uuid::parse_str(&body.target_id)
         .map_err(|_| ApiError::bad_request(format!("invalid target_id `{}`", body.target_id)))?;
 
-    let relationship = crate::storage::IssueLinkRelationship::from_str(&body.relationship)
+    let relationship = crate::storage::IssueLinkRelationship::from_db_str(&body.relationship)
         .ok_or_else(|| ApiError::bad_request(format!(
             "invalid relationship `{}`, must be one of: blocks, relates-to, duplicates",
             body.relationship
@@ -7315,7 +7315,7 @@ async fn list_escalations_handler(
         .status
         .as_deref()
         .map(|s| {
-            EscalationStatus::from_str(s)
+            EscalationStatus::from_db_str(s)
                 .ok_or_else(|| ApiError::bad_request(format!("unknown status `{s}`")))
         })
         .transpose()?;
@@ -7412,7 +7412,7 @@ async fn resolve_escalation_handler(
     let esc_id = uuid::Uuid::parse_str(&id)
         .map_err(|_| ApiError::bad_request(format!("invalid escalation ID `{id}`")))?;
 
-    let option = ResolutionOption::from_str(&body.option).ok_or_else(|| {
+    let option = ResolutionOption::from_db_str(&body.option).ok_or_else(|| {
         ApiError::bad_request(format!(
             "unknown resolution option `{}`; valid options: keep_agent_a, keep_agent_b, \
              send_back_to_agent_a, send_back_to_agent_b, pause_both",
@@ -7805,7 +7805,7 @@ async fn register_watcher_handler(
     let now = chrono::Utc::now();
     let watcher = Watcher {
         agent_id: body.agent_id,
-        watch_type: WatchType::from_str(&body.watch_type),
+        watch_type: WatchType::from_db_str(&body.watch_type),
         description: body.description,
         issue_creation_policy: body.issue_creation_policy,
         status: WatcherStatus::Active,
@@ -8844,7 +8844,7 @@ async fn get_me_handler(
 
         // Apply the key-level role cap if one is set.
         let effective = if let Some(cap_str) = &identity.role_override {
-            let cap = crate::storage::RepoRole::from_str(cap_str);
+            let cap = crate::storage::RepoRole::from_db_str(cap_str);
             if effective.rank() > cap.rank() { cap } else { effective }
         } else {
             effective
@@ -9724,7 +9724,7 @@ async fn create_key_handler(
     // Validate role_override: must be a recognised role string.
     let role_override = match &body.role_override {
         Some(r) => {
-            let parsed = crate::storage::RepoRole::from_str(r);
+            let parsed = crate::storage::RepoRole::from_db_str(r);
             // Ensure the creator is not escalating beyond their own permissions.
             if !identity.is_admin {
                 if let Some(repo_id) = &body.repo_id {

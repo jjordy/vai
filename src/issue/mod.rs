@@ -66,7 +66,7 @@ impl IssuePriority {
     }
 
     /// Parse from a string.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_db_str(s: &str) -> Option<Self> {
         match s {
             "critical" => Some(IssuePriority::Critical),
             "high" => Some(IssuePriority::High),
@@ -101,7 +101,7 @@ impl IssueStatus {
     }
 
     /// Parse from a string.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_db_str(s: &str) -> Option<Self> {
         match s {
             "open" => Some(IssueStatus::Open),
             "in_progress" => Some(IssueStatus::InProgress),
@@ -134,7 +134,7 @@ impl IssueResolution {
     }
 
     /// Parse from a string.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_db_str(s: &str) -> Option<Self> {
         match s {
             "resolved" => Some(IssueResolution::Resolved),
             "wontfix" => Some(IssueResolution::WontFix),
@@ -412,6 +412,7 @@ impl IssueStore {
     ///
     /// Returns [`IssueError::RateLimitExceeded`] when `agent_id` has already
     /// created `max_per_hour` issues within the current clock hour.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_by_agent(
         &self,
         title: impl Into<String>,
@@ -998,8 +999,8 @@ fn row_to_issue(row: &rusqlite::Row<'_>) -> rusqlite::Result<Issue> {
     let acceptance_criteria_json: Option<String> = row.get(11).unwrap_or(None);
 
     let id = Uuid::parse_str(&id_str).unwrap_or_else(|_| Uuid::nil());
-    let status = IssueStatus::from_str(&status_str).unwrap_or(IssueStatus::Open);
-    let priority = IssuePriority::from_str(&priority_str).unwrap_or(IssuePriority::Medium);
+    let status = IssueStatus::from_db_str(&status_str).unwrap_or(IssueStatus::Open);
+    let priority = IssuePriority::from_db_str(&priority_str).unwrap_or(IssuePriority::Medium);
     let labels: Vec<String> = if labels_str.is_empty() {
         Vec::new()
     } else {

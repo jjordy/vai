@@ -1837,7 +1837,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                             if arr.is_empty() {
                                 println!("No issues found.");
                             } else {
-                                println!("{:<10}  {:<11}  {:<8}  {:<30}  {}", "ID", "STATUS", "PRIORITY", "TITLE", "CREATED");
+                                println!("{:<10}  {:<11}  {:<8}  {:<30}  CREATED", "ID", "STATUS", "PRIORITY", "TITLE");
                                 println!("{}", "-".repeat(85));
                                 for issue in &arr {
                                     let id_short = json_id_short(issue, "id");
@@ -1967,7 +1967,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
 
             match issue_cmd {
                 IssueCommands::Create { title, body, priority, label } => {
-                    let prio = IssuePriority::from_str(&priority)
+                    let prio = IssuePriority::from_db_str(&priority)
                         .ok_or_else(|| CliError::Other(format!("unknown priority: {priority}")))?;
                     // Expand comma-separated label values (e.g. --label "a,b" or --label a --label b).
                     let labels: Vec<String> = label
@@ -2000,13 +2000,13 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 }
                 IssueCommands::List { status, priority, label, created_by } => {
                     let status_filter = if let Some(s) = status {
-                        Some(IssueStatus::from_str(&s)
+                        Some(IssueStatus::from_db_str(&s)
                             .ok_or_else(|| CliError::Other(format!("unknown status: {s}")))?)
                     } else {
                         None
                     };
                     let priority_filter = if let Some(p) = priority {
-                        Some(IssuePriority::from_str(&p)
+                        Some(IssuePriority::from_db_str(&p)
                             .ok_or_else(|| CliError::Other(format!("unknown priority: {p}")))?)
                     } else {
                         None
@@ -2025,8 +2025,8 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         println!("No issues found.");
                     } else {
                         println!(
-                            "{:<10}  {:<8}  {:<8}  {:<30}  {}",
-                            "ID", "STATUS", "PRIORITY", "TITLE", "CREATED"
+                            "{:<10}  {:<8}  {:<8}  {:<30}  CREATED",
+                            "ID", "STATUS", "PRIORITY", "TITLE"
                         );
                         println!("{}", "-".repeat(80));
                         for issue in &issues {
@@ -2082,7 +2082,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 }
                 IssueCommands::Update { id, priority, label, title, body } => {
                     let prio = if let Some(p) = priority {
-                        Some(IssuePriority::from_str(&p)
+                        Some(IssuePriority::from_db_str(&p)
                             .ok_or_else(|| CliError::Other(format!("unknown priority: {p}")))?)
                     } else {
                         None
@@ -2156,8 +2156,8 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         }
                     } else {
                         println!(
-                            "{:<10}  {:<10}  {:<8}  {:<30}  {}",
-                            "ID", "TYPE", "SEVERITY", "SUMMARY", "CREATED"
+                            "{:<10}  {:<10}  {:<8}  {:<30}  CREATED",
+                            "ID", "TYPE", "SEVERITY", "SUMMARY"
                         );
                         println!("{}", "-".repeat(80));
                         for e in &escalations {
@@ -2259,7 +2259,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     }
                 }
                 EscalationCommands::Resolve { id, resolution, by } => {
-                    let opt = ResolutionOption::from_str(&resolution).ok_or_else(|| {
+                    let opt = ResolutionOption::from_db_str(&resolution).ok_or_else(|| {
                         CliError::Other(format!(
                             "unknown resolution `{resolution}`; valid values: keep_agent_a, \
                              keep_agent_b, send_back_to_agent_a, send_back_to_agent_b, \
@@ -2311,7 +2311,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                             } else {
                                 if !available.is_empty() {
                                     println!("{}", "Available work:".green().bold());
-                                    println!("  {:<10}  {:<8}  {}", "ISSUE", "PRIORITY", "TITLE");
+                                    println!("  {:<10}  {:<8}  TITLE", "ISSUE", "PRIORITY");
                                     println!("  {}", "-".repeat(60));
                                     for item in &available {
                                         let id = item["issue_id"].as_str().unwrap_or("?");
@@ -2327,7 +2327,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                                 if !blocked.is_empty() {
                                     if !available.is_empty() { println!(); }
                                     println!("{}", "Blocked work:".yellow().bold());
-                                    println!("  {:<10}  {:<8}  {}", "ISSUE", "PRIORITY", "TITLE");
+                                    println!("  {:<10}  {:<8}  TITLE", "ISSUE", "PRIORITY");
                                     println!("  {}", "-".repeat(60));
                                     for item in &blocked {
                                         let id = item["issue_id"].as_str().unwrap_or("?");
@@ -2382,8 +2382,8 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         if !queue.available_work.is_empty() {
                             println!("{}", "Available work:".green().bold());
                             println!(
-                                "  {:<10}  {:<8}  {}",
-                                "ISSUE", "PRIORITY", "TITLE"
+                                "  {:<10}  {:<8}  TITLE",
+                                "ISSUE", "PRIORITY"
                             );
                             println!("  {}", "-".repeat(60));
                             for item in &queue.available_work {
@@ -2401,8 +2401,8 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                             }
                             println!("{}", "Blocked work:".yellow().bold());
                             println!(
-                                "  {:<10}  {:<8}  {}",
-                                "ISSUE", "PRIORITY", "TITLE"
+                                "  {:<10}  {:<8}  TITLE",
+                                "ISSUE", "PRIORITY"
                             );
                             println!("  {}", "-".repeat(60));
                             for item in &queue.blocked_work {

@@ -83,7 +83,7 @@ fn collect_impl(
             let path = entry.path();
 
             // Skip directories — we only collect regular files.
-            if entry.file_type().map_or(true, |ft| ft.is_dir()) {
+            if entry.file_type().is_none_or(|ft| ft.is_dir()) {
                 return None;
             }
 

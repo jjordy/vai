@@ -368,7 +368,7 @@ pub enum IssueLinkRelationship {
 
 impl IssueLinkRelationship {
     /// Parse from the string stored in the database.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_db_str(s: &str) -> Option<Self> {
         match s {
             "blocks" => Some(Self::Blocks),
             "relates-to" => Some(Self::RelatesTo),
@@ -874,7 +874,7 @@ pub enum OrgRole {
 
 impl OrgRole {
     /// Parses a stored role string, defaulting to `Member` on unknown values.
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_db_str(s: &str) -> Self {
         match s {
             "owner" => OrgRole::Owner,
             "admin" => OrgRole::Admin,
@@ -908,7 +908,7 @@ pub enum RepoRole {
 
 impl RepoRole {
     /// Parses a stored role string, defaulting to `Read` on unknown values.
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_db_str(s: &str) -> Self {
         match s {
             "owner" => RepoRole::Owner,
             "admin" => RepoRole::Admin,
@@ -1361,6 +1361,7 @@ pub trait WatcherRegistryStore: Send + Sync {
     ///
     /// `record_id`, `dedup_key`, and `received_at` must come from the
     /// [`DiscoveryPreparation`] returned by [`prepare_discovery`].
+    #[allow(clippy::too_many_arguments)]
     async fn record_discovery(
         &self,
         repo_id: &Uuid,

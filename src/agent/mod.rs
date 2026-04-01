@@ -1162,11 +1162,11 @@ fn append_dir_to_agent_tar<W: std::io::Write>(
 fn matches_ignore_pattern(pattern: &str, path: &str) -> bool {
     if pattern.starts_with('*') {
         // Suffix pattern: *.log → any segment ending with ".log".
-        let suffix = &pattern[1..];
+        let suffix = pattern.strip_prefix('*').unwrap_or_default();
         path.split('/').any(|seg| seg.ends_with(suffix))
     } else if pattern.ends_with('*') {
         // Prefix pattern: build* → any segment starting with "build".
-        let prefix = &pattern[..pattern.len() - 1];
+        let prefix = pattern.strip_suffix('*').unwrap_or_default();
         path.split('/').any(|seg| seg.starts_with(prefix))
     } else {
         // Exact match against the full relative path or any single component.

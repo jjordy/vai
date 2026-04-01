@@ -565,8 +565,8 @@ fn row_to_issue(row: sqlx::postgres::PgRow) -> Result<Issue, StorageError> {
     let updated_at: DateTime<Utc> = row.get("updated_at");
     let acceptance_criteria: Vec<String> = row.try_get("acceptance_criteria").unwrap_or_default();
 
-    let status = IssueStatus::from_str(&status_str).unwrap_or(IssueStatus::Open);
-    let priority = IssuePriority::from_str(&priority_str).unwrap_or(IssuePriority::Medium);
+    let status = IssueStatus::from_db_str(&status_str).unwrap_or(IssueStatus::Open);
+    let priority = IssuePriority::from_db_str(&priority_str).unwrap_or(IssuePriority::Medium);
     let agent_source: Option<AgentSource> = agent_source_val
         .and_then(|v| serde_json::from_value(v).ok());
 
@@ -737,7 +737,7 @@ impl IssueLinkStore for PostgresStorage {
                 let target_id: Uuid = row.get("target_id");
                 let rel_str: String = row.get("relationship");
                 let relationship =
-                    IssueLinkRelationship::from_str(&rel_str).unwrap_or(IssueLinkRelationship::RelatesTo);
+                    IssueLinkRelationship::from_db_str(&rel_str).unwrap_or(IssueLinkRelationship::RelatesTo);
                 // Return raw direction so API handlers can apply correct inverse strings.
                 IssueLink {
                     source_id,
@@ -911,9 +911,9 @@ fn row_to_escalation(row: sqlx::postgres::PgRow) -> Result<Escalation, StorageEr
     let resolved_at: Option<DateTime<Utc>> = row.get("resolved_at");
     let created_at: DateTime<Utc> = row.get("created_at");
 
-    let escalation_type = EscalationType::from_str(&esc_type_str)
+    let escalation_type = EscalationType::from_db_str(&esc_type_str)
         .unwrap_or(EscalationType::MergeConflict);
-    let severity = EscalationSeverity::from_str(&severity_str)
+    let severity = EscalationSeverity::from_db_str(&severity_str)
         .unwrap_or(EscalationSeverity::High);
     let conflicts: Vec<EscalationConflict> =
         serde_json::from_value(conflicts_val).unwrap_or_default();
@@ -921,7 +921,7 @@ fn row_to_escalation(row: sqlx::postgres::PgRow) -> Result<Escalation, StorageEr
         serde_json::from_value(resolution_options_val)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
     let resolution: Option<ResolutionOption> = resolution_str
-        .and_then(|s| ResolutionOption::from_str(&s));
+        .and_then(|s| ResolutionOption::from_db_str(&s));
     let status = if resolved {
         EscalationStatus::Resolved
     } else {
@@ -2022,7 +2022,7 @@ impl OrgStore for PostgresStorage {
         Ok(OrgMember {
             org_id: row.get("org_id"),
             user_id: row.get("user_id"),
-            role: OrgRole::from_str(row.get("role")),
+            role: OrgRole::from_db_str(row.get("role")),
             created_at: row.get("created_at"),
         })
     }
@@ -2051,7 +2051,7 @@ impl OrgStore for PostgresStorage {
         Ok(OrgMember {
             org_id: row.get("org_id"),
             user_id: row.get("user_id"),
-            role: OrgRole::from_str(row.get("role")),
+            role: OrgRole::from_db_str(row.get("role")),
             created_at: row.get("created_at"),
         })
     }
@@ -2089,7 +2089,7 @@ impl OrgStore for PostgresStorage {
             .map(|row| OrgMember {
                 org_id: row.get("org_id"),
                 user_id: row.get("user_id"),
-                role: OrgRole::from_str(row.get("role")),
+                role: OrgRole::from_db_str(row.get("role")),
                 created_at: row.get("created_at"),
             })
             .collect())
@@ -2150,7 +2150,7 @@ impl OrgStore for PostgresStorage {
         Ok(RepoCollaborator {
             repo_id: row.get("repo_id"),
             user_id: row.get("user_id"),
-            role: RepoRole::from_str(row.get("role")),
+            role: RepoRole::from_db_str(row.get("role")),
             created_at: row.get("created_at"),
         })
     }
@@ -2181,7 +2181,7 @@ impl OrgStore for PostgresStorage {
         Ok(RepoCollaborator {
             repo_id: row.get("repo_id"),
             user_id: row.get("user_id"),
-            role: RepoRole::from_str(row.get("role")),
+            role: RepoRole::from_db_str(row.get("role")),
             created_at: row.get("created_at"),
         })
     }
@@ -2227,7 +2227,7 @@ impl OrgStore for PostgresStorage {
             .map(|row| RepoCollaborator {
                 repo_id: row.get("repo_id"),
                 user_id: row.get("user_id"),
-                role: RepoRole::from_str(row.get("role")),
+                role: RepoRole::from_db_str(row.get("role")),
                 created_at: row.get("created_at"),
             })
             .collect())
@@ -2311,7 +2311,7 @@ impl OrgStore for PostgresStorage {
         // Direct collaborator role on this specific repo.
         let direct: Option<RepoRole> = {
             let direct_role: Option<&str> = row.get("direct_role");
-            direct_role.map(RepoRole::from_str)
+            direct_role.map(RepoRole::from_db_str)
         };
 
         // Return the most permissive of the two, or None if neither exists.
@@ -2480,10 +2480,10 @@ fn row_to_watcher(row: &sqlx::postgres::PgRow) -> Result<Watcher, StorageError> 
 
     Ok(Watcher {
         agent_id,
-        watch_type: WatchType::from_str(&watch_type),
+        watch_type: WatchType::from_db_str(&watch_type),
         description,
         issue_creation_policy: policy,
-        status: WatcherStatus::from_str(&status),
+        status: WatcherStatus::from_db_str(&status),
         registered_at,
         last_discovery_at,
         discovery_count: discovery_count as u32,

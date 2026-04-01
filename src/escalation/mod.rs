@@ -98,7 +98,7 @@ impl EscalationType {
     }
 
     /// Parse from a string.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_db_str(s: &str) -> Option<Self> {
         match s {
             "merge_conflict" => Some(EscalationType::MergeConflict),
             "intent_conflict" => Some(EscalationType::IntentConflict),
@@ -131,7 +131,7 @@ impl EscalationSeverity {
     }
 
     /// Parse from a string.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_db_str(s: &str) -> Option<Self> {
         match s {
             "high" => Some(EscalationSeverity::High),
             "critical" => Some(EscalationSeverity::Critical),
@@ -171,7 +171,7 @@ impl ResolutionOption {
     }
 
     /// Parse from a string.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_db_str(s: &str) -> Option<Self> {
         match s {
             "keep_agent_a" => Some(ResolutionOption::KeepAgentA),
             "keep_agent_b" => Some(ResolutionOption::KeepAgentB),
@@ -216,7 +216,7 @@ impl EscalationStatus {
     }
 
     /// Parse from a string.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_db_str(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(EscalationStatus::Pending),
             "resolved" => Some(EscalationStatus::Resolved),
@@ -327,6 +327,7 @@ impl EscalationStore {
     ///
     /// Resolution options are auto-generated based on the escalation type and
     /// the number of workspaces involved.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
         escalation_type: EscalationType,
@@ -568,10 +569,10 @@ fn row_to_escalation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Escalation> {
 
     let id = Uuid::parse_str(&id_str).unwrap_or_default();
     let escalation_type =
-        EscalationType::from_str(&type_str).unwrap_or(EscalationType::MergeConflict);
+        EscalationType::from_db_str(&type_str).unwrap_or(EscalationType::MergeConflict);
     let severity =
-        EscalationSeverity::from_str(&severity_str).unwrap_or(EscalationSeverity::High);
-    let status = EscalationStatus::from_str(&status_str).unwrap_or(EscalationStatus::Pending);
+        EscalationSeverity::from_db_str(&severity_str).unwrap_or(EscalationSeverity::High);
+    let status = EscalationStatus::from_db_str(&status_str).unwrap_or(EscalationStatus::Pending);
 
     let intents: Vec<String> = serde_json::from_str(&intents_json).unwrap_or_default();
     let agents: Vec<String> = serde_json::from_str(&agents_json).unwrap_or_default();
@@ -588,7 +589,7 @@ fn row_to_escalation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Escalation> {
         serde_json::from_str(&options_json).unwrap_or_default();
     let resolution = resolution_str
         .as_deref()
-        .and_then(ResolutionOption::from_str);
+        .and_then(ResolutionOption::from_db_str);
 
     let created_at = created_at_str
         .parse::<DateTime<Utc>>()

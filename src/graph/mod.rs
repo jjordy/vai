@@ -1499,11 +1499,8 @@ fn extract_ts_class(
     // Walk all named children to find class_heritage nodes.
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "class_heritage" => {
-                extract_ts_heritage(child, source, &id, file_path, relationships);
-            }
-            _ => {}
+        if child.kind() == "class_heritage" {
+            extract_ts_heritage(child, source, &id, file_path, relationships);
         }
     }
 

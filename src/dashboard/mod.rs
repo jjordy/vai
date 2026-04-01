@@ -149,6 +149,7 @@ impl ConnectionStatus {
 }
 
 /// Notifications sent from the background WebSocket thread to the TUI loop.
+#[allow(dead_code)]
 enum WsNotification {
     Connected,
     Disconnected,
@@ -206,6 +207,7 @@ struct IssueCounts {
 }
 
 /// Current view — overview or a drill-down panel.
+#[allow(clippy::large_enum_variant)]
 enum View {
     Overview,
     DrillDown(DrillDownContent),
@@ -255,6 +257,7 @@ impl App {
     }
 
     /// Construct an App wired to a background WebSocket receiver (server mode).
+    #[cfg(feature = "server")]
     fn new_server(vai_dir: PathBuf, rx: mpsc::Receiver<WsNotification>) -> Self {
         let mut app = Self::new(vai_dir);
         app.connection_status = ConnectionStatus::Reconnecting;

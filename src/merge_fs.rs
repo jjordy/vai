@@ -255,7 +255,7 @@ impl S3MergeFs {
             self.file_store
                 .put(&self.repo_id, &s3_path, &content)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
         }
         for s3_path in deletes {
             // Best-effort: ignore not-found errors on delete.
@@ -428,7 +428,7 @@ impl MergeFs for S3MergeFs {
             return Ok(true);
         }
         Self::block(self.file_store.exists(&self.repo_id, &s3_path))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     fn delete_file(&self, key: &str) -> io::Result<()> {

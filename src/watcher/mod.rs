@@ -84,7 +84,7 @@ impl WatchType {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_db_str(s: &str) -> Self {
         match s {
             "test_suite" => WatchType::TestSuite,
             "security" => WatchType::Security,
@@ -164,7 +164,7 @@ impl WatcherStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_db_str(s: &str) -> Self {
         match s {
             "paused" => WatcherStatus::Paused,
             _ => WatcherStatus::Active,
@@ -489,10 +489,10 @@ impl WatcherStore {
                 .with_timezone(&Utc);
             watchers.push(Watcher {
                 agent_id,
-                watch_type: WatchType::from_str(&watch_type),
+                watch_type: WatchType::from_db_str(&watch_type),
                 description,
                 issue_creation_policy: policy,
-                status: WatcherStatus::from_str(&status),
+                status: WatcherStatus::from_db_str(&status),
                 registered_at: reg,
                 last_discovery_at: last_disc,
                 discovery_count,
@@ -531,10 +531,10 @@ impl WatcherStore {
                     .with_timezone(&Utc);
                 Ok(Watcher {
                     agent_id,
-                    watch_type: WatchType::from_str(&watch_type),
+                    watch_type: WatchType::from_db_str(&watch_type),
                     description,
                     issue_creation_policy: policy,
-                    status: WatcherStatus::from_str(&status),
+                    status: WatcherStatus::from_db_str(&status),
                     registered_at: reg,
                     last_discovery_at: last_disc,
                     discovery_count,
@@ -779,6 +779,7 @@ impl WatcherStore {
     ///
     /// `record_id`, `dedup_key`, and `received_at` must come from the
     /// [`DiscoveryPreparation`] returned by [`prepare_discovery`].
+    #[allow(clippy::too_many_arguments)]
     pub fn record_discovery(
         &self,
         agent_id: &str,

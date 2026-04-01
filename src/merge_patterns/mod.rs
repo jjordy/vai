@@ -295,7 +295,7 @@ impl MergePatternStore {
     pub fn compute_hash(pattern_type: &PatternType, merge_level: u8) -> String {
         let mut hasher = Sha256::new();
         hasher.update(pattern_type.as_str().as_bytes());
-        hasher.update(&[merge_level]);
+        hasher.update([merge_level]);
         format!("{:x}", hasher.finalize())
     }
 
