@@ -1098,6 +1098,12 @@ pub trait OrgStore: Send + Sync {
         repo_name: &str,
     ) -> Result<Uuid, StorageError>;
 
+    /// Lists the UUIDs of all repositories belonging to `org_id`.
+    ///
+    /// Used during user auto-provisioning to grant the new user a default
+    /// collaborator role on every existing repo in the organisation.
+    async fn list_repo_ids_for_org(&self, org_id: &Uuid) -> Result<Vec<Uuid>, StorageError>;
+
     // ── Repo collaborators ────────────────────────────────────────────────────
 
     /// Grants a user a role on a specific repository.

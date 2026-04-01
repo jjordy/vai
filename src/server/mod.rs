@@ -543,6 +543,11 @@ pub(crate) struct AppState {
     /// Used to mint short-lived access tokens (via `POST /api/auth/token`)
     /// and to validate JWT Bearer tokens in the auth middleware.
     pub(crate) jwt_service: Arc<crate::auth::jwt::JwtService>,
+    /// Default repo role assigned to newly auto-provisioned users.
+    ///
+    /// Set via `VAI_DEFAULT_USER_ROLE` (accepted values: `admin`, `write`, `read`).
+    /// Defaults to `write` when the variable is absent or unrecognised.
+    default_new_user_role: crate::storage::RepoRole,
     /// In-memory sliding-window rate limiter shared across all requests.
     rate_limiter: Arc<RateLimiter>,
     /// Parsed CORS allowed origins.
@@ -9349,6 +9354,50 @@ async fn token_exchange_handler(
                         vai_user_id = %new_user.id,
                         "Auto-provisioned vai user from Better Auth identity"
                     );
+
+                    // Grant the new user a default collaborator role on every
+                    // existing repo across all orgs so the dashboard shows write
+                    // actions immediately after first login.
+                    let default_role = state.default_new_user_role.clone();
+                    let all_orgs = orgs.list_orgs().await.unwrap_or_default();
+                    for org in &all_orgs {
+                        let repo_ids = orgs
+                            .list_repo_ids_for_org(&org.id)
+                            .await
+                            .unwrap_or_default();
+                        for repo_id in repo_ids {
+                            // Ignore conflicts (user already a collaborator) and
+                            // other non-fatal errors — provisioning should not
+                            // fail the login flow.
+                            match orgs
+                                .add_collaborator(&repo_id, &new_user.id, default_role.clone())
+                                .await
+                            {
+                                Ok(_) => {
+                                    tracing::info!(
+                                        event = "auth.collaborator_granted",
+                                        vai_user_id = %new_user.id,
+                                        repo_id = %repo_id,
+                                        role = %default_role.as_str(),
+                                        "Granted default repo role to new user"
+                                    );
+                                }
+                                Err(crate::storage::StorageError::Conflict(_)) => {
+                                    // Already a collaborator — harmless.
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        event = "auth.collaborator_grant_failed",
+                                        vai_user_id = %new_user.id,
+                                        repo_id = %repo_id,
+                                        error = %e,
+                                        "Failed to grant default repo role to new user"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     new_user.id
                 }
                 Err(other) => return Err(ApiError::from(other)),
@@ -10795,6 +10844,7 @@ pub async fn start_for_testing(
         )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
+        default_new_user_role: crate::storage::RepoRole::Write,
     });
 
     let app = build_app(state);
@@ -10892,6 +10942,7 @@ pub async fn start_for_testing_pg(
         )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
+        default_new_user_role: crate::storage::RepoRole::Write,
     });
 
     let app = build_app(state);
@@ -10980,6 +11031,7 @@ pub async fn start_for_testing_pg_multi_repo(
         )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
+        default_new_user_role: crate::storage::RepoRole::Write,
     });
 
     let app = build_app(state);
@@ -11054,6 +11106,7 @@ pub async fn start_for_testing_pg_with_mem_fs(
         )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
+        default_new_user_role: crate::storage::RepoRole::Write,
     });
 
     let app = build_app(state);
@@ -11204,6 +11257,20 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         .unwrap_or_default();
     let cors_origins = parse_cors_origins(&cors_origins_raw);
 
+    // Resolve default role for auto-provisioned users: VAI_DEFAULT_USER_ROLE or "write".
+    let default_new_user_role = {
+        use crate::storage::RepoRole;
+        match std::env::var("VAI_DEFAULT_USER_ROLE")
+            .unwrap_or_default()
+            .to_lowercase()
+            .as_str()
+        {
+            "admin" => RepoRole::Admin,
+            "read" => RepoRole::Read,
+            _ => RepoRole::Write,
+        }
+    };
+
     let state = Arc::new(AppState {
         vai_dir: vai_dir.to_owned(),
         repo_root,
@@ -11221,6 +11288,7 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         jwt_service,
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins,
+        default_new_user_role,
     });
 
     let app = build_app(state);
@@ -11488,6 +11556,7 @@ mod tests {
             )),
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins: vec![],
+            default_new_user_role: crate::storage::RepoRole::Write,
         });
 
         let app = build_app(Arc::clone(&state));
@@ -13720,6 +13789,7 @@ mod tests {
             )),
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins: vec![],
+            default_new_user_role: crate::storage::RepoRole::Write,
         });
 
         let app = build_app(Arc::clone(&state));
@@ -14299,6 +14369,7 @@ mod tests {
             )),
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins,
+            default_new_user_role: crate::storage::RepoRole::Write,
         });
 
         let app = build_app(Arc::clone(&state));

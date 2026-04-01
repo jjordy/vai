@@ -1087,6 +1087,10 @@ impl OrgStore for SqliteStorage {
         Err(org_store_unsupported())
     }
 
+    async fn list_repo_ids_for_org(&self, _org_id: &Uuid) -> Result<Vec<Uuid>, StorageError> {
+        Err(org_store_unsupported())
+    }
+
     async fn add_collaborator(
         &self,
         _repo_id: &Uuid,

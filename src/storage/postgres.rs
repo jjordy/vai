@@ -2233,6 +2233,16 @@ impl OrgStore for PostgresStorage {
             .collect())
     }
 
+    async fn list_repo_ids_for_org(&self, org_id: &Uuid) -> Result<Vec<Uuid>, StorageError> {
+        let rows = sqlx::query("SELECT id FROM repos WHERE org_id = $1 ORDER BY created_at")
+            .bind(org_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(rows.iter().map(|r| r.get::<Uuid, _>("id")).collect())
+    }
+
     async fn resolve_repo_role(
         &self,
         user_id: &Uuid,
