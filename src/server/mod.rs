@@ -8726,7 +8726,7 @@ async fn create_user_handler(
     let user = state
         .storage
         .orgs()
-        .create_user(NewUser { email: body.email, name: body.name })
+        .create_user(NewUser { email: body.email, name: body.name, better_auth_id: None })
         .await
         .map_err(ApiError::from)?;
 
@@ -9313,8 +9313,8 @@ async fn token_exchange_handler(
                 ApiError::bad_request("session_token is required for session_exchange grant")
             })?;
 
-            // Validate the Better Auth session and extract user_id.
-            let user_id = auth.validate_session(session_token).await.map_err(|e| {
+            // Validate the Better Auth session and extract the BA user ID (opaque string).
+            let ba_user_id = auth.validate_session(session_token).await.map_err(|e| {
                 match e {
                     crate::storage::StorageError::NotFound(_) => {
                         ApiError::unauthorized("invalid or expired session token")
@@ -9322,6 +9322,37 @@ async fn token_exchange_handler(
                     other => ApiError::from(other),
                 }
             })?;
+
+            // Resolve or auto-provision the vai user for this Better Auth identity.
+            let orgs = state.storage.orgs();
+            let user_id = match orgs.get_user_by_external_id(&ba_user_id).await {
+                Ok(existing) => existing.id,
+                Err(crate::storage::StorageError::NotFound(_)) => {
+                    // First login — fetch BA profile and create a vai user record.
+                    let (email, name) = auth
+                        .get_better_auth_user(&ba_user_id)
+                        .await
+                        .map_err(ApiError::from)?;
+
+                    let new_user = orgs
+                        .create_user(crate::storage::NewUser {
+                            email,
+                            name,
+                            better_auth_id: Some(ba_user_id.clone()),
+                        })
+                        .await
+                        .map_err(ApiError::from)?;
+
+                    tracing::info!(
+                        event = "auth.user_provisioned",
+                        ba_user_id = %ba_user_id,
+                        vai_user_id = %new_user.id,
+                        "Auto-provisioned vai user from Better Auth identity"
+                    );
+                    new_user.id
+                }
+                Err(other) => return Err(ApiError::from(other)),
+            };
 
             // Resolve the user's repo role if repo_id was supplied.
             let role: Option<String> = if let Some(repo_id) = &body.repo_id {
@@ -10671,9 +10702,20 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         ));
 
     let cors = if state.cors_origins.is_empty() {
+        // No CORS origins configured — fall back to permissive mode for
+        // local development. Set VAI_CORS_ORIGINS for production.
+        tracing::warn!("No CORS origins configured (VAI_CORS_ORIGINS). Allowing http://localhost:3000 for development.");
         tower_http::cors::CorsLayer::new()
-            .allow_origin(tower_http::cors::Any)
-            .allow_methods(tower_http::cors::Any)
+            .allow_origin("http://localhost:3000".parse::<axum::http::HeaderValue>().unwrap())
+            .allow_credentials(true)
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::PUT,
+                axum::http::Method::PATCH,
+                axum::http::Method::DELETE,
+                axum::http::Method::OPTIONS,
+            ])
             .allow_headers([
                 axum::http::header::CONTENT_TYPE,
                 axum::http::header::AUTHORIZATION,
@@ -10683,7 +10725,15 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
             .allow_origin(tower_http::cors::AllowOrigin::list(
                 state.cors_origins.clone(),
             ))
-            .allow_methods(tower_http::cors::Any)
+            .allow_credentials(true)
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::PUT,
+                axum::http::Method::PATCH,
+                axum::http::Method::DELETE,
+                axum::http::Method::OPTIONS,
+            ])
             .allow_headers([
                 axum::http::header::CONTENT_TYPE,
                 axum::http::header::AUTHORIZATION,

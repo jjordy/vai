@@ -808,11 +808,20 @@ impl AuthStore for SqliteStorage {
         })
     }
 
-    async fn validate_session(&self, _session_token: &str) -> Result<Uuid, StorageError> {
+    async fn validate_session(&self, _session_token: &str) -> Result<String, StorageError> {
         // Session exchange is a server-only (Postgres) feature. SQLite mode has
         // no Better Auth integration.
         Err(StorageError::Database(
             "session_exchange grant is not supported in local (SQLite) mode".to_string(),
+        ))
+    }
+
+    async fn get_better_auth_user(
+        &self,
+        _ba_user_id: &str,
+    ) -> Result<(String, String), StorageError> {
+        Err(StorageError::Database(
+            "Better Auth user lookup is not supported in local (SQLite) mode".to_string(),
         ))
     }
 
@@ -1030,6 +1039,10 @@ impl OrgStore for SqliteStorage {
     }
 
     async fn get_user_by_email(&self, _email: &str) -> Result<User, StorageError> {
+        Err(org_store_unsupported())
+    }
+
+    async fn get_user_by_external_id(&self, _external_id: &str) -> Result<User, StorageError> {
         Err(org_store_unsupported())
     }
 

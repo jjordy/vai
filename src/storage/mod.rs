@@ -814,7 +814,18 @@ pub trait AuthStore: Send + Sync {
     /// for invalid or expired sessions.
     ///
     /// Only meaningful in Postgres (server) mode; SQLite mode returns an error.
-    async fn validate_session(&self, session_token: &str) -> Result<Uuid, StorageError>;
+    async fn validate_session(&self, session_token: &str) -> Result<String, StorageError>;
+
+    /// Fetches a Better Auth user's email and display name by their BA user ID.
+    ///
+    /// Queries the Better Auth `user` table (camelCase columns). Used during
+    /// auto-provisioning to seed the vai user record with the correct identity.
+    ///
+    /// Returns `(email, name)`. Only meaningful in Postgres mode.
+    async fn get_better_auth_user(
+        &self,
+        ba_user_id: &str,
+    ) -> Result<(String, String), StorageError>;
 
     /// Creates and persists a refresh token for `user_id`.
     ///
@@ -959,6 +970,8 @@ pub struct User {
     pub name: String,
     /// When the user account was created.
     pub created_at: DateTime<Utc>,
+    /// Better Auth user ID if this account was auto-provisioned via session exchange.
+    pub better_auth_id: Option<String>,
 }
 
 /// A user's membership record in an organization.
@@ -1003,6 +1016,8 @@ pub struct NewUser {
     pub email: String,
     /// Display name.
     pub name: String,
+    /// Better Auth user ID to link, when provisioning from a session exchange.
+    pub better_auth_id: Option<String>,
 }
 
 // ── OrgStore ──────────────────────────────────────────────────────────────────
@@ -1040,6 +1055,12 @@ pub trait OrgStore: Send + Sync {
 
     /// Fetches a user by email address.
     async fn get_user_by_email(&self, email: &str) -> Result<User, StorageError>;
+
+    /// Fetches a vai user by their Better Auth external ID.
+    ///
+    /// Returns [`StorageError::NotFound`] if no user has been linked to this
+    /// Better Auth identity yet (i.e. first login — caller should auto-provision).
+    async fn get_user_by_external_id(&self, external_id: &str) -> Result<User, StorageError>;
 
     // ── Org membership ────────────────────────────────────────────────────────
 
