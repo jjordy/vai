@@ -1,9 +1,15 @@
-//! API key management for vai server authentication.
+//! API key management and JWT infrastructure for vai server authentication.
 //!
 //! Keys are stored in `.vai/keys.db` (SQLite). The plaintext key is shown
 //! exactly once at creation; only a SHA-256 hash is persisted on disk.
 //!
 //! Key format: `vai_<32 hex chars>` (UUID v4 without dashes).
+//!
+//! JWT access tokens are short-lived (15 min) tokens signed with HMAC-SHA256.
+//! See [`jwt`] for signing, verification, and key rotation.
+
+#[cfg(feature = "server")]
+pub mod jwt;
 
 use std::path::Path;
 

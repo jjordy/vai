@@ -16,7 +16,7 @@ path = "src/lib.rs"
 [features]
 default = ["cli"]
 cli = []
-server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:utoipa", "dep:utoipa-swagger-ui", "dep:utoipa-axum", "dep:tracing", "dep:tracing-subscriber"]
+server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:utoipa", "dep:utoipa-swagger-ui", "dep:utoipa-axum", "dep:tracing", "dep:tracing-subscriber", "dep:jsonwebtoken"]
 postgres = ["server", "dep:sqlx"]
 s3 = ["server", "dep:aws-sdk-s3", "dep:aws-config"]
 full = ["cli", "server", "postgres", "s3"]
@@ -59,6 +59,7 @@ tar = "0.4"
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"], optional = true }
 utoipa-swagger-ui = { version = "8", optional = true }
 utoipa-axum = { version = "0.2", optional = true }
+jsonwebtoken = { version = "9", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

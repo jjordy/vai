@@ -536,6 +536,11 @@ pub(crate) struct AppState {
     /// startup and printed to stdout.  A request bearing this key bypasses
     /// normal API-key validation and receives full server-admin access.
     admin_key: String,
+    /// JWT signing and verification service.
+    ///
+    /// Used to mint short-lived access tokens (via `POST /api/auth/token`)
+    /// and to validate JWT Bearer tokens in the auth middleware.
+    pub(crate) jwt_service: Arc<crate::auth::jwt::JwtService>,
     /// In-memory sliding-window rate limiter shared across all requests.
     rate_limiter: Arc<RateLimiter>,
     /// Parsed CORS allowed origins.
@@ -10236,6 +10241,11 @@ pub async fn start_for_testing(
         storage: crate::storage::StorageBackend::local(vai_dir),
         // Tests use a fixed admin key so they can exercise admin-only endpoints.
         admin_key: "vai_admin_test".to_string(),
+        jwt_service: Arc::new(crate::auth::jwt::JwtService::new(
+            "test-jwt-secret".to_string(),
+            None,
+            3600,
+        )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
     });
@@ -10328,6 +10338,11 @@ pub async fn start_for_testing_pg(
         storage_root: None,
         storage,
         admin_key: "vai_admin_test".to_string(),
+        jwt_service: Arc::new(crate::auth::jwt::JwtService::new(
+            "test-jwt-secret".to_string(),
+            None,
+            3600,
+        )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
     });
@@ -10411,6 +10426,11 @@ pub async fn start_for_testing_pg_multi_repo(
         storage_root: Some(storage_root.to_path_buf()),
         storage,
         admin_key: "vai_admin_test".to_string(),
+        jwt_service: Arc::new(crate::auth::jwt::JwtService::new(
+            "test-jwt-secret".to_string(),
+            None,
+            3600,
+        )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
     });
@@ -10480,6 +10500,11 @@ pub async fn start_for_testing_pg_with_mem_fs(
         storage_root: Some(storage_root.to_path_buf()),
         storage,
         admin_key: "vai_admin_test".to_string(),
+        jwt_service: Arc::new(crate::auth::jwt::JwtService::new(
+            "test-jwt-secret".to_string(),
+            None,
+            3600,
+        )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
     });
@@ -10608,6 +10633,15 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
 
     let admin_key = resolve_admin_key();
 
+    // Resolve JWT signing service: VAI_JWT_SECRET env var or generate ephemeral key.
+    let jwt_overlap_secs = std::env::var("VAI_JWT_OVERLAP_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(3600);
+    let (jwt_service, _jwt_ephemeral) =
+        crate::auth::jwt::resolve_jwt_service(jwt_overlap_secs);
+    let jwt_service = Arc::new(jwt_service);
+
     // Resolve CORS origins: config takes priority, then VAI_CORS_ORIGINS env var.
     let cors_origins_raw = config
         .cors_origins
@@ -10637,6 +10671,7 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         storage_root: config.storage_root.clone(),
         storage,
         admin_key,
+        jwt_service,
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins,
     });
@@ -10899,6 +10934,11 @@ mod tests {
             storage_root: None,
             storage: crate::storage::StorageBackend::local(&vai_dir),
             admin_key: "vai_admin_test".to_string(),
+            jwt_service: Arc::new(crate::auth::jwt::JwtService::new(
+                "test-jwt-secret".to_string(),
+                None,
+                3600,
+            )),
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins: vec![],
         });
@@ -13126,6 +13166,11 @@ mod tests {
             storage_root: Some(storage_root),
             storage: crate::storage::StorageBackend::local(&vai_dir),
             admin_key: "vai_admin_test".to_string(),
+            jwt_service: Arc::new(crate::auth::jwt::JwtService::new(
+                "test-jwt-secret".to_string(),
+                None,
+                3600,
+            )),
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins: vec![],
         });
@@ -13700,6 +13745,11 @@ mod tests {
             storage_root: None,
             storage: crate::storage::StorageBackend::local(&vai_dir),
             admin_key: "vai_admin_test".to_string(),
+            jwt_service: Arc::new(crate::auth::jwt::JwtService::new(
+                "test-jwt-secret".to_string(),
+                None,
+                3600,
+            )),
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins,
         });
