@@ -763,9 +763,11 @@ impl AuthStore for SqliteStorage {
         name: &str,
         _user_id: Option<&Uuid>,
         _role_override: Option<&str>,
+        _agent_type: Option<&str>,
+        _expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(ApiKey, String), StorageError> {
-        // SQLite (local) mode has no user/RBAC concept; user_id and role_override
-        // are ignored. Keys are stored in the local keys.db.
+        // SQLite (local) mode has no user/RBAC concept; user_id, role_override,
+        // agent_type, and expires_at are ignored. Keys are stored in the local keys.db.
         auth::create(&self.vai_dir, name).map_err(|e| match e {
             auth::AuthError::Duplicate(n) => StorageError::Conflict(format!("key name '{n}' already exists")),
             other => StorageError::Database(other.to_string()),
@@ -1442,7 +1444,7 @@ mod tests {
     async fn auth_store_create_and_validate() {
         let (_tmp, storage, repo_id) = setup();
 
-        let (key_meta, plaintext) = storage.create_key(Some(&repo_id), "test-key", None, None).await.unwrap();
+        let (key_meta, plaintext) = storage.create_key(Some(&repo_id), "test-key", None, None, None, None).await.unwrap();
         assert_eq!(key_meta.name, "test-key");
 
         let validated = storage.validate_key(&plaintext).await.unwrap();

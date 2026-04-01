@@ -764,12 +764,16 @@ pub trait AuthStore: Send + Sync {
     /// `repo_id` is `None` for server-level keys.
     /// `user_id` associates the key with a user account (RBAC server mode).
     /// `role_override` caps the key's effective permissions at the given role.
+    /// `agent_type` is an optional label for the kind of agent (e.g. `"ci"`, `"worker"`).
+    /// `expires_at` is an optional expiry timestamp; `None` means the key never expires.
     async fn create_key(
         &self,
         repo_id: Option<&Uuid>,
         name: &str,
         user_id: Option<&Uuid>,
         role_override: Option<&str>,
+        agent_type: Option<&str>,
+        expires_at: Option<DateTime<Utc>>,
     ) -> Result<(ApiKey, String), StorageError>;
 
     /// Validates a plaintext API token and returns the associated key metadata.

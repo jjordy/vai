@@ -1469,6 +1469,8 @@ impl AuthStore for PostgresStorage {
         name: &str,
         user_id: Option<&Uuid>,
         role_override: Option<&str>,
+        agent_type: Option<&str>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(ApiKey, String), StorageError> {
         let id = Uuid::new_v4().to_string();
         let token = random_token(64);
@@ -1477,8 +1479,10 @@ impl AuthStore for PostgresStorage {
 
         sqlx::query(
             r#"
-            INSERT INTO api_keys (id, repo_id, name, key_hash, key_prefix, user_id, role_override)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO api_keys
+                (id, repo_id, name, key_hash, key_prefix, user_id, role_override,
+                 agent_type, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             "#,
         )
         .bind(&id)
@@ -1488,6 +1492,8 @@ impl AuthStore for PostgresStorage {
         .bind(&key_prefix)
         .bind(user_id)
         .bind(role_override)
+        .bind(agent_type)
+        .bind(expires_at)
         .execute(&self.pool)
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -1501,6 +1507,8 @@ impl AuthStore for PostgresStorage {
             revoked: false,
             user_id: user_id.copied(),
             role_override: role_override.map(|s| s.to_string()),
+            agent_type: agent_type.map(|s| s.to_string()),
+            expires_at,
         };
 
         Ok((key, token))
@@ -1511,8 +1519,11 @@ impl AuthStore for PostgresStorage {
 
         let row = sqlx::query(
             "SELECT id, name, key_prefix, last_used_at, created_at, revoked, \
-                    user_id, role_override \
-             FROM api_keys WHERE key_hash = $1 AND revoked = false",
+                    user_id, role_override, agent_type, expires_at \
+             FROM api_keys \
+             WHERE key_hash = $1 \
+               AND revoked = false \
+               AND (expires_at IS NULL OR expires_at > now())",
         )
         .bind(&key_hash)
         .fetch_optional(&self.pool)
@@ -1553,7 +1564,7 @@ impl AuthStore for PostgresStorage {
         let rows = match repo_id {
             Some(rid) => sqlx::query(
                 "SELECT id, name, key_prefix, last_used_at, created_at, revoked, \
-                        user_id, role_override \
+                        user_id, role_override, agent_type, expires_at \
                  FROM api_keys WHERE repo_id = $1 AND revoked = false ORDER BY created_at",
             )
             .bind(rid)
@@ -1561,7 +1572,7 @@ impl AuthStore for PostgresStorage {
             .await,
             None => sqlx::query(
                 "SELECT id, name, key_prefix, last_used_at, created_at, revoked, \
-                        user_id, role_override \
+                        user_id, role_override, agent_type, expires_at \
                  FROM api_keys WHERE repo_id IS NULL AND revoked = false ORDER BY created_at",
             )
             .fetch_all(&self.pool)
@@ -1575,7 +1586,7 @@ impl AuthStore for PostgresStorage {
     async fn list_keys_by_user(&self, user_id: &Uuid) -> Result<Vec<ApiKey>, StorageError> {
         let rows = sqlx::query(
             "SELECT id, name, key_prefix, last_used_at, created_at, revoked, \
-                    user_id, role_override \
+                    user_id, role_override, agent_type, expires_at \
              FROM api_keys WHERE user_id = $1 AND revoked = false ORDER BY created_at",
         )
         .bind(user_id)
@@ -1689,6 +1700,8 @@ fn row_to_api_key(row: sqlx::postgres::PgRow) -> Result<ApiKey, StorageError> {
         revoked: row.get("revoked"),
         user_id: row.get("user_id"),
         role_override: row.get("role_override"),
+        agent_type: row.get("agent_type"),
+        expires_at: row.get("expires_at"),
     })
 }
 

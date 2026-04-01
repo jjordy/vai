@@ -9549,6 +9549,12 @@ struct CreateKeyRequest {
     /// lesser of the creator's role and this value.
     /// Accepted values: `"owner"`, `"admin"`, `"write"`, `"read"`.
     role_override: Option<String>,
+    /// Optional label for the kind of agent that will use this key
+    /// (e.g. `"ci"`, `"worker"`, `"human"`).
+    agent_type: Option<String>,
+    /// Optional expiry timestamp (RFC-3339). `None` means the key never expires.
+    #[schema(value_type = Option<String>)]
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Response body for key creation.
@@ -9570,6 +9576,10 @@ struct ApiKeyResponse {
     last_used_at: Option<String>,
     user_id: Option<String>,
     role_override: Option<String>,
+    /// Optional agent type label (e.g. `"ci"`, `"worker"`, `"human"`).
+    agent_type: Option<String>,
+    /// Optional expiry timestamp (RFC-3339). `null` means the key never expires.
+    expires_at: Option<String>,
 }
 
 impl From<crate::auth::ApiKey> for ApiKeyResponse {
@@ -9582,6 +9592,8 @@ impl From<crate::auth::ApiKey> for ApiKeyResponse {
             last_used_at: k.last_used_at.map(|t| t.to_rfc3339()),
             user_id: k.user_id.map(|u| u.to_string()),
             role_override: k.role_override,
+            agent_type: k.agent_type,
+            expires_at: k.expires_at.map(|t| t.to_rfc3339()),
         }
     }
 }
@@ -9657,6 +9669,8 @@ async fn create_key_handler(
             &body.name,
             user_id.as_ref(),
             role_override.as_deref(),
+            body.agent_type.as_deref(),
+            body.expires_at,
         )
         .await
         .map_err(ApiError::from)?;

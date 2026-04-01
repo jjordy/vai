@@ -633,14 +633,16 @@ async fn test_auth_store() {
         return;
     };
 
-    // create repo-scoped key
+    // create repo-scoped key with agent_type
     let (key_meta, plaintext) = storage
-        .create_key(Some(&repo_id), "ci-bot", None, None)
+        .create_key(Some(&repo_id), "ci-bot", None, None, Some("ci"), None)
         .await
         .expect("create_key failed");
     assert_eq!(key_meta.name, "ci-bot");
     assert!(!plaintext.is_empty());
     assert!(key_meta.key_prefix.len() == 8);
+    assert_eq!(key_meta.agent_type.as_deref(), Some("ci"));
+    assert!(key_meta.expires_at.is_none());
 
     // validate
     let validated = storage
@@ -648,6 +650,7 @@ async fn test_auth_store() {
         .await
         .expect("validate_key failed");
     assert_eq!(validated.id, key_meta.id);
+    assert_eq!(validated.agent_type.as_deref(), Some("ci"));
 
     // list
     let keys = storage
@@ -656,9 +659,37 @@ async fn test_auth_store() {
         .expect("list_keys failed");
     assert_eq!(keys.len(), 1);
 
+    // create a key with an expires_at in the future — should validate fine
+    let future = chrono::Utc::now() + chrono::Duration::hours(1);
+    let (expiring_key, expiring_plaintext) = storage
+        .create_key(Some(&repo_id), "expiring-bot", None, None, None, Some(future))
+        .await
+        .expect("create expiring key failed");
+    assert_eq!(expiring_key.expires_at.map(|t| t.timestamp()), Some(future.timestamp()));
+    storage.validate_key(&expiring_plaintext).await.expect("non-expired key should validate");
+
+    // create a key with expires_at in the past — should be rejected by validate_key
+    let past = chrono::Utc::now() - chrono::Duration::hours(1);
+    let (expired_key, expired_plaintext) = storage
+        .create_key(Some(&repo_id), "expired-bot", None, None, None, Some(past))
+        .await
+        .expect("create expired key failed");
+    let exp_result = storage.validate_key(&expired_plaintext).await;
+    assert!(
+        matches!(exp_result, Err(StorageError::NotFound(_))),
+        "expired key should not validate"
+    );
+    // clean up extra keys
+    sqlx::query("DELETE FROM api_keys WHERE id = $1 OR id = $2")
+        .bind(&expiring_key.id)
+        .bind(&expired_key.id)
+        .execute(storage.pool())
+        .await
+        .unwrap();
+
     // create server-level key (repo_id=None)
     let (server_key, server_plaintext) = storage
-        .create_key(None, "admin", None, None)
+        .create_key(None, "admin", None, None, None, None)
         .await
         .expect("create server key failed");
     assert_eq!(server_key.name, "admin");

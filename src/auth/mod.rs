@@ -60,6 +60,12 @@ pub struct ApiKey {
     /// lesser of the user's computed role and this override. `None` means
     /// "inherit the user's full effective role".
     pub role_override: Option<String>,
+    /// Optional label for the kind of agent that owns this key (e.g. `"ci"`,
+    /// `"worker"`, `"human"`). `None` means unspecified.
+    pub agent_type: Option<String>,
+    /// Optional expiry timestamp. `None` means the key never expires. The auth
+    /// middleware rejects keys where `expires_at <= now()`.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -149,6 +155,8 @@ pub fn create(vai_dir: &Path, name: &str) -> Result<(ApiKey, String), AuthError>
         revoked: false,
         user_id: None,
         role_override: None,
+        agent_type: None,
+        expires_at: None,
     };
 
     Ok((key, plaintext))
@@ -175,6 +183,8 @@ pub fn list(vai_dir: &Path) -> Result<Vec<ApiKey>, AuthError> {
                 revoked: row.get::<_, i64>(5)? != 0,
                 user_id: None,
                 role_override: None,
+                agent_type: None,
+                expires_at: None,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -222,6 +232,8 @@ pub fn validate(vai_dir: &Path, plaintext: &str) -> Result<Option<ApiKey>, AuthE
                 revoked: row.get::<_, i64>(5)? != 0,
                 user_id: None,
                 role_override: None,
+                agent_type: None,
+                expires_at: None,
             })
         },
     );
