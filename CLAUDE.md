@@ -86,6 +86,27 @@ CI runs both: `cargo test` (CLI-only) and `cargo test --features full` (server w
 
 Do not add dependencies outside this list without justification in the commit message.
 
+### Agent CLI
+
+The `vai agent` subcommands provide a complete workflow for autonomous coding agents:
+
+```bash
+vai agent init --server https://vai.example.com --repo myapp
+while vai agent claim; do
+    vai agent download ./work
+    vai agent prompt | claude -p --allowedTools 'Read,Edit,Write,Bash,Glob,Grep'
+    vai agent submit ./work || vai agent reset
+    rm -rf ./work
+done
+```
+
+Key files:
+- `.vai/agent.toml` — persisted config (server URL, repo, quality checks, ignore patterns)
+- `.vai/agent-state.json` — ephemeral per-iteration state (current issue, workspace, phase)
+- `.vai/prompt.md` — prompt template; `{{issue}}` is replaced with current issue JSON
+
+The API key (`VAI_API_KEY`) is **never** stored on disk. See `docs/agent-cli.md` for the full guide including loop scripts for Claude, Codex, and custom Python agents.
+
 ### Security
 
 Run `cargo audit` periodically to check for known vulnerabilities in dependencies. CI automatically runs `cargo audit --deny warnings` and fails the build on any advisory. If you add a new dependency, run `cargo audit` locally before committing.
