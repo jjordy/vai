@@ -838,6 +838,18 @@ impl AuthStore for SqliteStorage {
             "refresh tokens are not supported in local (SQLite) mode".to_string(),
         ))
     }
+
+    async fn revoke_keys_by_repo(&self, _repo_id: &Uuid) -> Result<u64, StorageError> {
+        Err(StorageError::Database(
+            "bulk revocation by repo is not supported in local (SQLite) mode".to_string(),
+        ))
+    }
+
+    async fn revoke_keys_by_user(&self, _user_id: &Uuid) -> Result<u64, StorageError> {
+        Err(StorageError::Database(
+            "bulk revocation by user is not supported in local (SQLite) mode".to_string(),
+        ))
+    }
 }
 
 // ── FileStore ─────────────────────────────────────────────────────────────────

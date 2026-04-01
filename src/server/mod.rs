@@ -64,6 +64,8 @@
 //!   - `POST /api/keys` — create an API key (scoped to repo + role)
 //!   - `GET /api/keys` — list the authenticated user's keys
 //!   - `DELETE /api/keys/:id` — revoke a key by its record UUID
+//!   - `DELETE /api/keys?repo_id=<id>` — bulk-revoke all keys for a repo (admin only)
+//!   - `DELETE /api/keys?created_by=<user_id>` — bulk-revoke all keys by a user (admin only)
 //!
 //! ## Multi-Repo Endpoints (`/api/repos/:repo/`)
 //!   - `GET /api/repos/:repo/status` — per-repo health (same fields as `/api/status`)
@@ -9780,6 +9782,98 @@ async fn revoke_key_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Query parameters for `DELETE /api/keys` (bulk revocation).
+///
+/// Exactly one of `repo_id` or `created_by` must be supplied.
+#[derive(Debug, Deserialize)]
+struct BulkRevokeQuery {
+    /// Revoke all keys scoped to this repository UUID.
+    repo_id: Option<uuid::Uuid>,
+    /// Revoke all keys owned by this user UUID.
+    created_by: Option<uuid::Uuid>,
+}
+
+/// Response body for `DELETE /api/keys` (bulk revocation).
+#[derive(Debug, Serialize, ToSchema)]
+struct BulkRevokeResponse {
+    /// Number of API keys that were revoked.
+    revoked: u64,
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/keys",
+    params(
+        ("repo_id" = Option<String>, Query, description = "Revoke all keys scoped to this repository UUID"),
+        ("created_by" = Option<String>, Query, description = "Revoke all keys owned by this user UUID"),
+    ),
+    responses(
+        (status = 200, description = "Bulk revocation successful", body = BulkRevokeResponse),
+        (status = 400, description = "Neither or both query params provided", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — admin role required", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "auth"
+)]
+/// `DELETE /api/keys` — revokes all keys for a repo or all keys created by a user.
+///
+/// Requires admin role. Exactly one of `repo_id` or `created_by` must be provided.
+/// Returns the count of keys that were revoked.
+async fn bulk_revoke_keys_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    State(state): State<Arc<AppState>>,
+    AxumQuery(params): AxumQuery<BulkRevokeQuery>,
+) -> Result<Json<BulkRevokeResponse>, ApiError> {
+    if !identity.is_admin {
+        return Err(ApiError::forbidden("admin role required for bulk key revocation"));
+    }
+
+    let auth = state.storage.auth();
+    let revoked = match (params.repo_id, params.created_by) {
+        (Some(repo_id), None) => {
+            let count = auth
+                .revoke_keys_by_repo(&repo_id)
+                .await
+                .map_err(ApiError::from)?;
+            tracing::info!(
+                event = "keys.bulk_revoked",
+                actor = %identity.name,
+                repo_id = %repo_id,
+                count = count,
+                "bulk revoked keys for repo"
+            );
+            count
+        }
+        (None, Some(user_id)) => {
+            let count = auth
+                .revoke_keys_by_user(&user_id)
+                .await
+                .map_err(ApiError::from)?;
+            tracing::info!(
+                event = "keys.bulk_revoked",
+                actor = %identity.name,
+                user_id = %user_id,
+                count = count,
+                "bulk revoked keys for user"
+            );
+            count
+        }
+        (Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "provide either repo_id or created_by, not both",
+            ));
+        }
+        (None, None) => {
+            return Err(ApiError::bad_request(
+                "one of repo_id or created_by is required",
+            ));
+        }
+    };
+
+    Ok(Json(BulkRevokeResponse { revoked }))
+}
+
 // ── Migration handler (PRD 12.2) ──────────────────────────────────────────────
 
 #[utoipa::path(
@@ -10210,6 +10304,7 @@ impl utoipa::Modify for SecurityAddon {
         create_key_handler,
         list_keys_handler,
         revoke_key_handler,
+        bulk_revoke_keys_handler,
         migrate_handler,
         migration_stats_handler,
         openapi_handler,
@@ -10290,6 +10385,7 @@ impl utoipa::Modify for SecurityAddon {
             CreateKeyRequest,
             CreateKeyResponse,
             ApiKeyResponse,
+            BulkRevokeResponse,
             MigrationStatsResponse,
             crate::version::VersionMeta,
             crate::version::VersionEntityChange,
@@ -10467,6 +10563,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         // API key management endpoints (PRD 10.3).
         .route("/api/keys", post(create_key_handler))
         .route("/api/keys", get(list_keys_handler))
+        .route("/api/keys", delete(bulk_revoke_keys_handler))
         .route("/api/keys/:id", delete(revoke_key_handler))
         // Repository collaborator endpoints (PRD 10.3).
         .route(
@@ -14879,6 +14976,139 @@ mod tests {
             "JWT without user association should be rejected with 403, got {}",
             resp.status()
         );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    // ── Bulk key revocation tests (PRD 18 Issue 6) ────────────────────────────
+
+    /// Non-admin key is rejected with 403.
+    #[tokio::test]
+    async fn bulk_revoke_keys_non_admin_forbidden() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _admin_key) = start_test_server(root).await;
+
+        // Create a regular (non-admin) key directly in the local store.
+        let vai_dir = root.join(".vai");
+        let (_, regular_key) = auth::create(&vai_dir, "non-admin-agent").unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .delete(format!(
+                "http://{addr}/api/keys?repo_id=00000000-0000-0000-0000-000000000001"
+            ))
+            .bearer_auth(&regular_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            403,
+            "non-admin should get 403, got {}",
+            resp.status()
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// No query params returns 400.
+    #[tokio::test]
+    async fn bulk_revoke_keys_missing_params_returns_400() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, admin_key) = start_test_server(root).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .delete(format!("http://{addr}/api/keys"))
+            .bearer_auth(&admin_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "missing params should return 400, got {}",
+            resp.status()
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Providing both repo_id and created_by returns 400.
+    #[tokio::test]
+    async fn bulk_revoke_keys_both_params_returns_400() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, admin_key) = start_test_server(root).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .delete(format!(
+                "http://{addr}/api/keys\
+                 ?repo_id=00000000-0000-0000-0000-000000000001\
+                 &created_by=00000000-0000-0000-0000-000000000002"
+            ))
+            .bearer_auth(&admin_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "both params should return 400, got {}",
+            resp.status()
+        );
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Admin with repo_id in SQLite mode returns 500 (unsupported).
+    /// This verifies the request reaches the backend before failing.
+    #[tokio::test]
+    async fn bulk_revoke_keys_by_repo_sqlite_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, admin_key) = start_test_server(root).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .delete(format!(
+                "http://{addr}/api/keys?repo_id=00000000-0000-0000-0000-000000000001"
+            ))
+            .bearer_auth(&admin_key)
+            .send()
+            .await
+            .unwrap();
+        // SQLite mode doesn't support bulk revocation; expect an internal error,
+        // not a 400/403/401.
+        assert_ne!(resp.status(), 400, "should not be 400");
+        assert_ne!(resp.status(), 401, "should not be 401");
+        assert_ne!(resp.status(), 403, "should not be 403");
+
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Admin with created_by in SQLite mode returns 500 (unsupported).
+    #[tokio::test]
+    async fn bulk_revoke_keys_by_user_sqlite_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, admin_key) = start_test_server(root).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .delete(format!(
+                "http://{addr}/api/keys?created_by=00000000-0000-0000-0000-000000000002"
+            ))
+            .bearer_auth(&admin_key)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), 400, "should not be 400");
+        assert_ne!(resp.status(), 401, "should not be 401");
+        assert_ne!(resp.status(), 403, "should not be 403");
 
         shutdown_tx.send(()).ok();
     }

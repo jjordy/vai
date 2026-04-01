@@ -1607,6 +1607,27 @@ impl AuthStore for PostgresStorage {
         Ok(())
     }
 
+    async fn revoke_keys_by_repo(&self, repo_id: &Uuid) -> Result<u64, StorageError> {
+        let result =
+            sqlx::query("UPDATE api_keys SET revoked = true WHERE repo_id = $1 AND revoked = false")
+                .bind(repo_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn revoke_keys_by_user(&self, user_id: &Uuid) -> Result<u64, StorageError> {
+        let result = sqlx::query(
+            "UPDATE api_keys SET revoked = true WHERE user_id = $1 AND revoked = false",
+        )
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
     async fn validate_session(&self, session_token: &str) -> Result<Uuid, StorageError> {
         // Query the Better Auth `session` table. Better Auth stores the session
         // token in the `token` column and `user_id` as TEXT.

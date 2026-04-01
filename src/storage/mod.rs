@@ -795,6 +795,18 @@ pub trait AuthStore: Send + Sync {
     /// Revokes a key by its record ID. Revoked keys are rejected by `validate_key`.
     async fn revoke_key(&self, id: &str) -> Result<(), StorageError>;
 
+    /// Revokes all non-revoked keys scoped to the given repository.
+    ///
+    /// Returns the number of keys revoked. Only meaningful in Postgres (server)
+    /// mode; SQLite mode returns an error.
+    async fn revoke_keys_by_repo(&self, repo_id: &Uuid) -> Result<u64, StorageError>;
+
+    /// Revokes all non-revoked keys owned by the given user.
+    ///
+    /// Returns the number of keys revoked. Only meaningful in Postgres (server)
+    /// mode; SQLite mode returns an error.
+    async fn revoke_keys_by_user(&self, user_id: &Uuid) -> Result<u64, StorageError>;
+
     /// Validates a Better Auth session token and returns the associated user ID.
     ///
     /// Queries the `session` table (Better Auth schema) by the `token` column
