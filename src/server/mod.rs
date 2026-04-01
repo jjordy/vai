@@ -9163,6 +9163,191 @@ async fn remove_collaborator_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Auth token exchange (PRD 18) ──────────────────────────────────────────────
+
+/// Request body for `POST /api/auth/token`.
+///
+/// Two grant types are supported:
+/// - `"session_exchange"` — exchange a Better Auth session token for a vai JWT.
+///   Requires `session_token`. Returns an access token and a refresh token.
+/// - `"api_key"` — exchange a long-lived API key for a short-lived JWT.
+///   Requires `api_key`. Returns an access token only (no refresh token).
+#[derive(Debug, Deserialize, ToSchema)]
+struct TokenRequest {
+    /// Grant type. Accepted values: `"session_exchange"`, `"api_key"`.
+    grant_type: String,
+    /// Better Auth session token (required for `session_exchange`).
+    session_token: Option<String>,
+    /// Plaintext API key (required for `api_key`).
+    api_key: Option<String>,
+    /// Optional repository UUID to scope the token. When provided, the user's
+    /// effective role on this repo is embedded in the JWT claims.
+    #[schema(value_type = Option<String>)]
+    repo_id: Option<uuid::Uuid>,
+}
+
+/// Response body for `POST /api/auth/token`.
+#[derive(Debug, Serialize, ToSchema)]
+struct TokenResponse {
+    /// Short-lived JWT access token (HMAC-SHA256, 15 min TTL).
+    access_token: String,
+    /// Token type — always `"Bearer"`.
+    token_type: String,
+    /// Access token TTL in seconds (900 = 15 minutes).
+    expires_in: u64,
+    /// Opaque refresh token. Present only for `session_exchange` grants.
+    /// Use `POST /api/auth/refresh` to mint a new access token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/auth/token",
+    request_body = TokenRequest,
+    responses(
+        (status = 200, description = "Access token issued", body = TokenResponse),
+        (status = 400, description = "Missing or invalid parameters", body = ErrorBody),
+        (status = 401, description = "Invalid credentials", body = ErrorBody),
+    ),
+    tag = "auth"
+)]
+/// `POST /api/auth/token` — exchanges credentials for a short-lived JWT.
+///
+/// # Grant types
+///
+/// ## `session_exchange`
+/// Validates a Better Auth session token by querying the shared Postgres
+/// `session` table. On success, mints a JWT scoped to the authenticated user
+/// (and optionally to a specific repo) and creates a refresh token.
+///
+/// ## `api_key`
+/// Validates a plaintext vai API key. On success, mints a JWT carrying the
+/// same user and role as the key. No refresh token is issued; the agent should
+/// re-exchange the long-lived key before the JWT expires.
+async fn token_exchange_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<TokenRequest>,
+) -> Result<Json<TokenResponse>, ApiError> {
+    let auth = state.storage.auth();
+
+    match body.grant_type.as_str() {
+        "session_exchange" => {
+            let session_token = body.session_token.as_deref().ok_or_else(|| {
+                ApiError::bad_request("session_token is required for session_exchange grant")
+            })?;
+
+            // Validate the Better Auth session and extract user_id.
+            let user_id = auth.validate_session(session_token).await.map_err(|e| {
+                match e {
+                    crate::storage::StorageError::NotFound(_) => {
+                        ApiError::unauthorized("invalid or expired session token")
+                    }
+                    other => ApiError::from(other),
+                }
+            })?;
+
+            // Resolve the user's repo role if repo_id was supplied.
+            let role: Option<String> = if let Some(repo_id) = &body.repo_id {
+                let orgs = state.storage.orgs();
+                orgs.resolve_repo_role(&user_id, repo_id)
+                    .await
+                    .map_err(ApiError::from)?
+                    .map(|r| r.as_str().to_string())
+            } else {
+                None
+            };
+
+            // Mint the JWT access token.
+            let access_token = state
+                .jwt_service
+                .sign(
+                    user_id.to_string(),
+                    body.repo_id.as_ref().map(|id| id.to_string()),
+                    role,
+                )
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+
+            // Mint and persist a refresh token (7-day TTL).
+            let expires_at = chrono::Utc::now() + chrono::Duration::days(7);
+            let refresh_token = auth
+                .create_refresh_token(&user_id, expires_at)
+                .await
+                .map_err(ApiError::from)?;
+
+            tracing::info!(
+                event = "auth.token_issued",
+                grant_type = "session_exchange",
+                user_id = %user_id,
+                repo_id = ?body.repo_id,
+                "JWT access token issued via session exchange"
+            );
+
+            Ok(Json(TokenResponse {
+                access_token,
+                token_type: "Bearer".to_string(),
+                expires_in: state.jwt_service.access_token_ttl,
+                refresh_token: Some(refresh_token),
+            }))
+        }
+
+        "api_key" => {
+            let api_key_str = body.api_key.as_deref().ok_or_else(|| {
+                ApiError::bad_request("api_key is required for api_key grant")
+            })?;
+
+            // Bootstrap admin key takes priority over per-repo keys.
+            let (sub, role) = if api_key_str == state.admin_key {
+                ("admin".to_string(), Some("admin".to_string()))
+            } else {
+                // Validate the API key against the store.
+                let key_meta = auth.validate_key(api_key_str).await.map_err(|e| {
+                    match e {
+                        crate::storage::StorageError::NotFound(_) => {
+                            ApiError::unauthorized("invalid or revoked API key")
+                        }
+                        other => ApiError::from(other),
+                    }
+                })?;
+
+                tracing::info!(
+                    event = "auth.token_issued",
+                    grant_type = "api_key",
+                    key_id = %key_meta.id,
+                    key_name = %key_meta.name,
+                    "JWT access token issued via API key exchange"
+                );
+
+                let sub = key_meta
+                    .user_id
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| key_meta.id.clone());
+                let role = key_meta.role_override.clone();
+                (sub, role)
+            };
+
+            let repo_id_str = body.repo_id.as_ref().map(|id| id.to_string());
+            let access_token = state
+                .jwt_service
+                .sign(sub, repo_id_str, role)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+
+            // No refresh token for api_key grants — the long-lived key itself
+            // acts as the refresh credential.
+            Ok(Json(TokenResponse {
+                access_token,
+                token_type: "Bearer".to_string(),
+                expires_in: state.jwt_service.access_token_ttl,
+                refresh_token: None,
+            }))
+        }
+
+        other => Err(ApiError::bad_request(format!(
+            "unsupported grant_type '{other}'; accepted: 'session_exchange', 'api_key'"
+        ))),
+    }
+}
+
 // ── API key management (PRD 10.3) ─────────────────────────────────────────────
 
 /// Request body for `POST /api/keys`.
@@ -9818,6 +10003,7 @@ impl utoipa::Modify for SecurityAddon {
         list_collaborators_handler,
         update_collaborator_handler,
         remove_collaborator_handler,
+        token_exchange_handler,
         create_key_handler,
         list_keys_handler,
         revoke_key_handler,
@@ -9893,6 +10079,8 @@ impl utoipa::Modify for SecurityAddon {
             AddCollaboratorRequest,
             UpdateCollaboratorRequest,
             CollaboratorResponse,
+            TokenRequest,
+            TokenResponse,
             CreateKeyRequest,
             CreateKeyResponse,
             ApiKeyResponse,
@@ -9947,6 +10135,7 @@ impl utoipa::Modify for SecurityAddon {
         (name = "repos", description = "Repository management"),
         (name = "orgs", description = "Organization management"),
         (name = "users", description = "User management"),
+        (name = "auth", description = "Authentication and token exchange"),
         (name = "keys", description = "API key management"),
         (name = "migration", description = "Data migration"),
     ),
@@ -9991,7 +10180,9 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/status", get(status_handler))
         .route("/api/server/stats", get(server_stats_handler))
         .route("/api/openapi.json", get(openapi_handler))
-        .route("/ws/events", get(ws_events_handler));
+        .route("/ws/events", get(ws_events_handler))
+        // Token exchange is unauthenticated — it *is* the authentication step.
+        .route("/api/auth/token", post(token_exchange_handler));
 
     // Routes requiring `Authorization: Bearer <key>`.
     let protected = Router::new()
@@ -14072,6 +14263,141 @@ mod tests {
             "expected Retry-After header"
         );
 
+        shutdown_tx.send(()).ok();
+    }
+
+    // ── Token exchange tests (PRD 18) ──────────────────────────────────────────
+
+    /// `api_key` grant with a valid key mints a JWT.
+    #[tokio::test]
+    async fn token_exchange_api_key_grant_returns_jwt() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        // The test server creates "test-agent" with a known plaintext key via
+        // auth::create(). Retrieve the key from the local keys.db so we can
+        // exercise the api_key grant.
+        let vai_dir = root.join(".vai");
+        let keys = auth::list(&vai_dir).unwrap();
+        let test_key_meta = keys.iter().find(|k| k.name == "test-agent").unwrap().clone();
+        // We need the plaintext token — re-create it for the test, since
+        // auth::create() is the only caller that returns the plaintext.  Instead
+        // we use the admin key (known plaintext) so we can test the full round-trip.
+        let admin_key = "vai_admin_test";
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/auth/token"))
+            .json(&serde_json::json!({
+                "grant_type": "api_key",
+                "api_key": admin_key,
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200, "expected 200 for valid api_key grant");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["access_token"].is_string(), "access_token must be present");
+        assert_eq!(body["token_type"].as_str(), Some("Bearer"));
+        assert!(body["expires_in"].is_number());
+        assert!(body["refresh_token"].is_null(), "api_key grant should not return refresh_token");
+
+        // Verify the JWT is structurally valid (three dot-separated parts).
+        let token = body["access_token"].as_str().unwrap();
+        assert_eq!(token.split('.').count(), 3, "access_token should be a JWT");
+
+        let _ = test_key_meta; // suppress unused warning
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Missing `api_key` field returns 400.
+    #[tokio::test]
+    async fn token_exchange_api_key_grant_missing_key_returns_400() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/auth/token"))
+            .json(&serde_json::json!({ "grant_type": "api_key" }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 400);
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Invalid API key returns 401.
+    #[tokio::test]
+    async fn token_exchange_api_key_grant_invalid_key_returns_401() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/auth/token"))
+            .json(&serde_json::json!({
+                "grant_type": "api_key",
+                "api_key": "vai_notavalidkey000000000000000000",
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 401);
+        shutdown_tx.send(()).ok();
+    }
+
+    /// Unknown grant type returns 400.
+    #[tokio::test]
+    async fn token_exchange_unknown_grant_type_returns_400() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/auth/token"))
+            .json(&serde_json::json!({ "grant_type": "password" }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 400);
+        shutdown_tx.send(()).ok();
+    }
+
+    /// `session_exchange` grant without a database returns an error (not 500 —
+    /// SQLite mode does not support sessions, so it returns 500 wrapped as a
+    /// storage error, which the handler propagates as 500).
+    #[tokio::test]
+    async fn token_exchange_session_exchange_unsupported_in_local_mode() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/auth/token"))
+            .json(&serde_json::json!({
+                "grant_type": "session_exchange",
+                "session_token": "some-session-token",
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        // SQLite mode: validate_session returns a database error → 500.
+        assert!(
+            resp.status().is_server_error(),
+            "session_exchange in SQLite mode should return 5xx, got {}",
+            resp.status()
+        );
         shutdown_tx.send(()).ok();
     }
 }

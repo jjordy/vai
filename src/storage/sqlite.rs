@@ -805,6 +805,25 @@ impl AuthStore for SqliteStorage {
             other => StorageError::Database(other.to_string()),
         })
     }
+
+    async fn validate_session(&self, _session_token: &str) -> Result<Uuid, StorageError> {
+        // Session exchange is a server-only (Postgres) feature. SQLite mode has
+        // no Better Auth integration.
+        Err(StorageError::Database(
+            "session_exchange grant is not supported in local (SQLite) mode".to_string(),
+        ))
+    }
+
+    async fn create_refresh_token(
+        &self,
+        _user_id: &Uuid,
+        _expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<String, StorageError> {
+        // Refresh tokens are a server-only (Postgres) feature.
+        Err(StorageError::Database(
+            "refresh tokens are not supported in local (SQLite) mode".to_string(),
+        ))
+    }
 }
 
 // ── FileStore ─────────────────────────────────────────────────────────────────

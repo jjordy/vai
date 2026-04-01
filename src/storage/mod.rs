@@ -790,6 +790,27 @@ pub trait AuthStore: Send + Sync {
 
     /// Revokes a key by its record ID. Revoked keys are rejected by `validate_key`.
     async fn revoke_key(&self, id: &str) -> Result<(), StorageError>;
+
+    /// Validates a Better Auth session token and returns the associated user ID.
+    ///
+    /// Queries the `session` table (Better Auth schema) by the `token` column
+    /// and verifies the session has not expired. Returns `StorageError::NotFound`
+    /// for invalid or expired sessions.
+    ///
+    /// Only meaningful in Postgres (server) mode; SQLite mode returns an error.
+    async fn validate_session(&self, session_token: &str) -> Result<Uuid, StorageError>;
+
+    /// Creates and persists a refresh token for `user_id`.
+    ///
+    /// The plaintext token is returned with a `rt_` prefix and is shown only
+    /// once — only its SHA-256 hash is stored. The token expires at `expires_at`.
+    ///
+    /// Only meaningful in Postgres (server) mode; SQLite mode returns an error.
+    async fn create_refresh_token(
+        &self,
+        user_id: &Uuid,
+        expires_at: DateTime<Utc>,
+    ) -> Result<String, StorageError>;
 }
 
 // ── RBAC types ────────────────────────────────────────────────────────────────

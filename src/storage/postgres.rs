@@ -1595,6 +1595,46 @@ impl AuthStore for PostgresStorage {
 
         Ok(())
     }
+
+    async fn validate_session(&self, session_token: &str) -> Result<Uuid, StorageError> {
+        // Query the Better Auth `session` table. Better Auth stores the session
+        // token in the `token` column and `user_id` as TEXT.
+        let row = sqlx::query(
+            "SELECT user_id FROM session WHERE token = $1 AND expires_at > now()",
+        )
+        .bind(session_token)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .ok_or_else(|| StorageError::NotFound("invalid or expired session".to_string()))?;
+
+        let user_id_str: String = row.get("user_id");
+        Uuid::parse_str(&user_id_str)
+            .map_err(|e| StorageError::Database(format!("invalid user_id in session: {e}")))
+    }
+
+    async fn create_refresh_token(
+        &self,
+        user_id: &Uuid,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<String, StorageError> {
+        let token = random_token(64);
+        let token_hash = hash_token(&token);
+        let plaintext = format!("rt_{token}");
+
+        sqlx::query(
+            "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(user_id)
+        .bind(&token_hash)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(plaintext)
+    }
 }
 
 fn row_to_api_key(row: sqlx::postgres::PgRow) -> Result<ApiKey, StorageError> {
