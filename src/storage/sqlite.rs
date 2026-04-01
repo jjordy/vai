@@ -824,6 +824,18 @@ impl AuthStore for SqliteStorage {
             "refresh tokens are not supported in local (SQLite) mode".to_string(),
         ))
     }
+
+    async fn validate_refresh_token(&self, _token: &str) -> Result<Uuid, StorageError> {
+        Err(StorageError::Database(
+            "refresh tokens are not supported in local (SQLite) mode".to_string(),
+        ))
+    }
+
+    async fn revoke_refresh_token(&self, _token: &str) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "refresh tokens are not supported in local (SQLite) mode".to_string(),
+        ))
+    }
 }
 
 // ── FileStore ─────────────────────────────────────────────────────────────────

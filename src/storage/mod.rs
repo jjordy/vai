@@ -811,6 +811,24 @@ pub trait AuthStore: Send + Sync {
         user_id: &Uuid,
         expires_at: DateTime<Utc>,
     ) -> Result<String, StorageError>;
+
+    /// Validates a refresh token and returns the associated `user_id`.
+    ///
+    /// Hashes the plaintext token, looks it up in the `refresh_tokens` table,
+    /// and verifies it has not expired and has not been revoked.
+    /// Returns `StorageError::NotFound` for invalid, expired, or revoked tokens.
+    ///
+    /// Only meaningful in Postgres (server) mode; SQLite mode returns an error.
+    async fn validate_refresh_token(&self, token: &str) -> Result<Uuid, StorageError>;
+
+    /// Revokes a refresh token by setting its `revoked_at` timestamp.
+    ///
+    /// Hashes the plaintext token and marks it as revoked in the database.
+    /// Returns `StorageError::NotFound` if the token does not exist or is
+    /// already revoked.
+    ///
+    /// Only meaningful in Postgres (server) mode; SQLite mode returns an error.
+    async fn revoke_refresh_token(&self, token: &str) -> Result<(), StorageError>;
 }
 
 // ── RBAC types ────────────────────────────────────────────────────────────────

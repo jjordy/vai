@@ -9348,6 +9348,119 @@ async fn token_exchange_handler(
     }
 }
 
+// ── Auth refresh and revocation (PRD 18) ──────────────────────────────────────
+
+/// Request body for `POST /api/auth/refresh`.
+#[derive(Debug, Deserialize, ToSchema)]
+struct RefreshRequest {
+    /// Opaque refresh token previously issued by `POST /api/auth/token`.
+    refresh_token: String,
+}
+
+/// Response body for `POST /api/auth/refresh`.
+#[derive(Debug, Serialize, ToSchema)]
+struct RefreshResponse {
+    /// New short-lived JWT access token (HMAC-SHA256, 15 min TTL).
+    access_token: String,
+    /// Token type — always `"Bearer"`.
+    token_type: String,
+    /// Access token TTL in seconds (900 = 15 minutes).
+    expires_in: u64,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/auth/refresh",
+    request_body = RefreshRequest,
+    responses(
+        (status = 200, description = "New access token issued", body = RefreshResponse),
+        (status = 400, description = "Missing or malformed body", body = ErrorBody),
+        (status = 401, description = "Invalid, expired, or revoked refresh token", body = ErrorBody),
+    ),
+    tag = "auth"
+)]
+/// `POST /api/auth/refresh` — exchanges a refresh token for a new access token.
+///
+/// Validates the opaque refresh token (checks hash, expiry, and revocation),
+/// then mints a fresh short-lived JWT for the associated user.
+/// The refresh token remains valid after this call until it expires or is
+/// explicitly revoked via `POST /api/auth/revoke`.
+async fn refresh_token_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RefreshRequest>,
+) -> Result<Json<RefreshResponse>, ApiError> {
+    let auth = state.storage.auth();
+
+    let user_id = auth
+        .validate_refresh_token(&body.refresh_token)
+        .await
+        .map_err(|e| match e {
+            crate::storage::StorageError::NotFound(_) => {
+                ApiError::unauthorized("invalid, expired, or revoked refresh token")
+            }
+            other => ApiError::from(other),
+        })?;
+
+    let access_token = state
+        .jwt_service
+        .sign(user_id.to_string(), None, None)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    tracing::info!(
+        event = "auth.token_refreshed",
+        user_id = %user_id,
+        "JWT access token issued via refresh token"
+    );
+
+    Ok(Json(RefreshResponse {
+        access_token,
+        token_type: "Bearer".to_string(),
+        expires_in: state.jwt_service.access_token_ttl,
+    }))
+}
+
+/// Request body for `POST /api/auth/revoke`.
+#[derive(Debug, Deserialize, ToSchema)]
+struct RevokeRequest {
+    /// Opaque refresh token to revoke.
+    refresh_token: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/auth/revoke",
+    request_body = RevokeRequest,
+    responses(
+        (status = 200, description = "Refresh token revoked"),
+        (status = 400, description = "Missing or malformed body", body = ErrorBody),
+        (status = 401, description = "Token not found or already revoked", body = ErrorBody),
+    ),
+    tag = "auth"
+)]
+/// `POST /api/auth/revoke` — revokes a refresh token.
+///
+/// Marks the token as revoked so it can no longer be used to mint access tokens.
+/// Returns 401 if the token is not found or has already been revoked.
+async fn revoke_token_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RevokeRequest>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let auth = state.storage.auth();
+
+    auth.revoke_refresh_token(&body.refresh_token)
+        .await
+        .map_err(|e| match e {
+            crate::storage::StorageError::NotFound(_) => {
+                ApiError::unauthorized("refresh token not found or already revoked")
+            }
+            other => ApiError::from(other),
+        })?;
+
+    tracing::info!(event = "auth.token_revoked", "refresh token revoked");
+
+    Ok(axum::http::StatusCode::OK)
+}
+
 // ── API key management (PRD 10.3) ─────────────────────────────────────────────
 
 /// Request body for `POST /api/keys`.
@@ -10004,6 +10117,8 @@ impl utoipa::Modify for SecurityAddon {
         update_collaborator_handler,
         remove_collaborator_handler,
         token_exchange_handler,
+        refresh_token_handler,
+        revoke_token_handler,
         create_key_handler,
         list_keys_handler,
         revoke_key_handler,
@@ -10081,6 +10196,9 @@ impl utoipa::Modify for SecurityAddon {
             CollaboratorResponse,
             TokenRequest,
             TokenResponse,
+            RefreshRequest,
+            RefreshResponse,
+            RevokeRequest,
             CreateKeyRequest,
             CreateKeyResponse,
             ApiKeyResponse,
@@ -10182,7 +10300,10 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/openapi.json", get(openapi_handler))
         .route("/ws/events", get(ws_events_handler))
         // Token exchange is unauthenticated — it *is* the authentication step.
-        .route("/api/auth/token", post(token_exchange_handler));
+        .route("/api/auth/token", post(token_exchange_handler))
+        // Refresh and revoke use the refresh token itself as the credential.
+        .route("/api/auth/refresh", post(refresh_token_handler))
+        .route("/api/auth/revoke", post(revoke_token_handler));
 
     // Routes requiring `Authorization: Bearer <key>`.
     let protected = Router::new()
@@ -14369,6 +14490,106 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), 400);
+        shutdown_tx.send(()).ok();
+    }
+
+    // ── Refresh token tests (PRD 18) ───────────────────────────────────────────
+
+    /// `POST /api/auth/refresh` with a missing body returns 422 (unprocessable).
+    #[tokio::test]
+    async fn refresh_missing_body_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/auth/refresh"))
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+
+        // Missing `refresh_token` field — axum returns 422.
+        assert!(
+            resp.status().is_client_error(),
+            "empty body should return 4xx, got {}",
+            resp.status()
+        );
+        shutdown_tx.send(()).ok();
+    }
+
+    /// `POST /api/auth/refresh` with an invalid token returns 500 (SQLite mode
+    /// does not support refresh tokens, so storage returns a database error).
+    #[tokio::test]
+    async fn refresh_invalid_token_returns_error_in_sqlite_mode() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/auth/refresh"))
+            .json(&serde_json::json!({ "refresh_token": "rt_notavalidtoken" }))
+            .send()
+            .await
+            .unwrap();
+
+        // SQLite mode returns a database error (5xx).
+        assert!(
+            resp.status().is_server_error(),
+            "refresh in SQLite mode should return 5xx, got {}",
+            resp.status()
+        );
+        shutdown_tx.send(()).ok();
+    }
+
+    /// `POST /api/auth/revoke` with an invalid token returns 500 (SQLite mode).
+    #[tokio::test]
+    async fn revoke_invalid_token_returns_error_in_sqlite_mode() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/auth/revoke"))
+            .json(&serde_json::json!({ "refresh_token": "rt_notavalidtoken" }))
+            .send()
+            .await
+            .unwrap();
+
+        // SQLite mode returns a database error (5xx).
+        assert!(
+            resp.status().is_server_error(),
+            "revoke in SQLite mode should return 5xx, got {}",
+            resp.status()
+        );
+        shutdown_tx.send(()).ok();
+    }
+
+    /// `POST /api/auth/revoke` with a missing body returns 422.
+    #[tokio::test]
+    async fn revoke_missing_body_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/api/auth/revoke"))
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+
+        assert!(
+            resp.status().is_client_error(),
+            "empty body should return 4xx, got {}",
+            resp.status()
+        );
         shutdown_tx.send(()).ok();
     }
 

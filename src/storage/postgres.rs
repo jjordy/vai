@@ -1635,6 +1635,48 @@ impl AuthStore for PostgresStorage {
 
         Ok(plaintext)
     }
+
+    async fn validate_refresh_token(&self, token: &str) -> Result<Uuid, StorageError> {
+        let token_hash = hash_token(token);
+
+        let row = sqlx::query(
+            "SELECT user_id FROM refresh_tokens \
+             WHERE token_hash = $1 \
+               AND expires_at > now() \
+               AND revoked_at IS NULL",
+        )
+        .bind(&token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .ok_or_else(|| {
+            StorageError::NotFound("invalid, expired, or revoked refresh token".to_string())
+        })?;
+
+        let user_id: Uuid = row.get("user_id");
+        Ok(user_id)
+    }
+
+    async fn revoke_refresh_token(&self, token: &str) -> Result<(), StorageError> {
+        let token_hash = hash_token(token);
+
+        let result = sqlx::query(
+            "UPDATE refresh_tokens \
+             SET revoked_at = now() \
+             WHERE token_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(&token_hash)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(StorageError::NotFound(
+                "refresh token not found or already revoked".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn row_to_api_key(row: sqlx::postgres::PgRow) -> Result<ApiKey, StorageError> {
