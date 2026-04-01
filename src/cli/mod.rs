@@ -257,6 +257,32 @@ pub enum AgentCommands {
         #[arg(long)]
         prompt_template: Option<String>,
     },
+
+    /// Query the work queue and atomically claim the highest-priority issue.
+    ///
+    /// On success, writes `.vai/agent-state.json` with the issue ID, workspace
+    /// ID, and phase.  If state already exists from a previous (possibly
+    /// crashed) iteration, prints the current issue and exits 0 without
+    /// re-claiming.
+    ///
+    /// Exits 0 when work was claimed (or resumed).
+    /// Exits 1 when no work is available — enabling the shell loop pattern:
+    ///
+    /// ```sh
+    /// while vai agent claim; do
+    ///   vai agent download ./work
+    ///   vai agent submit ./work || vai agent reset
+    ///   rm -rf ./work
+    /// done
+    /// ```
+    Claim {
+        /// Override the server URL from config / env.
+        #[arg(long)]
+        server: Option<String>,
+        /// Override the repository name from config / env.
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 /// Issue management subcommands.
@@ -2924,6 +2950,26 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         println!("{}", serde_json::to_string_pretty(&result).unwrap());
                     } else {
                         agent::print_init_result(&result);
+                    }
+                }
+                AgentCommands::Claim { server, repo } => {
+                    let outcome = agent::claim(&cwd, server.as_deref(), repo.as_deref())?;
+                    if cli.json {
+                        match &outcome {
+                            agent::ClaimOutcome::Claimed(state)
+                            | agent::ClaimOutcome::AlreadyClaimed(state) => {
+                                println!("{}", serde_json::to_string_pretty(state).unwrap());
+                            }
+                            agent::ClaimOutcome::NoWork => {
+                                println!("{{\"status\":\"no_work\"}}");
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        agent::print_claim_result(&outcome);
+                        if matches!(outcome, agent::ClaimOutcome::NoWork) {
+                            std::process::exit(1);
+                        }
                     }
                 }
             }

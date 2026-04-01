@@ -279,6 +279,192 @@ pub fn clear_state(dir: &Path) -> Result<(), AgentError> {
     Ok(())
 }
 
+// ── HTTP client helpers ───────────────────────────────────────────────────────
+
+/// Build an authenticated `reqwest::Client` request with `Authorization: Bearer <key>`.
+fn authed_client(api_key: Option<&str>) -> reqwest::Client {
+    let _ = api_key; // used at call site via header injection
+    reqwest::Client::new()
+}
+
+/// Make an authenticated GET request and parse the JSON response.
+async fn agent_get<T: serde::de::DeserializeOwned>(
+    server: &str,
+    path: &str,
+    api_key: Option<&str>,
+) -> Result<T, AgentError> {
+    let url = format!("{}/{}", server.trim_end_matches('/'), path.trim_start_matches('/'));
+    let client = authed_client(api_key);
+    let mut req = client.get(&url);
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    let resp = req.send().await.map_err(|e| AgentError::ServerUnreachable {
+        url: url.clone(),
+        reason: e.to_string(),
+    })?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AgentError::Other(format!("server returned {status}: {body}")));
+    }
+    resp.json::<T>().await.map_err(|e| AgentError::Other(format!("JSON parse error: {e}")))
+}
+
+/// Make an authenticated POST request with a JSON body and parse the JSON response.
+async fn agent_post<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+    server: &str,
+    path: &str,
+    api_key: Option<&str>,
+    body: &B,
+) -> Result<T, AgentError> {
+    let url = format!("{}/{}", server.trim_end_matches('/'), path.trim_start_matches('/'));
+    let client = authed_client(api_key);
+    let mut req = client.post(&url).json(body);
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    let resp = req.send().await.map_err(|e| AgentError::ServerUnreachable {
+        url: url.clone(),
+        reason: e.to_string(),
+    })?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AgentError::Other(format!("server returned {status}: {body}")));
+    }
+    resp.json::<T>().await.map_err(|e| AgentError::Other(format!("JSON parse error: {e}")))
+}
+
+// ── claim ─────────────────────────────────────────────────────────────────────
+
+/// Outcome of a [`claim`] call.
+#[derive(Debug)]
+pub enum ClaimOutcome {
+    /// A new issue was claimed and state was saved.
+    Claimed(AgentState),
+    /// State already existed from a previous (possibly crashed) iteration.
+    ///
+    /// The existing state is returned unchanged so the caller can resume.
+    AlreadyClaimed(AgentState),
+    /// The work queue had no available issues.
+    NoWork,
+}
+
+/// Query the work queue and atomically claim the highest-priority available issue.
+///
+/// # Crash recovery
+///
+/// If `.vai/agent-state.json` already exists, this function does **not**
+/// re-claim. It returns [`ClaimOutcome::AlreadyClaimed`] with the existing
+/// state so the agent loop can resume where it left off.
+///
+/// # Exit semantics
+///
+/// The CLI translates the outcome to exit codes:
+/// - [`ClaimOutcome::Claimed`] / [`ClaimOutcome::AlreadyClaimed`] → exit 0
+/// - [`ClaimOutcome::NoWork`] → exit 1 (enables `while vai agent claim; do …; done`)
+pub fn claim(
+    dir: &Path,
+    server_override: Option<&str>,
+    repo_override: Option<&str>,
+) -> Result<ClaimOutcome, AgentError> {
+    // ── Crash recovery: if state exists, resume instead of re-claiming ─────
+    if let Ok(existing) = load_state(dir) {
+        return Ok(ClaimOutcome::AlreadyClaimed(existing));
+    }
+
+    let config = resolve_config(dir, server_override, repo_override)?;
+    let api_key = AgentConfig::resolve_api_key();
+    let api_key_ref = api_key.as_deref();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| AgentError::Other(format!("cannot create tokio runtime: {e}")))?;
+
+    rt.block_on(async {
+        // ── Fetch the work queue ───────────────────────────────────────────
+        let queue_path = format!("api/repos/{}/work-queue", config.repo);
+        let queue: serde_json::Value =
+            agent_get(&config.server, &queue_path, api_key_ref).await?;
+
+        let available = queue["available_work"].as_array().cloned().unwrap_or_default();
+        if available.is_empty() {
+            return Ok(ClaimOutcome::NoWork);
+        }
+
+        // Available issues are already sorted by priority (critical first).
+        let top = &available[0];
+        let issue_id = top["issue_id"].as_str().ok_or_else(|| {
+            AgentError::Other("work queue response missing issue_id".to_string())
+        })?;
+        let issue_title = top["title"].as_str().unwrap_or("(untitled)").to_string();
+
+        // ── Atomically claim the issue ─────────────────────────────────────
+        let claim_path = format!("api/repos/{}/work-queue/claim", config.repo);
+        let claim_body = serde_json::json!({ "issue_id": issue_id });
+        let result: serde_json::Value =
+            agent_post(&config.server, &claim_path, api_key_ref, &claim_body).await?;
+
+        let workspace_id = result["workspace_id"].as_str().ok_or_else(|| {
+            AgentError::Other("claim response missing workspace_id".to_string())
+        })?;
+
+        // ── Save state ────────────────────────────────────────────────────
+        // Ensure .vai/ exists (it may not if agent.toml was not yet written).
+        let vai_dir = dir.join(".vai");
+        if !vai_dir.exists() {
+            std::fs::create_dir_all(&vai_dir)?;
+        }
+
+        let state = AgentState {
+            issue_id: issue_id.to_string(),
+            issue_title,
+            workspace_id: workspace_id.to_string(),
+            phase: AgentPhase::Claimed,
+            claimed_at: chrono::Utc::now(),
+        };
+        save_state(dir, &state)?;
+
+        Ok(ClaimOutcome::Claimed(state))
+    })
+}
+
+/// Print a human-readable summary after a successful claim.
+pub fn print_claim_result(outcome: &ClaimOutcome) {
+    use colored::Colorize;
+    match outcome {
+        ClaimOutcome::Claimed(state) => {
+            println!(
+                "{} Claimed issue {}",
+                "✓".green().bold(),
+                state.issue_id[..8.min(state.issue_id.len())].cyan(),
+            );
+            println!("  Title     : {}", state.issue_title);
+            println!(
+                "  Workspace : {}",
+                state.workspace_id[..8.min(state.workspace_id.len())].cyan()
+            );
+            println!("  Phase     : {}", state.phase);
+        }
+        ClaimOutcome::AlreadyClaimed(state) => {
+            println!(
+                "{} Resuming existing claim — issue {}",
+                "↻".yellow().bold(),
+                state.issue_id[..8.min(state.issue_id.len())].cyan(),
+            );
+            println!("  Title     : {}", state.issue_title);
+            println!(
+                "  Workspace : {}",
+                state.workspace_id[..8.min(state.workspace_id.len())].cyan()
+            );
+            println!("  Phase     : {}", state.phase);
+        }
+        ClaimOutcome::NoWork => {
+            println!("{} No available work in the queue.", "–".dimmed());
+        }
+    }
+}
+
 // ── init ──────────────────────────────────────────────────────────────────────
 
 /// Result returned by [`init`].
@@ -515,6 +701,31 @@ mod tests {
         assert_eq!(loaded.phase, AgentPhase::Claimed);
         clear_state(dir).unwrap();
         assert!(matches!(load_state(dir), Err(AgentError::NoState)));
+    }
+
+    #[test]
+    fn claim_returns_already_claimed_when_state_exists() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join(".vai")).unwrap();
+
+        // Pre-populate state (simulates a crashed previous iteration).
+        let state = AgentState {
+            issue_id: "aaaaaaaa-0000-0000-0000-000000000000".to_string(),
+            issue_title: "Some issue".to_string(),
+            workspace_id: "bbbbbbbb-0000-0000-0000-000000000000".to_string(),
+            phase: AgentPhase::Claimed,
+            claimed_at: Utc::now(),
+        };
+        save_state(dir, &state).unwrap();
+
+        // claim() should detect the existing state and return AlreadyClaimed
+        // without touching the network.
+        let outcome = claim(dir, Some("https://vai.example.com"), Some("myrepo")).unwrap();
+        assert!(
+            matches!(outcome, ClaimOutcome::AlreadyClaimed(_)),
+            "expected AlreadyClaimed, got {outcome:?}"
+        );
     }
 
     /// RAII guard that removes an env var on drop (for cleanup in tests).
