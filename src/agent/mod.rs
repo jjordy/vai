@@ -580,6 +580,203 @@ fn validate_server_reachable(server_url: &str) -> bool {
     })
 }
 
+// ── download ──────────────────────────────────────────────────────────────────
+
+/// Result of a [`download`] call.
+#[derive(Debug, Serialize)]
+pub struct DownloadResult {
+    /// Number of files extracted to `<dir>`.
+    pub file_count: usize,
+    /// Path where files were extracted.
+    pub target_dir: PathBuf,
+    /// Server-reported version that was downloaded.
+    pub version: Option<String>,
+}
+
+/// Download the repository tarball into `target_dir` and update agent state.
+///
+/// Reads the workspace ID, issue ID, and server config from the state and
+/// config files in `dir`.  Fetches `GET /api/repos/:repo/files/download` with
+/// an `Authorization: Bearer` header, extracts the tarball into `target_dir`,
+/// saves a file listing at `<dir>/.vai/download-manifest.json` for later diff
+/// comparison during submit, and advances the state phase to
+/// [`AgentPhase::Downloaded`].
+///
+/// `target_dir` is created if it does not exist.
+pub fn download(dir: &Path, target_dir: &Path) -> Result<DownloadResult, AgentError> {
+    let config = load_config(dir)?;
+    let state = load_state(dir)?;
+    let api_key = AgentConfig::resolve_api_key();
+
+    // Create target directory if needed.
+    if !target_dir.exists() {
+        fs::create_dir_all(target_dir)?;
+    }
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| AgentError::Other(format!("cannot create tokio runtime: {e}")))?;
+
+    let gz_bytes = rt.block_on(async {
+        fetch_files_tarball(&config.server, &config.repo, api_key.as_deref()).await
+    })?;
+
+    // Parse the Content-Disposition / version header if present (best-effort).
+    // We extract a version hint from a sentinel in the tarball name later; for
+    // now we just record None and let the manifest carry the count.
+    let file_count = extract_tarball_to_dir(&gz_bytes, target_dir)?;
+
+    // Save a manifest of files present after extraction for submit diff.
+    let manifest = build_file_manifest(target_dir)?;
+    let manifest_path = dir.join(".vai").join("download-manifest.json");
+    let manifest_json = serde_json::to_string_pretty(&manifest)?;
+    fs::write(&manifest_path, manifest_json)
+        .map_err(|e| AgentError::Other(format!("cannot write download manifest: {e}")))?;
+
+    // Advance phase to Downloaded.
+    let mut updated_state = state;
+    updated_state.phase = AgentPhase::Downloaded;
+    save_state(dir, &updated_state)?;
+
+    Ok(DownloadResult {
+        file_count,
+        target_dir: target_dir.to_path_buf(),
+        version: None,
+    })
+}
+
+/// Fetch the repository tarball bytes from the server.
+async fn fetch_files_tarball(
+    server: &str,
+    repo: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<u8>, AgentError> {
+    let url = format!(
+        "{}/api/repos/{}/files/download",
+        server.trim_end_matches('/'),
+        repo
+    );
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    let resp = req.send().await.map_err(|e| AgentError::ServerUnreachable {
+        url: url.clone(),
+        reason: e.to_string(),
+    })?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AgentError::Other(format!("server returned {status}: {body}")));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| AgentError::Other(format!("failed to read response body: {e}")))
+}
+
+/// Extract a gzip-compressed tarball into `target_dir`.
+///
+/// Returns the number of regular files written.
+fn extract_tarball_to_dir(gz_bytes: &[u8], target_dir: &Path) -> Result<usize, AgentError> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    let decoder = GzDecoder::new(gz_bytes);
+    let mut archive = Archive::new(decoder);
+    let mut file_count = 0usize;
+
+    for entry_result in archive.entries().map_err(|e| {
+        AgentError::Other(format!("cannot read tarball entries: {e}"))
+    })? {
+        let mut entry = entry_result
+            .map_err(|e| AgentError::Other(format!("invalid tarball entry: {e}")))?;
+
+        // Only extract regular files and directories — skip symlinks, etc.
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() && !entry_type.is_dir() {
+            continue;
+        }
+
+        let rel_path = entry
+            .path()
+            .map_err(|e| AgentError::Other(format!("invalid path in tarball: {e}")))?
+            .to_path_buf();
+
+        // Safety: reject path traversal attempts.
+        for component in rel_path.components() {
+            use std::path::Component;
+            if matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)) {
+                return Err(AgentError::Other(format!(
+                    "unsafe path in tarball: {}",
+                    rel_path.display()
+                )));
+            }
+        }
+
+        let dest = target_dir.join(&rel_path);
+
+        if entry_type.is_dir() {
+            fs::create_dir_all(&dest)?;
+        } else {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            entry
+                .unpack(&dest)
+                .map_err(|e| AgentError::Other(format!("cannot unpack '{}': {e}", rel_path.display())))?;
+            file_count += 1;
+        }
+    }
+
+    Ok(file_count)
+}
+
+/// Walk `dir` recursively and collect relative file paths.
+///
+/// Used to produce a manifest of the downloaded files so that `vai agent
+/// submit` can compute what was added or modified.
+fn build_file_manifest(dir: &Path) -> Result<Vec<String>, AgentError> {
+    let mut paths = Vec::new();
+    collect_files(dir, dir, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_files(
+    root: &Path,
+    current: &Path,
+    out: &mut Vec<String>,
+) -> Result<(), AgentError> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(root, &path, out)?;
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| AgentError::Other(format!("strip_prefix error: {e}")))?;
+            out.push(rel.to_string_lossy().into_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Print a human-readable summary of a [`DownloadResult`].
+pub fn print_download_result(result: &DownloadResult) {
+    println!(
+        "{} Downloaded {} file{} to {}",
+        "✓".green().bold(),
+        result.file_count,
+        if result.file_count == 1 { "" } else { "s" },
+        result.target_dir.display()
+    );
+    if let Some(ref ver) = result.version {
+        println!("  Version : {ver}");
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -726,6 +923,113 @@ mod tests {
             matches!(outcome, ClaimOutcome::AlreadyClaimed(_)),
             "expected AlreadyClaimed, got {outcome:?}"
         );
+    }
+
+    // ── download helpers ──────────────────────────────────────────────────────
+
+    /// Build a minimal gzip tarball in memory for testing.
+    fn make_tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use tar::Builder;
+
+        let buf = Vec::new();
+        let enc = GzEncoder::new(buf, Compression::fast());
+        let mut ar = Builder::new(enc);
+        for (name, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            ar.append_data(&mut header, name, *data).unwrap();
+        }
+        let gz = ar.into_inner().unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn extract_tarball_writes_files() {
+        let tmp = TempDir::new().unwrap();
+        let tarball = make_tarball(&[
+            ("hello.txt", b"hello world"),
+            ("sub/world.txt", b"sub content"),
+        ]);
+        let count = extract_tarball_to_dir(&tarball, tmp.path()).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(fs::read_to_string(tmp.path().join("hello.txt")).unwrap(), "hello world");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("sub/world.txt")).unwrap(),
+            "sub content"
+        );
+    }
+
+    #[test]
+    fn extract_tarball_rejects_path_traversal() {
+        let tmp = TempDir::new().unwrap();
+        // Craft a raw tar entry with `../evil.txt` in the name field so that
+        // the `tar` crate builder's own path validation doesn't block us.
+        let tarball = make_raw_tar_with_name(b"../evil.txt\0", b"bad");
+        let err = extract_tarball_to_dir(&tarball, tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("unsafe path"),
+            "expected unsafe path error, got: {err}"
+        );
+    }
+
+    /// Build a minimal POSIX tar + gzip with a single file entry whose name is
+    /// set directly in the raw header bytes (bypassing the builder's validation).
+    fn make_raw_tar_with_name(name: &[u8], data: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        // A tar header is exactly 512 bytes.
+        let mut header = [0u8; 512];
+        // Name field: bytes 0-99 (100 bytes).
+        let name_len = name.len().min(100);
+        header[..name_len].copy_from_slice(&name[..name_len]);
+        // Mode field: bytes 100-107.
+        header[100..108].copy_from_slice(b"0000644\0");
+        // uid/gid: bytes 108-115, 116-123.
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        // Size: bytes 124-135 (12 bytes, octal).
+        let size_str = format!("{:011o}\0", data.len());
+        header[124..136].copy_from_slice(size_str.as_bytes());
+        // mtime: bytes 136-147.
+        header[136..148].copy_from_slice(b"00000000000\0");
+        // typeflag: byte 156 ('0' = regular file).
+        header[156] = b'0';
+        // Compute checksum: sum of all header bytes with checksum field as spaces.
+        header[148..156].copy_from_slice(b"        ");
+        let cksum: u32 = header.iter().map(|&b| b as u32).sum();
+        let cksum_str = format!("{:06o}\0 ", cksum);
+        header[148..156].copy_from_slice(cksum_str.as_bytes());
+
+        // Pad data to 512-byte blocks.
+        let padded_size = (data.len() + 511) & !511;
+        let mut tar_bytes = Vec::with_capacity(512 + padded_size + 1024);
+        tar_bytes.extend_from_slice(&header);
+        tar_bytes.extend_from_slice(data);
+        tar_bytes.extend(std::iter::repeat(0u8).take(padded_size - data.len()));
+        // Two 512-byte zero blocks mark end-of-archive.
+        tar_bytes.extend(std::iter::repeat(0u8).take(1024));
+
+        // Compress with gzip.
+        let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+        use std::io::Write as _;
+        enc.write_all(&tar_bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn build_file_manifest_collects_paths() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("a.txt"), b"a").unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/b.txt"), b"b").unwrap();
+        let manifest = build_file_manifest(tmp.path()).unwrap();
+        assert!(manifest.contains(&"a.txt".to_string()));
+        assert!(manifest.iter().any(|p| p.contains("b.txt")));
     }
 
     /// RAII guard that removes an env var on drop (for cleanup in tests).

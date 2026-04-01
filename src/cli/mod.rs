@@ -283,6 +283,19 @@ pub enum AgentCommands {
         #[arg(long)]
         repo: Option<String>,
     },
+
+    /// Download the repo tarball into a local working directory.
+    ///
+    /// Reads agent state from `.vai/agent-state.json` (written by `vai agent
+    /// claim`), fetches the current repository snapshot from the server, and
+    /// extracts it into `<dir>`.  A file manifest is saved to
+    /// `.vai/download-manifest.json` for use by `vai agent submit`.
+    ///
+    /// Advances the agent phase to `downloaded`.
+    Download {
+        /// Directory to extract repository files into (created if absent).
+        dir: std::path::PathBuf,
+    },
 }
 
 /// Issue management subcommands.
@@ -2970,6 +2983,14 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         if matches!(outcome, agent::ClaimOutcome::NoWork) {
                             std::process::exit(1);
                         }
+                    }
+                }
+                AgentCommands::Download { dir } => {
+                    let result = agent::download(&cwd, &dir)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        agent::print_download_result(&result);
                     }
                 }
             }
