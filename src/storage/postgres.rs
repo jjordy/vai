@@ -2243,6 +2243,27 @@ impl OrgStore for PostgresStorage {
         Ok(rows.iter().map(|r| r.get::<Uuid, _>("id")).collect())
     }
 
+    async fn list_all_repo_ids(&self) -> Result<Vec<Uuid>, StorageError> {
+        let rows = sqlx::query("SELECT id FROM repos ORDER BY created_at")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(rows.iter().map(|r| r.get::<Uuid, _>("id")).collect())
+    }
+
+    async fn count_collaborator_repos(&self, user_id: &Uuid) -> Result<u64, StorageError> {
+        let row =
+            sqlx::query("SELECT COUNT(*) AS n FROM repo_collaborators WHERE user_id = $1")
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let n: i64 = row.get("n");
+        Ok(n as u64)
+    }
+
     async fn resolve_repo_role(
         &self,
         user_id: &Uuid,

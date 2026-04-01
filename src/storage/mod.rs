@@ -1104,6 +1104,17 @@ pub trait OrgStore: Send + Sync {
     /// collaborator role on every existing repo in the organisation.
     async fn list_repo_ids_for_org(&self, org_id: &Uuid) -> Result<Vec<Uuid>, StorageError>;
 
+    /// Lists the UUIDs of **all** repositories in the system, regardless of org.
+    ///
+    /// Used during user auto-provisioning to ensure standalone repos (with no
+    /// org) are also covered when granting a new user their default role.
+    async fn list_all_repo_ids(&self) -> Result<Vec<Uuid>, StorageError>;
+
+    /// Returns the number of repos on which `user_id` has a direct collaborator
+    /// entry.  Used to detect users that slipped through auto-provisioning and
+    /// have no repo access at all.
+    async fn count_collaborator_repos(&self, user_id: &Uuid) -> Result<u64, StorageError>;
+
     // ── Repo collaborators ────────────────────────────────────────────────────
 
     /// Grants a user a role on a specific repository.
