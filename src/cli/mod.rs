@@ -309,6 +309,26 @@ pub enum AgentCommands {
     /// Exits 1 if no issue is currently claimed (no agent state).
     Issue,
 
+    /// Print the status of the current agent iteration.
+    ///
+    /// Reads `.vai/agent-state.json` and displays the current issue title,
+    /// workspace ID, phase, and elapsed time since the issue was claimed.
+    ///
+    /// Exits 1 if no agent state exists (i.e. no issue is currently claimed).
+    Status,
+
+    /// Discard the current workspace, reopen the issue, and clear state.
+    ///
+    /// Calls `DELETE /api/workspaces/:id` on the server, which atomically:
+    /// - marks the workspace as `Discarded`
+    /// - transitions the linked issue back to `Open`
+    ///
+    /// Use this after a failed or aborted iteration to return the issue to
+    /// the work queue so it can be claimed again.
+    ///
+    /// Exits 1 if no agent state exists or the server call fails.
+    Reset,
+
     /// Upload work, submit the workspace, close the issue, and clear state.
     ///
     /// Steps performed in order:
@@ -3031,6 +3051,48 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     } else {
                         let detail = agent::fetch_issue(&cwd)?;
                         agent::print_issue_detail(&detail);
+                    }
+                }
+                AgentCommands::Status => {
+                    let result = agent::status(&cwd);
+                    match result {
+                        Ok(r) => {
+                            if cli.json {
+                                println!("{}", serde_json::to_string_pretty(&r).unwrap());
+                            } else {
+                                agent::print_status_result(&r);
+                            }
+                        }
+                        Err(agent::AgentError::NoState) => {
+                            if cli.json {
+                                println!("{{\"error\":\"no active agent state\"}}");
+                            } else {
+                                eprintln!("No active agent state — run `vai agent claim` first.");
+                            }
+                            std::process::exit(1);
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                AgentCommands::Reset => {
+                    let result = agent::reset(&cwd);
+                    match result {
+                        Ok(r) => {
+                            if cli.json {
+                                println!("{}", serde_json::to_string_pretty(&r).unwrap());
+                            } else {
+                                agent::print_reset_result(&r);
+                            }
+                        }
+                        Err(agent::AgentError::NoState) => {
+                            if cli.json {
+                                println!("{{\"error\":\"no active agent state\"}}");
+                            } else {
+                                eprintln!("No active agent state — nothing to reset.");
+                            }
+                            std::process::exit(1);
+                        }
+                        Err(e) => return Err(e.into()),
                     }
                 }
                 AgentCommands::Submit { dir } => {

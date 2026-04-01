@@ -1174,6 +1174,139 @@ fn matches_ignore_pattern(pattern: &str, path: &str) -> bool {
     }
 }
 
+// ── status ────────────────────────────────────────────────────────────────────
+
+/// Result of a [`status`] call.
+#[derive(Debug, Serialize)]
+pub struct StatusResult {
+    /// Issue UUID of the currently claimed issue.
+    pub issue_id: String,
+    /// Human-readable title of the issue.
+    pub issue_title: String,
+    /// Workspace UUID created for this iteration.
+    pub workspace_id: String,
+    /// Current agent phase.
+    pub phase: AgentPhase,
+    /// ISO-8601 timestamp of when the issue was claimed.
+    pub claimed_at: DateTime<Utc>,
+    /// Seconds elapsed since the issue was claimed.
+    pub elapsed_seconds: i64,
+}
+
+/// Read the current agent state and return a structured status report.
+///
+/// Returns [`AgentError::NoState`] (exit 1) if no state file exists.
+pub fn status(dir: &Path) -> Result<StatusResult, AgentError> {
+    let state = load_state(dir)?;
+    let elapsed = (Utc::now() - state.claimed_at).num_seconds().max(0);
+    Ok(StatusResult {
+        issue_id: state.issue_id,
+        issue_title: state.issue_title,
+        workspace_id: state.workspace_id,
+        phase: state.phase,
+        claimed_at: state.claimed_at,
+        elapsed_seconds: elapsed,
+    })
+}
+
+/// Print a human-readable summary of a [`StatusResult`].
+pub fn print_status_result(r: &StatusResult) {
+    use colored::Colorize;
+    println!("{}", "Agent status".bold());
+    println!("  Issue     : {} — {}", r.issue_id[..8.min(r.issue_id.len())].cyan(), r.issue_title);
+    println!(
+        "  Workspace : {}",
+        r.workspace_id[..8.min(r.workspace_id.len())].cyan()
+    );
+    println!("  Phase     : {}", r.phase);
+
+    let elapsed = r.elapsed_seconds;
+    let (hours, rem) = (elapsed / 3600, elapsed % 3600);
+    let (mins, secs) = (rem / 60, rem % 60);
+    if hours > 0 {
+        println!("  Elapsed   : {}h {}m {}s", hours, mins, secs);
+    } else if mins > 0 {
+        println!("  Elapsed   : {}m {}s", mins, secs);
+    } else {
+        println!("  Elapsed   : {}s", secs);
+    }
+    println!("  Claimed at: {}", r.claimed_at.format("%Y-%m-%d %H:%M:%S UTC"));
+}
+
+// ── reset ─────────────────────────────────────────────────────────────────────
+
+/// Result of a [`reset`] call.
+#[derive(Debug, Serialize)]
+pub struct ResetResult {
+    /// Issue UUID that was re-opened.
+    pub issue_id: String,
+    /// Human-readable title of the issue.
+    pub issue_title: String,
+    /// Workspace UUID that was discarded.
+    pub workspace_id: String,
+}
+
+/// Discard the current workspace, reopen the linked issue, and clear state.
+///
+/// Calls `DELETE /api/workspaces/:id` on the server, which atomically:
+/// - marks the workspace as `Discarded`
+/// - transitions the linked issue back to `Open`
+///
+/// State is cleared only after the server call succeeds.
+pub fn reset(dir: &Path) -> Result<ResetResult, AgentError> {
+    // Check state first so we get a friendly NoState error when nothing is claimed.
+    let state = load_state(dir)?;
+    let config = load_config(dir)?;
+    let api_key = AgentConfig::resolve_api_key();
+    let api_key_ref = api_key.as_deref();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| AgentError::Other(format!("cannot create tokio runtime: {e}")))?;
+
+    rt.block_on(async {
+        let url = format!(
+            "{}/api/workspaces/{}",
+            config.server.trim_end_matches('/'),
+            state.workspace_id
+        );
+        let client = reqwest::Client::new();
+        let mut req = client.delete(&url);
+        if let Some(key) = api_key_ref {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = req.send().await.map_err(|e| AgentError::ServerUnreachable {
+            url: url.clone(),
+            reason: e.to_string(),
+        })?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AgentError::Other(format!("server returned {status}: {body}")));
+        }
+        Ok::<_, AgentError>(())
+    })?;
+
+    clear_state(dir)?;
+
+    Ok(ResetResult {
+        issue_id: state.issue_id,
+        issue_title: state.issue_title,
+        workspace_id: state.workspace_id,
+    })
+}
+
+/// Print a human-readable summary of a [`ResetResult`].
+pub fn print_reset_result(r: &ResetResult) {
+    use colored::Colorize;
+    println!(
+        "{} Reset complete — workspace {} discarded, issue {} reopened",
+        "✓".green().bold(),
+        r.workspace_id[..8.min(r.workspace_id.len())].cyan(),
+        r.issue_id[..8.min(r.issue_id.len())].cyan(),
+    );
+    println!("  Issue: {}", r.issue_title);
+}
+
 /// Print a human-readable summary of a [`SubmitResult`].
 pub fn print_submit_result(result: &SubmitResult) {
     println!(
@@ -1608,6 +1741,48 @@ mod tests {
         // No state file — submit should return NoState.
         let work = TempDir::new().unwrap();
         let err = submit(dir, work.path()).unwrap_err();
+        assert!(matches!(err, AgentError::NoState), "expected NoState, got {err}");
+    }
+
+    // ── status helpers ────────────────────────────────────────────────────────
+
+    #[test]
+    fn status_requires_state() {
+        let tmp = TempDir::new().unwrap();
+        let err = status(tmp.path()).unwrap_err();
+        assert!(matches!(err, AgentError::NoState), "expected NoState, got {err}");
+    }
+
+    #[test]
+    fn status_returns_state_fields() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join(".vai")).unwrap();
+
+        let claimed_at = Utc::now();
+        let state = AgentState {
+            issue_id: "aaaaaaaa-0000-0000-0000-000000000001".to_string(),
+            issue_title: "Test issue".to_string(),
+            workspace_id: "bbbbbbbb-0000-0000-0000-000000000002".to_string(),
+            phase: AgentPhase::Downloaded,
+            claimed_at,
+        };
+        save_state(dir, &state).unwrap();
+
+        let r = status(dir).unwrap();
+        assert_eq!(r.issue_id, state.issue_id);
+        assert_eq!(r.issue_title, "Test issue");
+        assert_eq!(r.workspace_id, state.workspace_id);
+        assert_eq!(r.phase, AgentPhase::Downloaded);
+        assert!(r.elapsed_seconds >= 0);
+    }
+
+    // ── reset helpers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn reset_requires_state() {
+        let tmp = TempDir::new().unwrap();
+        let err = reset(tmp.path()).unwrap_err();
         assert!(matches!(err, AgentError::NoState), "expected NoState, got {err}");
     }
 
