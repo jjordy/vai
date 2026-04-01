@@ -2,163 +2,156 @@
 
 ## Overview
 
-Get vai off the local machine and running as a hosted service. Start with the cheapest viable infrastructure (Fly.io + Cloudflare R2), design for portability across providers, and provide a self-hosted option for enterprise.
-
-## Design Principles
-
-1. **Provider-agnostic** — S3-compatible storage, standard Postgres, containerized compute. Switch providers by changing config, not code.
-2. **Self-hosted is a first-class target** — Docker Compose with vai-server + Postgres + MinIO. Three commands to run.
-3. **Infrastructure as code** — every environment reproducible from Terraform/Pulumi.
-4. **Zero-downtime deploys** — rolling updates, health checks, graceful shutdown.
-5. **vai deploys vai (eventually)** — once vai is stable enough, use it to manage its own deployments. Until then, GitHub Actions + container registry.
+Deploy vai to production using Fly.io for compute/Postgres and Cloudflare R2/Pages for storage/dashboard. Infrastructure as code via Fly.toml (compute) and Terraform (Cloudflare).
 
 ## Architecture
 
-### Components
-
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   vai server    │────▶│   Postgres        │     │   S3-compatible │
-│   (Rust binary) │     │   (managed)       │     │   (R2/S3/MinIO) │
-│                 │────▶│                   │     │                 │
-│   REST + WS     │     └──────────────────┘     └─────────────────┘
-└────────┬────────┘                                       ▲
-         │                                                │
-         └────────────────────────────────────────────────┘
+┌─────────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  Fly.io             │     │  Fly.io           │     │  Cloudflare R2  │
+│  vai-server         │────▶│  Managed Postgres │     │  Object Storage │
+│  (Docker container) │     │  (free tier)      │     │  (free 10GB)    │
+│                     │────▶│                   │     │                 │
+│  REST + WebSocket   │     └──────────────────┘     └─────────────────┘
+└────────┬────────────┘                                       ▲
+         │                                                    │
+         └────────────────────────────────────────────────────┘
          ▲                    ▲
          │                    │
 ┌────────┴───────┐   ┌───────┴────────┐
-│  vai-dashboard │   │  agents (CLI)  │
-│  (static SPA)  │   │  (vai-agent)   │
+│  Cloudflare    │   │  Agents (CLI)  │
+│  Pages         │   │  (vai-agent)   │
+│  (dashboard)   │   │                │
 └────────────────┘   └────────────────┘
 ```
 
-### Provider Matrix
+## Cost (Single User / Development)
 
-| Component | MVP (Cheapest) | Production | Self-Hosted |
-|-----------|---------------|------------|-------------|
-| Compute | Fly.io ($5-20/mo) | AWS ECS / Fly | Docker |
-| Database | Neon free tier / Fly Postgres | AWS RDS | Docker (Postgres) |
-| Object Storage | Cloudflare R2 (free egress) | R2 or AWS S3 | MinIO |
-| Dashboard | Cloudflare Pages (free) | Cloudflare Pages | Served by vai-server |
-| DNS/TLS | Cloudflare (free) | Cloudflare / Route53 | Let's Encrypt |
-| CI/CD | GitHub Actions (free) | GitHub Actions | GitHub Actions |
-| Monitoring | Fly metrics + Sentry free | Datadog / Grafana | Prometheus + Grafana |
+| Resource | Service | Monthly |
+|----------|---------|---------|
+| Compute | Fly.io shared-cpu-1x (256MB) | $3 |
+| Database | Fly Postgres (free tier, 1GB) | $0 |
+| Object Storage | Cloudflare R2 (10GB free, zero egress) | $0 |
+| Dashboard | Cloudflare Pages (free) | $0 |
+| DNS/TLS | Cloudflare (free) | $0 |
+| **Total** | | **~$3/mo** |
 
-### Cost Estimates
-
-**MVP (single instance, ~100 users):**
-| Resource | Monthly |
-|----------|---------|
-| Fly.io shared-cpu-1x (256MB) | $3 |
-| Fly Postgres (single node) | $0 (free tier) |
-| Cloudflare R2 (10GB) | $0 (free tier) |
-| Cloudflare Pages | $0 |
-| Total | **~$3/mo** |
-
-**Growth (dedicated, ~1000 users):**
-| Resource | Monthly |
-|----------|---------|
-| Fly.io performance-2x (4GB) | $60 |
-| Fly Postgres (HA, 2 nodes) | $50 |
-| Cloudflare R2 (100GB) | $1.50 |
-| Sentry (error tracking, free tier) | $0 |
-| Fly metrics (built-in) | $0 |
-| PostHog (analytics, free tier 1M events) | $0 |
-| Total | **~$112/mo** |
-
-**Enterprise (self-hosted, customer pays):**
-Customer runs Docker Compose or Helm chart on their infra. We provide the images and support.
-
-### Observability Strategy (Low-Cost Start)
-
-Avoid Datadog/New Relic until revenue justifies it. Start with free/cheap tools:
-
-| Need | Tool | Cost |
-|------|------|------|
-| Error tracking | Sentry (free: 5K events/mo) | $0 |
-| Metrics/dashboards | Fly.io built-in metrics + Grafana Cloud free | $0 |
-| Uptime monitoring | Betterstack (free: 5 monitors) | $0 |
-| Analytics | PostHog (free: 1M events/mo) | $0 |
-| Logging | Fly.io log drains → Logtail free tier | $0 |
-| Alerting | Sentry + Betterstack | $0 |
-
-Graduate to paid tools when: >$10K MRR or free tiers become limiting. Prometheus + Grafana self-hosted is always an option for the cost-conscious.
-
-### Pricing Tiers
-
-| Tier | Monthly | Includes | Target |
-|------|---------|----------|--------|
-| **Free** | $0 | 1 repo, 50 submits/mo, 500MB S3 | Individual devs trying it out |
-| **Personal** | $19/mo | 5 repos, 200 submits/mo, 5GB S3, 1 seat | Solo developers / freelancers |
-| **Team** | $99/mo | 10 repos, 500 submits/mo, 10GB S3, 5 seats | Small teams |
-| **Scale** | $499/mo | Unlimited repos, 5000 submits/mo, 100GB S3, unlimited seats | Growing teams |
-| **Enterprise** | Custom | Self-hosted, SLA, SSO, audit logs, dedicated support | Large orgs |
-
-Overage: $0.15/submit (Team), $0.08/submit (Scale). No overage on Free/Personal — hard cap.
-
-Expected funnel: most users stay on Free for weeks/months. Personal captures solo devs who hit the 1-repo limit. Team is the conversion target once they bring it to work.
-
-## Deployment Pipeline
-
-### Phase 1: Manual Deploy (Now → MVP)
+## Infrastructure as Code
 
 ```
-Developer pushes to GitHub
-  → GitHub Actions builds release binary
-  → Builds Docker image
-  → Pushes to GitHub Container Registry (ghcr.io)
-  → fly deploy (manual trigger or on tag)
+infra/
+├── fly.toml              # Fly.io app config (vai-server)
+├── Dockerfile.server     # Release Docker image for vai-server
+├── Dockerfile.dashboard  # Release Docker image for vai-dashboard
+├── terraform/
+│   ├── main.tf           # Cloudflare provider, R2 bucket, Pages project
+│   ├── variables.tf      # Configurable inputs
+│   ├── outputs.tf        # R2 endpoint, bucket name, Pages URL
+│   └── terraform.tfvars  # (gitignored) account-specific values
+├── docker-compose.yml    # Self-hosted quickstart
+└── .github/
+    └── workflows/
+        └── ci.yml        # Build, test, push images
 ```
 
-### Phase 2: Automated Deploy (MVP → Production)
+## Fly.io Configuration
 
+### fly.toml
+```toml
+app = "vai-server"
+primary_region = "iad"
+
+[build]
+  dockerfile = "infra/Dockerfile.server"
+
+[env]
+  VAI_PORT = "7865"
+  VAI_LOG_LEVEL = "info"
+
+[http_service]
+  internal_port = 7865
+  force_https = true
+  auto_stop_machines = false
+  min_machines_running = 1
+
+[checks]
+  [checks.health]
+    type = "http"
+    port = 7865
+    path = "/health"
+    interval = "10s"
+    timeout = "5s"
 ```
-Developer pushes to main
-  → GitHub Actions:
-    1. cargo test + clippy
-    2. Build multi-arch Docker image (amd64 + arm64)
-    3. Push to ghcr.io
-    4. Deploy to Fly.io staging
-    5. Run E2E smoke tests against staging
-    6. If pass → deploy to production (blue/green)
-    7. Health check → rollback if unhealthy
+
+### Secrets (set via fly secrets set)
 ```
-
-### Phase 3: vai Deploys vai (Future)
-
-```
-Agent submits workspace to vai repo
-  → vai creates new version
-  → Webhook triggers GitHub Actions
-  → CI builds + tests
-  → Deploy to staging
-  → Automated E2E verification
-  → Promote to production
-```
-
-## Configuration
-
-### Environment Variables
-
-```bash
-# Required
-DATABASE_URL=postgres://user:pass@host:5432/vai
-VAI_S3_ENDPOINT=https://xxx.r2.cloudflarestorage.com
+DATABASE_URL=postgres://...
+VAI_S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
 VAI_S3_BUCKET=vai-prod
-VAI_S3_ACCESS_KEY=xxx
-VAI_S3_SECRET_KEY=xxx
-VAI_ADMIN_KEY=xxx
-
-# Optional
-VAI_PORT=7865
+VAI_S3_ACCESS_KEY=...
+VAI_S3_SECRET_KEY=...
+VAI_ADMIN_KEY=<generate-strong-key>
 VAI_CORS_ORIGINS=https://dashboard.vai.dev
-VAI_LOG_LEVEL=info
-VAI_MAX_UPLOAD_SIZE=104857600  # 100MB
-VAI_PG_POOL_SIZE=25
 ```
 
-### Docker Compose (Self-Hosted)
+## Terraform (Cloudflare)
+
+```hcl
+# main.tf
+terraform {
+  required_providers {
+    cloudflare = {
+      source  = "cloudflare/cloudflare"
+      version = "~> 4.0"
+    }
+  }
+}
+
+provider "cloudflare" {
+  api_token = var.cloudflare_api_token
+}
+
+resource "cloudflare_r2_bucket" "vai" {
+  account_id = var.cloudflare_account_id
+  name       = var.r2_bucket_name
+  location   = "ENAM"
+}
+```
+
+## Docker Images
+
+### vai-server (Dockerfile.server)
+```dockerfile
+FROM rust:1.82-slim AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release --features full
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/vai /usr/local/bin/vai
+EXPOSE 7865
+ENTRYPOINT ["vai"]
+CMD ["server", "--multi-repo"]
+```
+
+### vai-dashboard (Dockerfile.dashboard)
+```dockerfile
+FROM node:22-alpine AS builder
+WORKDIR /app
+COPY package.json pnpm-lock.yaml ./
+RUN corepack enable && pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm run build
+
+FROM node:22-alpine
+WORKDIR /app
+COPY --from=builder /app/.output ./
+EXPOSE 3000
+CMD ["node", "server/index.mjs"]
+```
+
+## Docker Compose (Self-Hosted)
 
 ```yaml
 version: "3.8"
@@ -172,7 +165,7 @@ services:
       VAI_S3_BUCKET: vai
       VAI_S3_ACCESS_KEY: minioadmin
       VAI_S3_SECRET_KEY: minioadmin
-      VAI_ADMIN_KEY: ${VAI_ADMIN_KEY}
+      VAI_ADMIN_KEY: ${VAI_ADMIN_KEY:-change-me}
     depends_on: [postgres, minio]
 
   dashboard:
@@ -192,6 +185,7 @@ services:
   minio:
     image: minio/minio
     command: server /data --console-address ":9001"
+    ports: ["9001:9001"]
     volumes: ["s3data:/data"]
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -202,135 +196,85 @@ volumes:
   s3data:
 ```
 
-### Fly.io Config
+## CI/CD Pipeline
 
-```toml
-# fly.toml
-app = "vai-server"
-primary_region = "iad"
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
 
-[build]
-  dockerfile = "Dockerfile.release"
+jobs:
+  test-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+      - run: cargo clippy -- -D warnings
+      - run: cargo audit --deny warnings
 
-[http_service]
-  internal_port = 7865
-  force_https = true
-  auto_stop_machines = false
-  min_machines_running = 1
+  test-full:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: vai_test
+          POSTGRES_USER: vai
+          POSTGRES_PASSWORD: vai
+        ports: [5432:5432]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --features full
+        env:
+          VAI_TEST_DATABASE_URL: postgres://vai:vai@localhost:5432/vai_test
 
-[checks]
-  [checks.health]
-    type = "http"
-    port = 7865
-    path = "/health"
-    interval = "10s"
-    timeout = "5s"
+  build-image:
+    needs: [test-cli, test-full]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          file: infra/Dockerfile.server
+          push: true
+          tags: ghcr.io/jjordy/vai:latest,ghcr.io/jjordy/vai:${{ github.sha }}
 ```
 
-## Docker Images
+## Deployment Flow
 
-### vai-server
+### First-time setup (manual):
+1. `fly auth login`
+2. `fly launch --name vai-server --region iad`
+3. `fly postgres create --name vai-db`
+4. `fly postgres attach vai-db`
+5. Create R2 bucket via Terraform: `cd infra/terraform && terraform apply`
+6. Set secrets: `fly secrets set VAI_S3_ENDPOINT=... VAI_S3_BUCKET=... VAI_S3_ACCESS_KEY=... VAI_S3_SECRET_KEY=... VAI_ADMIN_KEY=...`
+7. Deploy: `fly deploy`
+8. Migrate: `vai remote add https://vai-server.fly.dev --key <admin-key> && vai remote migrate`
 
-```dockerfile
-# Dockerfile.release
-FROM rust:1.82-slim AS builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release --features full
-
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/vai /usr/local/bin/vai
-EXPOSE 7865
-CMD ["vai", "server", "--multi-repo", "--pg-url", "$DATABASE_URL"]
-```
-
-### vai-dashboard
-
-```dockerfile
-FROM node:22-alpine AS builder
-WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
-RUN corepack enable && pnpm install --frozen-lockfile
-COPY . .
-RUN pnpm run build
-
-FROM node:22-alpine
-WORKDIR /app
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json .
-EXPOSE 3000
-CMD ["node", "dist/server/index.mjs"]
-```
-
-## Database Migrations
-
-Migrations run automatically on server startup via `sqlx::migrate!()`. For production:
-
-1. Migrations are forward-only (no down migrations)
-2. Each migration is idempotent (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`)
-3. Breaking schema changes get a deprecation period: add new column → migrate data → remove old column (across 2 releases)
-4. Backup database before deploying migrations in production
-
-## Monitoring and Alerting
-
-### Health Checks
-- `GET /health` — returns 200 if server, Postgres, and S3 are reachable
-- Fly.io auto-restarts unhealthy instances
-
-### Metrics (Future — PRD XX-performance)
-- Request latency, error rates per endpoint
-- Postgres connection pool utilization
-- S3 operation latency
-- WebSocket connected clients
-- Active workspace count
-
-### Alerting Triggers
-- Health check fails for > 30s
-- Error rate > 5% for 5 minutes
-- Postgres connection pool exhausted
-- S3 unreachable
-
-## Rollback Strategy
-
-1. **Compute:** Fly.io keeps previous release. `fly releases rollback` instantly reverts.
-2. **Database:** Forward-only migrations. If a migration breaks, fix forward with a new migration.
-3. **S3:** Content-addressable — old content is never overwritten. Rollback is just updating path mappings.
+### Subsequent deploys:
+1. Push to main
+2. CI builds and pushes image
+3. `fly deploy` (manual) or add auto-deploy step to CI
 
 ## Issue Breakdown
 
-1. **Create release Dockerfile for vai-server** — Multi-stage build, feature flags, health check, minimal image size. Priority: high.
-2. **Create release Dockerfile for vai-dashboard** — Multi-stage build, static asset serving. Priority: high.
-3. **Set up GitHub Actions CI pipeline** — cargo test, clippy, build Docker images, push to ghcr.io on tag. Priority: high.
-4. **Deploy vai-server to Fly.io** — fly.toml config, secrets management, Fly Postgres setup. Priority: high.
-5. **Configure Cloudflare R2 for production storage** — Create bucket, configure CORS, set up access keys. Priority: high.
-6. **Deploy vai-dashboard to Cloudflare Pages** — Build config, environment variables, custom domain. Priority: high.
-7. **Create Docker Compose for self-hosted** — vai-server + dashboard + Postgres + MinIO. Document quickstart. Priority: medium.
-8. **Add health check endpoint with subsystem status** — Check Postgres connectivity, S3 connectivity, return detailed status. Priority: medium.
-9. **Create Terraform modules for AWS deployment** — ECS + RDS + S3 modules for enterprise customers. Priority: low.
-10. **Set up Helm chart for Kubernetes deployment** — For enterprise customers running k8s. Priority: low.
-
-## Migration Path (Local Dev → Hosted)
-
-1. Build and tag release: `git tag v0.1.0 && git push --tags`
-2. GitHub Actions builds images automatically
-3. Set up Fly.io app and Postgres: `fly launch && fly postgres create`
-4. Set up R2 bucket: via Cloudflare dashboard
-5. Configure secrets: `fly secrets set DATABASE_URL=... VAI_S3_ENDPOINT=...`
-6. Deploy: `fly deploy`
-7. Run migration from local repo: `vai remote add https://vai.fly.dev --key <admin-key> && vai remote migrate`
-8. Deploy dashboard to Cloudflare Pages
-9. Point DNS: `vai.dev` → Fly.io, `dashboard.vai.dev` → Cloudflare Pages
-
-## Future: vai Deploys vai
-
-Once vai is self-hosting:
-1. vai server monitors its own GitHub repo via watcher
-2. On new tag → creates issue "Deploy v0.2.0"
-3. Agent claims issue, runs deployment script
-4. Deployment script: pull image, blue/green swap, health check
-5. Agent closes issue with deployment summary
-6. If health check fails → agent creates rollback issue
-
-This is the ultimate dogfood — vai managing its own infrastructure lifecycle.
+1. Create release Dockerfile for vai-server (multi-stage, --features full)
+2. Create release Dockerfile for vai-dashboard (multi-stage, static output)
+3. Set up GitHub Actions CI pipeline (test CLI, test full with Postgres, build images)
+4. Create Docker Compose for self-hosted (vai + dashboard + Postgres + MinIO)
+5. Add health check endpoint with subsystem status (Postgres + S3 connectivity)
+6. Create Terraform config for Cloudflare R2 bucket
+7. Create fly.toml and Fly.io deployment config
+8. Create deployment documentation (first-time setup + subsequent deploys)

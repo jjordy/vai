@@ -98,7 +98,7 @@ impl JwtService {
             current_secret,
             previous_secret,
             overlap_secs,
-            access_token_ttl: 900,
+            access_token_ttl: 86400, // 24 hours
             leeway_secs: 30,
         }
     }
