@@ -1375,6 +1375,109 @@ pub fn prompt(dir: &Path, template_override: Option<&str>) -> Result<PromptResul
     Ok(template)
 }
 
+// ── verify ────────────────────────────────────────────────────────────────────
+
+/// Result of a single quality check command.
+#[derive(Debug, Serialize)]
+pub struct CheckResult {
+    /// The command string that was executed.
+    pub command: String,
+    /// Combined stdout output of the command.
+    pub stdout: String,
+    /// Combined stderr output of the command.
+    pub stderr: String,
+    /// Exit code returned by the command.
+    pub exit_code: i32,
+    /// Whether this check passed (exit code 0).
+    pub passed: bool,
+}
+
+/// Result of a [`verify`] call.
+#[derive(Debug, Serialize)]
+pub struct VerifyResult {
+    /// Individual results for each configured check.
+    pub checks: Vec<CheckResult>,
+    /// `true` when all checks passed (or no checks were configured).
+    pub all_passed: bool,
+    /// `true` when no checks were configured in `agent.toml`.
+    pub no_checks_configured: bool,
+}
+
+/// Run quality checks configured under `[checks]` in `.vai/agent.toml`.
+///
+/// Each command in `checks.commands` is executed sequentially with `work_dir`
+/// as its working directory.  If a command exits non-zero, execution continues
+/// so that all failures are collected and reported.
+///
+/// Returns [`VerifyResult`] with results for every check.  The caller should
+/// inspect `all_passed` and exit with a non-zero code on failure.
+///
+/// If no checks are configured the function returns successfully with
+/// `no_checks_configured = true`.
+pub fn verify(dir: &Path, work_dir: &Path) -> Result<VerifyResult, AgentError> {
+    let config = load_config(dir)?;
+    let commands = config
+        .checks
+        .map(|c| c.commands)
+        .unwrap_or_default();
+
+    if commands.is_empty() {
+        return Ok(VerifyResult {
+            checks: Vec::new(),
+            all_passed: true,
+            no_checks_configured: true,
+        });
+    }
+
+    let mut results = Vec::with_capacity(commands.len());
+
+    for cmd in &commands {
+        // Split command string for the shell.
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(work_dir)
+            .output()
+            .map_err(|e| AgentError::Other(format!("failed to run check `{cmd}`: {e}")))?;
+
+        let exit_code = output.status.code().unwrap_or(-1);
+        let passed = output.status.success();
+        results.push(CheckResult {
+            command: cmd.clone(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code,
+            passed,
+        });
+    }
+
+    let all_passed = results.iter().all(|r| r.passed);
+    Ok(VerifyResult { checks: results, all_passed, no_checks_configured: false })
+}
+
+/// Print a structured error summary of failed checks to stderr.
+///
+/// The format is designed for consumption by AI agents:
+/// ```text
+/// === <command> ===
+/// <stdout + stderr>
+/// ```
+pub fn print_verify_errors(result: &VerifyResult) {
+    for check in &result.checks {
+        if !check.passed {
+            eprintln!("=== {} ===", check.command);
+            if !check.stdout.is_empty() {
+                eprint!("{}", check.stdout);
+            }
+            if !check.stderr.is_empty() {
+                eprint!("{}", check.stderr);
+            }
+            eprintln!("  exit code: {}", check.exit_code);
+            eprintln!();
+        }
+    }
+}
+
 /// Print a human-readable summary of a [`SubmitResult`].
 pub fn print_submit_result(result: &SubmitResult) {
     println!(
@@ -1929,5 +2032,98 @@ mod tests {
             // SAFETY: tests use ENV_LOCK to serialise env access.
             unsafe { std::env::remove_var(&self.0) };
         }
+    }
+
+    // ── verify helpers ────────────────────────────────────────────────────────
+
+    fn write_config_with_checks(dir: &Path, commands: Vec<&str>) {
+        let vai_dir = dir.join(".vai");
+        fs::create_dir_all(&vai_dir).unwrap();
+        let checks_cmds: Vec<String> = commands.into_iter().map(String::from).collect();
+        let cfg = AgentConfig {
+            server: "https://vai.example.com".to_string(),
+            repo: "myrepo".to_string(),
+            prompt_template: None,
+            checks: Some(ChecksConfig { commands: checks_cmds }),
+            ignore: None,
+        };
+        let toml = toml::to_string(&cfg).unwrap();
+        fs::write(vai_dir.join("agent.toml"), toml).unwrap();
+    }
+
+    #[test]
+    fn verify_no_checks_configured() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let vai_dir = dir.join(".vai");
+        fs::create_dir_all(&vai_dir).unwrap();
+        let cfg = AgentConfig {
+            server: "https://vai.example.com".to_string(),
+            repo: "myrepo".to_string(),
+            prompt_template: None,
+            checks: None,
+            ignore: None,
+        };
+        let toml = toml::to_string(&cfg).unwrap();
+        fs::write(vai_dir.join("agent.toml"), toml).unwrap();
+
+        let result = verify(dir, dir).unwrap();
+        assert!(result.all_passed);
+        assert!(result.no_checks_configured);
+        assert!(result.checks.is_empty());
+    }
+
+    #[test]
+    fn verify_all_checks_pass() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_config_with_checks(dir, vec!["true", "echo hello"]);
+
+        let result = verify(dir, dir).unwrap();
+        assert!(result.all_passed);
+        assert!(!result.no_checks_configured);
+        assert_eq!(result.checks.len(), 2);
+        assert!(result.checks[0].passed);
+        assert!(result.checks[1].passed);
+    }
+
+    #[test]
+    fn verify_failing_check() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_config_with_checks(dir, vec!["true", "false", "echo after"]);
+
+        let result = verify(dir, dir).unwrap();
+        assert!(!result.all_passed);
+        assert_eq!(result.checks.len(), 3);
+        assert!(result.checks[0].passed);
+        assert!(!result.checks[1].passed);
+        // Execution continues after failure — third check runs.
+        assert!(result.checks[2].passed);
+    }
+
+    #[test]
+    fn verify_captures_stdout_and_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_config_with_checks(dir, vec!["echo out_text", "echo err_text >&2; exit 1"]);
+
+        let result = verify(dir, dir).unwrap();
+        assert_eq!(result.checks[0].stdout.trim(), "out_text");
+        assert!(!result.checks[1].passed);
+        assert!(result.checks[1].stderr.contains("err_text"));
+    }
+
+    #[test]
+    fn verify_uses_work_dir_as_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // Create a sentinel file in the work dir.
+        let work_dir = TempDir::new().unwrap();
+        fs::write(work_dir.path().join("sentinel.txt"), "hi").unwrap();
+        write_config_with_checks(dir, vec!["test -f sentinel.txt"]);
+
+        let result = verify(dir, work_dir.path()).unwrap();
+        assert!(result.all_passed, "check should find sentinel.txt in work_dir");
     }
 }

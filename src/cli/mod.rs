@@ -364,6 +364,30 @@ pub enum AgentCommands {
         /// Directory containing the agent's modified working tree.
         dir: std::path::PathBuf,
     },
+
+    /// Run quality checks configured in `.vai/agent.toml`.
+    ///
+    /// Reads `checks.commands` from the agent config and runs each command
+    /// sequentially with `<dir>` as the working directory.
+    ///
+    /// Exits 0 if all checks pass (or if no checks are configured).
+    /// Exits 1 if any check fails, printing a structured error summary to
+    /// stderr formatted for consumption by AI agents:
+    ///
+    /// ```text
+    /// === <command> ===
+    /// <stdout + stderr output>
+    /// ```
+    ///
+    /// Configure checks in `.vai/agent.toml`:
+    /// ```toml
+    /// [checks]
+    /// commands = ["cargo build", "cargo test", "cargo clippy -- -D warnings"]
+    /// ```
+    Verify {
+        /// Working directory in which to run checks (the agent's work tree).
+        dir: std::path::PathBuf,
+    },
 }
 
 /// Issue management subcommands.
@@ -3127,6 +3151,26 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         println!("{}", serde_json::to_string_pretty(&result).unwrap());
                     } else {
                         agent::print_submit_result(&result);
+                    }
+                }
+                AgentCommands::Verify { dir } => {
+                    let result = agent::verify(&cwd, &dir)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                        if !result.all_passed {
+                            std::process::exit(1);
+                        }
+                    } else if result.no_checks_configured {
+                        eprintln!("warning: no checks configured in .vai/agent.toml — nothing to verify");
+                    } else if result.all_passed {
+                        use colored::Colorize;
+                        let count = result.checks.len();
+                        println!("{} All {} check{} passed", "✓".green().bold(), count, if count == 1 { "" } else { "s" });
+                    } else {
+                        let failed: Vec<_> = result.checks.iter().filter(|c| !c.passed).collect();
+                        eprintln!("{} {}/{} check{} failed", "✗".red().bold(), failed.len(), result.checks.len(), if failed.len() == 1 { "" } else { "s" });
+                        agent::print_verify_errors(&result);
+                        std::process::exit(1);
                     }
                 }
             }
