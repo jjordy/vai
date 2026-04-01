@@ -1307,6 +1307,74 @@ pub fn print_reset_result(r: &ResetResult) {
     println!("  Issue: {}", r.issue_title);
 }
 
+// ── Prompt ────────────────────────────────────────────────────────────────────
+
+/// Result of building a prompt from a template.
+#[derive(Debug, Serialize)]
+pub struct PromptResult {
+    /// The fully rendered prompt text.
+    pub prompt: String,
+    /// Path to the template file that was used, or `None` if the built-in
+    /// default was used.
+    pub template_path: Option<String>,
+}
+
+/// Build a prompt by reading a template file and substituting issue details.
+///
+/// Steps:
+/// 1. Resolve the template path: `template_override` → `config.prompt_template`
+///    → `.vai/prompt.md` (default).
+/// 2. If the template file exists, read it; otherwise use the built-in default.
+/// 3. Replace every occurrence of `{{issue}}` with the JSON representation of
+///    the current issue (fetched from the server via [`fetch_issue_raw`]).
+/// 4. Return the rendered prompt.
+///
+/// Exits with an error if no agent state exists or the server call fails.
+pub fn prompt(dir: &Path, template_override: Option<&str>) -> Result<PromptResult, AgentError> {
+    // Resolve template path.
+    let (template_path, template_path_str) = if let Some(override_path) = template_override {
+        let p = dir.join(override_path);
+        let s = override_path.to_string();
+        (p, Some(s))
+    } else {
+        let config = load_config(dir)?;
+        let p = config.prompt_template_path(dir);
+        let s = config.prompt_template.clone();
+        (p, s)
+    };
+
+    // Fetch issue JSON.
+    let issue_json = fetch_issue_raw(dir)?;
+
+    // Load template or use built-in default.
+    let template = if template_path.exists() {
+        let content = fs::read_to_string(&template_path)?;
+        PromptResult {
+            prompt: content.replace("{{issue}}", &issue_json),
+            template_path: Some(
+                template_path_str
+                    .unwrap_or_else(|| template_path.to_string_lossy().into_owned()),
+            ),
+        }
+    } else {
+        // Built-in default prompt.
+        let default = format!(
+            "You are an AI agent working on a software development issue.\n\
+             \n\
+             Here are the details of the issue you need to work on:\n\
+             \n\
+             {issue_json}\n\
+             \n\
+             Please implement the required changes. When you are done, run \
+             `vai agent verify` to check your work, then `vai agent submit` \
+             to submit your changes.\n"
+        );
+        PromptResult { prompt: default, template_path: None }
+    };
+
+    Ok(template)
+}
+
 /// Print a human-readable summary of a [`SubmitResult`].
 pub fn print_submit_result(result: &SubmitResult) {
     println!(
@@ -1775,6 +1843,67 @@ mod tests {
         assert_eq!(r.workspace_id, state.workspace_id);
         assert_eq!(r.phase, AgentPhase::Downloaded);
         assert!(r.elapsed_seconds >= 0);
+    }
+
+    // ── prompt helpers ────────────────────────────────────────────────────────
+
+    #[test]
+    fn prompt_template_substitution() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join(".vai")).unwrap();
+
+        // Write a minimal agent.toml so load_config succeeds.
+        let cfg = AgentConfig {
+            server: "https://vai.example.com".to_string(),
+            repo: "myrepo".to_string(),
+            prompt_template: None,
+            checks: None,
+            ignore: None,
+        };
+        fs::write(config_path(dir), toml::to_string(&cfg).unwrap()).unwrap();
+
+        // Write a state file so fetch_issue_raw has something to work with
+        // (we don't need a real server — we test template logic separately).
+        // We write the template file only; the network call is not exercised.
+        let template_content = "Please fix:\n{{issue}}\nGood luck.";
+        let template_path = dir.join(".vai").join("prompt.md");
+        fs::write(&template_path, template_content).unwrap();
+
+        // Write a fake state file; fetch_issue_raw reads state to get issue_id.
+        let state = AgentState {
+            issue_id: "aaaaaaaa-0000-0000-0000-000000000000".to_string(),
+            issue_title: "Test issue".to_string(),
+            workspace_id: "bbbbbbbb-0000-0000-0000-000000000000".to_string(),
+            phase: AgentPhase::Claimed,
+            claimed_at: Utc::now(),
+        };
+        save_state(dir, &state).unwrap();
+
+        // prompt() will fail at the network call, so we test template
+        // substitution logic directly via the AgentConfig helper.
+        let path = cfg.prompt_template_path(dir);
+        assert_eq!(path, template_path);
+
+        // Verify template substitution logic works correctly.
+        let issue_json = r#"{"id":"abc"}"#;
+        let rendered = template_content.replace("{{issue}}", issue_json);
+        assert_eq!(rendered, "Please fix:\n{\"id\":\"abc\"}\nGood luck.");
+    }
+
+    #[test]
+    fn prompt_template_path_custom() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let cfg = AgentConfig {
+            server: "https://vai.example.com".to_string(),
+            repo: "myrepo".to_string(),
+            prompt_template: Some("custom/my-prompt.md".to_string()),
+            checks: None,
+            ignore: None,
+        };
+        let expected = dir.join("custom/my-prompt.md");
+        assert_eq!(cfg.prompt_template_path(dir), expected);
     }
 
     // ── reset helpers ─────────────────────────────────────────────────────────

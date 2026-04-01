@@ -329,6 +329,23 @@ pub enum AgentCommands {
     /// Exits 1 if no agent state exists or the server call fails.
     Reset,
 
+    /// Build a prompt from a template and the current issue details.
+    ///
+    /// Reads the template from `.vai/prompt.md` (default) or the path
+    /// configured as `prompt_template` in `.vai/agent.toml`.  Replaces
+    /// `{{issue}}` in the template with the JSON issue details fetched from
+    /// the server.  Prints the completed prompt to stdout.
+    ///
+    /// If no template file exists, prints a sensible built-in default prompt
+    /// containing the issue details.
+    ///
+    /// Exits 1 if no issue is currently claimed (no agent state).
+    Prompt {
+        /// Override the template file path.
+        #[arg(long)]
+        template: Option<String>,
+    },
+
     /// Upload work, submit the workspace, close the issue, and clear state.
     ///
     /// Steps performed in order:
@@ -3093,6 +3110,15 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                             std::process::exit(1);
                         }
                         Err(e) => return Err(e.into()),
+                    }
+                }
+                AgentCommands::Prompt { template } => {
+                    let result =
+                        agent::prompt(&cwd, template.as_deref())?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        print!("{}", result.prompt);
                     }
                 }
                 AgentCommands::Submit { dir } => {
