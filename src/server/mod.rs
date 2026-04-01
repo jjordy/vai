@@ -573,15 +573,26 @@ impl AppState {
 
 // ── Agent identity ────────────────────────────────────────────────────────────
 
+/// How the current request was authenticated.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuthSource {
+    /// A short-lived JWT access token validated by [`crate::auth::jwt::JwtService`].
+    Jwt,
+    /// A long-lived API key looked up in the key store.
+    ApiKey,
+    /// The bootstrap admin key from `VAI_ADMIN_KEY`.
+    AdminKey,
+}
+
 /// The authenticated agent making the current request.
 ///
 /// Injected into request extensions by [`auth_middleware`] and available to
 /// handlers via `Extension<AgentIdentity>`.
 #[derive(Debug, Clone)]
 pub struct AgentIdentity {
-    /// Key record ID.
+    /// Key record ID (or `"jwt:<sub>"` for JWT-authenticated requests).
     pub key_id: String,
-    /// Human-readable key name.
+    /// Human-readable key name (or JWT subject for JWT-authenticated requests).
     pub name: String,
     /// Whether this request was authenticated with the bootstrap admin key.
     ///
@@ -595,6 +606,8 @@ pub struct AgentIdentity {
     /// When present, the key's effective permissions are the lesser of the
     /// user's computed role and this override value.
     pub role_override: Option<String>,
+    /// How this request was authenticated.
+    pub auth_source: AuthSource,
 }
 
 // ── Per-request repository context ────────────────────────────────────────────
@@ -714,10 +727,16 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PathId {
 
 // ── Authentication middleware ─────────────────────────────────────────────────
 
-/// Axum middleware that enforces `Authorization: Bearer <key>` on every request.
+/// Axum middleware that enforces `Authorization: Bearer <token>` on every request.
 ///
-/// Valid keys result in an [`AgentIdentity`] being inserted into request
-/// extensions. Invalid or missing keys return 401 Unauthorized.
+/// Tokens are validated in this order:
+/// 1. **JWT** — if the token contains `'.'` it is validated by [`crate::auth::jwt::JwtService`]
+///    with no database hit. An invalid or expired JWT returns 401 immediately.
+/// 2. **API key** — the token is hashed and looked up in the key store.
+/// 3. **Admin key** — the token is compared against the bootstrap `VAI_ADMIN_KEY`.
+///
+/// The first successful match populates an [`AgentIdentity`] in request
+/// extensions. Returns 401 Unauthorized if all checks fail.
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     mut request: Request,
@@ -742,12 +761,8 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let (key_str, key_prefix_display) = match auth_header {
-        Some(ref h) if h.starts_with("Bearer ") => {
-            let k = h[7..].trim().to_string();
-            let pfx = if k.len() >= 12 { k[..12].to_string() } else { k.clone() };
-            (k, pfx)
-        }
+    let key_str = match auth_header {
+        Some(ref h) if h.starts_with("Bearer ") => h[7..].trim().to_string(),
         _ => {
             let ip = extract_client_ip(&request);
             tracing::warn!(
@@ -763,31 +778,63 @@ async fn auth_middleware(
         }
     };
 
-    // Bootstrap admin key check — takes priority over per-repo API keys.
-    if key_str == state.admin_key {
-        let ip = extract_client_ip(&request);
-        tracing::info!(
-            event = "auth.success",
-            actor = "admin",
-            key_prefix = "admin",
-            ip = %ip,
-            "authentication succeeded: bootstrap admin key"
-        );
-        request.extensions_mut().insert(AgentIdentity {
-            key_id: "admin".to_string(),
-            name: "admin".to_string(),
-            is_admin: true,
-            user_id: None,
-            role_override: None,
-        });
-        return next.run(request).await;
+    let key_prefix_display =
+        if key_str.len() >= 12 { key_str[..12].to_string() } else { key_str.clone() };
+    let ip = extract_client_ip(&request);
+
+    // (1) JWT check — if the token looks like a JWT (contains '.'), validate
+    // with JwtService. No database hit. Returns 401 immediately on failure;
+    // does not fall through to the API-key or admin-key checks.
+    if key_str.contains('.') {
+        use crate::auth::jwt::JwtError;
+        match state.jwt_service.verify(&key_str) {
+            Ok(claims) => {
+                tracing::info!(
+                    event = "auth.success",
+                    actor = %claims.sub,
+                    method = "jwt",
+                    ip = %ip,
+                    "authentication succeeded: JWT"
+                );
+                let user_id = uuid::Uuid::parse_str(&claims.sub).ok();
+                let is_admin = claims.role.as_deref() == Some("admin");
+                request.extensions_mut().insert(AgentIdentity {
+                    key_id: format!("jwt:{}", claims.sub),
+                    name: claims.sub,
+                    is_admin,
+                    user_id,
+                    role_override: claims.role,
+                    auth_source: AuthSource::Jwt,
+                });
+                return next.run(request).await;
+            }
+            Err(JwtError::Expired) => {
+                tracing::warn!(
+                    event = "auth.failure",
+                    method = "jwt",
+                    ip = %ip,
+                    reason = "expired_jwt",
+                    "authentication failed: expired JWT"
+                );
+                return ApiError::unauthorized("JWT token has expired").into_response();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "auth.failure",
+                    method = "jwt",
+                    ip = %ip,
+                    reason = "invalid_jwt",
+                    error = %e,
+                    "authentication failed: invalid JWT"
+                );
+                return ApiError::unauthorized("invalid JWT token").into_response();
+            }
+        }
     }
 
-    // Validate via the storage backend so that both SQLite (local) and
-    // Postgres (server) key stores are supported.
+    // (2) API key check — hash and lookup via storage backend (SQLite or Postgres).
     match state.storage.auth().validate_key(&key_str).await {
         Ok(api_key) => {
-            let ip = extract_client_ip(&request);
             tracing::info!(
                 event = "auth.success",
                 actor = %api_key.name,
@@ -801,22 +848,42 @@ async fn auth_middleware(
                 is_admin: false,
                 user_id: api_key.user_id,
                 role_override: api_key.role_override,
+                auth_source: AuthSource::ApiKey,
             });
-            next.run(request).await
+            return next.run(request).await;
         }
-        Err(crate::storage::StorageError::NotFound(_)) => {
-            let ip = extract_client_ip(&request);
-            tracing::warn!(
-                event = "auth.failure",
-                key_prefix = %key_prefix_display,
-                ip = %ip,
-                reason = "invalid_or_revoked_key",
-                "authentication failed: invalid or revoked API key"
-            );
-            ApiError::unauthorized("invalid or revoked API key").into_response()
-        }
-        Err(e) => ApiError::internal(format!("auth error: {e}")).into_response(),
+        Err(crate::storage::StorageError::NotFound(_)) => {} // fall through to admin key check
+        Err(e) => return ApiError::internal(format!("auth error: {e}")).into_response(),
     }
+
+    // (3) Bootstrap admin key check.
+    if key_str == state.admin_key {
+        tracing::info!(
+            event = "auth.success",
+            actor = "admin",
+            key_prefix = "admin",
+            ip = %ip,
+            "authentication succeeded: bootstrap admin key"
+        );
+        request.extensions_mut().insert(AgentIdentity {
+            key_id: "admin".to_string(),
+            name: "admin".to_string(),
+            is_admin: true,
+            user_id: None,
+            role_override: None,
+            auth_source: AuthSource::AdminKey,
+        });
+        return next.run(request).await;
+    }
+
+    tracing::warn!(
+        event = "auth.failure",
+        key_prefix = %key_prefix_display,
+        ip = %ip,
+        reason = "invalid_or_revoked_key",
+        "authentication failed: invalid or revoked API key"
+    );
+    ApiError::unauthorized("invalid or revoked API key").into_response()
 }
 
 // ── Rate-limit middleware ──────────────────────────────────────────────────────
@@ -8476,7 +8543,7 @@ pub struct MeResponse {
     pub role: String,
     /// Authentication method used for this request.
     ///
-    /// Always `"api_key"` — session auth is not yet implemented.
+    /// One of `"api_key"` (API key or admin key) or `"jwt"` (JWT access token).
     pub auth_type: String,
 }
 
@@ -8724,23 +8791,30 @@ async fn get_user_handler(
 ///
 /// Reads the [`AgentIdentity`] injected by the auth middleware and resolves:
 /// - Bootstrap admin key → role `"admin"`, no email.
-/// - Scoped key with user → look up email and resolve repo role via [`OrgStore`].
+/// - JWT or scoped key with user → look up email and resolve repo role via [`OrgStore`].
 /// - Legacy/local key without user → role `"owner"` (local mode grants full access).
 async fn get_me_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
 ) -> Result<Json<MeResponse>, ApiError> {
+    let auth_type = match identity.auth_source {
+        AuthSource::Jwt => "jwt",
+        AuthSource::ApiKey => "api_key",
+        AuthSource::AdminKey => "api_key",
+    }
+    .to_string();
+
     // Bootstrap admin key always has full access.
     if identity.is_admin {
         return Ok(Json(MeResponse {
             user_id: "admin".to_string(),
             email: None,
             role: "admin".to_string(),
-            auth_type: "api_key".to_string(),
+            auth_type,
         }));
     }
 
-    // Scoped key associated with a user: resolve effective repo role via OrgStore.
+    // Scoped key or JWT associated with a user: resolve effective repo role via OrgStore.
     if let Some(uid) = &identity.user_id {
         let user = ctx
             .storage
@@ -8773,7 +8847,7 @@ async fn get_me_handler(
             user_id: uid.to_string(),
             email: Some(user.email),
             role: effective.as_str().to_string(),
-            auth_type: "api_key".to_string(),
+            auth_type,
         }));
     }
 
@@ -8783,7 +8857,7 @@ async fn get_me_handler(
         user_id: identity.key_id.clone(),
         email: None,
         role: "owner".to_string(),
-        auth_type: "api_key".to_string(),
+        auth_type,
     }))
 }
 
@@ -14619,6 +14693,179 @@ mod tests {
             "session_exchange in SQLite mode should return 5xx, got {}",
             resp.status()
         );
+        shutdown_tx.send(()).ok();
+    }
+
+    // ── JWT auth middleware tests ──────────────────────────────────────────────
+
+    /// A valid JWT signed with the server's secret is accepted.
+    #[tokio::test]
+    async fn jwt_bearer_token_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, state, _key) = start_test_server(root).await;
+
+        // Mint a token using the same JwtService the server holds.
+        let token = state
+            .jwt_service
+            .sign("user-jwt-test".to_string(), None, Some("write".to_string()))
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/api/status"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+
+        // /api/status is public (unauthenticated), but a valid JWT should not
+        // cause a 401. We just verify the request is not rejected by auth middleware.
+        assert_ne!(resp.status(), 401, "valid JWT should not be rejected");
+        shutdown_tx.send(()).ok();
+    }
+
+    /// A JWT signed with a wrong secret is rejected with 401.
+    #[tokio::test]
+    async fn jwt_wrong_secret_returns_401() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        // Mint a token with a *different* secret than the server uses.
+        let wrong_svc = crate::auth::jwt::JwtService::new(
+            "wrong-secret".to_string(),
+            None,
+            3600,
+        );
+        let token = wrong_svc.sign("attacker".to_string(), None, None).unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 401, "JWT with wrong secret should be rejected");
+        shutdown_tx.send(()).ok();
+    }
+
+    /// An expired JWT is rejected with 401 and a descriptive message.
+    ///
+    /// To avoid a slow wall-clock sleep, we craft a JWT whose `exp` is set to
+    /// a Unix timestamp in the distant past (year 1970), which is always more
+    /// than the server's 30-second leeway.
+    #[tokio::test]
+    async fn jwt_expired_token_returns_401() {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        // Build a JWT with exp = 1000 (year 1970 — definitely expired).
+        let claims = serde_json::json!({
+            "sub": "u",
+            "iat": 900u64,
+            "exp": 1000u64,
+        });
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"test-jwt-secret"),
+        )
+        .unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 401, "expired JWT should be rejected with 401");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("expired"),
+            "response should mention expiry: {body}"
+        );
+        shutdown_tx.send(()).ok();
+    }
+
+    /// A valid API key still works (JWT path does not break existing API key auth).
+    #[tokio::test]
+    async fn api_key_still_accepted_after_jwt_middleware_change() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+
+        // Use the admin key (no dots — goes through API key + admin key path).
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/api/workspaces"))
+            .bearer_auth("vai_admin_test")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200, "admin key should still be accepted");
+        shutdown_tx.send(()).ok();
+    }
+
+    /// A JWT with `role = "admin"` sets `is_admin = true`, verified by accessing
+    /// `GET /api/keys` which returns all keys for admins and 403 for non-admins
+    /// without a user_id.
+    #[tokio::test]
+    async fn jwt_admin_role_grants_admin_access() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (addr, shutdown_tx, state, _key) = start_test_server(root).await;
+
+        // Admin JWT — is_admin should be true.
+        let admin_token = state
+            .jwt_service
+            .sign("svc-account".to_string(), None, Some("admin".to_string()))
+            .unwrap();
+
+        // Non-admin JWT without a user_id UUID as sub — is_admin false, no user_id.
+        let non_admin_token = state
+            .jwt_service
+            .sign("not-a-uuid-sub".to_string(), None, Some("write".to_string()))
+            .unwrap();
+
+        let client = reqwest::Client::new();
+
+        // Admin JWT: list_keys_handler returns all keys (200).
+        let resp = client
+            .get(format!("http://{addr}/api/keys"))
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "JWT with admin role should list all keys, got {}",
+            resp.status()
+        );
+
+        // Non-admin JWT without user association: list_keys_handler returns 403.
+        let resp = client
+            .get(format!("http://{addr}/api/keys"))
+            .bearer_auth(&non_admin_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            403,
+            "JWT without user association should be rejected with 403, got {}",
+            resp.status()
+        );
+
         shutdown_tx.send(()).ok();
     }
 }
