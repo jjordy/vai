@@ -20,8 +20,10 @@ server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:utoipa", "dep:utoipa-s
 postgres = ["server", "dep:sqlx"]
 s3 = ["server", "dep:aws-sdk-s3", "dep:aws-config"]
 full = ["cli", "server", "postgres", "s3"]
+vendored-openssl = ["dep:openssl"]
 
 [dependencies]
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

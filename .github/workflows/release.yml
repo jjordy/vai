@@ -55,7 +55,7 @@ jobs:
             ${{ runner.os }}-${{ matrix.target }}-cargo-release-
 
       - name: Build CLI-only release binary
-        run: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'cross' || 'cargo' }} build --release --target ${{ matrix.target }}
+        run: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'cross' || 'cargo' }} build --release --target ${{ matrix.target }} ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '--features vendored-openssl' || '' }}
 
       - name: Package binary
         shell: bash
