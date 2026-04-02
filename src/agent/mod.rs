@@ -658,7 +658,7 @@ pub fn fetch_issue(dir: &Path) -> Result<IssueDetail, AgentError> {
         .map_err(|e| AgentError::Other(format!("cannot create tokio runtime: {e}")))?;
 
     rt.block_on(async {
-        let path = format!("api/issues/{}", state.issue_id);
+        let path = format!("api/repos/{}/issues/{}", config.repo, state.issue_id);
         agent_get::<IssueDetail>(&config.server, &path, api_key.as_deref()).await
     })
 }
@@ -678,8 +678,9 @@ pub fn fetch_issue_raw(dir: &Path) -> Result<String, AgentError> {
 
     rt.block_on(async {
         let url = format!(
-            "{}/api/issues/{}",
+            "{}/api/repos/{}/issues/{}",
             config.server.trim_end_matches('/'),
+            config.repo,
             state.issue_id
         );
         let client = reqwest::Client::new();
@@ -1019,8 +1020,9 @@ pub fn submit(dir: &Path, work_dir: &Path) -> Result<SubmitResult, AgentError> {
     let (added, modified, deleted, version_id) = rt.block_on(async {
         // Step 1: Upload snapshot.
         let upload_url = format!(
-            "{}/api/workspaces/{}/upload-snapshot",
+            "{}/api/repos/{}/workspaces/{}/upload-snapshot",
             config.server.trim_end_matches('/'),
+            config.repo,
             state.workspace_id
         );
         let client = reqwest::Client::new();
@@ -1051,14 +1053,14 @@ pub fn submit(dir: &Path, work_dir: &Path) -> Result<SubmitResult, AgentError> {
         let deleted = upload["deleted"].as_u64().unwrap_or(0) as usize;
 
         // Step 2: Submit workspace.
-        let submit_path = format!("api/workspaces/{}/submit", state.workspace_id);
+        let submit_path = format!("api/repos/{}/workspaces/{}/submit", config.repo, state.workspace_id);
         let submit_val: serde_json::Value =
             agent_post(&config.server, &submit_path, api_key_ref, &serde_json::json!({}))
                 .await?;
         let version_id = submit_val["version"].as_str().map(|s| s.to_string());
 
         // Step 3: Close issue.
-        let close_path = format!("api/issues/{}/close", state.issue_id);
+        let close_path = format!("api/repos/{}/issues/{}/close", config.repo, state.issue_id);
         let _: serde_json::Value = agent_post(
             &config.server,
             &close_path,
@@ -1265,8 +1267,9 @@ pub fn reset(dir: &Path) -> Result<ResetResult, AgentError> {
 
     rt.block_on(async {
         let url = format!(
-            "{}/api/workspaces/{}",
+            "{}/api/repos/{}/workspaces/{}",
             config.server.trim_end_matches('/'),
+            config.repo,
             state.workspace_id
         );
         let client = reqwest::Client::new();
