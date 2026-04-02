@@ -272,7 +272,7 @@ async fn test_issue_store_crud() {
 
     // list — open issues should now be empty
     let open = storage
-        .list_issues(&repo_id, &IssueFilter::default())
+        .list_issues(&repo_id, &IssueFilter { status: Some(IssueStatus::Open), ..Default::default() })
         .await
         .expect("list_issues after close failed");
     assert!(open.is_empty());
@@ -1074,9 +1074,9 @@ async fn test_issue_parity_with_sqlite() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let vai_dir: PathBuf = tmp.path().join(".vai");
-    std::fs::create_dir_all(&vai_dir).unwrap();
 
     // Initialise SQLite stores used by SqliteStorage.
+    // repo::init creates the .vai directory — do not create it manually beforehand.
     vai::repo::init(tmp.path()).expect("repo init");
 
     let sq = SqliteStorage::new(&vai_dir);

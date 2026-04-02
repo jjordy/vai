@@ -1475,7 +1475,7 @@ impl AuthStore for PostgresStorage {
         let id = Uuid::new_v4().to_string();
         let token = random_token(64);
         let key_hash = hash_token(&token);
-        let key_prefix = token[..12].to_string();
+        let key_prefix = token[..8].to_string();
 
         sqlx::query(
             r#"
