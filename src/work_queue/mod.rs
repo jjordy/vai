@@ -23,8 +23,6 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-#[cfg(feature = "server")]
-use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::conflict::ConflictEngine;

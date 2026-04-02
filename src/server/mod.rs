@@ -949,7 +949,7 @@ fn classify_rate_limit(method: &axum::http::Method, path: &str) -> RateLimitCate
     // the single-repo and multi-repo URL shapes.
     let normalised = if let Some(rest) = path.strip_prefix("/api/repos/") {
         // Skip the repo name segment.
-        rest.splitn(2, '/').nth(1).map(|s| format!("/{s}")).unwrap_or_default()
+        rest.split_once('/').map(|x| format!("/{}", x.1)).unwrap_or_default()
     } else {
         path.to_string()
     };
@@ -7528,7 +7528,7 @@ async fn get_work_queue_handler(
             })
             .map(|l| l.source_id)
             .filter(|blocker_id| {
-                issue_status_map.get(blocker_id).map_or(false, |s| {
+                issue_status_map.get(blocker_id).is_some_and(|s| {
                     *s != crate::issue::IssueStatus::Closed
                         && *s != crate::issue::IssueStatus::Resolved
                 })
@@ -8031,7 +8031,7 @@ async fn submit_discovery_handler(
             body.event.event_type(),
             serde_json::to_string_pretty(&body.event).unwrap_or_default(),
         );
-        let agent_source_val = serde_json::to_value(&serde_json::json!({
+        let agent_source_val = serde_json::to_value(serde_json::json!({
             "source_type": body.event.event_type(),
             "details": &body.event,
         }))
@@ -10040,7 +10040,7 @@ async fn migrate_handler(
                DO NOTHING"#,
         )
         .bind(repo_id)
-        .bind(&event_type)
+        .bind(event_type)
         .bind(workspace_id)
         .bind(&payload_val)
         .bind(event.timestamp)

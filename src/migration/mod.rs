@@ -19,8 +19,6 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-#[cfg(feature = "server")]
-use utoipa::ToSchema;
 
 use crate::escalation::{Escalation, EscalationStore};
 use crate::event_log::{Event, EventLog};

@@ -20,8 +20,6 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-#[cfg(feature = "server")]
-use utoipa::ToSchema;
 
 use crate::event_log::{EventKind, EventLog, EventLogError};
 

@@ -199,7 +199,7 @@ impl EventStore for PostgresStorage {
             "#,
         )
         .bind(repo_id)
-        .bind(&event_type)
+        .bind(event_type)
         .bind(workspace_id)
         .bind(&payload)
         .fetch_one(&mut *tx)
@@ -699,7 +699,7 @@ impl IssueLinkStore for PostgresStorage {
         )
         .bind(repo_id)
         .bind(source_id)
-        .bind(&link.target_id)
+        .bind(link.target_id)
         .bind(link.relationship.as_str())
         .execute(&self.pool)
         .await
