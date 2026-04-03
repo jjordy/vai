@@ -280,6 +280,8 @@ impl IssueStore for SqliteStorage {
             }.to_string(),
             "status" => issue.status.as_str().to_string(),
             "title" => issue.title.clone(),
+            "creator" => issue.creator.clone(),
+            "id" => issue.id.to_string(),
             _ => String::new(),
         }))
     }
@@ -561,6 +563,8 @@ impl EscalationStore for SqliteStorage {
         Ok(paginate_in_memory(items, query, |esc, col| match col {
             "created_at" => esc.created_at.to_rfc3339(),
             "status" => esc.status.as_str().to_string(),
+            "id" => esc.id.to_string(),
+            "severity" => esc.severity.as_str().to_string(),
             _ => String::new(),
         }))
     }
@@ -706,6 +710,7 @@ impl VersionStore for SqliteStorage {
         Ok(paginate_in_memory(items, query, |v, col| match col {
             "created_at" => v.created_at.to_rfc3339(),
             "version_id" => v.version_id.clone(),
+            "created_by" => v.created_by.clone(),
             _ => String::new(),
         }))
     }
@@ -789,6 +794,7 @@ impl WorkspaceStore for SqliteStorage {
             "updated_at" => ws.updated_at.to_rfc3339(),
             "status" => ws.status.as_str().to_string(),
             "intent" => ws.intent.clone(),
+            "id" => ws.id.to_string(),
             _ => String::new(),
         }))
     }

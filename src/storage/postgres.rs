@@ -500,6 +500,8 @@ impl IssueStore for PostgresStorage {
             ("priority", "priority"),
             ("status", "status"),
             ("title", "title"),
+            ("creator", "creator"),
+            ("id", "id"),
         ]
         .into_iter()
         .collect();
@@ -907,6 +909,8 @@ impl EscalationStore for PostgresStorage {
         let col_map: HashMap<&str, &str> = [
             ("created_at", "created_at"),
             ("status", "resolved"),
+            ("id", "id"),
+            ("severity", "severity"),
         ]
         .into_iter()
         .collect();
@@ -1090,6 +1094,7 @@ impl VersionStore for PostgresStorage {
         let col_map: HashMap<&str, &str> = [
             ("created_at", "created_at"),
             ("version_id", "version_id"),
+            ("created_by", "created_by"),
         ]
         .into_iter()
         .collect();
@@ -1267,6 +1272,7 @@ impl WorkspaceStore for PostgresStorage {
             ("updated_at", "updated_at"),
             ("status", "status"),
             ("intent", "intent"),
+            ("id", "id"),
         ]
         .into_iter()
         .collect();

@@ -2079,7 +2079,7 @@ async fn list_workspaces_handler(
     AxumQuery(pagination): AxumQuery<PaginationParams>,
 ) -> Result<Json<PaginatedResponse<WorkspaceResponse>>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    const ALLOWED_SORT: &[&str] = &["created_at", "updated_at", "status", "intent"];
+    const ALLOWED_SORT: &[&str] = &["created_at", "updated_at", "status", "intent", "id"];
     let query = ListQuery::from_params(
         pagination.page,
         pagination.per_page,
@@ -2609,7 +2609,7 @@ async fn list_versions_handler(
     AxumQuery(pagination): AxumQuery<PaginationParams>,
 ) -> Result<Json<PaginatedResponse<version::VersionMeta>>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    const ALLOWED_SORT: &[&str] = &["created_at", "version_id"];
+    const ALLOWED_SORT: &[&str] = &["created_at", "version_id", "created_by"];
     let query = ListQuery::from_params(
         pagination.page,
         pagination.per_page,
@@ -6219,7 +6219,7 @@ async fn list_issues_handler(
         creator: query.created_by,
     };
 
-    const ALLOWED_SORT: &[&str] = &["created_at", "updated_at", "priority", "status", "title"];
+    const ALLOWED_SORT: &[&str] = &["created_at", "updated_at", "priority", "status", "title", "creator", "id"];
     let list_query = ListQuery::from_params(
         query.page,
         query.per_page,
@@ -7392,7 +7392,7 @@ async fn list_escalations_handler(
         })
         .transpose()?;
 
-    const ALLOWED_SORT: &[&str] = &["created_at", "status"];
+    const ALLOWED_SORT: &[&str] = &["created_at", "status", "id", "severity"];
     let list_query = ListQuery::from_params(
         params.page,
         params.per_page,
