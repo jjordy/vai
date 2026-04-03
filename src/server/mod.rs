@@ -1091,40 +1091,42 @@ async fn repo_resolve_middleware(
         None => return ApiError::bad_request("missing `:repo` path segment").into_response(),
     };
 
-    let storage_root = match state.storage_root.as_ref() {
-        Some(sr) => sr.clone(),
-        None => {
-            return ApiError::bad_request(
-                "server is not in multi-repo mode; set storage_root in ~/.vai/server.toml",
-            )
-            .into_response()
-        }
-    };
+    let (vai_dir, repo_root) = if let Some(storage_root) = state.storage_root.as_ref() {
+        // Multi-repo mode: look up the repo in the registry.
+        let registry = match RepoRegistry::load(storage_root) {
+            Ok(r) => r,
+            Err(e) => {
+                return ApiError::internal(format!("failed to load repo registry: {e}"))
+                    .into_response()
+            }
+        };
 
-    let registry = match RepoRegistry::load(&storage_root) {
-        Ok(r) => r,
-        Err(e) => {
-            return ApiError::internal(format!("failed to load repo registry: {e}"))
+        let entry = match registry.repos.iter().find(|r| r.name == repo_name) {
+            Some(e) => e.clone(),
+            None => {
+                return ApiError::not_found(format!(
+                    "repository `{repo_name}` is not registered on this server"
+                ))
                 .into_response()
-        }
-    };
-
-    let entry = match registry.repos.iter().find(|r| r.name == repo_name) {
-        Some(e) => e.clone(),
-        None => {
+            }
+        };
+        (entry.path.join(".vai"), entry.path.clone())
+    } else {
+        // Single-repo mode: only the server's own repository is available.
+        if repo_name != state.repo_name {
             return ApiError::not_found(format!(
                 "repository `{repo_name}` is not registered on this server"
             ))
-            .into_response()
+            .into_response();
         }
+        (state.vai_dir.clone(), state.repo_root.clone())
     };
 
-    let vai_dir = entry.path.join(".vai");
     let repo_id = repo_id_from_vai_dir(&vai_dir);
     let storage = repo_storage(&state.storage, &vai_dir);
     let ctx = RepoCtx {
         vai_dir,
-        repo_root: entry.path.clone(),
+        repo_root,
         repo_id,
         storage,
     };
@@ -11714,12 +11716,13 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
-        // POST /api/workspaces — create
+        // POST /api/repos/:repo/workspaces — create
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "add hello world feature" }))
             .send()
@@ -11732,9 +11735,9 @@ mod tests {
         assert_eq!(created["status"], "Created");
         assert_eq!(created["base_version"], "v1");
 
-        // GET /api/workspaces — list
+        // GET /api/repos/:repo/workspaces — list
         let resp = client
-            .get(format!("http://{addr}/api/workspaces"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .send()
             .await
@@ -11744,9 +11747,9 @@ mod tests {
         assert_eq!(list["data"].as_array().unwrap().len(), 1);
         assert_eq!(list["data"][0]["id"], ws_id.as_str());
 
-        // GET /api/workspaces/:id — details
+        // GET /api/repos/:repo/workspaces/:id — details
         let resp = client
-            .get(format!("http://{addr}/api/workspaces/{ws_id}"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}"))
             .bearer_auth(&key)
             .send()
             .await
@@ -11756,18 +11759,18 @@ mod tests {
         assert_eq!(detail["id"], ws_id.as_str());
         assert_eq!(detail["intent"], "add hello world feature");
 
-        // GET /api/workspaces/:id — 404 for unknown ID
+        // GET /api/repos/:repo/workspaces/:id — 404 for unknown ID
         let resp = client
-            .get(format!("http://{addr}/api/workspaces/nonexistent-id"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces/nonexistent-id"))
             .bearer_auth(&key)
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
 
-        // DELETE /api/workspaces/:id — discard
+        // DELETE /api/repos/:repo/workspaces/:id — discard
         let resp = client
-            .delete(format!("http://{addr}/api/workspaces/{ws_id}"))
+            .delete(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}"))
             .bearer_auth(&key)
             .send()
             .await
@@ -11776,7 +11779,7 @@ mod tests {
 
         // After discard, workspace should not appear in list
         let resp = client
-            .get(format!("http://{addr}/api/workspaces"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .send()
             .await
@@ -11908,12 +11911,13 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Create a workspace.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "extend hello" }))
             .send()
@@ -11933,9 +11937,9 @@ mod tests {
         )
         .unwrap();
 
-        // POST /api/workspaces/:id/submit
+        // POST /api/repos/:repo/workspaces/:id/submit
         let resp = client
-            .post(format!("http://{addr}/api/workspaces/{ws_id}/submit"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/submit"))
             .bearer_auth(&key)
             .send()
             .await
@@ -11956,12 +11960,13 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // 1. Authenticated request succeeds.
         let resp = client
-            .get(format!("http://{addr}/api/workspaces"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .send()
             .await
@@ -11970,7 +11975,7 @@ mod tests {
 
         // 2. Missing Authorization header returns 401.
         let resp = client
-            .get(format!("http://{addr}/api/workspaces"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .send()
             .await
             .unwrap();
@@ -11978,7 +11983,7 @@ mod tests {
 
         // 3. Wrong key returns 401.
         let resp = client
-            .get(format!("http://{addr}/api/workspaces"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth("vai_thisisnottherightkey00000000000")
             .send()
             .await
@@ -11999,7 +12004,7 @@ mod tests {
         let (_, revocable_key) = auth::create(&vai_dir, "revoke-me").unwrap();
         auth::revoke(&vai_dir, "revoke-me").unwrap();
         let resp = client
-            .get(format!("http://{addr}/api/workspaces"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&revocable_key)
             .send()
             .await
@@ -12022,7 +12027,8 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
 
         // Connect to WebSocket, authenticating via query param.
         let ws_url = format!("ws://{addr}/ws/events?key={key}");
@@ -12046,7 +12052,7 @@ mod tests {
         // Create a workspace via REST API — this should trigger a broadcast.
         let client = reqwest::Client::new();
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "websocket test workspace" }))
             .send()
@@ -12136,7 +12142,8 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
 
         // Subscribe to WorkspaceDiscarded only.
         let ws_url = format!("ws://{addr}/ws/events?key={key}");
@@ -12155,7 +12162,7 @@ mod tests {
         // Create a workspace — WorkspaceCreated should NOT be delivered.
         let client = reqwest::Client::new();
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "filter test" }))
             .send()
@@ -12190,7 +12197,8 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // ── Phase 1: connect, receive first event, then disconnect ─────────────
@@ -12212,7 +12220,7 @@ mod tests {
 
         // Create workspace A — this event should be delivered live.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "workspace A" }))
             .send()
@@ -12246,7 +12254,7 @@ mod tests {
 
         // Create workspace B — missed by disconnected agent.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "workspace B" }))
             .send()
@@ -12259,7 +12267,7 @@ mod tests {
         // Discard workspace B — NOT a WorkspaceCreated event; should NOT appear
         // in the replay (agent subscribed to WorkspaceCreated only).
         let resp = client
-            .delete(format!("http://{addr}/api/workspaces/{ws_b_id}"))
+            .delete(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_b_id}"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12268,7 +12276,7 @@ mod tests {
 
         // Create workspace C — also missed; matches subscription.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "workspace C" }))
             .send()
@@ -12364,11 +12372,12 @@ mod tests {
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
         let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Create a workspace to register one real event.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "seed workspace" }))
             .send()
@@ -12427,6 +12436,7 @@ mod tests {
         root: &std::path::Path,
         addr: SocketAddr,
         key: &str,
+        repo: &str,
         intent: &str,
         overlay_content: &[u8],
     ) -> String {
@@ -12434,7 +12444,7 @@ mod tests {
 
         // Create workspace.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(key)
             .json(&serde_json::json!({ "intent": intent }))
             .send()
@@ -12452,7 +12462,7 @@ mod tests {
 
         // Submit.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces/{ws_id}/submit"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/submit"))
             .bearer_auth(key)
             .send()
             .await
@@ -12470,12 +12480,13 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Initially only v1 exists.
         let resp = client
-            .get(format!("http://{addr}/api/versions"))
+            .get(format!("http://{addr}/api/repos/{repo}/versions"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12490,6 +12501,7 @@ mod tests {
             root,
             addr,
             &key,
+            repo,
             "add world",
             b"pub fn hello() {}\npub fn world() {}\n",
         )
@@ -12497,7 +12509,7 @@ mod tests {
 
         // Now two versions.
         let resp = client
-            .get(format!("http://{addr}/api/versions"))
+            .get(format!("http://{addr}/api/repos/{repo}/versions"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12511,7 +12523,7 @@ mod tests {
 
         // ?per_page=1&page=2 returns only the second version (v2).
         let resp = client
-            .get(format!("http://{addr}/api/versions?per_page=1&page=2"))
+            .get(format!("http://{addr}/api/repos/{repo}/versions?per_page=1&page=2"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12534,7 +12546,8 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Create v2 with a new function.
@@ -12542,14 +12555,15 @@ mod tests {
             root,
             addr,
             &key,
+            repo,
             "add world function",
             b"pub fn hello() {}\npub fn world() -> u32 { 42 }\n",
         )
         .await;
 
-        // GET /api/versions/v2 returns version changes.
+        // GET /api/repos/:repo/versions/v2 returns version changes.
         let resp = client
-            .get(format!("http://{addr}/api/versions/v2"))
+            .get(format!("http://{addr}/api/repos/{repo}/versions/v2"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12563,9 +12577,9 @@ mod tests {
             "v2 should have file changes"
         );
 
-        // GET /api/versions/v999 → 404.
+        // GET /api/repos/:repo/versions/v999 → 404.
         let resp = client
-            .get(format!("http://{addr}/api/versions/v999"))
+            .get(format!("http://{addr}/api/repos/{repo}/versions/v999"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12583,7 +12597,8 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Create v2 by modifying src/lib.rs.
@@ -12591,14 +12606,15 @@ mod tests {
             root,
             addr,
             &key,
+            repo,
             "add world function",
             b"pub fn hello() {}\npub fn world() -> u32 { 42 }\n",
         )
         .await;
 
-        // GET /api/versions/v2/diff returns file diffs.
+        // GET /api/repos/:repo/versions/v2/diff returns file diffs.
         let resp = client
-            .get(format!("http://{addr}/api/versions/v2/diff"))
+            .get(format!("http://{addr}/api/repos/{repo}/versions/v2/diff"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12617,9 +12633,9 @@ mod tests {
             "diff should contain + or - markers"
         );
 
-        // GET /api/versions/v1/diff → initial version has no file diffs.
+        // GET /api/repos/:repo/versions/v1/diff → initial version has no file diffs.
         let resp = client
-            .get(format!("http://{addr}/api/versions/v1/diff"))
+            .get(format!("http://{addr}/api/repos/{repo}/versions/v1/diff"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12628,9 +12644,9 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["files"].as_array().unwrap().len(), 0);
 
-        // GET /api/versions/v999/diff → 404.
+        // GET /api/repos/:repo/versions/v999/diff → 404.
         let resp = client
-            .get(format!("http://{addr}/api/versions/v999/diff"))
+            .get(format!("http://{addr}/api/repos/{repo}/versions/v999/diff"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12648,7 +12664,8 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Create v2.
@@ -12656,6 +12673,7 @@ mod tests {
             root,
             addr,
             &key,
+            repo,
             "add world",
             b"pub fn hello() {}\npub fn world() {}\n",
         )
@@ -12663,7 +12681,7 @@ mod tests {
 
         // Rollback v2 — no downstream, so should succeed with force: false.
         let resp = client
-            .post(format!("http://{addr}/api/versions/rollback"))
+            .post(format!("http://{addr}/api/repos/{repo}/versions/rollback"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "version": "v2", "force": false }))
             .send()
@@ -12684,7 +12702,8 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Create v2 modifying src/lib.rs.
@@ -12692,6 +12711,7 @@ mod tests {
             root,
             addr,
             &key,
+            repo,
             "add world",
             b"pub fn hello() {}\npub fn world() {}\n",
         )
@@ -12702,6 +12722,7 @@ mod tests {
             root,
             addr,
             &key,
+            repo,
             "add foo",
             b"pub fn hello() {}\npub fn world() {}\npub fn foo() {}\n",
         )
@@ -12709,7 +12730,7 @@ mod tests {
 
         // Rolling back v2 without force should return 409 because v3 depends on it.
         let resp = client
-            .post(format!("http://{addr}/api/versions/rollback"))
+            .post(format!("http://{addr}/api/repos/{repo}/versions/rollback"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "version": "v2", "force": false }))
             .send()
@@ -12722,7 +12743,7 @@ mod tests {
 
         // With force: true the rollback should proceed.
         let resp = client
-            .post(format!("http://{addr}/api/versions/rollback"))
+            .post(format!("http://{addr}/api/repos/{repo}/versions/rollback"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "version": "v2", "force": true }))
             .send()
@@ -12747,12 +12768,13 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Create a workspace.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "file upload test" }))
             .send()
@@ -12769,9 +12791,9 @@ mod tests {
         let text_b64 = BASE64.encode(text_content);
         let binary_b64 = BASE64.encode(&binary_content);
 
-        // Upload both files via POST /api/workspaces/:id/files.
+        // Upload both files via POST /api/repos/:repo/workspaces/:id/files.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files"))
             .bearer_auth(&key)
             .json(&serde_json::json!({
                 "files": [
@@ -12791,7 +12813,7 @@ mod tests {
 
         // Workspace should now be Active.
         let resp = client
-            .get(format!("http://{addr}/api/workspaces/{ws_id}"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12801,7 +12823,7 @@ mod tests {
 
         // Download text file from overlay.
         let resp = client
-            .get(format!("http://{addr}/api/workspaces/{ws_id}/files/src/new.rs"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files/src/new.rs"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12815,7 +12837,7 @@ mod tests {
 
         // Download binary file from overlay.
         let resp = client
-            .get(format!("http://{addr}/api/workspaces/{ws_id}/files/data/bin.bin"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files/data/bin.bin"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12828,7 +12850,7 @@ mod tests {
 
         // Download a file not in overlay — falls back to base (repo root).
         let resp = client
-            .get(format!("http://{addr}/api/workspaces/{ws_id}/files/src/lib.rs"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files/src/lib.rs"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12854,7 +12876,7 @@ mod tests {
 
         // 404 for non-existent file.
         let resp = client
-            .get(format!("http://{addr}/api/workspaces/{ws_id}/files/does/not/exist.txt"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files/does/not/exist.txt"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12883,12 +12905,13 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Create workspace.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "modify test" }))
             .send()
@@ -12906,7 +12929,7 @@ mod tests {
 
         // First upload: FileAdded.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files"))
             .bearer_auth(&key)
             .json(&upload_file(b"pub fn hello() {}\npub fn world() {}\n"))
             .send()
@@ -12916,7 +12939,7 @@ mod tests {
 
         // Second upload of the same path: FileModified.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files"))
             .bearer_auth(&key)
             .json(&upload_file(b"pub fn hello() {}\npub fn world() {}\npub fn foo() {}\n"))
             .send()
@@ -12926,7 +12949,7 @@ mod tests {
 
         // Verify final content is the latest upload.
         let resp = client
-            .get(format!("http://{addr}/api/workspaces/{ws_id}/files/src/lib.rs"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files/src/lib.rs"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12951,12 +12974,13 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() {}\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Create workspace.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "traversal test" }))
             .send()
@@ -12967,7 +12991,7 @@ mod tests {
 
         let b64 = BASE64.encode(b"evil content");
         let resp = client
-            .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files"))
             .bearer_auth(&key)
             .json(&serde_json::json!({
                 "files": [{ "path": "../../etc/passwd", "content_base64": b64 }]
@@ -13347,7 +13371,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // ── Create ────────────────────────────────────────────────────────────
@@ -13361,7 +13386,7 @@ mod tests {
         });
 
         let resp = client
-            .post(format!("http://{addr}/api/issues"))
+            .post(format!("http://{addr}/api/repos/{repo}/issues"))
             .bearer_auth(&key)
             .json(&create_body)
             .send()
@@ -13381,7 +13406,7 @@ mod tests {
         // ── Create a second issue ─────────────────────────────────────────────
 
         let resp2 = client
-            .post(format!("http://{addr}/api/issues"))
+            .post(format!("http://{addr}/api/repos/{repo}/issues"))
             .bearer_auth(&key)
             .json(&serde_json::json!({
                 "title": "Add rate limiting",
@@ -13396,7 +13421,7 @@ mod tests {
         // ── List all ──────────────────────────────────────────────────────────
 
         let resp = client
-            .get(format!("http://{addr}/api/issues"))
+            .get(format!("http://{addr}/api/repos/{repo}/issues"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13408,7 +13433,7 @@ mod tests {
         // ── List with filter ──────────────────────────────────────────────────
 
         let resp = client
-            .get(format!("http://{addr}/api/issues?priority=high"))
+            .get(format!("http://{addr}/api/repos/{repo}/issues?priority=high"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13420,7 +13445,7 @@ mod tests {
 
         // Filter by creator.
         let resp = client
-            .get(format!("http://{addr}/api/issues?created_by=agent-02"))
+            .get(format!("http://{addr}/api/repos/{repo}/issues?created_by=agent-02"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13432,7 +13457,7 @@ mod tests {
         // ── Get by ID ─────────────────────────────────────────────────────────
 
         let resp = client
-            .get(format!("http://{addr}/api/issues/{issue_id}"))
+            .get(format!("http://{addr}/api/repos/{repo}/issues/{issue_id}"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13446,7 +13471,7 @@ mod tests {
 
         let fake_id = uuid::Uuid::new_v4();
         let resp = client
-            .get(format!("http://{addr}/api/issues/{fake_id}"))
+            .get(format!("http://{addr}/api/repos/{repo}/issues/{fake_id}"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13456,7 +13481,7 @@ mod tests {
         // ── Update ────────────────────────────────────────────────────────────
 
         let resp = client
-            .patch(format!("http://{addr}/api/issues/{issue_id}"))
+            .patch(format!("http://{addr}/api/repos/{repo}/issues/{issue_id}"))
             .bearer_auth(&key)
             .json(&serde_json::json!({
                 "priority": "critical",
@@ -13473,7 +13498,7 @@ mod tests {
         // ── Close ─────────────────────────────────────────────────────────────
 
         let resp = client
-            .post(format!("http://{addr}/api/issues/{issue_id}/close"))
+            .post(format!("http://{addr}/api/repos/{repo}/issues/{issue_id}/close"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "resolution": "resolved" }))
             .send()
@@ -13487,7 +13512,7 @@ mod tests {
         // ── List with status filter ───────────────────────────────────────────
 
         let resp = client
-            .get(format!("http://{addr}/api/issues?status=open"))
+            .get(format!("http://{addr}/api/repos/{repo}/issues?status=open"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13501,7 +13526,7 @@ mod tests {
 
         // Re-open by creating a fresh issue and closing it with a free-text resolution.
         let resp = client
-            .post(format!("http://{addr}/api/issues"))
+            .post(format!("http://{addr}/api/repos/{repo}/issues"))
             .bearer_auth(&key)
             .json(&serde_json::json!({
                 "title": "Temp issue for free-text resolution test",
@@ -13518,7 +13543,7 @@ mod tests {
         let temp_id = temp_issue["id"].as_str().unwrap();
 
         let resp = client
-            .post(format!("http://{addr}/api/issues/{temp_id}/close"))
+            .post(format!("http://{addr}/api/repos/{repo}/issues/{temp_id}/close"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "resolution": "resolved in v5" }))
             .send()
@@ -13620,7 +13645,8 @@ mod tests {
     async fn agent_initiated_issues() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         let agent_source = serde_json::json!({
@@ -13630,7 +13656,7 @@ mod tests {
 
         // ── Create first agent issue ──────────────────────────────────────────
         let resp = client
-            .post(format!("http://{addr}/api/issues"))
+            .post(format!("http://{addr}/api/repos/{repo}/issues"))
             .bearer_auth(&key)
             .json(&serde_json::json!({
                 "title": "Auth login unit test failing",
@@ -13652,7 +13678,7 @@ mod tests {
 
         // ── Filter by agent creator ───────────────────────────────────────────
         let resp = client
-            .get(format!("http://{addr}/api/issues?created_by=ci-agent"))
+            .get(format!("http://{addr}/api/repos/{repo}/issues?created_by=ci-agent"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13662,7 +13688,7 @@ mod tests {
 
         // ── Duplicate detection: similar title warns ──────────────────────────
         let resp = client
-            .post(format!("http://{addr}/api/issues"))
+            .post(format!("http://{addr}/api/repos/{repo}/issues"))
             .bearer_auth(&key)
             .json(&serde_json::json!({
                 "title": "Auth login test failing again",
@@ -13685,7 +13711,7 @@ mod tests {
         // ── Rate limit: exceed max_per_hour = 2 ──────────────────────────────
         // Already created 2 above; third should be rejected.
         let resp = client
-            .post(format!("http://{addr}/api/issues"))
+            .post(format!("http://{addr}/api/repos/{repo}/issues"))
             .bearer_auth(&key)
             .json(&serde_json::json!({
                 "title": "Overflow issue",
@@ -13708,12 +13734,13 @@ mod tests {
     async fn work_queue_available_and_claim() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Create two open issues.
         let resp = client
-            .post(format!("http://{addr}/api/issues"))
+            .post(format!("http://{addr}/api/repos/{repo}/issues"))
             .bearer_auth(&key)
             .json(&serde_json::json!({
                 "title": "Fix login bug",
@@ -13728,7 +13755,7 @@ mod tests {
         let issue1_id = issue1["id"].as_str().unwrap().to_string();
 
         let resp = client
-            .post(format!("http://{addr}/api/issues"))
+            .post(format!("http://{addr}/api/repos/{repo}/issues"))
             .bearer_auth(&key)
             .json(&serde_json::json!({
                 "title": "Add metrics dashboard",
@@ -13773,7 +13800,7 @@ mod tests {
 
         // Claimed issue should now be in_progress.
         let resp = client
-            .get(format!("http://{addr}/api/issues/{issue1_id}"))
+            .get(format!("http://{addr}/api/repos/{repo}/issues/{issue1_id}"))
             .bearer_auth(&key)
             .send()
             .await
@@ -14114,18 +14141,6 @@ mod tests {
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0]["id"], ws_id);
 
-        // The legacy single-repo routes should NOT see this workspace
-        // (it lives under the storage_root repo, not the server's own .vai/).
-        let resp = client
-            .get(format!("http://{addr}/api/workspaces"))
-            .bearer_auth(&key)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let legacy: serde_json::Value = resp.json().await.unwrap();
-        assert!(legacy["data"].as_array().unwrap().is_empty());
-
         shutdown_tx.send(()).ok();
     }
 
@@ -14290,32 +14305,12 @@ mod tests {
             RateLimitCategory::AuthIp
         );
         assert_eq!(
-            classify_rate_limit(&Method::POST, "/api/issues"),
-            RateLimitCategory::IssueCreate
-        );
-        assert_eq!(
             classify_rate_limit(&Method::POST, "/api/repos/my-repo/issues"),
             RateLimitCategory::IssueCreate
         );
         assert_eq!(
-            classify_rate_limit(&Method::POST, "/api/workspaces"),
-            RateLimitCategory::WorkspaceCreate
-        );
-        assert_eq!(
             classify_rate_limit(&Method::POST, "/api/repos/my-repo/workspaces"),
             RateLimitCategory::WorkspaceCreate
-        );
-        assert_eq!(
-            classify_rate_limit(&Method::POST, "/api/workspaces/abc/files"),
-            RateLimitCategory::FileUpload
-        );
-        assert_eq!(
-            classify_rate_limit(&Method::POST, "/api/workspaces/abc/upload-snapshot"),
-            RateLimitCategory::FileUpload
-        );
-        assert_eq!(
-            classify_rate_limit(&Method::GET, "/api/issues"),
-            RateLimitCategory::None
         );
         assert_eq!(
             classify_rate_limit(&Method::GET, "/health"),
@@ -14369,6 +14364,7 @@ mod tests {
     async fn test_workspace_creation_rate_limited() {
         let root = tempfile::TempDir::new().unwrap();
         let (addr, shutdown_tx, state, _key) = start_test_server(root.path()).await;
+        let repo = &state.repo_name.clone();
 
         // Pre-fill the workspace_create bucket for the admin key.
         let rl_key = "workspace_create:admin";
@@ -14378,7 +14374,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth("vai_admin_test")
             .json(&serde_json::json!({"name": "ws", "description": null}))
             .send()
@@ -14585,12 +14581,13 @@ mod tests {
     async fn upload_snapshot_rejects_symlinks() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Create a workspace to upload into.
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "symlink test" }))
             .send()
@@ -14602,7 +14599,7 @@ mod tests {
         let tarball = make_tarball_with_symlink("evil_link", "/etc/passwd");
 
         let resp = client
-            .post(format!("http://{addr}/api/workspaces/{ws_id}/upload-snapshot"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/upload-snapshot"))
             .bearer_auth(&key)
             .header("Content-Type", "application/gzip")
             .body(tarball)
@@ -14643,11 +14640,12 @@ mod tests {
     async fn upload_snapshot_rejects_oversized_file() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "size test" }))
             .send()
@@ -14661,7 +14659,7 @@ mod tests {
         let tarball = make_tarball(&[("big_file.bin", &oversized)]);
 
         let resp = client
-            .post(format!("http://{addr}/api/workspaces/{ws_id}/upload-snapshot"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/upload-snapshot"))
             .bearer_auth(&key)
             .header("Content-Type", "application/gzip")
             .body(tarball)
@@ -14683,11 +14681,12 @@ mod tests {
     async fn file_upload_rejects_oversized_file() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         let resp = client
-            .post(format!("http://{addr}/api/workspaces"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "intent": "size test" }))
             .send()
@@ -14701,7 +14700,7 @@ mod tests {
         let b64 = BASE64.encode(&oversized);
 
         let resp = client
-            .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+            .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files"))
             .bearer_auth(&key)
             .json(&serde_json::json!({
                 "files": [{ "path": "big.bin", "content_base64": b64 }]
@@ -14724,6 +14723,7 @@ mod tests {
     async fn test_issue_creation_rate_limited() {
         let root = tempfile::TempDir::new().unwrap();
         let (addr, shutdown_tx, state, _key) = start_test_server(root.path()).await;
+        let repo = &state.repo_name.clone();
 
         // Pre-fill the issue_create bucket for the admin key.
         let rl_key = "issue_create:admin";
@@ -14735,7 +14735,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let resp = client
-            .post(format!("http://{addr}/api/issues"))
+            .post(format!("http://{addr}/api/repos/{repo}/issues"))
             .bearer_auth("vai_admin_test")
             .json(&serde_json::json!({ "title": "test issue", "body": "" }))
             .send()
@@ -15020,7 +15020,8 @@ mod tests {
     async fn jwt_wrong_secret_returns_401() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, _key) = start_test_server(root).await;
+        let repo = &state.repo_name;
 
         // Mint a token with a *different* secret than the server uses.
         let wrong_svc = crate::auth::jwt::JwtService::new(
@@ -15032,7 +15033,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let resp = client
-            .get(format!("http://{addr}/api/workspaces"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&token)
             .send()
             .await
@@ -15053,7 +15054,8 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, _key) = start_test_server(root).await;
+        let repo = &state.repo_name;
 
         // Build a JWT with exp = 1000 (year 1970 — definitely expired).
         let claims = serde_json::json!({
@@ -15070,7 +15072,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let resp = client
-            .get(format!("http://{addr}/api/workspaces"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth(&token)
             .send()
             .await
@@ -15090,12 +15092,13 @@ mod tests {
     async fn api_key_still_accepted_after_jwt_middleware_change() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        let (addr, shutdown_tx, _state, _key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, _key) = start_test_server(root).await;
+        let repo = &state.repo_name;
 
         // Use the admin key (no dots — goes through API key + admin key path).
         let client = reqwest::Client::new();
         let resp = client
-            .get(format!("http://{addr}/api/workspaces"))
+            .get(format!("http://{addr}/api/repos/{repo}/workspaces"))
             .bearer_auth("vai_admin_test")
             .send()
             .await
