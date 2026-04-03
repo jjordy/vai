@@ -285,6 +285,135 @@ async fn test_issue_store_crud() {
     teardown(&storage, &repo_id).await;
 }
 
+// ── IssueStore — paginated filters ───────────────────────────────────────────
+
+/// Regression test for: status filter on paginated issues endpoint returns 0
+/// results (issue #239).
+///
+/// The root cause was that the schema stored status/priority with title-case
+/// defaults ('Open', 'Medium') while the Rust code filters with lowercase
+/// values ('open', 'medium').  The fix:
+///   1. A migration normalizes existing rows to lowercase.
+///   2. `create_issue` now explicitly inserts `status = 'open'`.
+///   3. The `list_issues` WHERE clause uses `LOWER(status)` / `LOWER(priority)`.
+#[tokio::test]
+async fn test_issue_list_paginated_status_filter() {
+    let Some((storage, repo_id)) = setup().await else {
+        return;
+    };
+
+    let make_issue = |title: &str, priority: IssuePriority| NewIssue {
+        title: title.to_string(),
+        description: String::new(),
+        priority,
+        labels: vec![],
+        creator: "test".to_string(),
+        agent_source: None,
+        acceptance_criteria: vec![],
+    };
+
+    // Create three open issues and one closed issue.
+    let i1 = storage.create_issue(&repo_id, make_issue("Open A", IssuePriority::High)).await.unwrap();
+    let i2 = storage.create_issue(&repo_id, make_issue("Open B", IssuePriority::High)).await.unwrap();
+    let i3 = storage.create_issue(&repo_id, make_issue("Open C", IssuePriority::Low)).await.unwrap();
+    let i4 = storage.create_issue(&repo_id, make_issue("Closed D", IssuePriority::Medium)).await.unwrap();
+    storage.close_issue(&repo_id, &i4.id, "done").await.unwrap();
+
+    // status=open must return exactly the 3 open issues.
+    let open = storage
+        .list_issues(
+            &repo_id,
+            &IssueFilter { status: Some(IssueStatus::Open), ..Default::default() },
+            &ListQuery::default(),
+        )
+        .await
+        .expect("list_issues(status=open) failed");
+    assert_eq!(open.total, 3, "expected 3 open issues, got {}", open.total);
+    assert_eq!(open.items.len(), 3);
+    let open_ids: std::collections::HashSet<_> = open.items.iter().map(|i| i.id).collect();
+    assert!(open_ids.contains(&i1.id));
+    assert!(open_ids.contains(&i2.id));
+    assert!(open_ids.contains(&i3.id));
+    assert!(!open_ids.contains(&i4.id));
+
+    // status=closed must return exactly the 1 closed issue.
+    let closed = storage
+        .list_issues(
+            &repo_id,
+            &IssueFilter { status: Some(IssueStatus::Closed), ..Default::default() },
+            &ListQuery::default(),
+        )
+        .await
+        .expect("list_issues(status=closed) failed");
+    assert_eq!(closed.total, 1);
+    assert_eq!(closed.items[0].id, i4.id);
+
+    // priority=high must return the 2 high-priority open issues.
+    let high = storage
+        .list_issues(
+            &repo_id,
+            &IssueFilter { priority: Some(IssuePriority::High), ..Default::default() },
+            &ListQuery::default(),
+        )
+        .await
+        .expect("list_issues(priority=high) failed");
+    assert_eq!(high.total, 2);
+
+    // Combined filter: status=open AND priority=high → 2 results.
+    let open_high = storage
+        .list_issues(
+            &repo_id,
+            &IssueFilter {
+                status: Some(IssueStatus::Open),
+                priority: Some(IssuePriority::High),
+                ..Default::default()
+            },
+            &ListQuery::default(),
+        )
+        .await
+        .expect("list_issues(status=open,priority=high) failed");
+    assert_eq!(open_high.total, 2);
+
+    // Unfiltered must return all 4 issues with correct total.
+    let all = storage
+        .list_issues(&repo_id, &IssueFilter::default(), &ListQuery::default())
+        .await
+        .expect("list_issues(unfiltered) failed");
+    assert_eq!(all.total, 4);
+    assert_eq!(all.items.len(), 4);
+
+    // Paginated: page 1 of page_size=2 → 2 items, total=4.
+    let page1 = storage
+        .list_issues(
+            &repo_id,
+            &IssueFilter::default(),
+            &ListQuery::from_params(Some(1), Some(2), None, &[]).unwrap(),
+        )
+        .await
+        .expect("list_issues(page=1,per_page=2) failed");
+    assert_eq!(page1.total, 4);
+    assert_eq!(page1.items.len(), 2);
+
+    // Paginated: page 2 of page_size=2 → 2 items, total=4.
+    let page2 = storage
+        .list_issues(
+            &repo_id,
+            &IssueFilter::default(),
+            &ListQuery::from_params(Some(2), Some(2), None, &[]).unwrap(),
+        )
+        .await
+        .expect("list_issues(page=2,per_page=2) failed");
+    assert_eq!(page2.total, 4);
+    assert_eq!(page2.items.len(), 2);
+
+    // The two pages together should cover all 4 issues with no overlap.
+    let combined_ids: std::collections::HashSet<_> =
+        page1.items.iter().chain(page2.items.iter()).map(|i| i.id).collect();
+    assert_eq!(combined_ids.len(), 4);
+
+    teardown(&storage, &repo_id).await;
+}
+
 // ── EscalationStore ───────────────────────────────────────────────────────────
 
 #[tokio::test]

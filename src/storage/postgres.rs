@@ -413,6 +413,7 @@ fn rows_to_events(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Event>, Storag
 impl IssueStore for PostgresStorage {
     async fn create_issue(&self, repo_id: &Uuid, issue: NewIssue) -> Result<Issue, StorageError> {
         let id = Uuid::new_v4();
+        let status = IssueStatus::Open.as_str().to_string();
         let priority = issue.priority.as_str().to_string();
         let agent_source = issue
             .agent_source
@@ -420,14 +421,15 @@ impl IssueStore for PostgresStorage {
 
         sqlx::query(
             r#"
-            INSERT INTO issues (id, repo_id, title, body, priority, labels, creator, agent_source, acceptance_criteria)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            INSERT INTO issues (id, repo_id, title, body, status, priority, labels, creator, agent_source, acceptance_criteria)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
         )
         .bind(id)
         .bind(repo_id)
         .bind(&issue.title)
         .bind(&issue.description)
+        .bind(&status)
         .bind(&priority)
         .bind(&issue.labels)
         .bind(&issue.creator)
@@ -469,11 +471,11 @@ impl IssueStore for PostgresStorage {
         let mut param_idx = 2usize;
 
         if filter.status.is_some() {
-            conditions.push(format!("status = ${param_idx}"));
+            conditions.push(format!("LOWER(status) = ${param_idx}"));
             param_idx += 1;
         }
         if filter.priority.is_some() {
-            conditions.push(format!("priority = ${param_idx}"));
+            conditions.push(format!("LOWER(priority) = ${param_idx}"));
             param_idx += 1;
         }
         if filter.label.is_some() {
