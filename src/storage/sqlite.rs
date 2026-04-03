@@ -33,6 +33,7 @@ use super::{
     NewVersion, NewWorkspace, OrgMember, OrgRole, OrgStore, Organization, RepoCollaborator,
     RepoRole, StorageError, User, VersionStore, WatcherRegistryStore, WorkspaceStore, WorkspaceUpdate,
 };
+use super::pagination::{ListQuery, ListResult, SortDirection};
 use crate::watcher::{DiscoveryEventKind, DiscoveryPreparation, DiscoveryRecord, Watcher, WatcherStore};
 use crate::auth::ApiKey;
 use crate::escalation::{Escalation, ResolutionOption};
@@ -41,6 +42,49 @@ use crate::graph::{Entity, Relationship};
 use crate::issue::{Issue, IssueFilter};
 use crate::version::VersionMeta;
 use crate::workspace::WorkspaceMeta;
+
+// ── In-memory pagination helper ───────────────────────────────────────────────
+
+/// Apply `query` (sort + LIMIT/OFFSET) to an already-fetched `Vec<T>`.
+///
+/// `sort_key` maps a `ListQuery` column name to a comparable string extracted
+/// from `T`. Unknown columns are silently ignored (the caller's allowlist
+/// should have rejected them earlier).
+fn paginate_in_memory<T, F>(mut items: Vec<T>, query: &ListQuery, sort_key: F) -> ListResult<T>
+where
+    F: Fn(&T, &str) -> String,
+{
+    // Apply sort fields right-to-left so that the first sort field has
+    // highest precedence (stable multi-key sort).
+    for sf in query.sort.iter().rev() {
+        let col = sf.column.clone();
+        let dir = sf.direction.clone();
+        items.sort_by(|a, b| {
+            let ka = sort_key(a, &col);
+            let kb = sort_key(b, &col);
+            let ord = ka.cmp(&kb);
+            if dir == SortDirection::Desc { ord.reverse() } else { ord }
+        });
+    }
+
+    let total = items.len() as u64;
+
+    // Apply LIMIT/OFFSET.  When per_page == u32::MAX use the full list.
+    let (limit, offset) = query.sql_limit_offset();
+    let offset = offset as usize;
+    let items = if offset >= items.len() {
+        vec![]
+    } else {
+        let end = if limit == i64::MAX {
+            items.len()
+        } else {
+            (offset + limit as usize).min(items.len())
+        };
+        items.into_iter().skip(offset).take(end - offset).collect()
+    };
+
+    ListResult { items, total }
+}
 
 // ── SqliteStorage ─────────────────────────────────────────────────────────────
 
@@ -217,11 +261,27 @@ impl IssueStore for SqliteStorage {
         &self,
         _repo_id: &Uuid,
         filter: &IssueFilter,
-    ) -> Result<Vec<Issue>, StorageError> {
+        query: &ListQuery,
+    ) -> Result<ListResult<Issue>, StorageError> {
         let store = self.open_issue_store()?;
-        store
+        let items = store
             .list(filter)
-            .map_err(|e| StorageError::Database(e.to_string()))
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        use crate::issue::IssuePriority;
+        Ok(paginate_in_memory(items, query, |issue, col| match col {
+            "created_at" => issue.created_at.to_rfc3339(),
+            "updated_at" => issue.updated_at.to_rfc3339(),
+            // Map to numeric string so lexicographic sort gives critical < high < medium < low.
+            "priority" => match issue.priority {
+                IssuePriority::Critical => "0",
+                IssuePriority::High => "1",
+                IssuePriority::Medium => "2",
+                IssuePriority::Low => "3",
+            }.to_string(),
+            "status" => issue.status.as_str().to_string(),
+            "title" => issue.title.clone(),
+            _ => String::new(),
+        }))
     }
 
     async fn update_issue(
@@ -487,16 +547,22 @@ impl EscalationStore for SqliteStorage {
         &self,
         _repo_id: &Uuid,
         pending_only: bool,
-    ) -> Result<Vec<Escalation>, StorageError> {
+        query: &ListQuery,
+    ) -> Result<ListResult<Escalation>, StorageError> {
         let store = self.open_escalation_store()?;
         let status_filter = if pending_only {
             Some(EscalationStatus::Pending)
         } else {
             None
         };
-        store
+        let items = store
             .list(status_filter.as_ref())
-            .map_err(|e| StorageError::Database(e.to_string()))
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(paginate_in_memory(items, query, |esc, col| match col {
+            "created_at" => esc.created_at.to_rfc3339(),
+            "status" => esc.status.as_str().to_string(),
+            _ => String::new(),
+        }))
     }
 
     async fn resolve_escalation(
@@ -630,9 +696,18 @@ impl VersionStore for SqliteStorage {
         })
     }
 
-    async fn list_versions(&self, _repo_id: &Uuid) -> Result<Vec<VersionMeta>, StorageError> {
-        version::list_versions(&self.vai_dir)
-            .map_err(|e| StorageError::Io(e.to_string()))
+    async fn list_versions(
+        &self,
+        _repo_id: &Uuid,
+        query: &ListQuery,
+    ) -> Result<ListResult<VersionMeta>, StorageError> {
+        let items = version::list_versions(&self.vai_dir)
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        Ok(paginate_in_memory(items, query, |v, col| match col {
+            "created_at" => v.created_at.to_rfc3339(),
+            "version_id" => v.version_id.clone(),
+            _ => String::new(),
+        }))
     }
 
     async fn read_head(&self, _repo_id: &Uuid) -> Result<Option<String>, StorageError> {
@@ -701,13 +776,21 @@ impl WorkspaceStore for SqliteStorage {
         &self,
         _repo_id: &Uuid,
         include_inactive: bool,
-    ) -> Result<Vec<WorkspaceMeta>, StorageError> {
-        if include_inactive {
+        query: &ListQuery,
+    ) -> Result<ListResult<WorkspaceMeta>, StorageError> {
+        let items = if include_inactive {
             workspace::list_all(&self.vai_dir)
         } else {
             workspace::list(&self.vai_dir)
         }
-        .map_err(|e| StorageError::Io(e.to_string()))
+        .map_err(|e| StorageError::Io(e.to_string()))?;
+        Ok(paginate_in_memory(items, query, |ws, col| match col {
+            "created_at" => ws.created_at.to_rfc3339(),
+            "updated_at" => ws.updated_at.to_rfc3339(),
+            "status" => ws.status.as_str().to_string(),
+            "intent" => ws.intent.clone(),
+            _ => String::new(),
+        }))
     }
 
     async fn update_workspace(
@@ -1377,10 +1460,10 @@ mod tests {
         assert_eq!(fetched.id, issue.id);
 
         let issues = storage
-            .list_issues(&repo_id, &IssueFilter::default())
+            .list_issues(&repo_id, &IssueFilter::default(), &ListQuery::default())
             .await
             .unwrap();
-        assert_eq!(issues.len(), 1);
+        assert_eq!(issues.items.len(), 1);
     }
 
     #[tokio::test]
@@ -1432,9 +1515,9 @@ mod tests {
         let head = storage.read_head(&repo_id).await.unwrap();
         assert_eq!(head.as_deref(), Some("v1"));
 
-        let versions = storage.list_versions(&repo_id).await.unwrap();
-        assert_eq!(versions.len(), 1);
-        assert_eq!(versions[0].version_id, "v1");
+        let versions = storage.list_versions(&repo_id, &ListQuery::default()).await.unwrap();
+        assert_eq!(versions.items.len(), 1);
+        assert_eq!(versions.items[0].version_id, "v1");
     }
 
     #[tokio::test]
@@ -1473,8 +1556,8 @@ mod tests {
         let fetched = storage.get_workspace(&repo_id, &ws.id).await.unwrap();
         assert_eq!(fetched.intent, "implement feature X");
 
-        let list = storage.list_workspaces(&repo_id, false).await.unwrap();
-        assert_eq!(list.len(), 1);
+        let list = storage.list_workspaces(&repo_id, false, &ListQuery::default()).await.unwrap();
+        assert_eq!(list.items.len(), 1);
     }
 
     #[tokio::test]

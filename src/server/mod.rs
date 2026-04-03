@@ -146,7 +146,7 @@ pub use pagination::{PaginatedResponse, PaginationMeta, PaginationParams};
 
 use crate::auth;
 use crate::conflict;
-use crate::storage::{EventFilter, EventStore as _};
+use crate::storage::{EventFilter, EventStore as _, ListQuery};
 use crate::escalation::EscalationStatus;
 use crate::event_log::EventKind;
 use crate::graph::GraphSnapshot;
@@ -1832,24 +1832,24 @@ async fn status_handler(
     let workspace_count = ctx
         .storage
         .workspaces()
-        .list_workspaces(&ctx.repo_id, false)
+        .list_workspaces(&ctx.repo_id, false, &ListQuery::default())
         .await
-        .map(|w| w.len())
+        .map(|r| r.total as usize)
         .unwrap_or(0);
 
     let issue_count = ctx.storage.issues()
         .list_issues(&ctx.repo_id, &IssueFilter {
             status: Some(IssueStatus::Open),
             ..Default::default()
-        })
+        }, &ListQuery::default())
         .await
-        .map(|v| v.len())
+        .map(|r| r.total as usize)
         .unwrap_or(0);
 
     let escalation_count = ctx.storage.escalations()
-        .list_escalations(&ctx.repo_id, true)
+        .list_escalations(&ctx.repo_id, true, &ListQuery::default())
         .await
-        .map(|v| v.len())
+        .map(|r| r.total as usize)
         .unwrap_or(0);
 
     // Read entity count from storage trait; fall back to zero on error.
@@ -1966,9 +1966,9 @@ async fn server_stats_handler(
     let workspace_count = ctx
         .storage
         .workspaces()
-        .list_workspaces(&ctx.repo_id, false)
+        .list_workspaces(&ctx.repo_id, false, &ListQuery::default())
         .await
-        .map(|w| w.len())
+        .map(|r| r.total as usize)
         .unwrap_or(0);
 
     let (db_pool_active, db_pool_idle, db_pool_max) =
@@ -2079,10 +2079,10 @@ async fn list_workspaces_handler(
 ) -> Result<Json<Vec<WorkspaceResponse>>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let workspaces = ctx.storage.workspaces()
-        .list_workspaces(&ctx.repo_id, false)
+        .list_workspaces(&ctx.repo_id, false, &ListQuery::default())
         .await
         .map_err(ApiError::from)?;
-    let response: Vec<WorkspaceResponse> = workspaces.into_iter().map(Into::into).collect();
+    let response: Vec<WorkspaceResponse> = workspaces.items.into_iter().map(Into::into).collect();
     Ok(Json(response))
 }
 
@@ -2600,9 +2600,10 @@ async fn list_versions_handler(
     let mut versions = ctx
         .storage
         .versions()
-        .list_versions(&ctx.repo_id)
+        .list_versions(&ctx.repo_id, &ListQuery::default())
         .await
-        .map_err(ApiError::from)?;
+        .map_err(ApiError::from)?
+        .items;
     if let Some(limit) = params.limit {
         // Keep the N most-recent: the list is oldest-first, so drop from the front.
         let len = versions.len();
@@ -5202,9 +5203,10 @@ async fn build_file_map_at_version(
     let all_versions = ctx
         .storage
         .versions()
-        .list_versions(&ctx.repo_id)
+        .list_versions(&ctx.repo_id, &ListQuery::default())
         .await
-        .map_err(ApiError::from)?;
+        .map_err(ApiError::from)?
+        .items;
 
     let target_versions: Vec<_> = all_versions
         .into_iter()
@@ -5924,8 +5926,9 @@ async fn linked_workspace_ids(
 ) -> Vec<uuid::Uuid> {
     ctx.storage
         .workspaces()
-        .list_workspaces(&ctx.repo_id, true)
+        .list_workspaces(&ctx.repo_id, true, &ListQuery::default())
         .await
+        .map(|r| r.items)
         .unwrap_or_default()
         .into_iter()
         .filter(|ws| ws.issue_id == Some(issue_id))
@@ -6012,9 +6015,10 @@ async fn create_issue_handler(
         if let Some(ref agent_id) = body.created_by_agent {
             // Agent-initiated path: apply rate-limiting and duplicate-detection.
             let all_issues = issues
-                .list_issues(&ctx.repo_id, &IssueFilter::default())
+                .list_issues(&ctx.repo_id, &IssueFilter::default(), &ListQuery::default())
                 .await
-                .map_err(ApiError::from)?;
+                .map_err(ApiError::from)?
+                .items;
 
             // Rate-limiting: count issues created by this agent in the last hour.
             let one_hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
@@ -6170,14 +6174,16 @@ async fn list_issues_handler(
     };
 
     let issues = ctx.storage.issues()
-        .list_issues(&ctx.repo_id, &filter)
+        .list_issues(&ctx.repo_id, &filter, &ListQuery::default())
         .await
-        .map_err(ApiError::from)?;
+        .map_err(ApiError::from)?
+        .items;
 
     // Fetch all workspaces once to compute linked workspace IDs per issue.
     let all_workspaces = ctx.storage.workspaces()
-        .list_workspaces(&ctx.repo_id, true)
+        .list_workspaces(&ctx.repo_id, true, &ListQuery::default())
         .await
+        .map(|r| r.items)
         .unwrap_or_default();
 
     let mut response = Vec::with_capacity(issues.len());
@@ -7325,9 +7331,10 @@ async fn list_escalations_handler(
 
     let pending_only = matches!(status_filter, Some(EscalationStatus::Pending));
     let escalations = ctx.storage.escalations()
-        .list_escalations(&ctx.repo_id, pending_only)
+        .list_escalations(&ctx.repo_id, pending_only, &ListQuery::default())
         .await
-        .map_err(ApiError::from)?;
+        .map_err(ApiError::from)?
+        .items;
 
     // If a specific status other than Pending was requested (e.g. Resolved),
     // filter client-side since the trait only supports pending_only.
@@ -7495,15 +7502,17 @@ async fn get_work_queue_handler(
         .list_issues(&ctx.repo_id, &IssueFilter {
             status: Some(IssueStatus::Open),
             ..Default::default()
-        })
+        }, &ListQuery::default())
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .items;
 
     // Fetch all issues for blocker status lookups.
     let all_issues_for_deps = ctx.storage.issues()
-        .list_issues(&ctx.repo_id, &IssueFilter::default())
+        .list_issues(&ctx.repo_id, &IssueFilter::default(), &ListQuery::default())
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .items;
 
     let issue_status_map: std::collections::HashMap<uuid::Uuid, crate::issue::IssueStatus> =
         all_issues_for_deps.iter().map(|i| (i.id, i.status.clone())).collect();
@@ -8424,10 +8433,10 @@ async fn list_repos_handler(
             let workspace_count = state
                 .storage
                 .workspaces()
-                .list_workspaces(&repo_id, false)
+                .list_workspaces(&repo_id, false, &ListQuery::default())
                 .await
-                .unwrap_or_default()
-                .len();
+                .map(|r| r.total as usize)
+                .unwrap_or(0);
 
             let path = state
                 .storage_root

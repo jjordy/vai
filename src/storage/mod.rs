@@ -534,12 +534,13 @@ pub trait IssueStore: Send + Sync {
         id: &Uuid,
     ) -> Result<Issue, StorageError>;
 
-    /// Lists issues, optionally filtered.
+    /// Lists issues, optionally filtered and paginated.
     async fn list_issues(
         &self,
         repo_id: &Uuid,
         filter: &IssueFilter,
-    ) -> Result<Vec<Issue>, StorageError>;
+        query: &ListQuery,
+    ) -> Result<ListResult<Issue>, StorageError>;
 
     /// Applies partial updates to an issue.
     async fn update_issue(
@@ -582,7 +583,8 @@ pub trait EscalationStore: Send + Sync {
         &self,
         repo_id: &Uuid,
         pending_only: bool,
-    ) -> Result<Vec<Escalation>, StorageError>;
+        query: &ListQuery,
+    ) -> Result<ListResult<Escalation>, StorageError>;
 
     /// Marks an escalation as resolved with the operator's chosen resolution.
     async fn resolve_escalation(
@@ -669,11 +671,15 @@ pub trait VersionStore: Send + Sync {
         version_id: &str,
     ) -> Result<VersionMeta, StorageError>;
 
-    /// Returns all versions in chronological order (oldest first).
+    /// Returns versions, paginated and sorted according to `query`.
+    ///
+    /// `ListQuery::default()` returns all versions in chronological order
+    /// (oldest first), preserving the previous behaviour for existing callers.
     async fn list_versions(
         &self,
         repo_id: &Uuid,
-    ) -> Result<Vec<VersionMeta>, StorageError>;
+        query: &ListQuery,
+    ) -> Result<ListResult<VersionMeta>, StorageError>;
 
     /// Returns versions whose numeric suffix is `> since_num` and `<= head_num`,
     /// in ascending numeric order.
@@ -691,7 +697,7 @@ pub trait VersionStore: Send + Sync {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0)
         }
-        let mut versions = self.list_versions(repo_id).await?;
+        let mut versions = self.list_versions(repo_id, &ListQuery::default()).await?.items;
         versions.retain(|v| {
             let n = version_num(&v.version_id);
             n > since_num && n <= head_num
@@ -732,13 +738,16 @@ pub trait WorkspaceStore: Send + Sync {
         id: &Uuid,
     ) -> Result<WorkspaceMeta, StorageError>;
 
-    /// Lists workspaces. If `include_inactive` is false, discarded and merged
-    /// workspaces are excluded.
+    /// Lists workspaces, optionally paginated.
+    ///
+    /// If `include_inactive` is false, discarded and merged workspaces are
+    /// excluded. `ListQuery::default()` returns all matching workspaces.
     async fn list_workspaces(
         &self,
         repo_id: &Uuid,
         include_inactive: bool,
-    ) -> Result<Vec<WorkspaceMeta>, StorageError>;
+        query: &ListQuery,
+    ) -> Result<ListResult<WorkspaceMeta>, StorageError>;
 
     /// Applies partial updates to a workspace's metadata.
     async fn update_workspace(

@@ -53,6 +53,7 @@ use super::{
     OrgStore, Organization, RepoCollaborator, RepoRole, StorageError, User, VersionStore,
     WatcherRegistryStore, WorkspaceStore, WorkspaceUpdate,
 };
+use super::pagination::{ListQuery, ListResult};
 
 // ── PostgresStorage ───────────────────────────────────────────────────────────
 
@@ -461,7 +462,8 @@ impl IssueStore for PostgresStorage {
         &self,
         repo_id: &Uuid,
         filter: &IssueFilter,
-    ) -> Result<Vec<Issue>, StorageError> {
+        _query: &ListQuery,
+    ) -> Result<ListResult<Issue>, StorageError> {
         let rows = sqlx::query(
             "SELECT id, title, body, status, priority, labels, creator, agent_source, \
                     resolution, created_at, updated_at, acceptance_criteria \
@@ -472,15 +474,16 @@ impl IssueStore for PostgresStorage {
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
 
-        let mut issues = Vec::new();
+        let mut items = Vec::new();
         for row in rows {
             let issue = row_to_issue(row)?;
             if filter_matches_issue(&issue, filter) {
-                issues.push(issue);
+                items.push(issue);
             }
         }
 
-        Ok(issues)
+        let total = items.len() as u64;
+        Ok(ListResult { items, total })
     }
 
     async fn update_issue(
@@ -841,7 +844,8 @@ impl EscalationStore for PostgresStorage {
         &self,
         repo_id: &Uuid,
         pending_only: bool,
-    ) -> Result<Vec<Escalation>, StorageError> {
+        _query: &ListQuery,
+    ) -> Result<ListResult<Escalation>, StorageError> {
         let rows = if pending_only {
             sqlx::query(
                 "SELECT id, escalation_type, severity, summary, intents, agents, workspace_ids, \
@@ -865,7 +869,10 @@ impl EscalationStore for PostgresStorage {
         }
         .map_err(|e| StorageError::Database(e.to_string()))?;
 
-        rows.into_iter().map(row_to_escalation).collect()
+        let items: Result<Vec<Escalation>, StorageError> = rows.into_iter().map(row_to_escalation).collect();
+        let items = items?;
+        let total = items.len() as u64;
+        Ok(ListResult { items, total })
     }
 
     async fn resolve_escalation(
@@ -999,7 +1006,11 @@ impl VersionStore for PostgresStorage {
         row_to_version(row)
     }
 
-    async fn list_versions(&self, repo_id: &Uuid) -> Result<Vec<VersionMeta>, StorageError> {
+    async fn list_versions(
+        &self,
+        repo_id: &Uuid,
+        _query: &ListQuery,
+    ) -> Result<ListResult<VersionMeta>, StorageError> {
         let rows = sqlx::query(
             "SELECT version_id, parent_version_id, intent, created_by, merge_event_id, created_at \
              FROM versions WHERE repo_id = $1 ORDER BY created_at",
@@ -1009,7 +1020,10 @@ impl VersionStore for PostgresStorage {
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
 
-        rows.into_iter().map(row_to_version).collect()
+        let items: Result<Vec<VersionMeta>, StorageError> = rows.into_iter().map(row_to_version).collect();
+        let items = items?;
+        let total = items.len() as u64;
+        Ok(ListResult { items, total })
     }
 
     async fn list_versions_since(
@@ -1138,7 +1152,8 @@ impl WorkspaceStore for PostgresStorage {
         &self,
         repo_id: &Uuid,
         include_inactive: bool,
-    ) -> Result<Vec<WorkspaceMeta>, StorageError> {
+        _query: &ListQuery,
+    ) -> Result<ListResult<WorkspaceMeta>, StorageError> {
         let rows = if include_inactive {
             sqlx::query(
                 "SELECT id, intent, base_version, status, issue_id, deleted_paths, \
@@ -1161,7 +1176,10 @@ impl WorkspaceStore for PostgresStorage {
         }
         .map_err(|e| StorageError::Database(e.to_string()))?;
 
-        rows.into_iter().map(row_to_workspace).collect()
+        let items: Result<Vec<WorkspaceMeta>, StorageError> = rows.into_iter().map(row_to_workspace).collect();
+        let items = items?;
+        let total = items.len() as u64;
+        Ok(ListResult { items, total })
     }
 
     async fn update_workspace(
