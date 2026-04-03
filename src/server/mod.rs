@@ -141,6 +141,9 @@ use tokio::sync::broadcast;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
+pub mod pagination;
+pub use pagination::{PaginatedResponse, PaginationMeta, PaginationParams};
+
 use crate::auth;
 use crate::conflict;
 use crate::storage::{EventFilter, EventStore as _};

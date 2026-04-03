@@ -19,11 +19,14 @@
 //! Use [`StorageBackend`] to construct and access the appropriate backend.
 
 pub mod filesystem;
+pub mod pagination;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "s3")]
 pub mod s3;
 pub mod sqlite;
+
+pub use pagination::{ListQuery, ListResult, SortDirection, SortField};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
