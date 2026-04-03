@@ -30,11 +30,13 @@ async fn test_create_issue_title_too_long() {
     let (_tmp, vai_dir) = setup();
     let (_, api_key) = auth::create(&vai_dir, "agent").unwrap();
     let (addr, _tx) = server::start_for_testing(&vai_dir).await.unwrap();
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
 
     let client = reqwest::Client::new();
     let long_title = "x".repeat(501);
     let resp = client
-        .post(format!("http://{addr}/api/issues"))
+        .post(format!("http://{addr}/api/repos/{repo}/issues"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({ "title": long_title }))
         .send()
@@ -52,11 +54,13 @@ async fn test_create_issue_description_too_long() {
     let (_tmp, vai_dir) = setup();
     let (_, api_key) = auth::create(&vai_dir, "agent").unwrap();
     let (addr, _tx) = server::start_for_testing(&vai_dir).await.unwrap();
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
 
     let client = reqwest::Client::new();
     let long_desc = "a".repeat(50 * 1024 + 1);
     let resp = client
-        .post(format!("http://{addr}/api/issues"))
+        .post(format!("http://{addr}/api/repos/{repo}/issues"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({ "title": "ok", "description": long_desc }))
         .send()
@@ -74,11 +78,13 @@ async fn test_create_issue_too_many_labels() {
     let (_tmp, vai_dir) = setup();
     let (_, api_key) = auth::create(&vai_dir, "agent").unwrap();
     let (addr, _tx) = server::start_for_testing(&vai_dir).await.unwrap();
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
 
     let client = reqwest::Client::new();
     let labels: Vec<String> = (0..21).map(|i| format!("label-{i}")).collect();
     let resp = client
-        .post(format!("http://{addr}/api/issues"))
+        .post(format!("http://{addr}/api/repos/{repo}/issues"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({ "title": "ok", "labels": labels }))
         .send()
@@ -96,11 +102,13 @@ async fn test_create_issue_label_too_long() {
     let (_tmp, vai_dir) = setup();
     let (_, api_key) = auth::create(&vai_dir, "agent").unwrap();
     let (addr, _tx) = server::start_for_testing(&vai_dir).await.unwrap();
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
 
     let client = reqwest::Client::new();
     let long_label = "l".repeat(101);
     let resp = client
-        .post(format!("http://{addr}/api/issues"))
+        .post(format!("http://{addr}/api/repos/{repo}/issues"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({ "title": "ok", "labels": [long_label] }))
         .send()
@@ -118,11 +126,13 @@ async fn test_create_workspace_intent_too_long() {
     let (_tmp, vai_dir) = setup();
     let (_, api_key) = auth::create(&vai_dir, "agent").unwrap();
     let (addr, _tx) = server::start_for_testing(&vai_dir).await.unwrap();
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
 
     let client = reqwest::Client::new();
     let long_intent = "i".repeat(1001);
     let resp = client
-        .post(format!("http://{addr}/api/workspaces"))
+        .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({ "intent": long_intent }))
         .send()
@@ -140,11 +150,13 @@ async fn test_upload_path_traversal() {
     let (_tmp, vai_dir) = setup();
     let (_, api_key) = auth::create(&vai_dir, "agent").unwrap();
     let (addr, _tx) = server::start_for_testing(&vai_dir).await.unwrap();
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let client = reqwest::Client::new();
 
     // First create a workspace.
     let ws_resp = client
-        .post(format!("http://{addr}/api/workspaces"))
+        .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({ "intent": "traversal test" }))
         .send()
@@ -155,7 +167,7 @@ async fn test_upload_path_traversal() {
     let ws_id = ws["id"].as_str().unwrap();
 
     let resp = client
-        .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+        .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({
             "files": [{
@@ -176,10 +188,12 @@ async fn test_upload_path_null_byte() {
     let (_tmp, vai_dir) = setup();
     let (_, api_key) = auth::create(&vai_dir, "agent").unwrap();
     let (addr, _tx) = server::start_for_testing(&vai_dir).await.unwrap();
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let client = reqwest::Client::new();
 
     let ws_resp = client
-        .post(format!("http://{addr}/api/workspaces"))
+        .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({ "intent": "null byte test" }))
         .send()
@@ -192,7 +206,7 @@ async fn test_upload_path_null_byte() {
     // Encode a path with a null byte.
     let evil_path = "foo\0bar.rs";
     let resp = client
-        .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+        .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({
             "files": [{
@@ -213,10 +227,12 @@ async fn test_upload_too_many_files() {
     let (_tmp, vai_dir) = setup();
     let (_, api_key) = auth::create(&vai_dir, "agent").unwrap();
     let (addr, _tx) = server::start_for_testing(&vai_dir).await.unwrap();
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let client = reqwest::Client::new();
 
     let ws_resp = client
-        .post(format!("http://{addr}/api/workspaces"))
+        .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({ "intent": "many files test" }))
         .send()
@@ -236,7 +252,7 @@ async fn test_upload_too_many_files() {
         .collect();
 
     let resp = client
-        .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+        .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({ "files": files }))
         .send()
@@ -254,10 +270,12 @@ async fn test_upload_path_too_long() {
     let (_tmp, vai_dir) = setup();
     let (_, api_key) = auth::create(&vai_dir, "agent").unwrap();
     let (addr, _tx) = server::start_for_testing(&vai_dir).await.unwrap();
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let client = reqwest::Client::new();
 
     let ws_resp = client
-        .post(format!("http://{addr}/api/workspaces"))
+        .post(format!("http://{addr}/api/repos/{repo}/workspaces"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({ "intent": "path length test" }))
         .send()
@@ -269,7 +287,7 @@ async fn test_upload_path_too_long() {
 
     let long_path = "a".repeat(1001);
     let resp = client
-        .post(format!("http://{addr}/api/workspaces/{ws_id}/files"))
+        .post(format!("http://{addr}/api/repos/{repo}/workspaces/{ws_id}/files"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({
             "files": [{
@@ -292,10 +310,12 @@ async fn test_list_versions_limit_too_large() {
     let (_tmp, vai_dir) = setup();
     let (_, api_key) = auth::create(&vai_dir, "agent").unwrap();
     let (addr, _tx) = server::start_for_testing(&vai_dir).await.unwrap();
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
 
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("http://{addr}/api/versions?per_page=101"))
+        .get(format!("http://{addr}/api/repos/{repo}/versions?per_page=101"))
         .bearer_auth(&api_key)
         .send()
         .await
@@ -315,11 +335,13 @@ async fn test_update_issue_title_too_long() {
     let (_tmp, vai_dir) = setup();
     let (_, api_key) = auth::create(&vai_dir, "agent").unwrap();
     let (addr, _tx) = server::start_for_testing(&vai_dir).await.unwrap();
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let client = reqwest::Client::new();
 
     // Create an issue first.
     let create_resp = client
-        .post(format!("http://{addr}/api/issues"))
+        .post(format!("http://{addr}/api/repos/{repo}/issues"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({ "title": "Original" }))
         .send()
@@ -332,7 +354,7 @@ async fn test_update_issue_title_too_long() {
     // Attempt to update with a too-long title.
     let long_title = "t".repeat(501);
     let resp = client
-        .patch(format!("http://{addr}/api/issues/{issue_id}"))
+        .patch(format!("http://{addr}/api/repos/{repo}/issues/{issue_id}"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({ "title": long_title }))
         .send()
@@ -348,10 +370,12 @@ async fn test_valid_issue_creation_succeeds() {
     let (_tmp, vai_dir) = setup();
     let (_, api_key) = auth::create(&vai_dir, "agent").unwrap();
     let (addr, _tx) = server::start_for_testing(&vai_dir).await.unwrap();
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("http://{addr}/api/issues"))
+        .post(format!("http://{addr}/api/repos/{repo}/issues"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({
             "title": "Fix the thing",

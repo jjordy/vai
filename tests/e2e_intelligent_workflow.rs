@@ -77,6 +77,8 @@ async fn test_full_intelligent_workflow() {
     let (addr, shutdown_tx) = server::start_for_testing(&vai_dir)
         .await
         .expect("start_for_testing failed");
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -248,7 +250,7 @@ async fn test_full_intelligent_workflow() {
 
     // ── Step 8: Register a watcher agent ─────────────────────────────────────
     let register_res = client
-        .post(format!("{base}/api/watchers/register"))
+        .post(format!("{base}/api/repos/{repo}/watchers/register"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({
             "agent_id": "security-scanner",
@@ -271,7 +273,7 @@ async fn test_full_intelligent_workflow() {
 
     // ── Step 9: Submit discovery event → verify issue auto-created ────────────
     let discovery_res = client
-        .post(format!("{base}/api/discoveries"))
+        .post(format!("{base}/api/repos/{repo}/discoveries"))
         .bearer_auth(&api_key)
         .json(&serde_json::json!({
             "agent_id": "security-scanner",

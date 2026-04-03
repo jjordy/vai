@@ -948,13 +948,13 @@ fn classify_rate_limit(method: &axum::http::Method, path: &str) -> RateLimitCate
 
     match method {
         &Method::POST => {
-            if p == "/api/keys" || p == "/keys" {
+            if p == "/api/keys" {
                 return RateLimitCategory::AuthIp;
             }
-            if p == "/api/issues" || p == "/issues" {
+            if p == "/issues" {
                 return RateLimitCategory::IssueCreate;
             }
-            if p == "/api/workspaces" || p == "/workspaces" {
+            if p == "/workspaces" {
                 return RateLimitCategory::WorkspaceCreate;
             }
             // File upload: /api/workspaces/:id/files,
@@ -1979,8 +1979,11 @@ async fn server_stats_handler(
 /// Broadcasts a `WorkspaceCreated` event to WebSocket subscribers.
 #[utoipa::path(
     post,
-    path = "/api/workspaces",
+    path = "/api/repos/{repo}/workspaces",
     request_body = CreateWorkspaceRequest,
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 201, description = "Workspace created", body = WorkspaceResponse),
         (status = 400, description = "Bad request", body = ErrorBody),
@@ -2055,8 +2058,9 @@ async fn create_workspace_handler(
 /// `status`, `intent`.
 #[utoipa::path(
     get,
-    path = "/api/workspaces",
+    path = "/api/repos/{repo}/workspaces",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("page" = Option<u32>, Query, description = "Page number (1-indexed, default 1)"),
         ("per_page" = Option<u32>, Query, description = "Items per page (default 25, max 100)"),
         ("sort" = Option<String>, Query, description = "Sort fields, e.g. `created_at:desc,status:asc`"),
@@ -2096,8 +2100,9 @@ async fn list_workspaces_handler(
 /// Returns 404 if the workspace does not exist.
 #[utoipa::path(
     get,
-    path = "/api/workspaces/{id}",
+    path = "/api/repos/{repo}/workspaces/{id}",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Workspace ID"),
     ),
     responses(
@@ -2132,8 +2137,9 @@ async fn get_workspace_handler(
 /// Broadcasts a `WorkspaceSubmitted` event to WebSocket subscribers.
 #[utoipa::path(
     post,
-    path = "/api/workspaces/{id}/submit",
+    path = "/api/repos/{repo}/workspaces/{id}/submit",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Workspace ID"),
     ),
     responses(
@@ -2496,8 +2502,9 @@ async fn submit_workspace_handler(
 /// Broadcasts a `WorkspaceDiscarded` event to WebSocket subscribers.
 #[utoipa::path(
     delete,
-    path = "/api/workspaces/{id}",
+    path = "/api/repos/{repo}/workspaces/{id}",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Workspace ID"),
     ),
     responses(
@@ -2581,8 +2588,9 @@ async fn discard_workspace_handler(
 /// `?sort=created_at:desc`.  Sortable columns: `created_at`, `version_id`.
 #[utoipa::path(
     get,
-    path = "/api/versions",
+    path = "/api/repos/{repo}/versions",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("page" = Option<u32>, Query, description = "Page number (1-indexed, default 1)"),
         ("per_page" = Option<u32>, Query, description = "Items per page (default 25, max 100)"),
         ("sort" = Option<String>, Query, description = "Sort fields, e.g. `created_at:desc`"),
@@ -2620,8 +2628,9 @@ async fn list_versions_handler(
 
 #[utoipa::path(
     get,
-    path = "/api/versions/{id}",
+    path = "/api/repos/{repo}/versions/{id}",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Version ID"),
     ),
     responses(
@@ -2756,8 +2765,9 @@ async fn get_version_handler(
 
 #[utoipa::path(
     get,
-    path = "/api/versions/{id}/diff",
+    path = "/api/repos/{repo}/versions/{id}/diff",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Version ID"),
         ("base" = Option<String>, Query, description = "Base version ID to diff against"),
     ),
@@ -3017,8 +3027,11 @@ async fn get_version_diff_handler(
 
 #[utoipa::path(
     post,
-    path = "/api/versions/rollback",
+    path = "/api/repos/{repo}/versions/rollback",
     request_body = RollbackRequest,
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 200, description = "Rollback successful"),
         (status = 400, description = "Bad request", body = ErrorBody),
@@ -3959,8 +3972,9 @@ fn is_snapshot_path_ignored(path: &str) -> bool {
 
 #[utoipa::path(
     post,
-    path = "/api/workspaces/{id}/files",
+    path = "/api/repos/{repo}/workspaces/{id}/files",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Workspace ID"),
     ),
     request_body = UploadFilesRequest,
@@ -4239,8 +4253,9 @@ const MAX_SNAPSHOT_SIZE_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 
 #[utoipa::path(
     post,
-    path = "/api/workspaces/{id}/upload-snapshot",
+    path = "/api/repos/{repo}/workspaces/{id}/upload-snapshot",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Workspace ID"),
     ),
     request_body(
@@ -4498,8 +4513,9 @@ async fn upload_snapshot_handler(
 
 #[utoipa::path(
     get,
-    path = "/api/workspaces/{id}/files/{path}",
+    path = "/api/repos/{repo}/workspaces/{id}/files/{path}",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Workspace ID"),
         ("path" = String, Path, description = "File path within workspace"),
     ),
@@ -4615,7 +4631,10 @@ struct RepoFileListResponse {
 
 #[utoipa::path(
     get,
-    path = "/api/repo/files",
+    path = "/api/repos/{repo}/files",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 200, description = "List of repo files", body = RepoFileListResponse),
         (status = 401, description = "Unauthorized"),
@@ -4692,8 +4711,11 @@ fn read_vai_toml_ignore(repo_root: &std::path::Path) -> Vec<String> {
 
 #[utoipa::path(
     post,
-    path = "/api/files",
+    path = "/api/repos/{repo}/files",
     request_body = UploadFilesRequest,
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 200, description = "Files uploaded", body = UploadFilesResponse),
         (status = 400, description = "Bad request", body = ErrorBody),
@@ -4947,7 +4969,10 @@ async fn refresh_graph_from_files(
 
 #[utoipa::path(
     post,
-    path = "/api/graph/refresh",
+    path = "/api/repos/{repo}/graph/refresh",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 200, description = "Graph refreshed", body = ServerGraphRefreshResponse),
         (status = 401, description = "Unauthorized"),
@@ -5072,8 +5097,9 @@ async fn server_graph_refresh_handler(
 
 #[utoipa::path(
     get,
-    path = "/api/files/{path}",
+    path = "/api/repos/{repo}/files/{path}",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("path" = String, Path, description = "File path relative to repo root"),
     ),
     responses(
@@ -5747,8 +5773,9 @@ fn open_graph(vai_dir: &std::path::Path) -> Result<GraphSnapshot, ApiError> {
 
 #[utoipa::path(
     get,
-    path = "/api/graph/entities",
+    path = "/api/repos/{repo}/graph/entities",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("kind" = Option<String>, Query, description = "Filter by entity kind (e.g. \"function\", \"struct\")"),
         ("file" = Option<String>, Query, description = "Filter by exact file path"),
         ("name" = Option<String>, Query, description = "Filter by entity name substring"),
@@ -5782,8 +5809,9 @@ async fn list_graph_entities_handler(
 
 #[utoipa::path(
     get,
-    path = "/api/graph/entities/{id}",
+    path = "/api/repos/{repo}/graph/entities/{id}",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Entity ID"),
     ),
     responses(
@@ -5817,8 +5845,9 @@ async fn get_graph_entity_handler(
 
 #[utoipa::path(
     get,
-    path = "/api/graph/entities/{id}/deps",
+    path = "/api/repos/{repo}/graph/entities/{id}/deps",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Entity ID"),
     ),
     responses(
@@ -5865,8 +5894,9 @@ async fn get_entity_deps_handler(
 
 #[utoipa::path(
     get,
-    path = "/api/graph/blast-radius",
+    path = "/api/repos/{repo}/graph/blast-radius",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("entities" = String, Query, description = "Comma-separated entity IDs"),
         ("hops" = Option<usize>, Query, description = "Maximum traversal depth (default: 2)"),
     ),
@@ -5974,8 +6004,11 @@ async fn links_for_issue(
 
 #[utoipa::path(
     post,
-    path = "/api/issues",
+    path = "/api/repos/{repo}/issues",
     request_body = CreateIssueRequest,
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 201, description = "Issue created", body = IssueResponse),
         (status = 400, description = "Bad request", body = ErrorBody),
@@ -6145,8 +6178,9 @@ async fn create_issue_handler(
 /// `priority`, `status`, `title`.
 #[utoipa::path(
     get,
-    path = "/api/issues",
+    path = "/api/repos/{repo}/issues",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("status" = Option<String>, Query, description = "Filter by status (open, in_progress, closed)"),
         ("priority" = Option<String>, Query, description = "Filter by priority"),
         ("label" = Option<String>, Query, description = "Filter by label"),
@@ -6222,8 +6256,9 @@ async fn list_issues_handler(
 
 #[utoipa::path(
     get,
-    path = "/api/issues/{id}",
+    path = "/api/repos/{repo}/issues/{id}",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Issue ID"),
     ),
     responses(
@@ -6324,8 +6359,9 @@ async fn get_issue_handler(
 
 #[utoipa::path(
     patch,
-    path = "/api/issues/{id}",
+    path = "/api/repos/{repo}/issues/{id}",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Issue ID"),
     ),
     request_body = UpdateIssueRequest,
@@ -6409,8 +6445,9 @@ async fn update_issue_handler(
 
 #[utoipa::path(
     post,
-    path = "/api/issues/{id}/close",
+    path = "/api/repos/{repo}/issues/{id}/close",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Issue ID"),
     ),
     request_body = CloseIssueRequest,
@@ -7324,8 +7361,9 @@ fn default_resolved_by() -> String {
 /// `?sort=created_at:desc`.  Sortable columns: `created_at`, `status`.
 #[utoipa::path(
     get,
-    path = "/api/escalations",
+    path = "/api/repos/{repo}/escalations",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("status" = Option<String>, Query, description = "Filter by status (pending, resolved)"),
         ("page" = Option<u32>, Query, description = "Page number (1-indexed, default 1)"),
         ("per_page" = Option<u32>, Query, description = "Items per page (default 25, max 100)"),
@@ -7398,8 +7436,9 @@ struct ListEscalationsQuery {
 
 #[utoipa::path(
     get,
-    path = "/api/escalations/{id}",
+    path = "/api/repos/{repo}/escalations/{id}",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Escalation ID"),
     ),
     responses(
@@ -7432,8 +7471,9 @@ async fn get_escalation_handler(
 
 #[utoipa::path(
     post,
-    path = "/api/escalations/{id}/resolve",
+    path = "/api/repos/{repo}/escalations/{id}/resolve",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Escalation ID"),
     ),
     request_body = ResolveEscalationRequest,
@@ -7516,7 +7556,10 @@ struct ClaimWorkRequest {
 
 #[utoipa::path(
     get,
-    path = "/api/work-queue",
+    path = "/api/repos/{repo}/work-queue",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 200, description = "Work queue", body = work_queue::WorkQueue),
         (status = 401, description = "Unauthorized"),
@@ -7658,8 +7701,11 @@ async fn get_work_queue_handler(
 
 #[utoipa::path(
     post,
-    path = "/api/work-queue/claim",
+    path = "/api/repos/{repo}/work-queue/claim",
     request_body = ClaimWorkRequest,
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 201, description = "Work claimed", body = work_queue::ClaimResult),
         (status = 404, description = "Issue not found", body = ErrorBody),
@@ -7835,8 +7881,11 @@ impl From<Watcher> for WatcherResponse {
 
 #[utoipa::path(
     post,
-    path = "/api/watchers/register",
+    path = "/api/repos/{repo}/watchers/register",
     request_body = RegisterWatcherRequest,
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 201, description = "Watcher registered", body = WatcherResponse),
         (status = 400, description = "Bad request", body = ErrorBody),
@@ -7887,7 +7936,10 @@ async fn register_watcher_handler(
 
 #[utoipa::path(
     get,
-    path = "/api/watchers",
+    path = "/api/repos/{repo}/watchers",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 200, description = "List of registered watchers", body = Vec<WatcherResponse>),
         (status = 401, description = "Unauthorized"),
@@ -7912,8 +7964,9 @@ async fn list_watchers_handler(
 
 #[utoipa::path(
     post,
-    path = "/api/watchers/{id}/pause",
+    path = "/api/repos/{repo}/watchers/{id}/pause",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Watcher agent ID"),
     ),
     responses(
@@ -7947,8 +8000,9 @@ async fn pause_watcher_handler(
 
 #[utoipa::path(
     post,
-    path = "/api/watchers/{id}/resume",
+    path = "/api/repos/{repo}/watchers/{id}/resume",
     params(
+        ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Watcher agent ID"),
     ),
     responses(
@@ -8003,8 +8057,11 @@ struct DiscoveryOutcomeResponse {
 
 #[utoipa::path(
     post,
-    path = "/api/discoveries",
+    path = "/api/repos/{repo}/discoveries",
     request_body = SubmitDiscoveryRequest,
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 201, description = "Discovery submitted", body = DiscoveryOutcomeResponse),
         (status = 400, description = "Bad request", body = ErrorBody),
@@ -10014,8 +10071,11 @@ async fn bulk_revoke_keys_handler(
 
 #[utoipa::path(
     post,
-    path = "/api/migrate",
+    path = "/api/repos/{repo}/migrate",
     request_body(content = inline(serde_json::Value), description = "Migration payload (events, issues, versions, escalations)"),
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 201, description = "Migration successful", body = crate::migration::MigrationSummary),
         (status = 400, description = "Not running in Postgres mode or invalid payload", body = ErrorBody),
@@ -10261,7 +10321,10 @@ pub struct MigrationStatsResponse {
 
 #[utoipa::path(
     get,
-    path = "/api/migration-stats",
+    path = "/api/repos/{repo}/migration-stats",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
     responses(
         (status = 200, description = "Migration statistics", body = MigrationStatsResponse),
         (status = 400, description = "Not running in Postgres mode", body = ErrorBody),
@@ -10607,7 +10670,9 @@ async fn openapi_handler() -> impl IntoResponse {
 /// - `GET /ws/events?key=<api_key>` (WebSocket, auth via query param)
 ///
 /// Protected REST endpoints (require `Authorization: Bearer <key>`):
-/// - All `/api/workspaces` routes
+/// - Global management routes: `/api/repos`, `/api/users`, `/api/orgs`, `/api/keys`
+/// - All per-repo routes are under `/api/repos/:repo/` (workspaces, versions,
+///   graph, issues, escalations, work-queue, watchers, files, migrate, etc.)
 ///
 /// Exposed as `pub(crate)` so integration tests can build the app directly
 /// without going through the full TCP listener setup.
@@ -10629,57 +10694,6 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
 
     // Routes requiring `Authorization: Bearer <key>`.
     let protected = Router::new()
-        .route("/api/workspaces", post(create_workspace_handler))
-        .route("/api/workspaces", get(list_workspaces_handler))
-        .route("/api/workspaces/:id", get(get_workspace_handler))
-        .route("/api/workspaces/:id/submit", post(submit_workspace_handler))
-        .route("/api/workspaces/:id/files", post(upload_workspace_files_handler).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)))
-        .route("/api/workspaces/:id/upload-snapshot", post(upload_snapshot_handler).layer(DefaultBodyLimit::max(SNAPSHOT_BODY_LIMIT)))
-        .route("/api/workspaces/:id/files/*path", get(get_workspace_file_handler))
-        .route("/api/workspaces/:id", delete(discard_workspace_handler))
-        .route("/api/repo/files", get(list_repo_files_handler))
-        .route("/api/files", post(upload_source_files_handler).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)))
-        .route("/api/files/*path", get(get_main_file_handler))
-        .route("/api/graph/refresh", post(server_graph_refresh_handler))
-        .route("/api/versions", get(list_versions_handler))
-        // Static route registered before the dynamic one so that
-        // POST /api/versions/rollback is never captured by :id.
-        .route("/api/versions/rollback", post(rollback_handler))
-        .route("/api/versions/:id/diff", get(get_version_diff_handler))
-        .route("/api/versions/:id", get(get_version_handler))
-        // Graph query endpoints.
-        .route("/api/graph/entities", get(list_graph_entities_handler))
-        // Static sub-routes must come before the dynamic :id route.
-        .route("/api/graph/blast-radius", get(get_blast_radius_handler))
-        .route("/api/graph/entities/:id", get(get_graph_entity_handler))
-        .route(
-            "/api/graph/entities/:id/deps",
-            get(get_entity_deps_handler),
-        )
-        // Issue management endpoints.
-        .route("/api/issues", post(create_issue_handler))
-        .route("/api/issues", get(list_issues_handler))
-        // Static sub-routes must come before :id.
-        .route("/api/issues/:id/close", post(close_issue_handler))
-        .route("/api/issues/:id", get(get_issue_handler))
-        .route("/api/issues/:id", axum::routing::patch(update_issue_handler))
-        // Escalation endpoints.
-        .route("/api/escalations", get(list_escalations_handler))
-        // Static sub-routes must come before :id.
-        .route("/api/escalations/:id/resolve", post(resolve_escalation_handler))
-        .route("/api/escalations/:id", get(get_escalation_handler))
-        // Work queue endpoints.
-        .route("/api/work-queue", get(get_work_queue_handler))
-        .route("/api/work-queue/claim", post(claim_work_handler))
-        // Watcher registration and discovery endpoints.
-        .route("/api/watchers/register", post(register_watcher_handler))
-        .route("/api/watchers", get(list_watchers_handler))
-        .route("/api/watchers/:id/pause", post(pause_watcher_handler))
-        .route("/api/watchers/:id/resume", post(resume_watcher_handler))
-        .route("/api/discoveries", post(submit_discovery_handler))
-        // Migration endpoints (PRD 12.2, 12.5) — single-repo mode.
-        .route("/api/migrate", post(migrate_handler).layer(DefaultBodyLimit::max(MIGRATE_BODY_LIMIT)))
-        .route("/api/migration-stats", get(migration_stats_handler))
         // Multi-repo management endpoints.
         .route("/api/repos", post(create_repo_handler))
         .route("/api/repos", get(list_repos_handler))
@@ -12861,9 +12875,9 @@ mod tests {
         let decoded = BASE64.decode(dl["content_base64"].as_str().unwrap()).unwrap();
         assert_eq!(decoded, b"pub fn hello() {}\n");
 
-        // Download from main version via GET /api/files/:path.
+        // Download from main version via GET /api/repos/:repo/files/:path.
         let resp = client
-            .get(format!("http://{addr}/api/files/src/lib.rs"))
+            .get(format!("http://{addr}/api/repos/{repo}/files/src/lib.rs"))
             .bearer_auth(&key)
             .send()
             .await
@@ -12885,7 +12899,7 @@ mod tests {
 
         // 404 for non-existent main file.
         let resp = client
-            .get(format!("http://{addr}/api/files/does/not/exist.txt"))
+            .get(format!("http://{addr}/api/repos/{repo}/files/does/not/exist.txt"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13019,12 +13033,13 @@ mod tests {
         )
         .unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // List all entities — graph was populated during init.
         let resp = client
-            .get(format!("http://{addr}/api/graph/entities"))
+            .get(format!("http://{addr}/api/repos/{repo}/graph/entities"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13036,7 +13051,7 @@ mod tests {
 
         // Filter by kind=function — only functions should appear.
         let resp = client
-            .get(format!("http://{addr}/api/graph/entities?kind=function"))
+            .get(format!("http://{addr}/api/repos/{repo}/graph/entities?kind=function"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13051,7 +13066,7 @@ mod tests {
 
         // Filter by name=hello — should find at least one entity.
         let resp = client
-            .get(format!("http://{addr}/api/graph/entities?name=hello"))
+            .get(format!("http://{addr}/api/repos/{repo}/graph/entities?name=hello"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13079,12 +13094,13 @@ mod tests {
         )
         .unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Get all entities and pick one ID.
         let resp = client
-            .get(format!("http://{addr}/api/graph/entities"))
+            .get(format!("http://{addr}/api/repos/{repo}/graph/entities"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13095,9 +13111,9 @@ mod tests {
             .unwrap()
             .to_string();
 
-        // GET /api/graph/entities/:id
+        // GET /api/repos/:repo/graph/entities/:id
         let resp = client
-            .get(format!("http://{addr}/api/graph/entities/{id}"))
+            .get(format!("http://{addr}/api/repos/{repo}/graph/entities/{id}"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13108,9 +13124,9 @@ mod tests {
         assert!(detail["relationships"].is_array());
         assert_eq!(detail["entity"]["id"], id);
 
-        // GET /api/graph/entities/:id/deps
+        // GET /api/repos/:repo/graph/entities/:id/deps
         let resp = client
-            .get(format!("http://{addr}/api/graph/entities/{id}/deps"))
+            .get(format!("http://{addr}/api/repos/{repo}/graph/entities/{id}/deps"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13123,7 +13139,7 @@ mod tests {
 
         // 404 for non-existent entity.
         let resp = client
-            .get(format!("http://{addr}/api/graph/entities/nonexistent-id"))
+            .get(format!("http://{addr}/api/repos/{repo}/graph/entities/nonexistent-id"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13145,12 +13161,13 @@ mod tests {
         )
         .unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         // Get one entity ID to use as seed.
         let resp = client
-            .get(format!("http://{addr}/api/graph/entities"))
+            .get(format!("http://{addr}/api/repos/{repo}/graph/entities"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13161,10 +13178,10 @@ mod tests {
             .unwrap()
             .to_string();
 
-        // GET /api/graph/blast-radius?entities=<id>&hops=2
+        // GET /api/repos/:repo/graph/blast-radius?entities=<id>&hops=2
         let resp = client
             .get(format!(
-                "http://{addr}/api/graph/blast-radius?entities={id}&hops=2"
+                "http://{addr}/api/repos/{repo}/graph/blast-radius?entities={id}&hops=2"
             ))
             .bearer_auth(&key)
             .send()
@@ -13179,7 +13196,7 @@ mod tests {
 
         // Missing `entities` param → 400.
         let resp = client
-            .get(format!("http://{addr}/api/graph/blast-radius"))
+            .get(format!("http://{addr}/api/repos/{repo}/graph/blast-radius"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13207,11 +13224,12 @@ mod tests {
         fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
         fs::write(root.join("README.md"), b"# test\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo = &state.repo_name;
         let client = reqwest::Client::new();
 
         let resp = client
-            .get(format!("http://{addr}/api/repo/files"))
+            .get(format!("http://{addr}/api/repos/{repo}/files"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13248,10 +13266,11 @@ mod tests {
         fs::write(root.join("src/lib.rs"), b"pub fn hello() -> u32 { 42 }\n").unwrap();
         fs::write(root.join("src/main.rs"), b"fn main() { println!(\"hi\"); }\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
+        let repo_name = &state.repo_name;
 
         let dest = tmp.path().join("cloned");
-        let vai_url = format!("vai://{addr}/test-repo");
+        let vai_url = format!("vai://{addr}/{repo_name}");
         let result = remote_clone::clone(&vai_url, &dest, &key)
             .await
             .expect("clone should succeed");
@@ -13298,12 +13317,12 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), b"pub fn hello() -> u32 { 42 }\n").unwrap();
 
-        let (addr, shutdown_tx, _state, key) = start_test_server(root).await;
+        let (addr, shutdown_tx, state, key) = start_test_server(root).await;
 
         let remote = RemoteConfig {
             server_url: format!("http://{addr}"),
             api_key: key.clone(),
-            repo_name: "test-repo".to_string(),
+            repo_name: state.repo_name.clone(),
             cloned_at_version: "v1".to_string(),
         };
 
@@ -13767,10 +13786,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 201);
 
-        // ── GET /api/work-queue ────────────────────────────────────────────────
+        // ── GET /api/repos/:repo/work-queue ───────────────────────────────────
 
         let resp = client
-            .get(format!("http://{addr}/api/work-queue"))
+            .get(format!("http://{addr}/api/repos/{repo}/work-queue"))
             .bearer_auth(&key)
             .send()
             .await
@@ -13784,10 +13803,10 @@ mod tests {
         assert_eq!(available[0]["issue_id"], issue1_id);
         assert_eq!(queue["blocked_work"].as_array().unwrap().len(), 0);
 
-        // ── POST /api/work-queue/claim ─────────────────────────────────────────
+        // ── POST /api/repos/:repo/work-queue/claim ────────────────────────────
 
         let resp = client
-            .post(format!("http://{addr}/api/work-queue/claim"))
+            .post(format!("http://{addr}/api/repos/{repo}/work-queue/claim"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "issue_id": issue1_id }))
             .send()
@@ -13811,7 +13830,7 @@ mod tests {
         // ── Claim a non-existent issue → 404 ──────────────────────────────────
 
         let resp = client
-            .post(format!("http://{addr}/api/work-queue/claim"))
+            .post(format!("http://{addr}/api/repos/{repo}/work-queue/claim"))
             .bearer_auth(&key)
             .json(&serde_json::json!({
                 "issue_id": "00000000-0000-0000-0000-000000000000"
@@ -13824,7 +13843,7 @@ mod tests {
         // ── Claim an already in-progress issue → 409 ──────────────────────────
 
         let resp = client
-            .post(format!("http://{addr}/api/work-queue/claim"))
+            .post(format!("http://{addr}/api/repos/{repo}/work-queue/claim"))
             .bearer_auth(&key)
             .json(&serde_json::json!({ "issue_id": issue1_id }))
             .send()

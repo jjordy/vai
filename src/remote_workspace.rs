@@ -4,13 +4,13 @@
 //! repositories. Complements `sync.rs` (which handles pulling server changes)
 //! by handling the agent→server direction:
 //!
-//! 1. **Register** — `POST /api/workspaces` creates a workspace on the server
+//! 1. **Register** — `POST /api/repos/:repo/workspaces` creates a workspace on the server
 //!    and returns a server-assigned UUID that becomes the canonical workspace ID.
-//! 2. **Upload** — `POST /api/workspaces/:id/upload-snapshot` uploads a
+//! 2. **Upload** — `POST /api/repos/:repo/workspaces/:id/upload-snapshot` uploads a
 //!    gzip-compressed tarball; auto-detects full vs delta mode based on repo size.
-//! 3. **Submit** — `POST /api/workspaces/:id/submit` triggers the server-side
+//! 3. **Submit** — `POST /api/repos/:repo/workspaces/:id/submit` triggers the server-side
 //!    semantic merge and returns the resulting version or conflict details.
-//! 4. **List** — `GET /api/workspaces` fetches all active workspaces on the
+//! 4. **List** — `GET /api/repos/:repo/workspaces` fetches all active workspaces on the
 //!    server (used by `vai status --others`).
 //!
 //! ## Snapshot upload modes
@@ -113,7 +113,7 @@ pub struct RemoteSubmitResult {
 
 /// Registers a new workspace on the remote server.
 ///
-/// Calls `POST /api/workspaces` with `{"intent": "<intent>"}` and returns the
+/// Calls `POST /api/repos/:repo/workspaces` with `{"intent": "<intent>"}` and returns the
 /// server-assigned workspace UUID string. The caller should use this ID as the
 /// local workspace ID so both sides share the same identifier.
 pub async fn register_workspace(
@@ -121,7 +121,7 @@ pub async fn register_workspace(
     intent: &str,
 ) -> Result<RemoteWorkspaceMeta, RemoteWorkspaceError> {
     let client = reqwest::Client::new();
-    let url = format!("{}/api/workspaces", remote.server_url);
+    let url = format!("{}/api/repos/{}/workspaces", remote.server_url, remote.repo_name);
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", remote.api_key))
@@ -137,7 +137,7 @@ pub async fn register_workspace(
 /// Uploads all files in the workspace overlay to the server.
 ///
 /// Reads every file under `overlay_dir` and batches them into a single
-/// `POST /api/workspaces/:id/files` request with base64-encoded content.
+/// `POST /api/repos/:repo/workspaces/:id/files` request with base64-encoded content.
 /// Returns the list of file paths that were uploaded.
 pub async fn upload_overlay_files(
     remote: &RemoteConfig,
@@ -164,7 +164,7 @@ pub async fn upload_overlay_files(
         .collect();
 
     let client = reqwest::Client::new();
-    let url = format!("{}/api/workspaces/{}/files", remote.server_url, workspace_id);
+    let url = format!("{}/api/repos/{}/workspaces/{}/files", remote.server_url, remote.repo_name, workspace_id);
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", remote.api_key))
@@ -221,8 +221,8 @@ pub async fn upload_snapshot(
 
     let client = reqwest::Client::new();
     let url = format!(
-        "{}/api/workspaces/{}/upload-snapshot",
-        remote.server_url, workspace_id
+        "{}/api/repos/{}/workspaces/{}/upload-snapshot",
+        remote.server_url, remote.repo_name, workspace_id
     );
     let resp = client
         .post(&url)
@@ -238,7 +238,7 @@ pub async fn upload_snapshot(
 
 /// Submits a workspace on the server for semantic merge.
 ///
-/// Calls `POST /api/workspaces/:id/submit` and returns the merge result on
+/// Calls `POST /api/repos/:repo/workspaces/:id/submit` and returns the merge result on
 /// success. Returns [`RemoteWorkspaceError::MergeConflict`] when the server
 /// reports a 409 Conflict (unresolvable semantic conflicts).
 pub async fn submit_workspace(
@@ -246,7 +246,7 @@ pub async fn submit_workspace(
     workspace_id: &str,
 ) -> Result<RemoteSubmitResult, RemoteWorkspaceError> {
     let client = reqwest::Client::new();
-    let url = format!("{}/api/workspaces/{}/submit", remote.server_url, workspace_id);
+    let url = format!("{}/api/repos/{}/workspaces/{}/submit", remote.server_url, remote.repo_name, workspace_id);
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", remote.api_key))
@@ -272,7 +272,7 @@ pub async fn submit_workspace(
 
 /// Lists all active workspaces on the server.
 ///
-/// Calls `GET /api/workspaces` and returns the list of workspace metadata.
+/// Calls `GET /api/repos/:repo/workspaces` and returns the list of workspace metadata.
 ///
 /// The endpoint returns a paginated envelope `{"data": [...], "pagination": {...}}`.
 /// This function fetches the first page (up to 100 items) and returns the items.
@@ -285,7 +285,7 @@ pub async fn list_workspaces(
     }
 
     let client = reqwest::Client::new();
-    let url = format!("{}/api/workspaces?per_page=100", remote.server_url);
+    let url = format!("{}/api/repos/{}/workspaces?per_page=100", remote.server_url, remote.repo_name);
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", remote.api_key))

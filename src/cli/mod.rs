@@ -888,7 +888,8 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     // Proxy to remote if configured.
                     if let Some(client) = try_remote(&vai_dir, cli.local)? {
                         let rt = make_rt()?;
-                        let workspaces: serde_json::Value = rt.block_on(client.get("/api/workspaces"))?;
+                        let repo_name = repo::read_config(&vai_dir).map(|c| c.name).unwrap_or_default();
+                        let workspaces: serde_json::Value = rt.block_on(client.get(&format!("/api/repos/{repo_name}/workspaces")))?;
                         if cli.json {
                             println!("{}", serde_json::to_string_pretty(&workspaces).unwrap());
                         } else {
@@ -1817,6 +1818,9 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
             // ── Remote dispatch ────────────────────────────────────────────────
             if let Some(client) = try_remote(&vai_dir, cli.local)? {
                 let rt = make_rt()?;
+                let repo_name = repo::read_config(&vai_dir)
+                    .map(|c| c.name)
+                    .unwrap_or_default();
                 match issue_cmd {
                     IssueCommands::List { status, priority, label, created_by } => {
                         let mut params: Vec<String> = vec![];
@@ -1825,9 +1829,9 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         if let Some(l) = label { params.push(format!("label={l}")); }
                         if let Some(c) = created_by { params.push(format!("created_by={c}")); }
                         let path = if params.is_empty() {
-                            "/api/issues".to_string()
+                            format!("/api/repos/{repo_name}/issues")
                         } else {
-                            format!("/api/issues?{}", params.join("&"))
+                            format!("/api/repos/{repo_name}/issues?{}", params.join("&"))
                         };
                         let issues: serde_json::Value = rt.block_on(client.get(&path))?;
                         if cli.json {
@@ -1869,7 +1873,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                             "priority": priority,
                             "labels": labels,
                         });
-                        let issue: serde_json::Value = rt.block_on(client.post("/api/issues", &req))?;
+                        let issue: serde_json::Value = rt.block_on(client.post(&format!("/api/repos/{repo_name}/issues"), &req))?;
                         if cli.json {
                             println!("{}", serde_json::to_string_pretty(&issue).unwrap());
                         } else {
@@ -1880,7 +1884,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                         }
                     }
                     IssueCommands::Show { id } => {
-                        let path = format!("/api/issues/{id}");
+                        let path = format!("/api/repos/{repo_name}/issues/{id}");
                         let issue: serde_json::Value = rt.block_on(client.get(&path))?;
                         if cli.json {
                             println!("{}", serde_json::to_string_pretty(&issue).unwrap());
@@ -1934,7 +1938,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                             "description": body,
                             "labels": new_labels,
                         });
-                        let path = format!("/api/issues/{id}");
+                        let path = format!("/api/repos/{repo_name}/issues/{id}");
                         let issue: serde_json::Value = rt.block_on(client.patch(&path, &req))?;
                         if cli.json {
                             println!("{}", serde_json::to_string_pretty(&issue).unwrap());
@@ -1947,7 +1951,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                     }
                     IssueCommands::Close { id, resolution } => {
                         let req = serde_json::json!({ "resolution": resolution });
-                        let path = format!("/api/issues/{id}/close");
+                        let path = format!("/api/repos/{repo_name}/issues/{id}/close");
                         let issue: serde_json::Value = rt.block_on(client.post(&path, &req))?;
                         if cli.json {
                             println!("{}", serde_json::to_string_pretty(&issue).unwrap());

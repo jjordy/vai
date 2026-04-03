@@ -8,8 +8,8 @@
 //! 1. Parses the `vai://…` URL into an HTTP base URL.
 //! 2. Hits `GET /api/status` to verify the server is reachable and get the
 //!    repo name and HEAD version.
-//! 3. Hits `GET /api/repo/files` to get the list of files to download.
-//! 4. Downloads each file via `GET /api/files/<path>` (base64-encoded) and
+//! 3. Hits `GET /api/repos/<repo>/files` to get the list of files to download.
+//! 4. Downloads each file via `GET /api/repos/<repo>/files/<path>` (base64-encoded) and
 //!    writes it to the local directory.
 //! 5. Creates a minimal `.vai/` directory with `config.toml`, `head`, and
 //!    `remote.toml`.
@@ -143,10 +143,11 @@ pub async fn clone(url: &str, dest: &Path, api_key: &str) -> Result<CloneResult,
     )
     .await?;
 
-    // ── Get file list: GET /api/repo/files ────────────────────────────────
+    // ── Get file list: GET /api/repos/:repo/files ─────────────────────────
+    let repo_name = &status.repo_name;
     let file_list: RepoFileListResponse = get_json(
         &client,
-        &format!("{http_base}/api/repo/files"),
+        &format!("{http_base}/api/repos/{repo_name}/files"),
         Some(api_key),
     )
     .await?;
@@ -175,7 +176,7 @@ pub async fn clone(url: &str, dest: &Path, api_key: &str) -> Result<CloneResult,
         let encoded = urlencoding_encode(rel_path);
         let dl: FileDownloadResponse = get_json(
             &client,
-            &format!("{http_base}/api/files/{encoded}"),
+            &format!("{http_base}/api/repos/{repo_name}/files/{encoded}"),
             Some(api_key),
         )
         .await?;

@@ -71,6 +71,8 @@ async fn test_dashboard_server_receives_workspace_created_event() {
         .await
         .expect("start server");
 
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo_name = &repo_config.name;
     let base_http = format!("http://{addr}");
     let ws_url = format!("ws://{addr}/ws/events?key={api_key}");
 
@@ -100,7 +102,7 @@ async fn test_dashboard_server_receives_workspace_created_event() {
     // ── Create workspace via REST API ─────────────────────────────────────────
     let http = reqwest::Client::new();
     let resp = http
-        .post(format!("{base_http}/api/workspaces"))
+        .post(format!("{base_http}/api/repos/{repo_name}/workspaces"))
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({ "intent": "dashboard server test workspace" }))
         .send()

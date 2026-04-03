@@ -111,6 +111,8 @@ async fn test_multi_agent_coordination() {
         .await
         .expect("start_for_testing failed");
 
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let base_url = format!("http://{addr}");
     let ws_url = format!("ws://{addr}/ws/events");
     let client = reqwest::Client::new();
@@ -135,7 +137,7 @@ async fn test_multi_agent_coordination() {
 
     // ── 5. Both agents create workspaces ─────────────────────────────────────
     let resp_a = client
-        .post(format!("{base_url}/api/workspaces"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces"))
         .bearer_auth(&key_a)
         .json(&serde_json::json!({ "intent": "add token generation to auth module" }))
         .send()
@@ -146,7 +148,7 @@ async fn test_multi_agent_coordination() {
     let ws_a_id = ws_a_meta["id"].as_str().unwrap().to_string();
 
     let resp_b = client
-        .post(format!("{base_url}/api/workspaces"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces"))
         .bearer_auth(&key_b)
         .json(&serde_json::json!({ "intent": "add audit logging to auth module" }))
         .send()
@@ -162,7 +164,7 @@ async fn test_multi_agent_coordination() {
         "{AUTH_RS}\n/// Generates a new token.\npub fn generate_token(secret: &str) -> String {{\n    secret.to_uppercase()\n}}\n"
     );
     let upload_a = client
-        .post(format!("{base_url}/api/workspaces/{ws_a_id}/files"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces/{ws_a_id}/files"))
         .bearer_auth(&key_a)
         .json(&serde_json::json!({
             "files": [{ "path": "src/auth.rs", "content_base64": b64(auth_a.as_bytes()) }]
@@ -178,7 +180,7 @@ async fn test_multi_agent_coordination() {
         "{AUTH_RS}\n/// Audits a login attempt.\npub fn audit_login(user: &str) {{\n    println!(\"Login attempt: {{}}\", user);\n}}\n"
     );
     let upload_b = client
-        .post(format!("{base_url}/api/workspaces/{ws_b_id}/files"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces/{ws_b_id}/files"))
         .bearer_auth(&key_b)
         .json(&serde_json::json!({
             "files": [{ "path": "src/auth.rs", "content_base64": b64(auth_b.as_bytes()) }]
@@ -228,7 +230,7 @@ async fn test_multi_agent_coordination() {
 
     // ── 9. Agent A submits → v2 (fast-forward) ───────────────────────────────
     let submit_a = client
-        .post(format!("{base_url}/api/workspaces/{ws_a_id}/submit"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces/{ws_a_id}/submit"))
         .bearer_auth(&key_a)
         .send()
         .await
@@ -255,7 +257,7 @@ async fn test_multi_agent_coordination() {
     // The server's merge engine should auto-resolve: A added `generate_token`,
     // B added `audit_login` — different entities in the same file.
     let submit_b = client
-        .post(format!("{base_url}/api/workspaces/{ws_b_id}/submit"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces/{ws_b_id}/submit"))
         .bearer_auth(&key_b)
         .send()
         .await
@@ -274,7 +276,7 @@ async fn test_multi_agent_coordination() {
 
     // ── 11. Verify final auth.rs contains both agents' changes ────────────────
     let file_resp = client
-        .get(format!("{base_url}/api/files/src/auth.rs"))
+        .get(format!("{base_url}/api/repos/{repo}/files/src/auth.rs"))
         .bearer_auth(&key_a)
         .send()
         .await
@@ -296,7 +298,7 @@ async fn test_multi_agent_coordination() {
 
     // ── 12. Verify version history ────────────────────────────────────────────
     let versions_resp = client
-        .get(format!("{base_url}/api/versions"))
+        .get(format!("{base_url}/api/repos/{repo}/versions"))
         .bearer_auth(&key_a)
         .send()
         .await
@@ -314,7 +316,7 @@ async fn test_multi_agent_coordination() {
     // ── 13. Audit trail: verify event log has full history ───────────────────
     // The v2 and v3 version detail endpoints should both report file changes.
     let v2_resp = client
-        .get(format!("{base_url}/api/versions/v2"))
+        .get(format!("{base_url}/api/repos/{repo}/versions/v2"))
         .bearer_auth(&key_a)
         .send()
         .await
@@ -332,7 +334,7 @@ async fn test_multi_agent_coordination() {
     );
 
     let v3_resp = client
-        .get(format!("{base_url}/api/versions/v3"))
+        .get(format!("{base_url}/api/repos/{repo}/versions/v3"))
         .bearer_auth(&key_a)
         .send()
         .await
@@ -367,6 +369,8 @@ async fn test_event_buffer_replay_on_reconnect() {
         .await
         .expect("start_for_testing failed");
 
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let base_url = format!("http://{addr}");
     let ws_url = format!("ws://{addr}/ws/events");
     let client = reqwest::Client::new();
@@ -382,7 +386,7 @@ async fn test_event_buffer_replay_on_reconnect() {
 
     // Create a workspace to generate an event.
     let resp = client
-        .post(format!("{base_url}/api/workspaces"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces"))
         .bearer_auth(&key)
         .json(&serde_json::json!({ "intent": "test replay" }))
         .send()
@@ -411,7 +415,7 @@ async fn test_event_buffer_replay_on_reconnect() {
 
     // Generate another event while disconnected.
     let resp2 = client
-        .post(format!("{base_url}/api/workspaces"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces"))
         .bearer_auth(&key)
         .json(&serde_json::json!({ "intent": "second workspace during disconnect" }))
         .send()
@@ -481,12 +485,14 @@ async fn test_concurrent_non_overlapping_workspaces() {
         .await
         .expect("start failed");
 
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let base_url = format!("http://{addr}");
     let client = reqwest::Client::new();
 
     // Both agents create workspaces.
     let resp_a = client
-        .post(format!("{base_url}/api/workspaces"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces"))
         .bearer_auth(&key_a)
         .json(&serde_json::json!({ "intent": "enhance auth module" }))
         .send()
@@ -499,7 +505,7 @@ async fn test_concurrent_non_overlapping_workspaces() {
         .to_string();
 
     let resp_b = client
-        .post(format!("{base_url}/api/workspaces"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces"))
         .bearer_auth(&key_b)
         .json(&serde_json::json!({ "intent": "enhance config module" }))
         .send()
@@ -516,7 +522,7 @@ async fn test_concurrent_non_overlapping_workspaces() {
         "{AUTH_RS}\npub fn hash_token(t: &str) -> u64 {{\n    t.len() as u64\n}}\n"
     );
     client
-        .post(format!("{base_url}/api/workspaces/{ws_a_id}/files"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces/{ws_a_id}/files"))
         .bearer_auth(&key_a)
         .json(&serde_json::json!({
             "files": [{ "path": "src/auth.rs", "content_base64": b64(auth_enhanced.as_bytes()) }]
@@ -529,7 +535,7 @@ async fn test_concurrent_non_overlapping_workspaces() {
         "{CONFIG_RS}\npub fn is_valid(cfg: &Config) -> bool {{\n    !cfg.name.is_empty()\n}}\n"
     );
     client
-        .post(format!("{base_url}/api/workspaces/{ws_b_id}/files"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces/{ws_b_id}/files"))
         .bearer_auth(&key_b)
         .json(&serde_json::json!({
             "files": [{ "path": "src/config.rs", "content_base64": b64(config_enhanced.as_bytes()) }]
@@ -540,7 +546,7 @@ async fn test_concurrent_non_overlapping_workspaces() {
 
     // Agent A submits → v2.
     let s_a = client
-        .post(format!("{base_url}/api/workspaces/{ws_a_id}/submit"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces/{ws_a_id}/submit"))
         .bearer_auth(&key_a)
         .send()
         .await
@@ -553,7 +559,7 @@ async fn test_concurrent_non_overlapping_workspaces() {
 
     // Agent B submits → v3 (config.rs not touched by A, so no merge needed).
     let s_b = client
-        .post(format!("{base_url}/api/workspaces/{ws_b_id}/submit"))
+        .post(format!("{base_url}/api/repos/{repo}/workspaces/{ws_b_id}/submit"))
         .bearer_auth(&key_b)
         .send()
         .await
@@ -566,7 +572,7 @@ async fn test_concurrent_non_overlapping_workspaces() {
 
     // Both changes visible in their respective files.
     let auth_resp = client
-        .get(format!("{base_url}/api/files/src/auth.rs"))
+        .get(format!("{base_url}/api/repos/{repo}/files/src/auth.rs"))
         .bearer_auth(&key_a)
         .send()
         .await
@@ -585,7 +591,7 @@ async fn test_concurrent_non_overlapping_workspaces() {
     assert!(auth_content.contains("hash_token"), "auth.rs should have hash_token");
 
     let cfg_resp = client
-        .get(format!("{base_url}/api/files/src/config.rs"))
+        .get(format!("{base_url}/api/repos/{repo}/files/src/config.rs"))
         .bearer_auth(&key_a)
         .send()
         .await

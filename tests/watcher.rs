@@ -48,12 +48,14 @@ async fn test_watcher_registration_and_discovery_pipeline() {
         .await
         .expect("start_for_testing failed");
 
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
     // ── 1. Register a watcher ────────────────────────────────────────────────
     let register_res = client
-        .post(format!("{base}/api/watchers/register"))
+        .post(format!("{base}/api/repos/{repo}/watchers/register"))
         .bearer_auth(&key)
         .json(&serde_json::json!({
             "agent_id": "ci-watcher",
@@ -76,7 +78,7 @@ async fn test_watcher_registration_and_discovery_pipeline() {
 
     // ── 2. List watchers ─────────────────────────────────────────────────────
     let list_res = client
-        .get(format!("{base}/api/watchers"))
+        .get(format!("{base}/api/repos/{repo}/watchers"))
         .bearer_auth(&key)
         .send()
         .await
@@ -95,7 +97,7 @@ async fn test_watcher_registration_and_discovery_pipeline() {
 
     // Duplicate registration should fail.
     let dup_res = client
-        .post(format!("{base}/api/watchers/register"))
+        .post(format!("{base}/api/repos/{repo}/watchers/register"))
         .bearer_auth(&key)
         .json(&serde_json::json!({
             "agent_id": "ci-watcher",
@@ -109,7 +111,7 @@ async fn test_watcher_registration_and_discovery_pipeline() {
 
     // ── 3. Submit a discovery event → issue auto-created ─────────────────────
     let disc_res = client
-        .post(format!("{base}/api/discoveries"))
+        .post(format!("{base}/api/repos/{repo}/discoveries"))
         .bearer_auth(&key)
         .json(&serde_json::json!({
             "agent_id": "ci-watcher",
@@ -135,7 +137,7 @@ async fn test_watcher_registration_and_discovery_pipeline() {
 
     // ── 4. Submit duplicate → suppressed ─────────────────────────────────────
     let dup_disc_res = client
-        .post(format!("{base}/api/discoveries"))
+        .post(format!("{base}/api/repos/{repo}/discoveries"))
         .bearer_auth(&key)
         .json(&serde_json::json!({
             "agent_id": "ci-watcher",
@@ -160,7 +162,7 @@ async fn test_watcher_registration_and_discovery_pipeline() {
 
     // ── 5. Pause the watcher ──────────────────────────────────────────────────
     let pause_res = client
-        .post(format!("{base}/api/watchers/ci-watcher/pause"))
+        .post(format!("{base}/api/repos/{repo}/watchers/ci-watcher/pause"))
         .bearer_auth(&key)
         .send()
         .await
@@ -171,7 +173,7 @@ async fn test_watcher_registration_and_discovery_pipeline() {
 
     // ── 6. Discovery on paused watcher → error ────────────────────────────────
     let paused_disc = client
-        .post(format!("{base}/api/discoveries"))
+        .post(format!("{base}/api/repos/{repo}/discoveries"))
         .bearer_auth(&key)
         .json(&serde_json::json!({
             "agent_id": "ci-watcher",
@@ -193,7 +195,7 @@ async fn test_watcher_registration_and_discovery_pipeline() {
 
     // ── 7. Resume watcher → discovery succeeds ────────────────────────────────
     let resume_res = client
-        .post(format!("{base}/api/watchers/ci-watcher/resume"))
+        .post(format!("{base}/api/repos/{repo}/watchers/ci-watcher/resume"))
         .bearer_auth(&key)
         .send()
         .await
@@ -203,7 +205,7 @@ async fn test_watcher_registration_and_discovery_pipeline() {
     assert_eq!(resumed["status"], "active");
 
     let new_disc = client
-        .post(format!("{base}/api/discoveries"))
+        .post(format!("{base}/api/repos/{repo}/discoveries"))
         .bearer_auth(&key)
         .json(&serde_json::json!({
             "agent_id": "ci-watcher",

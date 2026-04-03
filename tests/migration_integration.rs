@@ -167,12 +167,14 @@ async fn test_migrate_local_repo_to_postgres() {
         .await
         .expect("start_for_testing_pg failed");
 
+    let repo_config = vai::repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
-    // ── POST /api/migrate ─────────────────────────────────────────────────────
+    // ── POST /api/repos/:repo/migrate ─────────────────────────────────────────
     let migrate_resp = client
-        .post(format!("{base}/api/migrate"))
+        .post(format!("{base}/api/repos/{repo}/migrate"))
         .bearer_auth("vai_admin_test")
         .json(&payload)
         .send()
@@ -196,9 +198,9 @@ async fn test_migrate_local_repo_to_postgres() {
     assert_eq!(summary.versions_migrated, expected_versions);
     assert_eq!(summary.head_version, expected_head);
 
-    // ── GET /api/migration-stats — independent verification ───────────────────
+    // ── GET /api/repos/:repo/migration-stats — independent verification ──────
     let stats_resp = client
-        .get(format!("{base}/api/migration-stats"))
+        .get(format!("{base}/api/repos/{repo}/migration-stats"))
         .bearer_auth("vai_admin_test")
         .send()
         .await
@@ -227,7 +229,7 @@ async fn test_migrate_local_repo_to_postgres() {
 
     // ── Idempotency check — second POST must succeed and insert nothing new ────
     let dup_resp = client
-        .post(format!("{base}/api/migrate"))
+        .post(format!("{base}/api/repos/{repo}/migrate"))
         .bearer_auth("vai_admin_test")
         .json(&payload)
         .send()
@@ -242,7 +244,7 @@ async fn test_migrate_local_repo_to_postgres() {
     );
 
     let dup_summary: MigrationSummary = client
-        .post(format!("{base}/api/migrate"))
+        .post(format!("{base}/api/repos/{repo}/migrate"))
         .bearer_auth("vai_admin_test")
         .json(&payload)
         .send()

@@ -78,6 +78,8 @@ async fn test_concurrent_workspace_creation() {
         .await
         .expect("start server");
 
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let base_url = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -85,7 +87,7 @@ async fn test_concurrent_workspace_creation() {
     let mut handles = Vec::new();
     for (i, key) in keys.iter().enumerate() {
         let client = client.clone();
-        let url = format!("{base_url}/api/workspaces");
+        let url = format!("{base_url}/api/repos/{repo}/workspaces");
         let key = key.clone();
         handles.push(tokio::spawn(async move {
             let resp = client
@@ -141,6 +143,8 @@ async fn test_concurrent_file_uploads_sequential_submits() {
         .await
         .expect("start server");
 
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let base_url = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -157,7 +161,7 @@ async fn test_concurrent_file_uploads_sequential_submits() {
 
     for (key, module, intent, _content) in &agents {
         let resp = client
-            .post(format!("{base_url}/api/workspaces"))
+            .post(format!("{base_url}/api/repos/{repo}/workspaces"))
             .bearer_auth(*key)
             .json(&serde_json::json!({ "intent": intent }))
             .send()
@@ -171,7 +175,7 @@ async fn test_concurrent_file_uploads_sequential_submits() {
     // Upload files concurrently.
     for (i, (ws_id, module)) in ws_ids.iter().enumerate() {
         let client = client.clone();
-        let url = format!("{base_url}/api/workspaces/{ws_id}/files");
+        let url = format!("{base_url}/api/repos/{repo}/workspaces/{ws_id}/files");
         let key = agents[i].0.clone();
         let content = agents[i].3;
         let module = module.clone();
@@ -200,7 +204,7 @@ async fn test_concurrent_file_uploads_sequential_submits() {
     let expected_versions = ["v2", "v3", "v4"];
     for (i, (ws_id, _module)) in ws_ids.iter().enumerate() {
         let resp = client
-            .post(format!("{base_url}/api/workspaces/{ws_id}/submit"))
+            .post(format!("{base_url}/api/repos/{repo}/workspaces/{ws_id}/submit"))
             .bearer_auth(agents[i].0)
             .send()
             .await
@@ -218,7 +222,7 @@ async fn test_concurrent_file_uploads_sequential_submits() {
     // Verify all files have the updated content.
     for (i, (_ws_id, module)) in ws_ids.iter().enumerate() {
         let resp = client
-            .get(format!("{base_url}/api/files/src/{module}.rs"))
+            .get(format!("{base_url}/api/repos/{repo}/files/src/{module}.rs"))
             .bearer_auth(agents[0].0)
             .send()
             .await
@@ -238,7 +242,7 @@ async fn test_concurrent_file_uploads_sequential_submits() {
 
     // Verify version history is complete.
     let versions_resp = client
-        .get(format!("{base_url}/api/versions"))
+        .get(format!("{base_url}/api/repos/{repo}/versions"))
         .bearer_auth(agents[0].0)
         .send()
         .await
@@ -261,6 +265,8 @@ async fn test_concurrent_issue_creation() {
         .await
         .expect("start server");
 
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let base_url = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -268,7 +274,7 @@ async fn test_concurrent_issue_creation() {
     let mut handles = Vec::new();
     for i in 0..10 {
         let client = client.clone();
-        let url = format!("{base_url}/api/issues");
+        let url = format!("{base_url}/api/repos/{repo}/issues");
         let key = key.clone();
         handles.push(tokio::spawn(async move {
             let resp = client
@@ -300,7 +306,7 @@ async fn test_concurrent_issue_creation() {
 
     // Verify issue count via list endpoint.
     let list_resp = client
-        .get(format!("{base_url}/api/issues"))
+        .get(format!("{base_url}/api/repos/{repo}/issues"))
         .bearer_auth(&key)
         .send()
         .await
@@ -324,6 +330,8 @@ async fn test_concurrent_ws_and_event_reads() {
         .await
         .expect("start server");
 
+    let repo_config = repo::read_config(&vai_dir).expect("read config");
+    let repo = &repo_config.name;
     let base_url = format!("http://{addr}");
     let ws_url = format!("ws://{addr}/ws/events?key={key}");
     let client = reqwest::Client::new();
@@ -347,7 +355,7 @@ async fn test_concurrent_ws_and_event_reads() {
     let mut handles = Vec::new();
     for i in 0..5 {
         let client = client.clone();
-        let url = format!("{base_url}/api/workspaces");
+        let url = format!("{base_url}/api/repos/{repo}/workspaces");
         let key = key.clone();
         handles.push(tokio::spawn(async move {
             client
