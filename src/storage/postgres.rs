@@ -462,28 +462,102 @@ impl IssueStore for PostgresStorage {
         &self,
         repo_id: &Uuid,
         filter: &IssueFilter,
-        _query: &ListQuery,
+        query: &ListQuery,
     ) -> Result<ListResult<Issue>, StorageError> {
-        let rows = sqlx::query(
-            "SELECT id, title, body, status, priority, labels, creator, agent_source, \
-                    resolution, created_at, updated_at, acceptance_criteria \
-             FROM issues WHERE repo_id = $1 ORDER BY created_at DESC",
-        )
-        .bind(repo_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+        // Build dynamic WHERE clause from filter fields.
+        let mut conditions = vec!["repo_id = $1".to_string()];
+        let mut param_idx = 2usize;
 
-        let mut items = Vec::new();
-        for row in rows {
-            let issue = row_to_issue(row)?;
-            if filter_matches_issue(&issue, filter) {
-                items.push(issue);
-            }
+        if filter.status.is_some() {
+            conditions.push(format!("status = ${param_idx}"));
+            param_idx += 1;
+        }
+        if filter.priority.is_some() {
+            conditions.push(format!("priority = ${param_idx}"));
+            param_idx += 1;
+        }
+        if filter.label.is_some() {
+            // Case-insensitive array element match.
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM unnest(labels) l WHERE lower(l) = lower(${param_idx}))"
+            ));
+            param_idx += 1;
+        }
+        if filter.creator.is_some() {
+            conditions.push(format!("creator = ${param_idx}"));
+            param_idx += 1;
+        }
+        let _ = param_idx; // suppress unused warning after last use
+
+        let where_clause = conditions.join(" AND ");
+
+        // Build ORDER BY from query sort fields.
+        let col_map: HashMap<&str, &str> = [
+            ("created_at", "created_at"),
+            ("updated_at", "updated_at"),
+            ("priority", "priority"),
+            ("status", "status"),
+            ("title", "title"),
+        ]
+        .into_iter()
+        .collect();
+        let order_by = query.sql_order_by(&col_map);
+        let order_by = if order_by.is_empty() {
+            "ORDER BY created_at DESC".to_string()
+        } else {
+            order_by
+        };
+
+        let (limit, offset) = query.sql_limit_offset();
+        let limit_clause = if limit == i64::MAX {
+            String::new()
+        } else {
+            format!(" LIMIT {limit} OFFSET {offset}")
+        };
+
+        let select_sql = format!(
+            "SELECT id, title, body, status, priority, labels, creator, agent_source, \
+             resolution, created_at, updated_at, acceptance_criteria \
+             FROM issues WHERE {where_clause} {order_by}{limit_clause}"
+        );
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM issues WHERE {where_clause}"
+        );
+
+        // Bind parameters in the same order as the WHERE clause.
+        macro_rules! bind_filter {
+            ($q:expr) => {{
+                let mut q = $q;
+                q = q.bind(*repo_id);
+                if let Some(ref s) = filter.status {
+                    q = q.bind(s.as_str().to_string());
+                }
+                if let Some(ref p) = filter.priority {
+                    q = q.bind(p.as_str().to_string());
+                }
+                if let Some(ref l) = filter.label {
+                    q = q.bind(l.clone());
+                }
+                if let Some(ref c) = filter.creator {
+                    q = q.bind(c.clone());
+                }
+                q
+            }};
         }
 
-        let total = items.len() as u64;
-        Ok(ListResult { items, total })
+        let count_row = bind_filter!(sqlx::query(&count_sql))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let total: i64 = count_row.get(0);
+
+        let rows = bind_filter!(sqlx::query(&select_sql))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let items: Result<Vec<Issue>, StorageError> = rows.into_iter().map(row_to_issue).collect();
+        Ok(ListResult { items: items?, total: total as u64 })
     }
 
     async fn update_issue(
@@ -587,30 +661,6 @@ fn row_to_issue(row: sqlx::postgres::PgRow) -> Result<Issue, StorageError> {
         created_at,
         updated_at,
     })
-}
-
-fn filter_matches_issue(issue: &Issue, filter: &IssueFilter) -> bool {
-    if let Some(ref s) = filter.status {
-        if issue.status != *s {
-            return false;
-        }
-    }
-    if let Some(ref p) = filter.priority {
-        if issue.priority != *p {
-            return false;
-        }
-    }
-    if let Some(ref label) = filter.label {
-        if !issue.labels.iter().any(|l| l.eq_ignore_ascii_case(label)) {
-            return false;
-        }
-    }
-    if let Some(ref creator) = filter.creator {
-        if &issue.creator != creator {
-            return false;
-        }
-    }
-    true
 }
 
 // ── CommentStore ──────────────────────────────────────────────────────────────
@@ -844,35 +894,59 @@ impl EscalationStore for PostgresStorage {
         &self,
         repo_id: &Uuid,
         pending_only: bool,
-        _query: &ListQuery,
+        query: &ListQuery,
     ) -> Result<ListResult<Escalation>, StorageError> {
-        let rows = if pending_only {
-            sqlx::query(
-                "SELECT id, escalation_type, severity, summary, intents, agents, workspace_ids, \
-                        affected_entities, conflicts, resolution_options, resolved, resolution, \
-                        resolved_by, resolved_at, created_at \
-                 FROM escalations WHERE repo_id = $1 AND resolved = false ORDER BY created_at",
-            )
-            .bind(repo_id)
-            .fetch_all(&self.pool)
-            .await
+        let where_clause = if pending_only {
+            "repo_id = $1 AND resolved = false"
         } else {
-            sqlx::query(
-                "SELECT id, escalation_type, severity, summary, intents, agents, workspace_ids, \
-                        affected_entities, conflicts, resolution_options, resolved, resolution, \
-                        resolved_by, resolved_at, created_at \
-                 FROM escalations WHERE repo_id = $1 ORDER BY created_at",
-            )
+            "repo_id = $1"
+        };
+
+        let col_map: HashMap<&str, &str> = [
+            ("created_at", "created_at"),
+            ("status", "resolved"),
+        ]
+        .into_iter()
+        .collect();
+        let order_by = query.sql_order_by(&col_map);
+        let order_by = if order_by.is_empty() {
+            "ORDER BY created_at DESC".to_string()
+        } else {
+            order_by
+        };
+
+        let (limit, offset) = query.sql_limit_offset();
+        let limit_clause = if limit == i64::MAX {
+            String::new()
+        } else {
+            format!(" LIMIT {limit} OFFSET {offset}")
+        };
+
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM escalations WHERE {where_clause}"
+        );
+        let select_sql = format!(
+            "SELECT id, escalation_type, severity, summary, intents, agents, workspace_ids, \
+             affected_entities, conflicts, resolution_options, resolved, resolution, \
+             resolved_by, resolved_at, created_at \
+             FROM escalations WHERE {where_clause} {order_by}{limit_clause}"
+        );
+
+        let count_row = sqlx::query(&count_sql)
+            .bind(repo_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let total: i64 = count_row.get(0);
+
+        let rows = sqlx::query(&select_sql)
             .bind(repo_id)
             .fetch_all(&self.pool)
             .await
-        }
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+            .map_err(|e| StorageError::Database(e.to_string()))?;
 
         let items: Result<Vec<Escalation>, StorageError> = rows.into_iter().map(row_to_escalation).collect();
-        let items = items?;
-        let total = items.len() as u64;
-        Ok(ListResult { items, total })
+        Ok(ListResult { items: items?, total: total as u64 })
     }
 
     async fn resolve_escalation(
@@ -1009,21 +1083,47 @@ impl VersionStore for PostgresStorage {
     async fn list_versions(
         &self,
         repo_id: &Uuid,
-        _query: &ListQuery,
+        query: &ListQuery,
     ) -> Result<ListResult<VersionMeta>, StorageError> {
-        let rows = sqlx::query(
+        let col_map: HashMap<&str, &str> = [
+            ("created_at", "created_at"),
+            ("version_id", "version_id"),
+        ]
+        .into_iter()
+        .collect();
+        let order_by = query.sql_order_by(&col_map);
+        let order_by = if order_by.is_empty() {
+            "ORDER BY created_at DESC".to_string()
+        } else {
+            order_by
+        };
+
+        let (limit, offset) = query.sql_limit_offset();
+        let limit_clause = if limit == i64::MAX {
+            String::new()
+        } else {
+            format!(" LIMIT {limit} OFFSET {offset}")
+        };
+
+        let count_row = sqlx::query("SELECT COUNT(*) FROM versions WHERE repo_id = $1")
+            .bind(repo_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let total: i64 = count_row.get(0);
+
+        let select_sql = format!(
             "SELECT version_id, parent_version_id, intent, created_by, merge_event_id, created_at \
-             FROM versions WHERE repo_id = $1 ORDER BY created_at",
-        )
-        .bind(repo_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+             FROM versions WHERE repo_id = $1 {order_by}{limit_clause}"
+        );
+        let rows = sqlx::query(&select_sql)
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
 
         let items: Result<Vec<VersionMeta>, StorageError> = rows.into_iter().map(row_to_version).collect();
-        let items = items?;
-        let total = items.len() as u64;
-        Ok(ListResult { items, total })
+        Ok(ListResult { items: items?, total: total as u64 })
     }
 
     async fn list_versions_since(
@@ -1152,34 +1252,58 @@ impl WorkspaceStore for PostgresStorage {
         &self,
         repo_id: &Uuid,
         include_inactive: bool,
-        _query: &ListQuery,
+        query: &ListQuery,
     ) -> Result<ListResult<WorkspaceMeta>, StorageError> {
-        let rows = if include_inactive {
-            sqlx::query(
-                "SELECT id, intent, base_version, status, issue_id, deleted_paths, \
-                 created_at, updated_at \
-                 FROM workspaces WHERE repo_id = $1 ORDER BY created_at",
-            )
-            .bind(repo_id)
-            .fetch_all(&self.pool)
-            .await
+        let where_clause = if include_inactive {
+            "repo_id = $1"
         } else {
-            sqlx::query(
-                "SELECT id, intent, base_version, status, issue_id, deleted_paths, \
-                 created_at, updated_at \
-                 FROM workspaces WHERE repo_id = $1 \
-                 AND status NOT IN ('Discarded', 'Merged') ORDER BY created_at",
-            )
+            "repo_id = $1 AND status NOT IN ('Discarded', 'Merged')"
+        };
+
+        let col_map: HashMap<&str, &str> = [
+            ("created_at", "created_at"),
+            ("updated_at", "updated_at"),
+            ("status", "status"),
+            ("intent", "intent"),
+        ]
+        .into_iter()
+        .collect();
+        let order_by = query.sql_order_by(&col_map);
+        let order_by = if order_by.is_empty() {
+            "ORDER BY created_at DESC".to_string()
+        } else {
+            order_by
+        };
+
+        let (limit, offset) = query.sql_limit_offset();
+        let limit_clause = if limit == i64::MAX {
+            String::new()
+        } else {
+            format!(" LIMIT {limit} OFFSET {offset}")
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM workspaces WHERE {where_clause}");
+        let select_sql = format!(
+            "SELECT id, intent, base_version, status, issue_id, deleted_paths, \
+             created_at, updated_at \
+             FROM workspaces WHERE {where_clause} {order_by}{limit_clause}"
+        );
+
+        let count_row = sqlx::query(&count_sql)
+            .bind(repo_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let total: i64 = count_row.get(0);
+
+        let rows = sqlx::query(&select_sql)
             .bind(repo_id)
             .fetch_all(&self.pool)
             .await
-        }
-        .map_err(|e| StorageError::Database(e.to_string()))?;
+            .map_err(|e| StorageError::Database(e.to_string()))?;
 
         let items: Result<Vec<WorkspaceMeta>, StorageError> = rows.into_iter().map(row_to_workspace).collect();
-        let items = items?;
-        let total = items.len() as u64;
-        Ok(ListResult { items, total })
+        Ok(ListResult { items: items?, total: total as u64 })
     }
 
     async fn update_workspace(

@@ -30,6 +30,7 @@ use vai::escalation::{EscalationSeverity, EscalationStatus, EscalationType, Reso
 use vai::event_log::EventKind;
 use vai::graph::{Entity, EntityKind, Relationship, RelationshipKind};
 use vai::issue::{IssueFilter, IssuePriority, IssueStatus};
+use vai::storage::pagination::ListQuery;
 use vai::storage::postgres::PostgresStorage;
 use vai::storage::{
     AuthStore, CommentStore, EscalationStore, EventStore, GraphStore, IssueStore, NewEscalation,
@@ -258,10 +259,10 @@ async fn test_issue_store_crud() {
         ..Default::default()
     };
     let issues = storage
-        .list_issues(&repo_id, &filter)
+        .list_issues(&repo_id, &filter, &ListQuery::default())
         .await
         .expect("list_issues failed");
-    assert_eq!(issues.len(), 1);
+    assert_eq!(issues.items.len(), 1);
 
     // close
     let closed = storage
@@ -272,10 +273,10 @@ async fn test_issue_store_crud() {
 
     // list — open issues should now be empty
     let open = storage
-        .list_issues(&repo_id, &IssueFilter { status: Some(IssueStatus::Open), ..Default::default() })
+        .list_issues(&repo_id, &IssueFilter { status: Some(IssueStatus::Open), ..Default::default() }, &ListQuery::default())
         .await
         .expect("list_issues after close failed");
-    assert!(open.is_empty());
+    assert!(open.items.is_empty());
 
     // not found
     let missing = storage.get_issue(&repo_id, &Uuid::new_v4()).await;
@@ -322,10 +323,10 @@ async fn test_escalation_store_crud() {
 
     // list pending_only=true
     let pending = storage
-        .list_escalations(&repo_id, true)
+        .list_escalations(&repo_id, true, &ListQuery::default())
         .await
         .expect("list_escalations failed");
-    assert_eq!(pending.len(), 1);
+    assert_eq!(pending.items.len(), 1);
 
     // resolve
     let resolved = storage
@@ -337,17 +338,17 @@ async fn test_escalation_store_crud() {
 
     // list pending_only=true should now be empty
     let pending_after = storage
-        .list_escalations(&repo_id, true)
+        .list_escalations(&repo_id, true, &ListQuery::default())
         .await
         .expect("list after resolve failed");
-    assert!(pending_after.is_empty());
+    assert!(pending_after.items.is_empty());
 
     // list all (pending_only=false) should still have 1
     let all = storage
-        .list_escalations(&repo_id, false)
+        .list_escalations(&repo_id, false, &ListQuery::default())
         .await
         .expect("list_all failed");
-    assert_eq!(all.len(), 1);
+    assert_eq!(all.items.len(), 1);
 
     teardown(&storage, &repo_id).await;
 }
@@ -403,11 +404,12 @@ async fn test_version_store() {
 
     // list_versions — chronological order
     let versions = storage
-        .list_versions(&repo_id)
+        .list_versions(&repo_id, &ListQuery::default())
         .await
         .expect("list_versions failed");
-    assert_eq!(versions.len(), 2);
-    assert_eq!(versions[0].version_id, "v1");
+    assert_eq!(versions.items.len(), 2);
+    // Default ordering is created_at DESC, so v2 (created last) comes first.
+    assert!(versions.items.iter().any(|v| v.version_id == "v1"));
 
     // advance_head
     storage
@@ -478,10 +480,10 @@ async fn test_workspace_store() {
 
     // list — include_inactive=false should return 1 active workspace
     let active = storage
-        .list_workspaces(&repo_id, false)
+        .list_workspaces(&repo_id, false, &ListQuery::default())
         .await
         .expect("list_workspaces failed");
-    assert_eq!(active.len(), 1);
+    assert_eq!(active.items.len(), 1);
 
     // discard
     storage
@@ -491,17 +493,17 @@ async fn test_workspace_store() {
 
     // After discard, include_inactive=false should return empty
     let after_discard = storage
-        .list_workspaces(&repo_id, false)
+        .list_workspaces(&repo_id, false, &ListQuery::default())
         .await
         .expect("list_workspaces after discard failed");
-    assert!(after_discard.is_empty());
+    assert!(after_discard.items.is_empty());
 
     // include_inactive=true should still return the discarded workspace
     let all = storage
-        .list_workspaces(&repo_id, true)
+        .list_workspaces(&repo_id, true, &ListQuery::default())
         .await
         .expect("list_workspaces include_inactive failed");
-    assert_eq!(all.len(), 1);
+    assert_eq!(all.items.len(), 1);
 
     // not found
     let missing = storage.get_workspace(&repo_id, &Uuid::new_v4()).await;
@@ -1174,10 +1176,10 @@ async fn test_issue_store_cross_repo_isolation() {
 
     // repo_b should see no issues.
     let list_b = storage
-        .list_issues(&repo_b, &IssueFilter::default())
+        .list_issues(&repo_b, &IssueFilter::default(), &ListQuery::default())
         .await
         .expect("list_issues failed");
-    assert!(list_b.is_empty(), "repo_b should not see repo_a's issues");
+    assert!(list_b.items.is_empty(), "repo_b should not see repo_a's issues");
 
     // get_issue from repo_b with repo_a's ID should return NotFound.
     let result = storage.get_issue(&repo_b, &issue.id).await;
@@ -1270,11 +1272,11 @@ async fn test_escalation_store_cross_repo_isolation() {
 
     // repo_b should see no escalations.
     let list_b = storage
-        .list_escalations(&repo_b, false)
+        .list_escalations(&repo_b, false, &ListQuery::default())
         .await
         .expect("list_escalations failed");
     assert!(
-        list_b.is_empty(),
+        list_b.items.is_empty(),
         "repo_b should not see repo_a's escalations"
     );
 
@@ -1311,11 +1313,11 @@ async fn test_workspace_store_cross_repo_isolation() {
 
     // repo_b should see no workspaces.
     let list_b = storage
-        .list_workspaces(&repo_b, true)
+        .list_workspaces(&repo_b, true, &ListQuery::default())
         .await
         .expect("list_workspaces failed");
     assert!(
-        list_b.is_empty(),
+        list_b.items.is_empty(),
         "repo_b should not see repo_a's workspaces"
     );
 
@@ -1358,11 +1360,11 @@ async fn test_version_store_cross_repo_isolation() {
 
     // repo_b should have no versions and no head.
     let versions_b = storage
-        .list_versions(&repo_b)
+        .list_versions(&repo_b, &ListQuery::default())
         .await
         .expect("list_versions failed");
     assert!(
-        versions_b.is_empty(),
+        versions_b.items.is_empty(),
         "repo_b should not see repo_a's versions"
     );
 
