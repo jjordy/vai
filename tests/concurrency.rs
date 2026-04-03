@@ -243,7 +243,8 @@ async fn test_concurrent_file_uploads_sequential_submits() {
         .send()
         .await
         .unwrap();
-    let versions: Vec<serde_json::Value> = versions_resp.json().await.unwrap();
+    let versions_body: serde_json::Value = versions_resp.json().await.unwrap();
+    let versions = versions_body["data"].as_array().unwrap();
     assert_eq!(versions.len(), 4, "should have v1 through v4");
 
     let _ = shutdown_tx.send(());
@@ -305,7 +306,8 @@ async fn test_concurrent_issue_creation() {
         .await
         .unwrap();
     assert_eq!(list_resp.status(), 200);
-    let issues: Vec<serde_json::Value> = list_resp.json().await.unwrap();
+    let issues_body: serde_json::Value = list_resp.json().await.unwrap();
+    let issues = issues_body["data"].as_array().unwrap();
     assert_eq!(issues.len(), 10, "should have exactly 10 issues");
 
     let _ = shutdown_tx.send(());

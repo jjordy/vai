@@ -286,7 +286,7 @@ async fn test_upload_path_too_long() {
     assert!(body.contains("path"), "error should mention 'path'");
 }
 
-/// Pagination limit above 1000 → 400.
+/// Pagination per_page above 100 → 400.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_list_versions_limit_too_large() {
     let (_tmp, vai_dir) = setup();
@@ -295,16 +295,16 @@ async fn test_list_versions_limit_too_large() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("http://{addr}/api/versions?limit=1001"))
+        .get(format!("http://{addr}/api/versions?per_page=101"))
         .bearer_auth(&api_key)
         .send()
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 400, "expected 400 for limit > 1000");
+    assert_eq!(resp.status(), 400, "expected 400 for per_page > 100");
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("1000") || body.contains("page size") || body.contains("limit"),
+        body.contains("101") || body.contains("per_page") || body.contains("100"),
         "error should mention the limit: {body}"
     );
 }

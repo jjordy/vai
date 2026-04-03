@@ -131,7 +131,7 @@ async fn test_complete_agent_workflow() {
     let resp = client.get(format!("{rp}/issues")).bearer_auth(admin).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let issues: serde_json::Value = resp.json().await.unwrap();
-    let arr = issues.as_array().unwrap();
+    let arr = issues["data"].as_array().unwrap();
     assert!(!arr.is_empty(), "issue list must not be empty");
     assert!(
         arr.iter().any(|i| i["id"].as_str() == Some(&issue_id)),
@@ -220,7 +220,7 @@ async fn test_complete_agent_workflow() {
     let resp = client.get(format!("{rp}/versions")).bearer_auth(admin).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let versions: serde_json::Value = resp.json().await.unwrap();
-    let version_arr = versions.as_array().unwrap();
+    let version_arr = versions["data"].as_array().unwrap();
     assert!(
         version_arr.iter().any(|v| v["label"].as_str() == Some(&new_version)),
         "submitted version must appear in version list"
@@ -651,7 +651,7 @@ async fn test_concurrent_agents() {
     let resp = client.get(format!("{rp}/versions")).bearer_auth(admin).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let versions: serde_json::Value = resp.json().await.unwrap();
-    let version_count = versions.as_array().unwrap().len();
+    let version_count = versions["data"].as_array().unwrap().len();
     assert!(version_count >= 2, "expected at least 2 versions, got {version_count}");
 
     shutdown_tx.send(()).ok();
@@ -872,7 +872,7 @@ async fn test_version_diff_via_storage() {
     let resp = client.get(format!("{rp}/versions")).bearer_auth(admin).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let versions: serde_json::Value = resp.json().await.unwrap();
-    let version_id = versions
+    let version_id = versions["data"]
         .as_array()
         .unwrap()
         .iter()
@@ -1745,7 +1745,7 @@ async fn test_deletion_round_trip() {
     let resp = client.get(format!("{rp}/versions")).bearer_auth(admin).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let versions: serde_json::Value = resp.json().await.unwrap();
-    let v2_id = versions
+    let v2_id = versions["data"]
         .as_array()
         .unwrap()
         .iter()
@@ -1849,7 +1849,7 @@ async fn test_deletion_round_trip() {
     let resp = client.get(format!("{rp}/versions")).bearer_auth(admin).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let versions: serde_json::Value = resp.json().await.unwrap();
-    let v3_id = versions
+    let v3_id = versions["data"]
         .as_array()
         .unwrap()
         .iter()
@@ -2047,7 +2047,7 @@ async fn test_complete_agent_workflow_readonly_repo_root() {
     let resp = client.get(format!("{rp}/versions")).bearer_auth(admin).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let versions: serde_json::Value = resp.json().await.unwrap();
-    let version_arr = versions.as_array().unwrap();
+    let version_arr = versions["data"].as_array().unwrap();
     assert!(
         version_arr.iter().any(|v| v["label"].as_str() == Some(&new_version)),
         "submitted version must appear in version list"

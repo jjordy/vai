@@ -301,7 +301,8 @@ async fn test_multi_agent_coordination() {
         .send()
         .await
         .unwrap();
-    let version_list: Vec<serde_json::Value> = versions_resp.json().await.unwrap();
+    let versions_body: serde_json::Value = versions_resp.json().await.unwrap();
+    let version_list = versions_body["data"].as_array().unwrap();
 
     assert_eq!(version_list.len(), 3, "should have v1, v2, and v3");
     assert_eq!(version_list[0]["version_id"], "v1");

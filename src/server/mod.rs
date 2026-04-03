@@ -283,8 +283,6 @@ const MAX_LABELS_PER_ISSUE: usize = 20;
 const MAX_PATH_LEN: usize = 1000;
 /// Maximum number of files per upload request.
 const MAX_FILES_PER_REQUEST: usize = 100;
-/// Maximum pagination page size.
-const MAX_PAGE_SIZE: usize = 1000;
 /// Default JSON body size limit (10 MiB) — applies to all endpoints.
 const DEFAULT_BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// Body size limit for file-upload endpoints (50 MiB).
@@ -318,16 +316,6 @@ fn validate_labels(labels: &[String]) -> Result<(), ApiError> {
     }
     for label in labels {
         validate_str_len(label, MAX_LABEL_LEN, "label")?;
-    }
-    Ok(())
-}
-
-/// Returns `Err(ApiError::bad_request(...))` when `limit` exceeds `MAX_PAGE_SIZE`.
-fn validate_page_limit(limit: usize) -> Result<(), ApiError> {
-    if limit > MAX_PAGE_SIZE {
-        return Err(ApiError::bad_request(format!(
-            "page size {limit} exceeds maximum of {MAX_PAGE_SIZE}"
-        )));
     }
     Ok(())
 }
@@ -1561,13 +1549,6 @@ impl From<merge::SubmitResult> for SubmitResponse {
     }
 }
 
-/// Query parameters for `GET /api/versions`.
-#[derive(Debug, Deserialize)]
-struct ListVersionsQuery {
-    /// Maximum number of versions to return (default: unlimited).
-    limit: Option<usize>,
-}
-
 /// Query parameters for `GET /api/versions/:id/diff`.
 #[derive(Debug, Default, Deserialize)]
 struct VersionDiffQuery {
@@ -1685,6 +1666,9 @@ struct ListIssuesQuery {
     priority: Option<String>,
     label: Option<String>,
     created_by: Option<String>,
+    page: Option<u32>,
+    per_page: Option<u32>,
+    sort: Option<String>,
 }
 
 /// Response body for issue endpoints.
@@ -2063,11 +2047,21 @@ async fn create_workspace_handler(
 }
 
 /// `GET /api/workspaces` — lists all active (non-discarded, non-merged) workspaces.
+///
+/// Supports pagination via `?page=1&per_page=25` and sorting via
+/// `?sort=created_at:desc`.  Sortable columns: `created_at`, `updated_at`,
+/// `status`, `intent`.
 #[utoipa::path(
     get,
     path = "/api/workspaces",
+    params(
+        ("page" = Option<u32>, Query, description = "Page number (1-indexed, default 1)"),
+        ("per_page" = Option<u32>, Query, description = "Items per page (default 25, max 100)"),
+        ("sort" = Option<String>, Query, description = "Sort fields, e.g. `created_at:desc,status:asc`"),
+    ),
     responses(
-        (status = 200, description = "List of workspaces", body = Vec<WorkspaceResponse>),
+        (status = 200, description = "Paginated list of workspaces", body = PaginatedResponse<WorkspaceResponse>),
+        (status = 400, description = "Invalid pagination or sort params", body = ErrorBody),
         (status = 401, description = "Unauthorized"),
     ),
     security(("bearer_auth" = [])),
@@ -2076,14 +2070,23 @@ async fn create_workspace_handler(
 async fn list_workspaces_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
-) -> Result<Json<Vec<WorkspaceResponse>>, ApiError> {
+    AxumQuery(pagination): AxumQuery<PaginationParams>,
+) -> Result<Json<PaginatedResponse<WorkspaceResponse>>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    let workspaces = ctx.storage.workspaces()
-        .list_workspaces(&ctx.repo_id, false, &ListQuery::default())
+    const ALLOWED_SORT: &[&str] = &["created_at", "updated_at", "status", "intent"];
+    let query = ListQuery::from_params(
+        pagination.page,
+        pagination.per_page,
+        pagination.sort.as_deref(),
+        ALLOWED_SORT,
+    )
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let result = ctx.storage.workspaces()
+        .list_workspaces(&ctx.repo_id, false, &query)
         .await
         .map_err(ApiError::from)?;
-    let response: Vec<WorkspaceResponse> = workspaces.items.into_iter().map(Into::into).collect();
-    Ok(Json(response))
+    let items: Vec<WorkspaceResponse> = result.items.into_iter().map(Into::into).collect();
+    Ok(Json(PaginatedResponse::new(items, result.total, &query)))
 }
 
 /// `GET /api/workspaces/:id` — returns details for a single workspace.
@@ -2570,48 +2573,47 @@ async fn discard_workspace_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /api/versions` — lists versions with pagination and optional sorting.
+///
+/// Supports pagination via `?page=1&per_page=25` and sorting via
+/// `?sort=created_at:desc`.  Sortable columns: `created_at`, `version_id`.
 #[utoipa::path(
     get,
     path = "/api/versions",
     params(
-        ("limit" = Option<usize>, Query, description = "Maximum number of versions to return"),
+        ("page" = Option<u32>, Query, description = "Page number (1-indexed, default 1)"),
+        ("per_page" = Option<u32>, Query, description = "Items per page (default 25, max 100)"),
+        ("sort" = Option<String>, Query, description = "Sort fields, e.g. `created_at:desc`"),
     ),
     responses(
-        (status = 200, description = "List of versions", body = Vec<version::VersionMeta>),
+        (status = 200, description = "Paginated list of versions", body = PaginatedResponse<version::VersionMeta>),
+        (status = 400, description = "Invalid pagination or sort params", body = ErrorBody),
         (status = 401, description = "Unauthorized"),
     ),
     security(("bearer_auth" = [])),
     tag = "versions"
 )]
-/// `GET /api/versions` — lists all versions in chronological order.
-///
-/// Optional `?limit=N` query parameter truncates the result to the N most
-/// recent versions (the list is already oldest-first, so we truncate from
-/// the end after reversing).
 async fn list_versions_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
-    AxumQuery(params): AxumQuery<ListVersionsQuery>,
-) -> Result<Json<Vec<version::VersionMeta>>, ApiError> {
+    AxumQuery(pagination): AxumQuery<PaginationParams>,
+) -> Result<Json<PaginatedResponse<version::VersionMeta>>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    if let Some(limit) = params.limit {
-        validate_page_limit(limit)?;
-    }
-    let mut versions = ctx
+    const ALLOWED_SORT: &[&str] = &["created_at", "version_id"];
+    let query = ListQuery::from_params(
+        pagination.page,
+        pagination.per_page,
+        pagination.sort.as_deref(),
+        ALLOWED_SORT,
+    )
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let result = ctx
         .storage
         .versions()
-        .list_versions(&ctx.repo_id, &ListQuery::default())
+        .list_versions(&ctx.repo_id, &query)
         .await
-        .map_err(ApiError::from)?
-        .items;
-    if let Some(limit) = params.limit {
-        // Keep the N most-recent: the list is oldest-first, so drop from the front.
-        let len = versions.len();
-        if limit < len {
-            versions.drain(..len - limit);
-        }
-    }
-    Ok(Json(versions))
+        .map_err(ApiError::from)?;
+    Ok(Json(PaginatedResponse::new(result.items, result.total, &query)))
 }
 
 #[utoipa::path(
@@ -6134,6 +6136,11 @@ async fn create_issue_handler(
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
+/// `GET /api/issues` — list issues with optional filters and pagination.
+///
+/// Supports pagination via `?page=1&per_page=25` and sorting via
+/// `?sort=created_at:desc`.  Sortable columns: `created_at`, `updated_at`,
+/// `priority`, `status`, `title`.
 #[utoipa::path(
     get,
     path = "/api/issues",
@@ -6142,20 +6149,23 @@ async fn create_issue_handler(
         ("priority" = Option<String>, Query, description = "Filter by priority"),
         ("label" = Option<String>, Query, description = "Filter by label"),
         ("created_by" = Option<String>, Query, description = "Filter by creator"),
+        ("page" = Option<u32>, Query, description = "Page number (1-indexed, default 1)"),
+        ("per_page" = Option<u32>, Query, description = "Items per page (default 25, max 100)"),
+        ("sort" = Option<String>, Query, description = "Sort fields, e.g. `created_at:desc,priority:asc`"),
     ),
     responses(
-        (status = 200, description = "List of issues", body = Vec<IssueResponse>),
+        (status = 200, description = "Paginated list of issues", body = PaginatedResponse<IssueResponse>),
+        (status = 400, description = "Invalid filter, pagination, or sort params", body = ErrorBody),
         (status = 401, description = "Unauthorized"),
     ),
     security(("bearer_auth" = [])),
     tag = "issues"
 )]
-/// `GET /api/issues` — list issues with optional filters.
 async fn list_issues_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumQuery(query): AxumQuery<ListIssuesQuery>,
-) -> Result<Json<Vec<IssueResponse>>, ApiError> {
+) -> Result<Json<PaginatedResponse<IssueResponse>>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     use crate::issue::{IssueFilter, IssueStatus, IssuePriority};
 
@@ -6173,11 +6183,19 @@ async fn list_issues_handler(
         creator: query.created_by,
     };
 
-    let issues = ctx.storage.issues()
-        .list_issues(&ctx.repo_id, &filter, &ListQuery::default())
+    const ALLOWED_SORT: &[&str] = &["created_at", "updated_at", "priority", "status", "title"];
+    let list_query = ListQuery::from_params(
+        query.page,
+        query.per_page,
+        query.sort.as_deref(),
+        ALLOWED_SORT,
+    )
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let result = ctx.storage.issues()
+        .list_issues(&ctx.repo_id, &filter, &list_query)
         .await
-        .map_err(ApiError::from)?
-        .items;
+        .map_err(ApiError::from)?;
 
     // Fetch all workspaces once to compute linked workspace IDs per issue.
     let all_workspaces = ctx.storage.workspaces()
@@ -6186,8 +6204,8 @@ async fn list_issues_handler(
         .map(|r| r.items)
         .unwrap_or_default();
 
-    let mut response = Vec::with_capacity(issues.len());
-    for issue in issues {
+    let mut response = Vec::with_capacity(result.items.len());
+    for issue in result.items {
         let linked: Vec<uuid::Uuid> = all_workspaces
             .iter()
             .filter(|ws| ws.issue_id == Some(issue.id))
@@ -6197,7 +6215,7 @@ async fn list_issues_handler(
         response.push(IssueResponse::from_issue(issue, linked, blocked_by, blocking));
     }
 
-    Ok(Json(response))
+    Ok(Json(PaginatedResponse::new(response, result.total, &list_query)))
 }
 
 #[utoipa::path(
@@ -7298,27 +7316,32 @@ fn default_resolved_by() -> String {
     "api".to_string()
 }
 
+/// `GET /api/escalations` — list escalations with optional filter and pagination.
+///
+/// Supports pagination via `?page=1&per_page=25` and sorting via
+/// `?sort=created_at:desc`.  Sortable columns: `created_at`, `status`.
 #[utoipa::path(
     get,
     path = "/api/escalations",
     params(
         ("status" = Option<String>, Query, description = "Filter by status (pending, resolved)"),
+        ("page" = Option<u32>, Query, description = "Page number (1-indexed, default 1)"),
+        ("per_page" = Option<u32>, Query, description = "Items per page (default 25, max 100)"),
+        ("sort" = Option<String>, Query, description = "Sort fields, e.g. `created_at:desc`"),
     ),
     responses(
-        (status = 200, description = "List of escalations", body = Vec<EscalationResponse>),
+        (status = 200, description = "Paginated list of escalations", body = PaginatedResponse<EscalationResponse>),
+        (status = 400, description = "Invalid pagination or sort params", body = ErrorBody),
         (status = 401, description = "Unauthorized"),
     ),
     security(("bearer_auth" = [])),
     tag = "escalations"
 )]
-/// `GET /api/escalations` — list escalations.
-///
-/// Optional `?status=pending|resolved` filter.
 async fn list_escalations_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     AxumQuery(params): AxumQuery<ListEscalationsQuery>,
-) -> Result<Json<Vec<EscalationResponse>>, ApiError> {
+) -> Result<Json<PaginatedResponse<EscalationResponse>>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     let status_filter = params
         .status
@@ -7329,30 +7352,46 @@ async fn list_escalations_handler(
         })
         .transpose()?;
 
+    const ALLOWED_SORT: &[&str] = &["created_at", "status"];
+    let list_query = ListQuery::from_params(
+        params.page,
+        params.per_page,
+        params.sort.as_deref(),
+        ALLOWED_SORT,
+    )
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
     let pending_only = matches!(status_filter, Some(EscalationStatus::Pending));
-    let escalations = ctx.storage.escalations()
-        .list_escalations(&ctx.repo_id, pending_only, &ListQuery::default())
+    let result = ctx.storage.escalations()
+        .list_escalations(&ctx.repo_id, pending_only, &list_query)
         .await
-        .map_err(ApiError::from)?
-        .items;
+        .map_err(ApiError::from)?;
 
     // If a specific status other than Pending was requested (e.g. Resolved),
-    // filter client-side since the trait only supports pending_only.
-    let escalations = if let Some(ref sf) = status_filter {
-        escalations.into_iter().filter(|e| &e.status == sf).collect()
+    // filter client-side since the trait only supports pending_only flag.
+    let (items, total) = if let Some(ref sf) = status_filter {
+        if !pending_only {
+            let filtered: Vec<_> = result.items.into_iter().filter(|e| &e.status == sf).collect();
+            let total = filtered.len() as u64;
+            (filtered, total)
+        } else {
+            (result.items, result.total)
+        }
     } else {
-        escalations
+        (result.items, result.total)
     };
 
-    Ok(Json(
-        escalations.into_iter().map(EscalationResponse::from).collect(),
-    ))
+    let responses: Vec<EscalationResponse> = items.into_iter().map(EscalationResponse::from).collect();
+    Ok(Json(PaginatedResponse::new(responses, total, &list_query)))
 }
 
 /// Query parameters for `GET /api/escalations`.
 #[derive(Debug, Deserialize)]
 struct ListEscalationsQuery {
     status: Option<String>,
+    page: Option<u32>,
+    per_page: Option<u32>,
+    sort: Option<String>,
 }
 
 #[utoipa::path(
@@ -10411,6 +10450,8 @@ impl utoipa::Modify for SecurityAddon {
             BroadcastEvent,
             SubscriptionFilter,
             ErrorBody,
+            PaginationMeta,
+            PaginationParams,
             StatusResponse,
             HealthResponse,
             SubsystemStatus,
@@ -11700,8 +11741,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let list: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(list.as_array().unwrap().len(), 1);
-        assert_eq!(list[0]["id"], ws_id.as_str());
+        assert_eq!(list["data"].as_array().unwrap().len(), 1);
+        assert_eq!(list["data"][0]["id"], ws_id.as_str());
 
         // GET /api/workspaces/:id — details
         let resp = client
@@ -11743,7 +11784,7 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let list: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(
-            list.as_array().unwrap().len(),
+            list["data"].as_array().unwrap().len(),
             0,
             "discarded workspace should not appear"
         );
@@ -12441,8 +12482,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let versions: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(versions.as_array().unwrap().len(), 1);
-        assert_eq!(versions[0]["version_id"], "v1");
+        assert_eq!(versions["data"].as_array().unwrap().len(), 1);
+        assert_eq!(versions["data"][0]["version_id"], "v1");
 
         // Submit to create v2.
         create_version_via_submit(
@@ -12463,22 +12504,24 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let versions: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(versions.as_array().unwrap().len(), 2);
-        assert_eq!(versions[0]["version_id"], "v1");
-        assert_eq!(versions[1]["version_id"], "v2");
+        assert_eq!(versions["data"].as_array().unwrap().len(), 2);
+        assert_eq!(versions["data"][0]["version_id"], "v1");
+        assert_eq!(versions["data"][1]["version_id"], "v2");
+        assert_eq!(versions["pagination"]["total"], 2);
 
-        // ?limit=1 returns only v2 (most recent).
+        // ?per_page=1&page=2 returns only the second version (v2).
         let resp = client
-            .get(format!("http://{addr}/api/versions?limit=1"))
+            .get(format!("http://{addr}/api/versions?per_page=1&page=2"))
             .bearer_auth(&key)
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
         let versions: serde_json::Value = resp.json().await.unwrap();
-        let arr = versions.as_array().unwrap();
+        let arr = versions["data"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["version_id"], "v2");
+        assert_eq!(versions["pagination"]["total"], 2);
 
         shutdown_tx.send(()).ok();
     }
@@ -13360,7 +13403,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let issues: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(issues.as_array().unwrap().len(), 2);
+        assert_eq!(issues["data"].as_array().unwrap().len(), 2);
 
         // ── List with filter ──────────────────────────────────────────────────
 
@@ -13372,8 +13415,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let filtered: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(filtered.as_array().unwrap().len(), 1);
-        assert_eq!(filtered[0]["title"], "Fix login bug");
+        assert_eq!(filtered["data"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["data"][0]["title"], "Fix login bug");
 
         // Filter by creator.
         let resp = client
@@ -13383,8 +13426,8 @@ mod tests {
             .await
             .unwrap();
         let by_creator: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(by_creator.as_array().unwrap().len(), 1);
-        assert_eq!(by_creator[0]["title"], "Add rate limiting");
+        assert_eq!(by_creator["data"].as_array().unwrap().len(), 1);
+        assert_eq!(by_creator["data"][0]["title"], "Add rate limiting");
 
         // ── Get by ID ─────────────────────────────────────────────────────────
 
@@ -13451,8 +13494,8 @@ mod tests {
             .unwrap();
         let open_issues: serde_json::Value = resp.json().await.unwrap();
         // Only the second issue (rate limiting) remains open.
-        assert_eq!(open_issues.as_array().unwrap().len(), 1);
-        assert_eq!(open_issues[0]["title"], "Add rate limiting");
+        assert_eq!(open_issues["data"].as_array().unwrap().len(), 1);
+        assert_eq!(open_issues["data"][0]["title"], "Add rate limiting");
 
         // ── Free-text resolution is accepted (any string allowed) ────────────────
 
@@ -13615,7 +13658,7 @@ mod tests {
             .await
             .unwrap();
         let by_agent: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(by_agent.as_array().unwrap().len(), 1);
+        assert_eq!(by_agent["data"].as_array().unwrap().len(), 1);
 
         // ── Duplicate detection: similar title warns ──────────────────────────
         let resp = client
@@ -14067,7 +14110,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let list: serde_json::Value = resp.json().await.unwrap();
-        let workspaces = list.as_array().unwrap();
+        let workspaces = list["data"].as_array().unwrap();
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0]["id"], ws_id);
 
@@ -14081,7 +14124,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let legacy: serde_json::Value = resp.json().await.unwrap();
-        assert!(legacy.as_array().unwrap().is_empty());
+        assert!(legacy["data"].as_array().unwrap().is_empty());
 
         shutdown_tx.send(()).ok();
     }
@@ -14164,7 +14207,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let b_issues: serde_json::Value = resp.json().await.unwrap();
-        assert!(b_issues.as_array().unwrap().is_empty());
+        assert!(b_issues["data"].as_array().unwrap().is_empty());
 
         // repo-a should have exactly one issue.
         let resp = client
@@ -14175,8 +14218,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let a_issues: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(a_issues.as_array().unwrap().len(), 1);
-        assert_eq!(a_issues[0]["title"], "Issue in A");
+        assert_eq!(a_issues["data"].as_array().unwrap().len(), 1);
+        assert_eq!(a_issues["data"][0]["title"], "Issue in A");
 
         shutdown_tx.send(()).ok();
     }

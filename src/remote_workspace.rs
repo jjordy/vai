@@ -273,11 +273,19 @@ pub async fn submit_workspace(
 /// Lists all active workspaces on the server.
 ///
 /// Calls `GET /api/workspaces` and returns the list of workspace metadata.
+///
+/// The endpoint returns a paginated envelope `{"data": [...], "pagination": {...}}`.
+/// This function fetches the first page (up to 100 items) and returns the items.
 pub async fn list_workspaces(
     remote: &RemoteConfig,
 ) -> Result<Vec<RemoteWorkspaceMeta>, RemoteWorkspaceError> {
+    #[derive(serde::Deserialize)]
+    struct Page {
+        data: Vec<RemoteWorkspaceMeta>,
+    }
+
     let client = reqwest::Client::new();
-    let url = format!("{}/api/workspaces", remote.server_url);
+    let url = format!("{}/api/workspaces?per_page=100", remote.server_url);
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", remote.api_key))
@@ -285,7 +293,8 @@ pub async fn list_workspaces(
         .await?;
 
     let body = ensure_success(resp).await?;
-    serde_json::from_str::<Vec<RemoteWorkspaceMeta>>(&body).map_err(RemoteWorkspaceError::Json)
+    let page: Page = serde_json::from_str(&body).map_err(RemoteWorkspaceError::Json)?;
+    Ok(page.data)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
