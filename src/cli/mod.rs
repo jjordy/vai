@@ -28,6 +28,7 @@ use crate::repo;
 #[cfg(feature = "server")]
 use crate::server;
 use crate::pull as remote_pull;
+use crate::push as remote_push;
 use crate::remote_diff;
 use crate::status as remote_status;
 use crate::sync as remote_sync;
@@ -70,6 +71,9 @@ pub enum CliError {
 
     #[error("Pull error: {0}")]
     Pull(#[from] remote_pull::PullError),
+
+    #[error("Push error: {0}")]
+    Push(#[from] remote_push::PushError),
 
     #[error("Status error: {0}")]
     Status(#[from] remote_status::StatusError),
@@ -243,6 +247,31 @@ pub enum Commands {
         /// Force a full re-download, replacing all tracked files with the server's current state.
         #[arg(long)]
         force: bool,
+    },
+    /// Push local changes to the remote server as a new version.
+    ///
+    /// Compares the local working directory against the server, creates a
+    /// temporary workspace, uploads all modified files, and submits them for
+    /// merge. Updates `.vai/head` to the resulting version on success.
+    ///
+    /// Uses the remote configured via `vai remote add`, or explicit
+    /// --to/--key/--repo flags.
+    Push {
+        /// Commit message / intent describing this push. Required.
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+        /// Remote server URL (e.g. `http://localhost:7865`). Uses configured remote if omitted.
+        #[arg(long)]
+        to: Option<String>,
+        /// API key for the remote server. Required when --to is set.
+        #[arg(long)]
+        key: Option<String>,
+        /// Repository name on the server. Required when --to is set.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Show what would be pushed without actually pushing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Pull the latest changes from the remote server (incremental).
     Sync,
@@ -1890,6 +1919,40 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
             } else {
                 remote_pull::print_pull_result(&result);
+            }
+        }
+        Some(Commands::Push { message, to, key, repo, dry_run }) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+            let root = repo::find_root(&cwd)
+                .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
+            let vai_dir = root.join(".vai");
+
+            let msg = message.ok_or(remote_push::PushError::MissingMessage)?;
+
+            // Build PushConfig from explicit flags or the configured remote.
+            let push_config = if let Some(server_url) = to {
+                let api_key = key.ok_or(remote_push::PushError::MissingKey)?;
+                let repo_name = repo.ok_or(remote_push::PushError::MissingRepo)?;
+                remote_push::PushConfig { server_url, api_key, repo_name }
+            } else {
+                let config = repo::read_config(&vai_dir)?;
+                let remote = config.remote.ok_or(remote_push::PushError::NoRemote)?;
+                let api_key = remote.resolve_api_key()
+                    .map_err(|e| CliError::Other(format!("API key error: {e}")))?;
+                remote_push::PushConfig {
+                    server_url: remote.url,
+                    api_key,
+                    repo_name: config.name,
+                }
+            };
+
+            let result = make_rt()?.block_on(remote_push::push(&root, push_config, &msg, dry_run))?;
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            } else {
+                remote_push::print_push_result(&result, dry_run);
             }
         }
         Some(Commands::Sync) => {
