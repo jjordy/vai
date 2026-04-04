@@ -5456,6 +5456,7 @@ async fn files_download_handler(
             axum::http::header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{filename}\""),
         )
+        .header("X-Vai-Head", head_version.clone())
         .body(axum::body::Body::from(gz_bytes))
         .map_err(|e| ApiError::internal(format!("build response: {e}")))?;
 

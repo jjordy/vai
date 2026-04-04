@@ -193,6 +193,11 @@ pub enum Commands {
     /// Pull the latest changes from the remote server into the local working directory.
     ///
     /// Uses the remote configured via `vai remote add`, or explicit --from/--key/--repo flags.
+    ///
+    /// With `--force`, downloads the full file tarball and replaces all tracked files,
+    /// preserving ignored paths (`.vai/`, `.git/`, `node_modules/`, etc.).  Use this
+    /// when local files may have diverged from the server (e.g. after `vai agent download`
+    /// or external edits).
     Pull {
         /// Remote server URL (e.g. `http://localhost:7865`). Uses configured remote if omitted.
         #[arg(long)]
@@ -203,6 +208,9 @@ pub enum Commands {
         /// Repository name on the server. Required when --from is set.
         #[arg(long)]
         repo: Option<String>,
+        /// Force a full re-download, replacing all tracked files with the server's current state.
+        #[arg(long)]
+        force: bool,
     },
     /// Pull the latest changes from the remote server (incremental).
     Sync,
@@ -1760,7 +1768,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 remote_clone::print_clone_result(&result);
             }
         }
-        Some(Commands::Pull { from, key, repo }) => {
+        Some(Commands::Pull { from, key, repo, force }) => {
             let cwd = std::env::current_dir()
                 .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
             let root = repo::find_root(&cwd)
@@ -1784,7 +1792,11 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 }
             };
 
-            let result = make_rt()?.block_on(remote_pull::pull(&root, pull_config))?;
+            let result = if force {
+                make_rt()?.block_on(remote_pull::pull_force(&root, pull_config))?
+            } else {
+                make_rt()?.block_on(remote_pull::pull(&root, pull_config))?
+            };
 
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
