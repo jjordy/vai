@@ -28,6 +28,7 @@ use crate::repo;
 #[cfg(feature = "server")]
 use crate::server;
 use crate::pull as remote_pull;
+use crate::remote_diff;
 use crate::status as remote_status;
 use crate::sync as remote_sync;
 use crate::version::VersionMeta;
@@ -72,6 +73,9 @@ pub enum CliError {
 
     #[error("Status error: {0}")]
     Status(#[from] remote_status::StatusError),
+
+    #[error("Diff error (remote): {0}")]
+    RemoteDiff(#[from] remote_diff::RemoteDiffError),
 
     #[error("Sync error: {0}")]
     Sync(#[from] remote_sync::SyncError),
@@ -170,12 +174,36 @@ pub enum Commands {
         #[arg(long)]
         entity: Option<String>,
     },
-    /// Show semantic diff between two versions.
+    /// Show differences between local files and the server, or between two versions.
+    ///
+    /// With no arguments, compares the local working directory against the
+    /// server's current state (equivalent to `git diff` vs remote HEAD).
+    ///
+    /// With a single `<path>` argument, diffs that specific file against the
+    /// server.
+    ///
+    /// With two version arguments (`<version_a> <version_b>`), shows the
+    /// semantic diff between those two versions (local mode only).
+    ///
+    /// Uses the remote configured via `vai remote add`, or explicit
+    /// --from/--key/--repo flags.
     Diff {
-        /// First version.
-        version_a: String,
-        /// Second version.
-        version_b: String,
+        /// File path to diff (local vs server), or first version ID for
+        /// version-to-version semantic diff.
+        #[arg()]
+        arg1: Option<String>,
+        /// Second version ID for version-to-version semantic diff.
+        #[arg()]
+        arg2: Option<String>,
+        /// Remote server URL. Uses configured remote if omitted.
+        #[arg(long)]
+        from: Option<String>,
+        /// API key for the remote server. Required when --from is set.
+        #[arg(long)]
+        key: Option<String>,
+        /// Repository name on the server. Required when --from is set.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Query and inspect the semantic graph.
     #[command(subcommand)]
@@ -1269,8 +1297,11 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
             }
         }
         Some(Commands::Diff {
-            version_a,
-            version_b,
+            arg1,
+            arg2,
+            from,
+            key,
+            repo,
         }) => {
             let cwd = std::env::current_dir()
                 .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
@@ -1278,52 +1309,91 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
                 .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
             let vai_dir = root.join(".vai");
 
-            let all_changes = version::get_versions_diff(&vai_dir, &version_a, &version_b)?;
+            match (arg1, arg2) {
+                // ── Two version args → semantic diff (local mode) ─────────────
+                (Some(version_a), Some(version_b)) => {
+                    let all_changes = version::get_versions_diff(&vai_dir, &version_a, &version_b)?;
 
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&all_changes).unwrap());
-            } else if all_changes.is_empty() {
-                println!("No changes between {} and {}.", version_a, version_b);
-            } else {
-                println!(
-                    "{} Semantic diff: {} → {}",
-                    "●".cyan(),
-                    version_a.bold(),
-                    version_b.bold()
-                );
-                for vc in &all_changes {
-                    println!(
-                        "\n{}  {}",
-                        vc.version.version_id.bold(),
-                        format!("\"{}\"", vc.version.intent).italic()
-                    );
-                    for fc in &vc.file_changes {
-                        let sigil = match fc.change_type {
-                            version::VersionFileChangeType::Added => "+".green(),
-                            version::VersionFileChangeType::Modified => "M".yellow(),
-                            version::VersionFileChangeType::Removed => "-".red(),
-                        };
-                        println!("  {} {}", sigil, fc.path);
-                    }
-                    for ec in &vc.entity_changes {
-                        let sigil = ec.change_type.sigil();
-                        let colored_sigil = match ec.change_type {
-                            version::VersionChangeType::Added => sigil.green(),
-                            version::VersionChangeType::Modified => sigil.yellow(),
-                            version::VersionChangeType::Removed => sigil.red(),
-                        };
-                        if let (Some(kind), Some(name)) = (&ec.kind, &ec.qualified_name) {
-                            println!("  {} {} {}", colored_sigil, kind.cyan(), name.bold());
-                        } else if let Some(desc) = &ec.change_description {
-                            println!("  {} {}", colored_sigil, desc);
-                        } else {
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&all_changes).unwrap());
+                    } else if all_changes.is_empty() {
+                        println!("No changes between {} and {}.", version_a, version_b);
+                    } else {
+                        println!(
+                            "{} Semantic diff: {} → {}",
+                            "●".cyan(),
+                            version_a.bold(),
+                            version_b.bold()
+                        );
+                        for vc in &all_changes {
                             println!(
-                                "  {} entity {} {}",
-                                colored_sigil,
-                                ec.entity_id,
-                                ec.change_type.label()
+                                "\n{}  {}",
+                                vc.version.version_id.bold(),
+                                format!("\"{}\"", vc.version.intent).italic()
                             );
+                            for fc in &vc.file_changes {
+                                let sigil = match fc.change_type {
+                                    version::VersionFileChangeType::Added => "+".green(),
+                                    version::VersionFileChangeType::Modified => "M".yellow(),
+                                    version::VersionFileChangeType::Removed => "-".red(),
+                                };
+                                println!("  {} {}", sigil, fc.path);
+                            }
+                            for ec in &vc.entity_changes {
+                                let sigil = ec.change_type.sigil();
+                                let colored_sigil = match ec.change_type {
+                                    version::VersionChangeType::Added => sigil.green(),
+                                    version::VersionChangeType::Modified => sigil.yellow(),
+                                    version::VersionChangeType::Removed => sigil.red(),
+                                };
+                                if let (Some(kind), Some(name)) = (&ec.kind, &ec.qualified_name) {
+                                    println!("  {} {} {}", colored_sigil, kind.cyan(), name.bold());
+                                } else if let Some(desc) = &ec.change_description {
+                                    println!("  {} {}", colored_sigil, desc);
+                                } else {
+                                    println!(
+                                        "  {} entity {} {}",
+                                        colored_sigil,
+                                        ec.entity_id,
+                                        ec.change_type.label()
+                                    );
+                                }
+                            }
                         }
+                    }
+                }
+                // ── Zero or one arg → local vs server diff ─────────────────────
+                // Note: (None, Some(_)) is structurally impossible via clap since
+                // arg2 requires arg1 to be present first.
+                (path_filter, _) => {
+                    // Build DiffConfig from explicit flags or the configured remote.
+                    let diff_config = if let Some(server_url) = from {
+                        let api_key = key.ok_or(remote_diff::RemoteDiffError::MissingKey)?;
+                        let repo_name = repo.ok_or(remote_diff::RemoteDiffError::MissingRepo)?;
+                        remote_diff::DiffConfig {
+                            server_url,
+                            api_key,
+                            repo_name,
+                            path_filter,
+                        }
+                    } else {
+                        let config = repo::read_config(&vai_dir)?;
+                        let remote = config.remote.ok_or(remote_diff::RemoteDiffError::NoRemote)?;
+                        let api_key = remote.resolve_api_key()
+                            .map_err(|e| CliError::Other(format!("API key error: {e}")))?;
+                        remote_diff::DiffConfig {
+                            server_url: remote.url,
+                            api_key,
+                            repo_name: config.name,
+                            path_filter,
+                        }
+                    };
+
+                    let result = make_rt()?.block_on(remote_diff::compute_diff(&root, diff_config))?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        remote_diff::print_diff_result(&result);
                     }
                 }
             }
