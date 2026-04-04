@@ -28,6 +28,7 @@ use crate::repo;
 #[cfg(feature = "server")]
 use crate::server;
 use crate::pull as remote_pull;
+use crate::status as remote_status;
 use crate::sync as remote_sync;
 use crate::version::VersionMeta;
 use crate::version;
@@ -68,6 +69,9 @@ pub enum CliError {
 
     #[error("Pull error: {0}")]
     Pull(#[from] remote_pull::PullError),
+
+    #[error("Status error: {0}")]
+    Status(#[from] remote_status::StatusError),
 
     #[error("Sync error: {0}")]
     Sync(#[from] remote_sync::SyncError),
@@ -1340,24 +1344,38 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
 
                     // ── Remote dispatch (skip when --others or --local) ───
                     if !others && !cli.local {
-                        if let Some(client) = try_remote(&vai_dir, cli.local)? {
-                            let rt = make_rt()?;
-                            let status: serde_json::Value = rt.block_on(client.get("/api/status"))?;
-                            if cli.json {
-                                println!("{}", serde_json::to_string_pretty(&status).unwrap());
+                        // Try cloned-repo remote first (.vai/remote.toml), then
+                        // the [remote] section of config.toml.
+                        let maybe_status_config: Option<remote_status::StatusConfig> =
+                            if let Some(remote) = remote_clone::read_remote_config(&vai_dir) {
+                                Some(remote_status::StatusConfig {
+                                    server_url: remote.server_url,
+                                    api_key: remote.api_key,
+                                    repo_name: remote.repo_name,
+                                })
                             } else {
-                                let repo_name = status["repo_name"].as_str().unwrap_or("?");
-                                let head = status["head_version"].as_str().unwrap_or("?");
-                                let ws_count = status["workspace_count"].as_u64().unwrap_or(0);
-                                let issue_count = status["issue_count"].as_u64().unwrap_or(0);
-                                let entity_count = status["entity_count"].as_u64().unwrap_or(0);
-                                let uptime = status["uptime_secs"].as_u64().unwrap_or(0);
-                                println!("{} repository: {}", "vai".bold(), repo_name.bold());
-                                println!("Current version: {}", head.bold());
-                                println!("Active workspaces: {ws_count}");
-                                println!("Open issues: {issue_count}");
-                                println!("Graph entities: {entity_count}");
-                                println!("Server uptime: {}s", uptime);
+                                let cfg = repo::read_config(&vai_dir)
+                                    .map_err(|e| CliError::Other(format!("cannot read config: {e}")))?;
+                                if let Some(remote_cfg) = cfg.remote {
+                                    let api_key = remote_cfg.resolve_api_key()
+                                        .map_err(|e| CliError::Other(format!("cannot resolve API key: {e}")))?;
+                                    Some(remote_status::StatusConfig {
+                                        server_url: remote_cfg.url,
+                                        api_key,
+                                        repo_name: cfg.name,
+                                    })
+                                } else {
+                                    None
+                                }
+                            };
+
+                        if let Some(status_config) = maybe_status_config {
+                            let rt = make_rt()?;
+                            let result = rt.block_on(remote_status::check_status(&root, status_config))?;
+                            if cli.json {
+                                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                            } else {
+                                remote_status::print_status_result(&result);
                             }
                             return Ok(());
                         }

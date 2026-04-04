@@ -28,6 +28,7 @@ pub mod scope_inference;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod pull;
+pub mod status;
 pub mod sync;
 pub mod version;
 pub mod watcher;

@@ -5663,6 +5663,107 @@ async fn files_pull_handler(
     }))
 }
 
+// ── File manifest ─────────────────────────────────────────────────────────────
+
+/// A single entry in the files manifest response.
+#[derive(Debug, Serialize, ToSchema)]
+struct ManifestFileEntry {
+    /// Path relative to the repository root (e.g. `"src/lib.rs"`).
+    path: String,
+    /// Lowercase hex-encoded SHA-256 hash of the file content.
+    sha256: String,
+}
+
+/// Response body for `GET /api/repos/:repo/files/manifest`.
+#[derive(Debug, Serialize, ToSchema)]
+struct FilesManifestResponse {
+    /// The current HEAD version of the repository.
+    pub version: String,
+    /// Every file in the repository root with its content hash.
+    pub files: Vec<ManifestFileEntry>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/repos/{repo}/files/manifest",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "File paths and SHA-256 hashes for all files at HEAD", body = FilesManifestResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Repository not found", body = ErrorBody),
+        (status = 500, description = "Internal error", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "files"
+)]
+/// `GET /api/repos/:repo/files/manifest` — returns paths and SHA-256 hashes for
+/// every file in the repository at HEAD.
+///
+/// This lightweight endpoint lets clients (e.g. `vai status`) compare their
+/// local working copy against the server without downloading file contents.
+/// The SHA-256 hash is computed from the raw file bytes stored in S3/filesystem.
+async fn files_manifest_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+) -> Result<Json<FilesManifestResponse>, ApiError> {
+    use sha2::{Digest, Sha256};
+
+    require_repo_permission(
+        &ctx.storage,
+        &identity,
+        &ctx.repo_id,
+        crate::storage::RepoRole::Read,
+    )
+    .await?;
+
+    let head_version = ctx
+        .storage
+        .versions()
+        .read_head(&ctx.repo_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("read head: {e}")))?
+        .unwrap_or_else(|| "v0".to_string());
+
+    // List all files from the `current/` prefix in storage.
+    let storage_files = ctx
+        .storage
+        .files()
+        .list(&ctx.repo_id, "current/")
+        .await
+        .map_err(|e| ApiError::internal(format!("list current/: {e}")))?;
+
+    let mut entries: Vec<ManifestFileEntry> = Vec::with_capacity(storage_files.len());
+
+    for fm in &storage_files {
+        let rel = match fm.path.strip_prefix("current/") {
+            Some(r) if !r.is_empty() => r.to_string(),
+            _ => continue,
+        };
+
+        let content = ctx
+            .storage
+            .files()
+            .get(&ctx.repo_id, &fm.path)
+            .await
+            .map_err(|e| ApiError::internal(format!("read {}: {e}", fm.path)))?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(&content);
+        let sha256 = format!("{:x}", hasher.finalize());
+
+        entries.push(ManifestFileEntry { path: rel, sha256 });
+    }
+
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(Json(FilesManifestResponse {
+        version: head_version,
+        files: entries,
+    }))
+}
+
 // ── Graph API types ───────────────────────────────────────────────────────────
 
 /// Query parameters for `GET /api/graph/entities`.
@@ -10510,6 +10611,7 @@ impl utoipa::Modify for SecurityAddon {
         openapi_handler,
         files_download_handler,
         files_pull_handler,
+        files_manifest_handler,
     ),
     components(
         schemas(
@@ -10614,6 +10716,8 @@ impl utoipa::Modify for SecurityAddon {
             FileChangeType,
             PullFileEntry,
             FilesPullResponse,
+            ManifestFileEntry,
+            FilesManifestResponse,
             crate::issue::IssueAttachment,
         )
     ),
@@ -10768,6 +10872,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         // Static sub-routes must come before the wildcard `/files/*path`.
         .route("/files/download", get(files_download_handler))
         .route("/files/pull", get(files_pull_handler))
+        .route("/files/manifest", get(files_manifest_handler))
         .route("/files/*path", get(get_main_file_handler))
         .route("/versions", get(list_versions_handler))
         .route("/versions/rollback", post(rollback_handler))
