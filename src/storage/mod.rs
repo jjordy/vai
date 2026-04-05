@@ -336,6 +336,45 @@ pub struct NewIssueComment {
     pub parent_id: Option<uuid::Uuid>,
 }
 
+// ── CommentMention ────────────────────────────────────────────────────────────
+
+/// A resolved @mention stored against a comment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommentMention {
+    /// Unique mention record ID.
+    pub id: uuid::Uuid,
+    /// The comment this mention belongs to.
+    pub comment_id: uuid::Uuid,
+    /// User UUID for human mentions, `None` for agent mentions.
+    pub mentioned_user_id: Option<uuid::Uuid>,
+    /// API key UUID for agent mentions, `None` for human mentions.
+    pub mentioned_key_id: Option<uuid::Uuid>,
+    /// The raw name that was @-mentioned.
+    pub mentioned_name: String,
+    /// `"human"` or `"agent"`.
+    pub mention_type: String,
+}
+
+impl CommentMention {
+    /// Returns the effective UUID (user_id for humans, key_id for agents).
+    pub fn entity_id(&self) -> Option<uuid::Uuid> {
+        self.mentioned_user_id.or(self.mentioned_key_id)
+    }
+}
+
+/// Input for creating a single mention record.
+#[derive(Debug, Clone)]
+pub struct NewCommentMention {
+    /// User UUID, populated when `mention_type == "human"`.
+    pub mentioned_user_id: Option<uuid::Uuid>,
+    /// API key UUID, populated when `mention_type == "agent"`.
+    pub mentioned_key_id: Option<uuid::Uuid>,
+    /// The raw name that was @-mentioned.
+    pub mentioned_name: String,
+    /// `"human"` or `"agent"`.
+    pub mention_type: String,
+}
+
 // ── CommentStore ──────────────────────────────────────────────────────────────
 
 /// Storage for issue comments.
@@ -370,6 +409,33 @@ pub trait CommentStore: Send + Sync {
         repo_id: &Uuid,
         comment_id: &Uuid,
     ) -> Result<IssueComment, StorageError>;
+
+    /// Replaces all @mention records for a comment.
+    ///
+    /// Deletes existing mentions for `comment_id` then inserts the new set.
+    /// Pass an empty slice to clear all mentions.
+    async fn replace_mentions(
+        &self,
+        repo_id: &Uuid,
+        comment_id: &Uuid,
+        mentions: Vec<NewCommentMention>,
+    ) -> Result<Vec<CommentMention>, StorageError>;
+
+    /// Returns all @mention records for a comment.
+    async fn list_mentions(
+        &self,
+        repo_id: &Uuid,
+        comment_id: &Uuid,
+    ) -> Result<Vec<CommentMention>, StorageError>;
+
+    /// Returns all @mention records for every comment on an issue, keyed by comment UUID.
+    ///
+    /// Use this instead of calling `list_mentions` per comment to avoid N+1 queries.
+    async fn list_issue_mentions(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+    ) -> Result<std::collections::HashMap<uuid::Uuid, Vec<CommentMention>>, StorageError>;
 }
 
 // ── IssueLinkStore ────────────────────────────────────────────────────────────

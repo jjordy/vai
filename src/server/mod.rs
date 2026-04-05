@@ -6398,14 +6398,16 @@ async fn get_issue_handler(
     let links_store = ctx.storage.links();
     let attachments_store = ctx.storage.attachments();
     let comments_store = ctx.storage.comments();
-    let (raw_links, attachments, all_comments) = tokio::join!(
+    let (raw_links, attachments, all_comments, mentions_by_comment) = tokio::join!(
         links_store.list_links(&ctx.repo_id, &issue_id),
         attachments_store.list_attachments(&ctx.repo_id, &issue_id),
         comments_store.list_comments(&ctx.repo_id, &issue_id),
+        comments_store.list_issue_mentions(&ctx.repo_id, &issue_id),
     );
     let raw_links = raw_links.map_err(ApiError::from)?;
     let attachments = attachments.map_err(ApiError::from)?;
     let mut all_comments = all_comments.map_err(ApiError::from)?;
+    let mut mentions_by_comment = mentions_by_comment.unwrap_or_default();
 
     // Enrich links: fetch status + title of the other issue in each link.
     let mut links: Vec<IssueLinkDetailResponse> = Vec::with_capacity(raw_links.len());
@@ -6430,7 +6432,11 @@ async fn get_issue_handler(
     let comments_start = all_comments.len().saturating_sub(50);
     let recent_comments: Vec<CommentResponse> = all_comments
         .drain(comments_start..)
-        .map(CommentResponse::from)
+        .map(|c| {
+            let id = c.id;
+            let mentions = mentions_by_comment.remove(&id).unwrap_or_default();
+            CommentResponse::with_mentions(c, &mentions)
+        })
         .collect();
 
     let agent_source = issue.agent_source.as_ref().map(|s| {
@@ -6633,6 +6639,27 @@ struct CreateCommentRequest {
 }
 
 
+/// A resolved @mention embedded in a comment response.
+#[derive(Debug, Serialize, ToSchema)]
+struct MentionRef {
+    /// Stable UUID — user ID for humans, API key ID for agents.
+    id: String,
+    /// Display name of the mentioned user or agent.
+    name: String,
+    /// `"human"` for users, `"agent"` for API keys.
+    mention_type: String,
+}
+
+impl From<&crate::storage::CommentMention> for MentionRef {
+    fn from(m: &crate::storage::CommentMention) -> Self {
+        MentionRef {
+            id: m.entity_id().map(|u| u.to_string()).unwrap_or_default(),
+            name: m.mentioned_name.clone(),
+            mention_type: m.mention_type.clone(),
+        }
+    }
+}
+
 /// Response body for a single issue comment.
 #[derive(Debug, Serialize, ToSchema)]
 struct CommentResponse {
@@ -6652,10 +6679,13 @@ struct CommentResponse {
     edited_at: Option<String>,
     /// When the comment was soft-deleted, if ever.
     deleted_at: Option<String>,
+    /// Resolved @mentions found in the comment body.
+    mentions: Vec<MentionRef>,
 }
 
-impl From<crate::issue::IssueComment> for CommentResponse {
-    fn from(c: crate::issue::IssueComment) -> Self {
+impl CommentResponse {
+    /// Build a response from a comment and its resolved mentions.
+    fn with_mentions(c: crate::issue::IssueComment, mentions: &[crate::storage::CommentMention]) -> Self {
         CommentResponse {
             id: c.id.to_string(),
             issue_id: c.issue_id.to_string(),
@@ -6667,8 +6697,84 @@ impl From<crate::issue::IssueComment> for CommentResponse {
             parent_id: c.parent_id.map(|u| u.to_string()),
             edited_at: c.edited_at.map(|t| t.to_rfc3339()),
             deleted_at: c.deleted_at.map(|t| t.to_rfc3339()),
+            mentions: mentions.iter().map(MentionRef::from).collect(),
         }
     }
+}
+
+impl From<crate::issue::IssueComment> for CommentResponse {
+    fn from(c: crate::issue::IssueComment) -> Self {
+        CommentResponse::with_mentions(c, &[])
+    }
+}
+
+/// Extracts unique @mention names from a comment body.
+///
+/// Matches the pattern `@word` where the name starts with a word character and
+/// may contain word characters, dots, and dashes. Duplicate names are removed.
+fn extract_mention_names(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut names: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'@' {
+            i += 1;
+            // First char must be alphanumeric or underscore.
+            if i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric()
+                        || bytes[i] == b'_'
+                        || bytes[i] == b'.'
+                        || bytes[i] == b'-')
+                {
+                    i += 1;
+                }
+                if let Ok(name) = std::str::from_utf8(&bytes[start..i]) {
+                    names.push(name.to_string());
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Validates @mention names against repo members and returns `NewCommentMention` records.
+///
+/// Names that do not match any repo member are silently ignored.
+async fn resolve_comment_mentions(
+    storage: &crate::storage::StorageBackend,
+    repo_id: &uuid::Uuid,
+    names: Vec<String>,
+) -> Vec<crate::storage::NewCommentMention> {
+    if names.is_empty() {
+        return vec![];
+    }
+    let mut result = Vec::new();
+    let orgs = storage.orgs();
+    for name in names {
+        // Search returns prefix matches; we filter for exact case-insensitive match.
+        if let Ok(members) = orgs.search_repo_members(repo_id, &name, 10).await {
+            if let Some(m) = members.into_iter().find(|m| m.name.eq_ignore_ascii_case(&name)) {
+                let (user_id, key_id) = if m.member_type == "human" {
+                    (uuid::Uuid::parse_str(&m.id).ok(), None)
+                } else {
+                    (None, uuid::Uuid::parse_str(&m.id).ok())
+                };
+                result.push(crate::storage::NewCommentMention {
+                    mentioned_user_id: user_id,
+                    mentioned_key_id: key_id,
+                    mentioned_name: m.name,
+                    mention_type: m.member_type,
+                });
+            }
+        }
+    }
+    result
 }
 
 #[utoipa::path(
@@ -6691,6 +6797,7 @@ impl From<crate::issue::IssueComment> for CommentResponse {
 /// `POST /api/repos/:repo/issues/:id/comments` — add a comment to an issue.
 async fn create_issue_comment_handler(
     Extension(identity): Extension<AgentIdentity>,
+    State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     PathId(id): PathId,
     Json(body): Json<CreateCommentRequest>,
@@ -6741,18 +6848,56 @@ async fn create_issue_comment_handler(
         None
     };
 
+    // Resolve @mentions from the body against repo members.
+    let mention_names = extract_mention_names(&body.body);
+    let new_mentions = resolve_comment_mentions(&ctx.storage, &ctx.repo_id, mention_names).await;
+
     let comment = ctx.storage.comments()
         .create_comment(&ctx.repo_id, &issue_id, crate::storage::NewIssueComment {
-            author,
+            author: author.clone(),
             body: body.body,
-            author_type,
+            author_type: author_type.clone(),
             author_id,
             parent_id,
         })
         .await
         .map_err(ApiError::from)?;
 
-    Ok((StatusCode::CREATED, Json(CommentResponse::from(comment))))
+    // Store mentions and collect mention UUIDs for the event payload.
+    let mentions = ctx.storage.comments()
+        .replace_mentions(&ctx.repo_id, &comment.id, new_mentions)
+        .await
+        .unwrap_or_default();
+    let mention_ids: Vec<uuid::Uuid> = mentions.iter().filter_map(|m| m.entity_id()).collect();
+
+    // Append CommentCreated event — triggers pg_notify in Postgres mode.
+    let _ = ctx.storage.events()
+        .append(&ctx.repo_id, EventKind::CommentCreated {
+            issue_id,
+            comment_id: comment.id,
+            author: author.clone(),
+            author_type: author_type.clone(),
+            parent_id: comment.parent_id,
+            mentions: mention_ids.clone(),
+        })
+        .await;
+
+    state.broadcast(BroadcastEvent {
+        event_type: "CommentCreated".to_string(),
+        event_id: 0,
+        workspace_id: None,
+        timestamp: comment.created_at.to_rfc3339(),
+        data: serde_json::json!({
+            "issue_id": issue_id.to_string(),
+            "comment_id": comment.id.to_string(),
+            "author": author,
+            "author_type": author_type,
+            "parent_id": comment.parent_id.map(|u| u.to_string()),
+            "mentions": mention_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        }),
+    });
+
+    Ok((StatusCode::CREATED, Json(CommentResponse::with_mentions(comment, &mentions))))
 }
 
 #[utoipa::path(
@@ -6787,12 +6932,24 @@ async fn list_issue_comments_handler(
         .await
         .map_err(ApiError::from)?;
 
-    let comments = ctx.storage.comments()
-        .list_comments(&ctx.repo_id, &issue_id)
-        .await
-        .map_err(ApiError::from)?;
+    let comments_store = ctx.storage.comments();
+    let (comments, mentions_map) = tokio::join!(
+        comments_store.list_comments(&ctx.repo_id, &issue_id),
+        comments_store.list_issue_mentions(&ctx.repo_id, &issue_id),
+    );
+    let comments = comments.map_err(ApiError::from)?;
+    let mut mentions_by_comment = mentions_map.unwrap_or_default();
 
-    Ok(Json(comments.into_iter().map(CommentResponse::from).collect()))
+    Ok(Json(
+        comments
+            .into_iter()
+            .map(|c| {
+                let id = c.id;
+                let mentions = mentions_by_comment.remove(&id).unwrap_or_default();
+                CommentResponse::with_mentions(c, &mentions)
+            })
+            .collect(),
+    ))
 }
 
 /// Request body for `PATCH /api/repos/:repo/issues/:id/comments/:comment_id`.
@@ -6874,12 +7031,21 @@ async fn update_issue_comment_handler(
         return Err(ApiError::forbidden("only the original author may edit this comment"));
     }
 
+    // Re-parse and replace @mentions for the new body.
+    let mention_names = extract_mention_names(&body.body);
+    let new_mentions = resolve_comment_mentions(&ctx.storage, &ctx.repo_id, mention_names).await;
+
     let updated = ctx.storage.comments()
         .update_comment(&ctx.repo_id, &comment_id, &body.body)
         .await
         .map_err(ApiError::from)?;
 
-    Ok(Json(CommentResponse::from(updated)))
+    let mentions = ctx.storage.comments()
+        .replace_mentions(&ctx.repo_id, &comment_id, new_mentions)
+        .await
+        .unwrap_or_default();
+
+    Ok(Json(CommentResponse::with_mentions(updated, &mentions)))
 }
 
 #[utoipa::path(
@@ -10905,6 +11071,7 @@ impl utoipa::Modify for SecurityAddon {
             CreateCommentRequest,
             UpdateCommentRequest,
             CommentResponse,
+            MentionRef,
             CreateIssueLinkRequest,
             IssueLinkResponse,
             UploadAttachmentRequest,

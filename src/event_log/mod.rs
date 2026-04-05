@@ -207,6 +207,16 @@ pub enum EventKind {
         resolution: String,
         resolved_by: String,
     },
+    /// A comment was created on an issue.
+    CommentCreated {
+        issue_id: Uuid,
+        comment_id: Uuid,
+        author: String,
+        author_type: String,
+        parent_id: Option<Uuid>,
+        /// UUIDs of users/agents that were @mentioned in the comment body.
+        mentions: Vec<Uuid>,
+    },
 }
 
 impl EventKind {
@@ -236,6 +246,7 @@ impl EventKind {
             EventKind::IssueClosed { .. } => "IssueClosed",
             EventKind::EscalationCreated { .. } => "EscalationCreated",
             EventKind::EscalationResolved { .. } => "EscalationResolved",
+            EventKind::CommentCreated { .. } => "CommentCreated",
         }
     }
 

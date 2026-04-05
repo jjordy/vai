@@ -812,6 +812,123 @@ impl CommentStore for PostgresStorage {
             deleted_at: row.get("deleted_at"),
         })
     }
+
+    async fn replace_mentions(
+        &self,
+        repo_id: &Uuid,
+        comment_id: &Uuid,
+        mentions: Vec<super::NewCommentMention>,
+    ) -> Result<Vec<super::CommentMention>, StorageError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        // Delete existing mentions for this comment.
+        sqlx::query("DELETE FROM comment_mentions WHERE comment_id = $1 AND repo_id = $2")
+            .bind(comment_id)
+            .bind(repo_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut result = Vec::with_capacity(mentions.len());
+        for m in mentions {
+            let row = sqlx::query(
+                r#"
+                INSERT INTO comment_mentions (comment_id, repo_id, mentioned_user_id, mentioned_key_id, mentioned_name, mention_type)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, comment_id, mentioned_user_id, mentioned_key_id, mentioned_name, mention_type
+                "#,
+            )
+            .bind(comment_id)
+            .bind(repo_id)
+            .bind(m.mentioned_user_id)
+            .bind(m.mentioned_key_id)
+            .bind(&m.mentioned_name)
+            .bind(&m.mention_type)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+            result.push(super::CommentMention {
+                id: row.get("id"),
+                comment_id: row.get("comment_id"),
+                mentioned_user_id: row.get("mentioned_user_id"),
+                mentioned_key_id: row.get("mentioned_key_id"),
+                mentioned_name: row.get("mentioned_name"),
+                mention_type: row.get("mention_type"),
+            });
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(result)
+    }
+
+    async fn list_mentions(
+        &self,
+        repo_id: &Uuid,
+        comment_id: &Uuid,
+    ) -> Result<Vec<super::CommentMention>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT id, comment_id, mentioned_user_id, mentioned_key_id, mentioned_name, mention_type \
+             FROM comment_mentions WHERE repo_id = $1 AND comment_id = $2 ORDER BY created_at ASC",
+        )
+        .bind(repo_id)
+        .bind(comment_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| super::CommentMention {
+                id: row.get("id"),
+                comment_id: row.get("comment_id"),
+                mentioned_user_id: row.get("mentioned_user_id"),
+                mentioned_key_id: row.get("mentioned_key_id"),
+                mentioned_name: row.get("mentioned_name"),
+                mention_type: row.get("mention_type"),
+            })
+            .collect())
+    }
+
+    async fn list_issue_mentions(
+        &self,
+        repo_id: &Uuid,
+        issue_id: &Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<super::CommentMention>>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT cm.id, cm.comment_id, cm.mentioned_user_id, cm.mentioned_key_id, cm.mentioned_name, cm.mention_type \
+             FROM comment_mentions cm \
+             JOIN issue_comments ic ON ic.id = cm.comment_id \
+             WHERE cm.repo_id = $1 AND ic.issue_id = $2 \
+             ORDER BY cm.created_at ASC",
+        )
+        .bind(repo_id)
+        .bind(issue_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut map: std::collections::HashMap<Uuid, Vec<super::CommentMention>> = std::collections::HashMap::new();
+        for row in rows {
+            let mention = super::CommentMention {
+                id: row.get("id"),
+                comment_id: row.get("comment_id"),
+                mentioned_user_id: row.get("mentioned_user_id"),
+                mentioned_key_id: row.get("mentioned_key_id"),
+                mentioned_name: row.get("mentioned_name"),
+                mention_type: row.get("mention_type"),
+            };
+            map.entry(mention.comment_id).or_default().push(mention);
+        }
+        Ok(map)
+    }
 }
 
 // ── IssueLinkStore ────────────────────────────────────────────────────────────

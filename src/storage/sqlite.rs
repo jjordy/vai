@@ -450,6 +450,32 @@ impl CommentStore for SqliteStorage {
             .soft_delete_comment(*comment_id)
             .map_err(|e| StorageError::Database(e.to_string()))
     }
+
+    async fn replace_mentions(
+        &self,
+        _repo_id: &Uuid,
+        _comment_id: &Uuid,
+        _mentions: Vec<super::NewCommentMention>,
+    ) -> Result<Vec<super::CommentMention>, StorageError> {
+        // Mentions are not tracked in local SQLite mode.
+        Ok(vec![])
+    }
+
+    async fn list_mentions(
+        &self,
+        _repo_id: &Uuid,
+        _comment_id: &Uuid,
+    ) -> Result<Vec<super::CommentMention>, StorageError> {
+        Ok(vec![])
+    }
+
+    async fn list_issue_mentions(
+        &self,
+        _repo_id: &Uuid,
+        _issue_id: &Uuid,
+    ) -> Result<std::collections::HashMap<uuid::Uuid, Vec<super::CommentMention>>, StorageError> {
+        Ok(std::collections::HashMap::new())
+    }
 }
 
 // ── IssueLinkStore ────────────────────────────────────────────────────────────
