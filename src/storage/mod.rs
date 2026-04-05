@@ -1029,6 +1029,20 @@ pub struct RepoCollaborator {
     pub created_at: DateTime<Utc>,
 }
 
+/// A member of a repository, either a human user or an agent API key.
+///
+/// Returned by the `search_repo_members` storage method to power @mention
+/// autocomplete in comments (PRD 22, Issue 5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoMember {
+    /// Stable UUID — user ID for humans, API key ID for agents.
+    pub id: String,
+    /// Display name of the user or API key.
+    pub name: String,
+    /// `"human"` for users, `"agent"` for API keys.
+    pub member_type: String,
+}
+
 /// Input for creating a new organization.
 #[derive(Debug, Clone)]
 pub struct NewOrg {
@@ -1170,6 +1184,21 @@ pub trait OrgStore: Send + Sync {
         &self,
         repo_id: &Uuid,
     ) -> Result<Vec<RepoCollaborator>, StorageError>;
+
+    /// Searches for repo members (users and agent API keys) matching `query`.
+    ///
+    /// Returns up to `limit` results. Users are matched case-insensitively
+    /// against their name or email; API keys are matched against their name.
+    /// Users are sourced from both direct `repo_collaborators` entries and
+    /// `org_members` of the org that owns the repo (if any).
+    ///
+    /// An empty `query` returns the first `limit` members alphabetically.
+    async fn search_repo_members(
+        &self,
+        repo_id: &Uuid,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<RepoMember>, StorageError>;
 
     // ── Permission resolution ─────────────────────────────────────────────────
 

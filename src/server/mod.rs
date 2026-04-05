@@ -107,6 +107,7 @@
 //!   - `POST /api/repos/:repo/watchers/:id/pause` — pause watcher
 //!   - `POST /api/repos/:repo/watchers/:id/resume` — resume watcher
 //!   - `POST /api/repos/:repo/discoveries` — submit discovery event
+//!   - `GET /api/repos/:repo/members` — search repo members for @mention autocomplete
 //!   - `WS /api/repos/:repo/ws/events` — per-repo WebSocket event stream
 //!
 //! ## WebSocket Endpoints
@@ -9649,6 +9650,73 @@ async fn remove_collaborator_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Repo members search (PRD 22, Issue 5) ────────────────────────────────────
+
+/// Query parameters for `GET /api/repos/:repo/members`.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+struct MembersSearchParams {
+    /// Case-insensitive prefix to filter members by name or email.
+    /// An empty or absent `q` returns the first 10 members alphabetically.
+    #[serde(default)]
+    q: String,
+}
+
+/// A repo member — either a human user or an agent API key.
+#[derive(Debug, Serialize, ToSchema)]
+struct RepoMemberResponse {
+    /// Stable UUID — user ID for humans, API key ID for agents.
+    id: String,
+    /// Display name.
+    name: String,
+    /// `"human"` for users, `"agent"` for API keys.
+    #[serde(rename = "type")]
+    member_type: String,
+}
+
+impl From<crate::storage::RepoMember> for RepoMemberResponse {
+    fn from(m: crate::storage::RepoMember) -> Self {
+        RepoMemberResponse {
+            id: m.id,
+            name: m.name,
+            member_type: m.member_type,
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/repos/{repo}/members",
+    params(
+        ("repo" = String, Path, description = "Repository slug"),
+        MembersSearchParams,
+    ),
+    responses(
+        (status = 200, description = "List of matching repo members", body = Vec<RepoMemberResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
+/// `GET /api/repos/:repo/members` — searches for repo members for @mention autocomplete.
+///
+/// Returns up to 10 users (with access via collaborators or org membership) and
+/// agent API keys whose names match the `q` prefix (case-insensitive).
+async fn search_repo_members_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    AxumQuery(params): AxumQuery<MembersSearchParams>,
+) -> Result<Json<Vec<RepoMemberResponse>>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
+
+    let members = ctx.storage.orgs()
+        .search_repo_members(&ctx.repo_id, &params.q, 10)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(members.into_iter().map(RepoMemberResponse::from).collect()))
+}
+
 // ── Auth token exchange (PRD 18) ──────────────────────────────────────────────
 
 /// Request body for `POST /api/auth/token`.
@@ -10794,6 +10862,7 @@ impl utoipa::Modify for SecurityAddon {
         list_collaborators_handler,
         update_collaborator_handler,
         remove_collaborator_handler,
+        search_repo_members_handler,
         token_exchange_handler,
         refresh_token_handler,
         revoke_token_handler,
@@ -10877,6 +10946,7 @@ impl utoipa::Modify for SecurityAddon {
             AddCollaboratorRequest,
             UpdateCollaboratorRequest,
             CollaboratorResponse,
+            RepoMemberResponse,
             TokenRequest,
             TokenResponse,
             RefreshRequest,
@@ -11105,6 +11175,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/watchers/:id/pause", post(pause_watcher_handler))
         .route("/watchers/:id/resume", post(resume_watcher_handler))
         .route("/discoveries", post(submit_discovery_handler))
+        .route("/members", get(search_repo_members_handler))
         .route("/ws/events", get(ws_events_handler))
         // Migration endpoints (PRD 12.2, 12.5) — multi-repo mode.
         .route("/migrate", post(migrate_handler).layer(DefaultBodyLimit::max(MIGRATE_BODY_LIMIT)))

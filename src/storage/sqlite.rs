@@ -1245,6 +1245,15 @@ impl OrgStore for SqliteStorage {
         Err(org_store_unsupported())
     }
 
+    async fn search_repo_members(
+        &self,
+        _repo_id: &Uuid,
+        _query: &str,
+        _limit: i64,
+    ) -> Result<Vec<super::RepoMember>, StorageError> {
+        Err(org_store_unsupported())
+    }
+
     async fn resolve_repo_role(
         &self,
         _user_id: &Uuid,

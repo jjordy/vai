@@ -2460,6 +2460,71 @@ impl OrgStore for PostgresStorage {
             .collect())
     }
 
+    async fn search_repo_members(
+        &self,
+        repo_id: &Uuid,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<super::RepoMember>, StorageError> {
+        // Build a LIKE pattern: prefix match, case-insensitive via ILIKE.
+        let pattern = format!("{}%", query);
+
+        // Union of:
+        //   1. Direct repo collaborators (via repo_collaborators JOIN users)
+        //   2. Org members (via repos → org_members JOIN users), when the repo
+        //      belongs to an org
+        //   3. Agent API keys scoped to this repo (not revoked)
+        // Deduplicated by (id, member_type), ordered by name, limited.
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name, member_type FROM (
+                -- Direct collaborators
+                SELECT u.id::text AS id, u.name AS name, 'human' AS member_type
+                FROM repo_collaborators rc
+                JOIN users u ON u.id = rc.user_id
+                WHERE rc.repo_id = $1
+                  AND (u.name ILIKE $2 OR u.email ILIKE $2)
+
+                UNION
+
+                -- Org members (when this repo belongs to an org)
+                SELECT u.id::text AS id, u.name AS name, 'human' AS member_type
+                FROM repos r
+                JOIN org_members om ON om.org_id = r.org_id
+                JOIN users u ON u.id = om.user_id
+                WHERE r.id = $1
+                  AND (u.name ILIKE $2 OR u.email ILIKE $2)
+
+                UNION
+
+                -- Agent API keys scoped to this repo
+                SELECT ak.id::text AS id, ak.name AS name, 'agent' AS member_type
+                FROM api_keys ak
+                WHERE ak.repo_id = $1
+                  AND NOT ak.revoked
+                  AND ak.name ILIKE $2
+            ) AS combined
+            ORDER BY name
+            LIMIT $3
+            "#,
+        )
+        .bind(repo_id)
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| super::RepoMember {
+                id: row.get("id"),
+                name: row.get("name"),
+                member_type: row.get("member_type"),
+            })
+            .collect())
+    }
+
     async fn list_repo_ids_for_org(&self, org_id: &Uuid) -> Result<Vec<Uuid>, StorageError> {
         let rows = sqlx::query("SELECT id FROM repos WHERE org_id = $1 ORDER BY created_at")
             .bind(org_id)
