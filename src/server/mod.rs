@@ -6626,6 +6626,9 @@ struct CreateCommentRequest {
     #[serde(default)]
     #[allow(dead_code)]
     author: Option<String>,
+    /// Optional parent comment UUID for threaded replies.
+    #[serde(default)]
+    parent_id: Option<String>,
 }
 
 
@@ -6635,12 +6638,19 @@ struct CommentResponse {
     id: String,
     issue_id: String,
     author: String,
-    body: String,
+    /// Comment body. `null` when the comment has been soft-deleted.
+    body: Option<String>,
     /// Whether the author is a `"human"` or `"agent"`.
     author_type: String,
     /// Optional structured author identifier.
     author_id: Option<String>,
     created_at: String,
+    /// Parent comment UUID for threaded replies.
+    parent_id: Option<String>,
+    /// When the comment was last edited, if ever.
+    edited_at: Option<String>,
+    /// When the comment was soft-deleted, if ever.
+    deleted_at: Option<String>,
 }
 
 impl From<crate::issue::IssueComment> for CommentResponse {
@@ -6653,6 +6663,9 @@ impl From<crate::issue::IssueComment> for CommentResponse {
             author_type: c.author_type,
             author_id: c.author_id,
             created_at: c.created_at.to_rfc3339(),
+            parent_id: c.parent_id.map(|u| u.to_string()),
+            edited_at: c.edited_at.map(|t| t.to_rfc3339()),
+            deleted_at: c.deleted_at.map(|t| t.to_rfc3339()),
         }
     }
 }
@@ -6708,12 +6721,32 @@ async fn create_issue_comment_handler(
         }
     };
 
+    // Parse and validate optional parent_id.
+    let parent_id = if let Some(ref pid_str) = body.parent_id {
+        let pid = uuid::Uuid::parse_str(pid_str)
+            .map_err(|_| ApiError::bad_request(format!("invalid parent_id `{pid_str}`")))?;
+        // Verify the parent comment exists on the same issue.
+        let existing = ctx.storage.comments()
+            .list_comments(&ctx.repo_id, &issue_id)
+            .await
+            .map_err(ApiError::from)?;
+        if !existing.iter().any(|c| c.id == pid) {
+            return Err(ApiError::bad_request(
+                format!("parent_id `{pid_str}` does not reference a comment on this issue"),
+            ));
+        }
+        Some(pid)
+    } else {
+        None
+    };
+
     let comment = ctx.storage.comments()
         .create_comment(&ctx.repo_id, &issue_id, crate::storage::NewIssueComment {
             author,
             body: body.body,
             author_type,
             author_id,
+            parent_id,
         })
         .await
         .map_err(ApiError::from)?;

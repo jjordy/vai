@@ -679,9 +679,9 @@ impl CommentStore for PostgresStorage {
     ) -> Result<IssueComment, StorageError> {
         let row = sqlx::query(
             r#"
-            INSERT INTO issue_comments (repo_id, issue_id, author, body, author_type, author_id)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, issue_id, author, body, created_at, author_type, author_id
+            INSERT INTO issue_comments (repo_id, issue_id, author, body, author_type, author_id, parent_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, issue_id, author, body, created_at, author_type, author_id, parent_id, edited_at, deleted_at
             "#,
         )
         .bind(repo_id)
@@ -690,6 +690,7 @@ impl CommentStore for PostgresStorage {
         .bind(&comment.body)
         .bind(&comment.author_type)
         .bind(&comment.author_id)
+        .bind(comment.parent_id)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -702,6 +703,9 @@ impl CommentStore for PostgresStorage {
             author_type: row.get("author_type"),
             author_id: row.get("author_id"),
             created_at: row.get("created_at"),
+            parent_id: row.get("parent_id"),
+            edited_at: row.get("edited_at"),
+            deleted_at: row.get("deleted_at"),
         })
     }
 
@@ -711,7 +715,7 @@ impl CommentStore for PostgresStorage {
         issue_id: &Uuid,
     ) -> Result<Vec<IssueComment>, StorageError> {
         let rows = sqlx::query(
-            "SELECT id, issue_id, author, body, created_at, author_type, author_id \
+            "SELECT id, issue_id, author, body, created_at, author_type, author_id, parent_id, edited_at, deleted_at \
              FROM issue_comments \
              WHERE repo_id = $1 AND issue_id = $2 \
              ORDER BY created_at ASC",
@@ -732,6 +736,9 @@ impl CommentStore for PostgresStorage {
                 author_type: row.get("author_type"),
                 author_id: row.get("author_id"),
                 created_at: row.get("created_at"),
+                parent_id: row.get("parent_id"),
+                edited_at: row.get("edited_at"),
+                deleted_at: row.get("deleted_at"),
             })
             .collect())
     }

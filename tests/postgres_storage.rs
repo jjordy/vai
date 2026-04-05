@@ -1354,6 +1354,7 @@ async fn test_issue_comment_cross_repo_isolation() {
                 body: "A comment".to_string(),
                 author_type: "human".to_string(),
                 author_id: None,
+                parent_id: None,
             },
         )
         .await

@@ -412,6 +412,7 @@ impl CommentStore for SqliteStorage {
                 &comment.body,
                 &comment.author_type,
                 comment.author_id.as_deref(),
+                comment.parent_id,
             )
             .map_err(|e| StorageError::Database(e.to_string()))
     }

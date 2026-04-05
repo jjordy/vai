@@ -332,6 +332,8 @@ pub struct NewIssueComment {
     pub author_type: String,
     /// Optional structured author identifier (e.g. agent instance ID).
     pub author_id: Option<String>,
+    /// Optional parent comment UUID for threaded replies.
+    pub parent_id: Option<uuid::Uuid>,
 }
 
 // ── CommentStore ──────────────────────────────────────────────────────────────

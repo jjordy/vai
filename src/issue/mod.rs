@@ -155,14 +155,20 @@ pub struct IssueComment {
     pub issue_id: Uuid,
     /// Author username or agent ID.
     pub author: String,
-    /// Comment body (Markdown supported).
-    pub body: String,
+    /// Comment body (Markdown supported). `None` when soft-deleted.
+    pub body: Option<String>,
     /// Whether the author is a `"human"` or `"agent"`.
     pub author_type: String,
     /// Optional structured author identifier (e.g. agent instance ID).
     pub author_id: Option<String>,
     /// When the comment was created.
     pub created_at: DateTime<Utc>,
+    /// Parent comment UUID for threaded replies.
+    pub parent_id: Option<Uuid>,
+    /// When the comment was last edited, if ever.
+    pub edited_at: Option<DateTime<Utc>>,
+    /// When the comment was soft-deleted, if ever.
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 // ── Issue attachment ──────────────────────────────────────────────────────────
@@ -339,6 +345,19 @@ impl IssueStore {
         );
         let _ = self.conn.execute(
             "ALTER TABLE issue_comments ADD COLUMN author_id TEXT",
+            [],
+        );
+        // Migrate existing databases that lack threading / soft-delete columns.
+        let _ = self.conn.execute(
+            "ALTER TABLE issue_comments ADD COLUMN parent_id TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE issue_comments ADD COLUMN edited_at TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE issue_comments ADD COLUMN deleted_at TEXT",
             [],
         );
         Ok(())
@@ -845,12 +864,13 @@ impl IssueStore {
         body: &str,
         author_type: &str,
         author_id: Option<&str>,
+        parent_id: Option<Uuid>,
     ) -> Result<IssueComment, IssueError> {
         let id = Uuid::new_v4();
         let now = Utc::now();
         self.conn.execute(
-            "INSERT INTO issue_comments (id, issue_id, author, body, created_at, author_type, author_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO issue_comments (id, issue_id, author, body, created_at, author_type, author_id, parent_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id.to_string(),
                 issue_id.to_string(),
@@ -859,39 +879,46 @@ impl IssueStore {
                 now.to_rfc3339(),
                 author_type,
                 author_id,
+                parent_id.map(|p| p.to_string()),
             ],
         )?;
         Ok(IssueComment {
             id,
             issue_id,
             author: author.to_string(),
-            body: body.to_string(),
+            body: Some(body.to_string()),
             author_type: author_type.to_string(),
             author_id: author_id.map(|s| s.to_string()),
             created_at: now,
+            parent_id,
+            edited_at: None,
+            deleted_at: None,
         })
     }
 
     /// List all comments for an issue, ordered by `created_at` ascending.
     pub fn list_comments(&self, issue_id: Uuid) -> Result<Vec<IssueComment>, IssueError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, issue_id, author, body, created_at, author_type, author_id \
+            "SELECT id, issue_id, author, body, created_at, author_type, author_id, parent_id, edited_at, deleted_at \
              FROM issue_comments WHERE issue_id = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![issue_id.to_string()], |row| {
             let id_str: String = row.get(0)?;
             let iid_str: String = row.get(1)?;
             let author: String = row.get(2)?;
-            let body: String = row.get(3)?;
+            let body: Option<String> = row.get(3)?;
             let ts: String = row.get(4)?;
             let author_type: String = row.get(5)?;
             let author_id: Option<String> = row.get(6)?;
-            Ok((id_str, iid_str, author, body, ts, author_type, author_id))
+            let parent_id_str: Option<String> = row.get(7)?;
+            let edited_at_str: Option<String> = row.get(8)?;
+            let deleted_at_str: Option<String> = row.get(9)?;
+            Ok((id_str, iid_str, author, body, ts, author_type, author_id, parent_id_str, edited_at_str, deleted_at_str))
         })?;
 
         let mut comments = Vec::new();
         for row in rows {
-            let (id_str, iid_str, author, body, ts, author_type, author_id) = row?;
+            let (id_str, iid_str, author, body, ts, author_type, author_id, parent_id_str, edited_at_str, deleted_at_str) = row?;
             let id = Uuid::parse_str(&id_str)
                 .map_err(|_| IssueError::Sqlite(rusqlite::Error::InvalidColumnType(0, "id".into(), rusqlite::types::Type::Text)))?;
             let iid = Uuid::parse_str(&iid_str)
@@ -899,7 +926,14 @@ impl IssueStore {
             let created_at = chrono::DateTime::parse_from_rfc3339(&ts)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| IssueError::Sqlite(rusqlite::Error::InvalidColumnType(4, "created_at".into(), rusqlite::types::Type::Text)))?;
-            comments.push(IssueComment { id, issue_id: iid, author, body, author_type, author_id, created_at });
+            let parent_id = parent_id_str.as_deref().and_then(|s| Uuid::parse_str(s).ok());
+            let edited_at = edited_at_str.as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            let deleted_at = deleted_at_str.as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            comments.push(IssueComment { id, issue_id: iid, author, body, author_type, author_id, created_at, parent_id, edited_at, deleted_at });
         }
         Ok(comments)
     }
