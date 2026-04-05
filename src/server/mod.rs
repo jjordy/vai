@@ -6620,20 +6620,14 @@ async fn close_issue_handler(
 /// Request body for `POST /api/repos/:repo/issues/:id/comments`.
 #[derive(Debug, Deserialize, ToSchema)]
 struct CreateCommentRequest {
-    /// Author username or agent ID.
-    author: String,
     /// Comment body (Markdown supported).
     body: String,
-    /// Whether the author is a `"human"` or `"agent"`. Defaults to `"human"`.
-    #[serde(default = "default_author_type")]
-    author_type: String,
-    /// Optional structured author identifier (e.g. agent instance ID).
-    author_id: Option<String>,
+    /// Ignored — author is always derived from the authenticated identity.
+    #[serde(default)]
+    #[allow(dead_code)]
+    author: Option<String>,
 }
 
-fn default_author_type() -> String {
-    "human".to_string()
-}
 
 /// Response body for a single issue comment.
 #[derive(Debug, Serialize, ToSchema)]
@@ -6698,12 +6692,28 @@ async fn create_issue_comment_handler(
         .await
         .map_err(ApiError::from)?;
 
+    // Derive author info from the authenticated identity, ignoring any
+    // client-supplied author field.
+    let (author, author_type, author_id) = match identity.auth_source {
+        AuthSource::Jwt => {
+            let id = identity.user_id.map(|u| u.to_string())
+                .unwrap_or_else(|| identity.key_id.clone());
+            (identity.name.clone(), "human".to_string(), Some(id))
+        }
+        AuthSource::ApiKey => {
+            (identity.name.clone(), "agent".to_string(), Some(identity.key_id.clone()))
+        }
+        AuthSource::AdminKey => {
+            ("admin".to_string(), "human".to_string(), None)
+        }
+    };
+
     let comment = ctx.storage.comments()
         .create_comment(&ctx.repo_id, &issue_id, crate::storage::NewIssueComment {
-            author: body.author,
+            author,
             body: body.body,
-            author_type: body.author_type,
-            author_id: body.author_id,
+            author_type,
+            author_id,
         })
         .await
         .map_err(ApiError::from)?;
