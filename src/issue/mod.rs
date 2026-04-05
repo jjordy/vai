@@ -938,6 +938,90 @@ impl IssueStore {
         Ok(comments)
     }
 
+    /// Update a comment body and set `edited_at` to now.
+    pub fn update_comment(&self, comment_id: Uuid, new_body: &str) -> Result<IssueComment, IssueError> {
+        let now = Utc::now();
+        let rows_changed = self.conn.execute(
+            "UPDATE issue_comments SET body = ?1, edited_at = ?2 WHERE id = ?3",
+            params![new_body, now.to_rfc3339(), comment_id.to_string()],
+        )?;
+        if rows_changed == 0 {
+            return Err(IssueError::NotFound(comment_id));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, issue_id, author, body, created_at, author_type, author_id, parent_id, edited_at, deleted_at \
+             FROM issue_comments WHERE id = ?1",
+        )?;
+        let row = stmt.query_row(params![comment_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })?;
+        Self::row_to_comment(row)
+    }
+
+    /// Soft-delete a comment by setting `deleted_at` to now.
+    pub fn soft_delete_comment(&self, comment_id: Uuid) -> Result<IssueComment, IssueError> {
+        let now = Utc::now();
+        let rows_changed = self.conn.execute(
+            "UPDATE issue_comments SET deleted_at = ?1 WHERE id = ?2",
+            params![now.to_rfc3339(), comment_id.to_string()],
+        )?;
+        if rows_changed == 0 {
+            return Err(IssueError::NotFound(comment_id));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, issue_id, author, body, created_at, author_type, author_id, parent_id, edited_at, deleted_at \
+             FROM issue_comments WHERE id = ?1",
+        )?;
+        let row = stmt.query_row(params![comment_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })?;
+        Self::row_to_comment(row)
+    }
+
+    /// Parse a comment from a row tuple.
+    fn row_to_comment(
+        row: (String, String, String, Option<String>, String, String, Option<String>, Option<String>, Option<String>, Option<String>),
+    ) -> Result<IssueComment, IssueError> {
+        let (id_str, iid_str, author, body, ts, author_type, author_id, parent_id_str, edited_at_str, deleted_at_str) = row;
+        let id = Uuid::parse_str(&id_str)
+            .map_err(|_| IssueError::Sqlite(rusqlite::Error::InvalidColumnType(0, "id".into(), rusqlite::types::Type::Text)))?;
+        let issue_id = Uuid::parse_str(&iid_str)
+            .map_err(|_| IssueError::Sqlite(rusqlite::Error::InvalidColumnType(1, "issue_id".into(), rusqlite::types::Type::Text)))?;
+        let created_at = chrono::DateTime::parse_from_rfc3339(&ts)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|_| IssueError::Sqlite(rusqlite::Error::InvalidColumnType(4, "created_at".into(), rusqlite::types::Type::Text)))?;
+        let parent_id = parent_id_str.as_deref().and_then(|s| Uuid::parse_str(s).ok());
+        let edited_at = edited_at_str.as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        let deleted_at = deleted_at_str.as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        Ok(IssueComment { id, issue_id, author, body, author_type, author_id, created_at, parent_id, edited_at, deleted_at })
+    }
+
     /// List workspaces linked to an issue.
     pub fn linked_workspaces(&self, id: Uuid) -> Result<Vec<Uuid>, IssueError> {
         let mut stmt = self.conn.prepare(

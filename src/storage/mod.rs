@@ -355,6 +355,21 @@ pub trait CommentStore: Send + Sync {
         repo_id: &Uuid,
         issue_id: &Uuid,
     ) -> Result<Vec<IssueComment>, StorageError>;
+
+    /// Updates the body of a comment and sets `edited_at` to now.
+    async fn update_comment(
+        &self,
+        repo_id: &Uuid,
+        comment_id: &Uuid,
+        new_body: &str,
+    ) -> Result<IssueComment, StorageError>;
+
+    /// Soft-deletes a comment by setting `deleted_at` to now.
+    async fn soft_delete_comment(
+        &self,
+        repo_id: &Uuid,
+        comment_id: &Uuid,
+    ) -> Result<IssueComment, StorageError>;
 }
 
 // ── IssueLinkStore ────────────────────────────────────────────────────────────

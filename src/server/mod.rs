@@ -6794,6 +6794,156 @@ async fn list_issue_comments_handler(
     Ok(Json(comments.into_iter().map(CommentResponse::from).collect()))
 }
 
+/// Request body for `PATCH /api/repos/:repo/issues/:id/comments/:comment_id`.
+#[derive(Debug, Deserialize, ToSchema)]
+struct UpdateCommentRequest {
+    /// New comment body (Markdown supported).
+    body: String,
+}
+
+/// Returns `true` if the authenticated identity is the author of the comment.
+fn is_comment_author(identity: &AgentIdentity, comment: &crate::issue::IssueComment) -> bool {
+    match &comment.author_id {
+        None => identity.is_admin,
+        Some(author_id) => match identity.auth_source {
+            AuthSource::Jwt => {
+                let my_id = identity.user_id.map(|u| u.to_string())
+                    .unwrap_or_else(|| identity.key_id.clone());
+                my_id == *author_id
+            }
+            AuthSource::ApiKey => identity.key_id == *author_id,
+            AuthSource::AdminKey => identity.is_admin,
+        },
+    }
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/repos/{repo}/issues/{id}/comments/{comment_id}",
+    params(
+        ("repo" = String, Path, description = "Repository slug"),
+        ("id" = String, Path, description = "Issue UUID"),
+        ("comment_id" = String, Path, description = "Comment UUID"),
+    ),
+    request_body = UpdateCommentRequest,
+    responses(
+        (status = 200, description = "Comment updated", body = CommentResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — not the comment author", body = ErrorBody),
+        (status = 404, description = "Comment not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
+/// `PATCH /api/repos/:repo/issues/:id/comments/:comment_id` — edit a comment body.
+///
+/// Only the original author may edit a comment.
+async fn update_issue_comment_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    AxumPath(params): AxumPath<HashMap<String, String>>,
+    Json(body): Json<UpdateCommentRequest>,
+) -> Result<Json<CommentResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
+
+    let issue_id_str = params.get("id").cloned().unwrap_or_default();
+    let comment_id_str = params.get("comment_id").cloned().unwrap_or_default();
+
+    let issue_id = uuid::Uuid::parse_str(&issue_id_str)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{issue_id_str}`")))?;
+    let comment_id = uuid::Uuid::parse_str(&comment_id_str)
+        .map_err(|_| ApiError::bad_request(format!("invalid comment ID `{comment_id_str}`")))?;
+
+    // Verify the issue exists.
+    ctx.storage.issues()
+        .get_issue(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    // Find the comment to check ownership.
+    let comments = ctx.storage.comments()
+        .list_comments(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(ApiError::from)?;
+    let comment = comments.into_iter().find(|c| c.id == comment_id)
+        .ok_or_else(|| ApiError::not_found(format!("comment `{comment_id_str}` not found")))?;
+
+    if !is_comment_author(&identity, &comment) {
+        return Err(ApiError::forbidden("only the original author may edit this comment"));
+    }
+
+    let updated = ctx.storage.comments()
+        .update_comment(&ctx.repo_id, &comment_id, &body.body)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(CommentResponse::from(updated)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/repos/{repo}/issues/{id}/comments/{comment_id}",
+    params(
+        ("repo" = String, Path, description = "Repository slug"),
+        ("id" = String, Path, description = "Issue UUID"),
+        ("comment_id" = String, Path, description = "Comment UUID"),
+    ),
+    responses(
+        (status = 200, description = "Comment deleted (soft)", body = CommentResponse),
+        (status = 400, description = "Bad request", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — not the comment author or admin", body = ErrorBody),
+        (status = 404, description = "Comment not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "issues"
+)]
+/// `DELETE /api/repos/:repo/issues/:id/comments/:comment_id` — soft-delete a comment.
+///
+/// The original author or any admin may delete a comment. The comment is not
+/// removed from the database; it is soft-deleted by setting `deleted_at`.
+async fn delete_issue_comment_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    AxumPath(params): AxumPath<HashMap<String, String>>,
+) -> Result<Json<CommentResponse>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Write).await?;
+
+    let issue_id_str = params.get("id").cloned().unwrap_or_default();
+    let comment_id_str = params.get("comment_id").cloned().unwrap_or_default();
+
+    let issue_id = uuid::Uuid::parse_str(&issue_id_str)
+        .map_err(|_| ApiError::bad_request(format!("invalid issue ID `{issue_id_str}`")))?;
+    let comment_id = uuid::Uuid::parse_str(&comment_id_str)
+        .map_err(|_| ApiError::bad_request(format!("invalid comment ID `{comment_id_str}`")))?;
+
+    // Verify the issue exists.
+    ctx.storage.issues()
+        .get_issue(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    // Find the comment to check ownership.
+    let comments = ctx.storage.comments()
+        .list_comments(&ctx.repo_id, &issue_id)
+        .await
+        .map_err(ApiError::from)?;
+    let comment = comments.into_iter().find(|c| c.id == comment_id)
+        .ok_or_else(|| ApiError::not_found(format!("comment `{comment_id_str}` not found")))?;
+
+    if !identity.is_admin && !is_comment_author(&identity, &comment) {
+        return Err(ApiError::forbidden("only the original author or an admin may delete this comment"));
+    }
+
+    let deleted = ctx.storage.comments()
+        .soft_delete_comment(&ctx.repo_id, &comment_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(CommentResponse::from(deleted)))
+}
+
 // ── Issue link handlers ───────────────────────────────────────────────────────
 
 /// Request body for `POST /api/repos/:repo/issues/:id/links`.
@@ -10608,6 +10758,8 @@ impl utoipa::Modify for SecurityAddon {
         close_issue_handler,
         create_issue_comment_handler,
         list_issue_comments_handler,
+        update_issue_comment_handler,
+        delete_issue_comment_handler,
         create_issue_link_handler,
         list_issue_links_handler,
         delete_issue_link_handler,
@@ -10682,6 +10834,7 @@ impl utoipa::Modify for SecurityAddon {
             IssueDetailResponse,
             IssueLinkDetailResponse,
             CreateCommentRequest,
+            UpdateCommentRequest,
             CommentResponse,
             CreateIssueLinkRequest,
             IssueLinkResponse,
@@ -10931,6 +11084,8 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/issues/:id/close", post(close_issue_handler))
         .route("/issues/:id/comments", post(create_issue_comment_handler))
         .route("/issues/:id/comments", get(list_issue_comments_handler))
+        .route("/issues/:id/comments/:comment_id", axum::routing::patch(update_issue_comment_handler))
+        .route("/issues/:id/comments/:comment_id", axum::routing::delete(delete_issue_comment_handler))
         .route("/issues/:id/links", post(create_issue_link_handler))
         .route("/issues/:id/links", get(list_issue_links_handler))
         .route("/issues/:id/links/:target_id", axum::routing::delete(delete_issue_link_handler))

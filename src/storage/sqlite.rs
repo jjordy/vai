@@ -427,6 +427,29 @@ impl CommentStore for SqliteStorage {
             .list_comments(*issue_id)
             .map_err(|e| StorageError::Database(e.to_string()))
     }
+
+    async fn update_comment(
+        &self,
+        _repo_id: &Uuid,
+        comment_id: &Uuid,
+        new_body: &str,
+    ) -> Result<IssueComment, StorageError> {
+        let store = self.open_issue_store()?;
+        store
+            .update_comment(*comment_id, new_body)
+            .map_err(|e| StorageError::Database(e.to_string()))
+    }
+
+    async fn soft_delete_comment(
+        &self,
+        _repo_id: &Uuid,
+        comment_id: &Uuid,
+    ) -> Result<IssueComment, StorageError> {
+        let store = self.open_issue_store()?;
+        store
+            .soft_delete_comment(*comment_id)
+            .map_err(|e| StorageError::Database(e.to_string()))
+    }
 }
 
 // ── IssueLinkStore ────────────────────────────────────────────────────────────

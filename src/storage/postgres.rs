@@ -742,6 +742,76 @@ impl CommentStore for PostgresStorage {
             })
             .collect())
     }
+
+    async fn update_comment(
+        &self,
+        repo_id: &Uuid,
+        comment_id: &Uuid,
+        new_body: &str,
+    ) -> Result<IssueComment, StorageError> {
+        let row = sqlx::query(
+            r#"
+            UPDATE issue_comments
+            SET body = $1, edited_at = now()
+            WHERE id = $2 AND repo_id = $3
+            RETURNING id, issue_id, author, body, created_at, author_type, author_id, parent_id, edited_at, deleted_at
+            "#,
+        )
+        .bind(new_body)
+        .bind(comment_id)
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .ok_or_else(|| StorageError::NotFound(comment_id.to_string()))?;
+
+        Ok(IssueComment {
+            id: row.get("id"),
+            issue_id: row.get("issue_id"),
+            author: row.get("author"),
+            body: row.get("body"),
+            author_type: row.get("author_type"),
+            author_id: row.get("author_id"),
+            created_at: row.get("created_at"),
+            parent_id: row.get("parent_id"),
+            edited_at: row.get("edited_at"),
+            deleted_at: row.get("deleted_at"),
+        })
+    }
+
+    async fn soft_delete_comment(
+        &self,
+        repo_id: &Uuid,
+        comment_id: &Uuid,
+    ) -> Result<IssueComment, StorageError> {
+        let row = sqlx::query(
+            r#"
+            UPDATE issue_comments
+            SET deleted_at = now()
+            WHERE id = $1 AND repo_id = $2
+            RETURNING id, issue_id, author, body, created_at, author_type, author_id, parent_id, edited_at, deleted_at
+            "#,
+        )
+        .bind(comment_id)
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .ok_or_else(|| StorageError::NotFound(comment_id.to_string()))?;
+
+        Ok(IssueComment {
+            id: row.get("id"),
+            issue_id: row.get("issue_id"),
+            author: row.get("author"),
+            body: row.get("body"),
+            author_type: row.get("author_type"),
+            author_id: row.get("author_id"),
+            created_at: row.get("created_at"),
+            parent_id: row.get("parent_id"),
+            edited_at: row.get("edited_at"),
+            deleted_at: row.get("deleted_at"),
+        })
+    }
 }
 
 // ── IssueLinkStore ────────────────────────────────────────────────────────────
