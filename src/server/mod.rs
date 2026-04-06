@@ -797,9 +797,10 @@ async fn auth_middleware(
                 );
                 let user_id = uuid::Uuid::parse_str(&claims.sub).ok();
                 let is_admin = claims.role.as_deref() == Some("admin");
+                let name = claims.name.unwrap_or_else(|| claims.sub.clone());
                 request.extensions_mut().insert(AgentIdentity {
                     key_id: format!("jwt:{}", claims.sub),
-                    name: claims.sub,
+                    name,
                     is_admin,
                     user_id,
                     role_override: claims.role,
@@ -10032,8 +10033,8 @@ async fn token_exchange_handler(
 
             // Resolve or auto-provision the vai user for this Better Auth identity.
             let orgs = state.storage.orgs();
-            let user_id = match orgs.get_user_by_external_id(&ba_user_id).await {
-                Ok(existing) => existing.id,
+            let (user_id, user_name) = match orgs.get_user_by_external_id(&ba_user_id).await {
+                Ok(existing) => (existing.id, existing.name),
                 Err(crate::storage::StorageError::NotFound(_)) => {
                     // First login — fetch BA profile and create a vai user record.
                     let (email, name) = auth
@@ -10057,7 +10058,7 @@ async fn token_exchange_handler(
                         "Auto-provisioned vai user from Better Auth identity"
                     );
 
-                    new_user.id
+                    (new_user.id, new_user.name)
                 }
                 Err(other) => return Err(ApiError::from(other)),
             };
@@ -10124,6 +10125,7 @@ async fn token_exchange_handler(
                 .jwt_service
                 .sign(
                     user_id.to_string(),
+                    Some(user_name),
                     body.repo_id.as_ref().map(|id| id.to_string()),
                     role,
                 )
@@ -10158,8 +10160,8 @@ async fn token_exchange_handler(
             })?;
 
             // Bootstrap admin key takes priority over per-repo keys.
-            let (sub, role) = if api_key_str == state.admin_key {
-                ("admin".to_string(), Some("admin".to_string()))
+            let (sub, name, role) = if api_key_str == state.admin_key {
+                ("admin".to_string(), "admin".to_string(), Some("admin".to_string()))
             } else {
                 // Validate the API key against the store.
                 let key_meta = auth.validate_key(api_key_str).await.map_err(|e| {
@@ -10183,14 +10185,15 @@ async fn token_exchange_handler(
                     .user_id
                     .map(|u| u.to_string())
                     .unwrap_or_else(|| key_meta.id.clone());
+                let key_name = key_meta.name.clone();
                 let role = key_meta.role_override.clone();
-                (sub, role)
+                (sub, key_name, role)
             };
 
             let repo_id_str = body.repo_id.as_ref().map(|id| id.to_string());
             let access_token = state
                 .jwt_service
-                .sign(sub, repo_id_str, role)
+                .sign(sub, Some(name), repo_id_str, role)
                 .map_err(|e| ApiError::internal(e.to_string()))?;
 
             // No refresh token for api_key grants — the long-lived key itself
@@ -10262,9 +10265,18 @@ async fn refresh_token_handler(
             other => ApiError::from(other),
         })?;
 
+    // Look up the user's display name to embed in the refreshed access token.
+    let user_name = state
+        .storage
+        .orgs()
+        .get_user(&user_id)
+        .await
+        .ok()
+        .map(|u| u.name);
+
     let access_token = state
         .jwt_service
-        .sign(user_id.to_string(), None, None)
+        .sign(user_id.to_string(), user_name, None, None)
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     tracing::info!(
@@ -15622,7 +15634,7 @@ mod tests {
         // Mint a token using the same JwtService the server holds.
         let token = state
             .jwt_service
-            .sign("user-jwt-test".to_string(), None, Some("write".to_string()))
+            .sign("user-jwt-test".to_string(), None, None, Some("write".to_string()))
             .unwrap();
 
         let client = reqwest::Client::new();
@@ -15653,7 +15665,7 @@ mod tests {
             None,
             3600,
         );
-        let token = wrong_svc.sign("attacker".to_string(), None, None).unwrap();
+        let token = wrong_svc.sign("attacker".to_string(), None, None, None).unwrap();
 
         let client = reqwest::Client::new();
         let resp = client
@@ -15744,13 +15756,13 @@ mod tests {
         // Admin JWT — is_admin should be true.
         let admin_token = state
             .jwt_service
-            .sign("svc-account".to_string(), None, Some("admin".to_string()))
+            .sign("svc-account".to_string(), None, None, Some("admin".to_string()))
             .unwrap();
 
         // Non-admin JWT without a user_id UUID as sub — is_admin false, no user_id.
         let non_admin_token = state
             .jwt_service
-            .sign("not-a-uuid-sub".to_string(), None, Some("write".to_string()))
+            .sign("not-a-uuid-sub".to_string(), None, None, Some("write".to_string()))
             .unwrap();
 
         let client = reqwest::Client::new();

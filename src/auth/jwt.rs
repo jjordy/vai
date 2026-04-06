@@ -40,6 +40,12 @@ pub enum JwtError {
 pub struct TokenClaims {
     /// Subject — the user ID this token was issued for.
     pub sub: String,
+    /// Human-readable display name for the subject.
+    ///
+    /// Absent in tokens minted before this field was introduced; callers
+    /// should fall back to `sub` when `name` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Repository ID this token is scoped to (`None` for server-wide tokens).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_id: Option<String>,
@@ -109,12 +115,14 @@ impl JwtService {
     pub fn sign(
         &self,
         sub: String,
+        name: Option<String>,
         repo_id: Option<String>,
         role: Option<String>,
     ) -> Result<String, JwtError> {
         let now = Utc::now().timestamp() as u64;
         let claims = TokenClaims {
             sub,
+            name,
             repo_id,
             role,
             iat: now,
@@ -238,12 +246,14 @@ mod tests {
         let token = svc
             .sign(
                 "user-123".to_string(),
+                Some("Alice".to_string()),
                 Some("repo-abc".to_string()),
                 Some("write".to_string()),
             )
             .unwrap();
         let claims = svc.verify(&token).unwrap();
         assert_eq!(claims.sub, "user-123");
+        assert_eq!(claims.name.as_deref(), Some("Alice"));
         assert_eq!(claims.repo_id.as_deref(), Some("repo-abc"));
         assert_eq!(claims.role.as_deref(), Some("write"));
     }
@@ -253,7 +263,7 @@ mod tests {
         let svc_a = service("secret-a");
         let svc_b = service("secret-b");
         let token = svc_a
-            .sign("user-1".to_string(), None, None)
+            .sign("user-1".to_string(), None, None, None)
             .unwrap();
         let err = svc_b.verify(&token).unwrap_err();
         assert!(matches!(err, JwtError::Invalid(_)), "got: {err:?}");
@@ -273,7 +283,7 @@ mod tests {
         let mut svc = service("secret");
         svc.access_token_ttl = 1; // 1 second TTL
         svc.leeway_secs = 0; // no grace period so 1s sleep is sufficient
-        let token = svc.sign("u".to_string(), None, None).unwrap();
+        let token = svc.sign("u".to_string(), None, None, None).unwrap();
         sleep(Duration::from_secs(2));
         let err = svc.verify(&token).unwrap_err();
         assert_eq!(err, JwtError::Expired);
@@ -285,7 +295,7 @@ mod tests {
     fn rotated_service_accepts_old_token() {
         // Mint a token with the old secret.
         let old_svc = service("old-secret");
-        let token = old_svc.sign("u".to_string(), None, None).unwrap();
+        let token = old_svc.sign("u".to_string(), None, None, None).unwrap();
 
         // Rotate: new secret becomes current, old secret goes to previous.
         let new_svc = JwtService::new(
@@ -306,7 +316,7 @@ mod tests {
             Some("old-secret".to_string()),
             3600,
         );
-        let token = new_svc.sign("u".to_string(), None, None).unwrap();
+        let token = new_svc.sign("u".to_string(), None, None, None).unwrap();
 
         // Old-only service should reject the new token.
         let old_svc = service("old-secret");
@@ -321,7 +331,7 @@ mod tests {
     fn no_previous_secret_rejects_unknown_token() {
         let svc_a = service("secret-a");
         let svc_b = service("secret-b"); // no previous
-        let token = svc_a.sign("u".to_string(), None, None).unwrap();
+        let token = svc_a.sign("u".to_string(), None, None, None).unwrap();
         assert!(matches!(svc_b.verify(&token), Err(JwtError::Invalid(_))));
     }
 
@@ -330,10 +340,24 @@ mod tests {
     #[test]
     fn none_claims_round_trip() {
         let svc = service("sec");
-        let token = svc.sign("u".to_string(), None, None).unwrap();
+        let token = svc.sign("u".to_string(), None, None, None).unwrap();
         let claims = svc.verify(&token).unwrap();
         assert_eq!(claims.sub, "u");
+        assert!(claims.name.is_none());
         assert!(claims.repo_id.is_none());
         assert!(claims.role.is_none());
+    }
+
+    #[test]
+    fn old_token_without_name_still_verifies() {
+        // Simulate a token minted before the `name` field was introduced by
+        // manually building a claims struct without the field and signing it.
+        let svc = service("sec");
+        // Sign a token without a name (None) — mirrors old behaviour.
+        let token = svc.sign("user-uuid".to_string(), None, None, None).unwrap();
+        let claims = svc.verify(&token).unwrap();
+        assert_eq!(claims.sub, "user-uuid");
+        // The `name` field defaults to None for tokens that lack it.
+        assert!(claims.name.is_none());
     }
 }
