@@ -66,11 +66,27 @@ pub enum AgentError {
 /// Quality check configuration stored under `[checks]` in `agent.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChecksConfig {
+    /// Shell commands to run before check commands.
+    ///
+    /// Used to build the project, start servers, etc.  Each command is run
+    /// sequentially with the working directory set to the target directory.
+    /// If any setup command fails, checks are **skipped** and the setup
+    /// error is returned as the verify failure.
+    #[serde(default)]
+    pub setup: Vec<String>,
+
     /// Shell commands to run sequentially to verify agent output.
     ///
     /// Each command is run with the working directory set to the target
     /// directory passed to `vai agent verify <dir>`.
     pub commands: Vec<String>,
+
+    /// Shell commands to run after checks complete (pass or fail).
+    ///
+    /// Used to stop background processes started in `setup`.  Teardown
+    /// commands always run and their exit codes are ignored.
+    #[serde(default)]
+    pub teardown: Vec<String>,
 }
 
 /// Ignore pattern configuration stored under `[ignore]` in `agent.toml`.
@@ -1439,9 +1455,10 @@ pub struct VerifyResult {
 /// `no_checks_configured = true`.
 pub fn verify(dir: &Path, work_dir: &Path) -> Result<VerifyResult, AgentError> {
     let config = load_config(dir)?;
-    let commands = config
-        .checks
-        .map(|c| c.commands)
+    let checks_config = config.checks;
+    let commands = checks_config
+        .as_ref()
+        .map(|c| c.commands.clone())
         .unwrap_or_default();
 
     if commands.is_empty() {
@@ -1452,26 +1469,106 @@ pub fn verify(dir: &Path, work_dir: &Path) -> Result<VerifyResult, AgentError> {
         });
     }
 
+    let setup = checks_config
+        .as_ref()
+        .map(|c| c.setup.clone())
+        .unwrap_or_default();
+    let teardown = checks_config
+        .as_ref()
+        .map(|c| c.teardown.clone())
+        .unwrap_or_default();
+
+    // ── Setup ─────────────────────────────────────────────────────────────
+    // Run setup commands sequentially.  If any fail, skip checks and return
+    // the setup error.  Teardown still runs.
+    //
+    // Commands that end with `&` spawn background processes (e.g. a preview
+    // server).  For these we detach stdout/stderr so `status()` doesn't
+    // block waiting for the child's file descriptors to close.  For normal
+    // commands we capture output so failures include useful error messages.
+    let mut setup_failed: Option<CheckResult> = None;
+
+    for cmd in &setup {
+        let is_background = cmd.trim_end().ends_with('&');
+
+        if is_background {
+            // Background command — fire and forget, don't capture output.
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(work_dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|e| AgentError::Other(format!("failed to run setup `{cmd}`: {e}")))?;
+
+            if !status.success() {
+                setup_failed = Some(CheckResult {
+                    command: format!("[setup] {cmd}"),
+                    stdout: String::new(),
+                    stderr: format!("background setup command exited with code {}", status.code().unwrap_or(-1)),
+                    exit_code: status.code().unwrap_or(-1),
+                    passed: false,
+                });
+                break;
+            }
+        } else {
+            // Foreground command — capture output for error reporting.
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(work_dir)
+                .output()
+                .map_err(|e| AgentError::Other(format!("failed to run setup `{cmd}`: {e}")))?;
+
+            if !output.status.success() {
+                setup_failed = Some(CheckResult {
+                    command: format!("[setup] {cmd}"),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    exit_code: output.status.code().unwrap_or(-1),
+                    passed: false,
+                });
+                break;
+            }
+        }
+    }
+
+    // ── Checks ────────────────────────────────────────────────────────────
     let mut results = Vec::with_capacity(commands.len());
 
-    for cmd in &commands {
-        // Split command string for the shell.
-        let output = std::process::Command::new("sh")
+    if let Some(setup_err) = setup_failed {
+        // Setup failed — skip checks, report setup error.
+        results.push(setup_err);
+    } else {
+        for cmd in &commands {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(work_dir)
+                .output()
+                .map_err(|e| AgentError::Other(format!("failed to run check `{cmd}`: {e}")))?;
+
+            let exit_code = output.status.code().unwrap_or(-1);
+            let passed = output.status.success();
+            results.push(CheckResult {
+                command: cmd.clone(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                exit_code,
+                passed,
+            });
+        }
+    }
+
+    // ── Teardown ──────────────────────────────────────────────────────────
+    // Always run teardown, ignore exit codes.
+    for cmd in &teardown {
+        let _ = std::process::Command::new("sh")
             .arg("-c")
             .arg(cmd)
             .current_dir(work_dir)
-            .output()
-            .map_err(|e| AgentError::Other(format!("failed to run check `{cmd}`: {e}")))?;
-
-        let exit_code = output.status.code().unwrap_or(-1);
-        let passed = output.status.success();
-        results.push(CheckResult {
-            command: cmd.clone(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            exit_code,
-            passed,
-        });
+            .output();
     }
 
     let all_passed = results.iter().all(|r| r.passed);
