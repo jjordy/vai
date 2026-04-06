@@ -3098,10 +3098,13 @@ struct WsQueryParams {
     last_event_id: Option<u64>,
 }
 
-/// `GET /ws/events?key=<api_key>` — upgrades the connection to WebSocket and
+/// `GET /ws/events?key=<api_key_or_jwt>` — upgrades the connection to WebSocket and
 /// begins streaming events matching the client's subscription filter.
 ///
-/// Authentication is via the `key` query parameter (plain API key string).
+/// Authentication is via the `key` query parameter. Accepted formats (checked
+/// in this order): JWT access token (contains `'.'`), admin bootstrap key,
+/// or a plain API key string looked up in the key store.
+///
 /// After connecting, the client must send a subscribe message:
 ///
 /// ```json
@@ -3115,7 +3118,7 @@ struct WsQueryParams {
     get,
     path = "/ws/events",
     params(
-        ("key" = String, Query, description = "API key for authentication"),
+        ("key" = String, Query, description = "Authentication token — JWT access token or API key"),
         ("last_event_id" = Option<u64>, Query, description = "Last received event ID for replay on reconnect"),
     ),
     responses(
@@ -3140,11 +3143,31 @@ async fn ws_events_handler(
         }
     };
 
-    // Admin key takes priority — allow it as a WebSocket credential.
-    let agent_name = if key_str == state.admin_key {
+    // Authenticate the WebSocket connection using the same precedence as
+    // `auth_middleware`:
+    //   1. JWT — if the key contains '.' treat it as a JWT token.
+    //   2. Admin key — compare against the bootstrap admin key.
+    //   3. API key — hash and look up via storage backend.
+    let agent_name = if key_str.contains('.') {
+        // (1) JWT check — validate with JwtService; no database hit.
+        use crate::auth::jwt::JwtError;
+        match state.jwt_service.verify(&key_str) {
+            Ok(claims) => {
+                tracing::debug!(actor = %claims.sub, "WebSocket connection authenticated via JWT");
+                claims.sub
+            }
+            Err(JwtError::Expired) => {
+                return ApiError::unauthorized("JWT token has expired").into_response();
+            }
+            Err(_) => {
+                return ApiError::unauthorized("invalid JWT token").into_response();
+            }
+        }
+    } else if key_str == state.admin_key {
+        // (2) Admin key.
         "admin".to_string()
     } else {
-        // Validate via storage backend (handles both SQLite and Postgres).
+        // (3) Validate via storage backend (handles both SQLite and Postgres).
         match state.storage.auth().validate_key(&key_str).await {
             Ok(api_key) => {
                 tracing::debug!(agent = %api_key.name, "WebSocket connection authenticated");
