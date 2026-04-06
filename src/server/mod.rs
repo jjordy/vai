@@ -8981,14 +8981,13 @@ async fn create_repo_handler(
 )]
 /// `GET /api/repos` — lists all registered repositories with basic stats.
 ///
-/// Returns an empty array if no repos are registered or if storage_root is not
-/// set.
+/// Admin key returns all repos. JWT or API-key users receive only repos they
+/// have access to (via direct `repo_collaborators` entry or org owner/admin
+/// membership). Unauthenticated requests are rejected by the auth middleware.
 async fn list_repos_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<RepoResponse>>, ApiError> {
-    require_server_admin(&identity)?;
-
     // In server mode (Postgres), read repo list and stats from Postgres so that
     // this handler works without touching the filesystem.
     if let crate::storage::StorageBackend::Server(ref pg)
@@ -8996,10 +8995,44 @@ async fn list_repos_handler(
     | crate::storage::StorageBackend::ServerWithMemFs(ref pg, _) = state.storage
     {
         use sqlx::Row as _;
-        let rows = sqlx::query("SELECT id, name, created_at FROM repos ORDER BY created_at ASC")
+
+        // Fetch the list of (id, name, created_at) rows the caller can see.
+        let rows = if identity.is_admin {
+            // Admin key — return every repo.
+            sqlx::query("SELECT id, name, created_at FROM repos ORDER BY created_at ASC")
+                .fetch_all(pg.pool())
+                .await
+                .map_err(|e| ApiError::internal(format!("failed to query repos: {e}")))?
+        } else if let Some(user_id) = identity.user_id {
+            // JWT / API-key user — return only repos the user can access:
+            //   1. direct repo_collaborators entry, OR
+            //   2. org owner/admin membership (org members need an explicit
+            //      collaborator row; only owner/admin roles confer implicit access).
+            sqlx::query(
+                "SELECT DISTINCT r.id, r.name, r.created_at
+                 FROM repos r
+                 WHERE (
+                     EXISTS (
+                         SELECT 1 FROM repo_collaborators rc
+                         WHERE rc.repo_id = r.id AND rc.user_id = $1
+                     )
+                     OR EXISTS (
+                         SELECT 1 FROM org_members om
+                         WHERE om.org_id = r.org_id
+                           AND om.user_id = $1
+                           AND om.role IN ('owner', 'admin')
+                     )
+                 )
+                 ORDER BY r.created_at ASC",
+            )
+            .bind(user_id)
             .fetch_all(pg.pool())
             .await
-            .map_err(|e| ApiError::internal(format!("failed to query repos: {e}")))?;
+            .map_err(|e| ApiError::internal(format!("failed to query repos: {e}")))?
+        } else {
+            // Non-admin API key without an associated user — no repo access.
+            vec![]
+        };
 
         let mut responses = Vec::with_capacity(rows.len());
         for row in rows {
@@ -9040,7 +9073,12 @@ async fn list_repos_handler(
         return Ok(Json(responses));
     }
 
-    // Local mode: read from the on-disk registry and filesystem.
+    // Local mode: admin sees all repos from the on-disk registry; non-admin
+    // users have no RBAC data available so return an empty list.
+    if !identity.is_admin {
+        return Ok(Json(vec![]));
+    }
+
     let storage_root = match state.storage_root.as_ref() {
         Some(sr) => sr,
         None => return Ok(Json(vec![])),
