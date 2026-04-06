@@ -1,0 +1,402 @@
+//! Auth token exchange, refresh, and revocation handlers (PRD 18).
+//!
+//! Endpoints:
+//!   - `POST /api/auth/token` — exchange credentials for a short-lived JWT
+//!   - `POST /api/auth/refresh` — exchange a refresh token for a new access token
+//!   - `POST /api/auth/revoke` — revoke a refresh token
+
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::Json;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use super::{ApiError, AppState};
+
+// ── Auth token exchange (PRD 18) ──────────────────────────────────────────────
+
+/// Request body for `POST /api/auth/token`.
+///
+/// Two grant types are supported:
+/// - `"session_exchange"` — exchange a Better Auth session token for a vai JWT.
+///   Requires `session_token`. Returns an access token and a refresh token.
+/// - `"api_key"` — exchange a long-lived API key for a short-lived JWT.
+///   Requires `api_key`. Returns an access token only (no refresh token).
+#[derive(Debug, Deserialize, ToSchema)]
+pub(super) struct TokenRequest {
+    /// Grant type. Accepted values: `"session_exchange"`, `"api_key"`.
+    grant_type: String,
+    /// Better Auth session token (required for `session_exchange`).
+    session_token: Option<String>,
+    /// Plaintext API key (required for `api_key`).
+    api_key: Option<String>,
+    /// Optional repository UUID to scope the token. When provided, the user's
+    /// effective role on this repo is embedded in the JWT claims.
+    #[schema(value_type = Option<String>)]
+    repo_id: Option<uuid::Uuid>,
+}
+
+/// Response body for `POST /api/auth/token`.
+#[derive(Debug, Serialize, ToSchema)]
+pub(super) struct TokenResponse {
+    /// Short-lived JWT access token (HMAC-SHA256, 15 min TTL).
+    access_token: String,
+    /// Token type — always `"Bearer"`.
+    token_type: String,
+    /// Access token TTL in seconds (900 = 15 minutes).
+    expires_in: u64,
+    /// Opaque refresh token. Present only for `session_exchange` grants.
+    /// Use `POST /api/auth/refresh` to mint a new access token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/auth/token",
+    request_body = TokenRequest,
+    responses(
+        (status = 200, description = "Access token issued", body = TokenResponse),
+        (status = 400, description = "Missing or invalid parameters", body = super::ErrorBody),
+        (status = 401, description = "Invalid credentials", body = super::ErrorBody),
+    ),
+    tag = "auth"
+)]
+/// `POST /api/auth/token` — exchanges credentials for a short-lived JWT.
+///
+/// # Grant types
+///
+/// ## `session_exchange`
+/// Validates a Better Auth session token by querying the shared Postgres
+/// `session` table. On success, mints a JWT scoped to the authenticated user
+/// (and optionally to a specific repo) and creates a refresh token.
+///
+/// ## `api_key`
+/// Validates a plaintext vai API key. On success, mints a JWT carrying the
+/// same user and role as the key. No refresh token is issued; the agent should
+/// re-exchange the long-lived key before the JWT expires.
+pub(super) async fn token_exchange_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<TokenRequest>,
+) -> Result<Json<TokenResponse>, ApiError> {
+    let auth = state.storage.auth();
+
+    match body.grant_type.as_str() {
+        "session_exchange" => {
+            let session_token = body.session_token.as_deref().ok_or_else(|| {
+                ApiError::bad_request("session_token is required for session_exchange grant")
+            })?;
+
+            // Validate the Better Auth session and extract the BA user ID (opaque string).
+            let ba_user_id = auth.validate_session(session_token).await.map_err(|e| {
+                match e {
+                    crate::storage::StorageError::NotFound(_) => {
+                        ApiError::unauthorized("invalid or expired session token")
+                    }
+                    other => ApiError::from(other),
+                }
+            })?;
+
+            // Resolve or auto-provision the vai user for this Better Auth identity.
+            let orgs = state.storage.orgs();
+            let (user_id, user_name) = match orgs.get_user_by_external_id(&ba_user_id).await {
+                Ok(existing) => (existing.id, existing.name),
+                Err(crate::storage::StorageError::NotFound(_)) => {
+                    // First login — fetch BA profile and create a vai user record.
+                    let (email, name) = auth
+                        .get_better_auth_user(&ba_user_id)
+                        .await
+                        .map_err(ApiError::from)?;
+
+                    let new_user = orgs
+                        .create_user(crate::storage::NewUser {
+                            email,
+                            name,
+                            better_auth_id: Some(ba_user_id.clone()),
+                        })
+                        .await
+                        .map_err(ApiError::from)?;
+
+                    tracing::info!(
+                        event = "auth.user_provisioned",
+                        ba_user_id = %ba_user_id,
+                        vai_user_id = %new_user.id,
+                        "Auto-provisioned vai user from Better Auth identity"
+                    );
+
+                    (new_user.id, new_user.name)
+                }
+                Err(other) => return Err(ApiError::from(other)),
+            };
+
+            // Grant the user a default collaborator role on every repo they are
+            // not yet a collaborator on.  This runs for both newly provisioned
+            // users and existing users who were created before auto-provisioning
+            // was in place (i.e. they have zero collaborator records).  The
+            // check is cheap and the grant loop is a no-op when the user is
+            // already a member of every repo.
+            let needs_grant = orgs
+                .count_collaborator_repos(&user_id)
+                .await
+                .unwrap_or(0)
+                == 0;
+            if needs_grant {
+                let default_role = state.default_new_user_role.clone();
+                let repo_ids = orgs.list_all_repo_ids().await.unwrap_or_default();
+                for repo_id in repo_ids {
+                    // Ignore conflicts (already a collaborator) and other
+                    // non-fatal errors — provisioning must not fail the login.
+                    match orgs
+                        .add_collaborator(&repo_id, &user_id, default_role.clone())
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::info!(
+                                event = "auth.collaborator_granted",
+                                vai_user_id = %user_id,
+                                repo_id = %repo_id,
+                                role = %default_role.as_str(),
+                                "Granted default repo role to user"
+                            );
+                        }
+                        Err(crate::storage::StorageError::Conflict(_)) => {
+                            // Already a collaborator — harmless.
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                event = "auth.collaborator_grant_failed",
+                                vai_user_id = %user_id,
+                                repo_id = %repo_id,
+                                error = %e,
+                                "Failed to grant default repo role to user"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Resolve the user's repo role if repo_id was supplied.
+            let role: Option<String> = if let Some(repo_id) = &body.repo_id {
+                let orgs = state.storage.orgs();
+                orgs.resolve_repo_role(&user_id, repo_id)
+                    .await
+                    .map_err(ApiError::from)?
+                    .map(|r| r.as_str().to_string())
+            } else {
+                None
+            };
+
+            // Mint the JWT access token.
+            let access_token = state
+                .jwt_service
+                .sign(
+                    user_id.to_string(),
+                    Some(user_name),
+                    body.repo_id.as_ref().map(|id| id.to_string()),
+                    role,
+                )
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+
+            // Mint and persist a refresh token (7-day TTL).
+            let expires_at = chrono::Utc::now() + chrono::Duration::days(7);
+            let refresh_token = auth
+                .create_refresh_token(&user_id, expires_at)
+                .await
+                .map_err(ApiError::from)?;
+
+            tracing::info!(
+                event = "auth.token_issued",
+                grant_type = "session_exchange",
+                user_id = %user_id,
+                repo_id = ?body.repo_id,
+                "JWT access token issued via session exchange"
+            );
+
+            Ok(Json(TokenResponse {
+                access_token,
+                token_type: "Bearer".to_string(),
+                expires_in: state.jwt_service.access_token_ttl,
+                refresh_token: Some(refresh_token),
+            }))
+        }
+
+        "api_key" => {
+            let api_key_str = body.api_key.as_deref().ok_or_else(|| {
+                ApiError::bad_request("api_key is required for api_key grant")
+            })?;
+
+            // Bootstrap admin key takes priority over per-repo keys.
+            let (sub, name, role) = if api_key_str == state.admin_key {
+                ("admin".to_string(), "admin".to_string(), Some("admin".to_string()))
+            } else {
+                // Validate the API key against the store.
+                let key_meta = auth.validate_key(api_key_str).await.map_err(|e| {
+                    match e {
+                        crate::storage::StorageError::NotFound(_) => {
+                            ApiError::unauthorized("invalid or revoked API key")
+                        }
+                        other => ApiError::from(other),
+                    }
+                })?;
+
+                tracing::info!(
+                    event = "auth.token_issued",
+                    grant_type = "api_key",
+                    key_id = %key_meta.id,
+                    key_name = %key_meta.name,
+                    "JWT access token issued via API key exchange"
+                );
+
+                let sub = key_meta
+                    .user_id
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| key_meta.id.clone());
+                let key_name = key_meta.name.clone();
+                let role = key_meta.role_override.clone();
+                (sub, key_name, role)
+            };
+
+            let repo_id_str = body.repo_id.as_ref().map(|id| id.to_string());
+            let access_token = state
+                .jwt_service
+                .sign(sub, Some(name), repo_id_str, role)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+
+            // No refresh token for api_key grants — the long-lived key itself
+            // acts as the refresh credential.
+            Ok(Json(TokenResponse {
+                access_token,
+                token_type: "Bearer".to_string(),
+                expires_in: state.jwt_service.access_token_ttl,
+                refresh_token: None,
+            }))
+        }
+
+        other => Err(ApiError::bad_request(format!(
+            "unsupported grant_type '{other}'; accepted: 'session_exchange', 'api_key'"
+        ))),
+    }
+}
+
+// ── Auth refresh and revocation (PRD 18) ──────────────────────────────────────
+
+/// Request body for `POST /api/auth/refresh`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub(super) struct RefreshRequest {
+    /// Opaque refresh token previously issued by `POST /api/auth/token`.
+    refresh_token: String,
+}
+
+/// Response body for `POST /api/auth/refresh`.
+#[derive(Debug, Serialize, ToSchema)]
+pub(super) struct RefreshResponse {
+    /// New short-lived JWT access token (HMAC-SHA256, 15 min TTL).
+    access_token: String,
+    /// Token type — always `"Bearer"`.
+    token_type: String,
+    /// Access token TTL in seconds (900 = 15 minutes).
+    expires_in: u64,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/auth/refresh",
+    request_body = RefreshRequest,
+    responses(
+        (status = 200, description = "New access token issued", body = RefreshResponse),
+        (status = 400, description = "Missing or malformed body", body = super::ErrorBody),
+        (status = 401, description = "Invalid, expired, or revoked refresh token", body = super::ErrorBody),
+    ),
+    tag = "auth"
+)]
+/// `POST /api/auth/refresh` — exchanges a refresh token for a new access token.
+///
+/// Validates the opaque refresh token (checks hash, expiry, and revocation),
+/// then mints a fresh short-lived JWT for the associated user.
+/// The refresh token remains valid after this call until it expires or is
+/// explicitly revoked via `POST /api/auth/revoke`.
+pub(super) async fn refresh_token_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RefreshRequest>,
+) -> Result<Json<RefreshResponse>, ApiError> {
+    let auth = state.storage.auth();
+
+    let user_id = auth
+        .validate_refresh_token(&body.refresh_token)
+        .await
+        .map_err(|e| match e {
+            crate::storage::StorageError::NotFound(_) => {
+                ApiError::unauthorized("invalid, expired, or revoked refresh token")
+            }
+            other => ApiError::from(other),
+        })?;
+
+    // Look up the user's display name to embed in the refreshed access token.
+    let user_name = state
+        .storage
+        .orgs()
+        .get_user(&user_id)
+        .await
+        .ok()
+        .map(|u| u.name);
+
+    let access_token = state
+        .jwt_service
+        .sign(user_id.to_string(), user_name, None, None)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    tracing::info!(
+        event = "auth.token_refreshed",
+        user_id = %user_id,
+        "JWT access token issued via refresh token"
+    );
+
+    Ok(Json(RefreshResponse {
+        access_token,
+        token_type: "Bearer".to_string(),
+        expires_in: state.jwt_service.access_token_ttl,
+    }))
+}
+
+/// Request body for `POST /api/auth/revoke`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub(super) struct RevokeRequest {
+    /// Opaque refresh token to revoke.
+    refresh_token: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/auth/revoke",
+    request_body = RevokeRequest,
+    responses(
+        (status = 200, description = "Refresh token revoked"),
+        (status = 400, description = "Missing or malformed body", body = super::ErrorBody),
+        (status = 401, description = "Token not found or already revoked", body = super::ErrorBody),
+    ),
+    tag = "auth"
+)]
+/// `POST /api/auth/revoke` — revokes a refresh token.
+///
+/// Marks the token as revoked so it can no longer be used to mint access tokens.
+/// Returns 401 if the token is not found or has already been revoked.
+pub(super) async fn revoke_token_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RevokeRequest>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let auth = state.storage.auth();
+
+    auth.revoke_refresh_token(&body.refresh_token)
+        .await
+        .map_err(|e| match e {
+            crate::storage::StorageError::NotFound(_) => {
+                ApiError::unauthorized("refresh token not found or already revoked")
+            }
+            other => ApiError::from(other),
+        })?;
+
+    tracing::info!(event = "auth.token_revoked", "refresh token revoked");
+
+    Ok(axum::http::StatusCode::OK)
+}
