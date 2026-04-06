@@ -28,6 +28,9 @@
 
 use std::path::Path;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use base64::prelude::{Engine, BASE64_STANDARD as BASE64};
 use flate2::{write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
@@ -432,13 +435,30 @@ fn append_dir_to_tar<W: std::io::Write>(
             let data = std::fs::read(&path).map_err(RemoteWorkspaceError::Io)?;
             let mut header = tar::Header::new_gnu();
             header.set_size(data.len() as u64);
-            header.set_mode(0o644);
+            header.set_mode(file_mode_for_path(&path, &data));
             header.set_cksum();
             tar.append_data(&mut header, &rel, data.as_slice())
                 .map_err(RemoteWorkspaceError::Io)?;
         }
     }
     Ok(())
+}
+
+/// Returns the Unix mode bits to use for a file in a tarball.
+///
+/// On Unix, reads the actual file permissions from disk so that the executable
+/// bit is preserved for scripts.  On non-Unix platforms, falls back to a
+/// shebang-line heuristic: files starting with `#!` get `0o755`, others `0o644`.
+#[cfg(unix)]
+fn file_mode_for_path(path: &Path, content: &[u8]) -> u32 {
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or_else(|_| if content.starts_with(b"#!") { 0o755 } else { 0o644 })
+}
+
+#[cfg(not(unix))]
+fn file_mode_for_path(_path: &Path, content: &[u8]) -> u32 {
+    if content.starts_with(b"#!") { 0o755 } else { 0o644 }
 }
 
 /// Recursively collects `(relative_path, content)` pairs for all files under

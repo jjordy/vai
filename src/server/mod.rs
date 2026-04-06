@@ -5429,7 +5429,9 @@ async fn files_download_handler(
             let content = &file_map[rel];
             let mut header = tar::Header::new_gnu();
             header.set_size(content.len() as u64);
-            header.set_mode(0o644);
+            // Preserve executable bit for scripts with a shebang line.
+            let mode = if content.starts_with(b"#!") { 0o755 } else { 0o644 };
+            header.set_mode(mode);
             header.set_cksum();
             archive
                 .append_data(&mut header, rel, content.as_slice())

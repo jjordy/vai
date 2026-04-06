@@ -19,6 +19,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use base64::prelude::{Engine, BASE64_STANDARD as BASE64};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -206,6 +209,7 @@ pub async fn pull(repo_root: &Path, config: PullConfig) -> Result<PullResult, Pu
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(&dest, &content)?;
+                set_executable_if_shebang(&dest, &content)?;
                 files_updated.push(entry.path.clone());
             }
             pb.inc(1);
@@ -346,6 +350,25 @@ pub fn print_pull_result(result: &PullResult) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Sets the executable bit on `path` if `content` begins with a shebang (`#!`).
+///
+/// On non-Unix platforms this is a no-op.
+#[cfg(unix)]
+fn set_executable_if_shebang(path: &Path, content: &[u8]) -> Result<(), PullError> {
+    if content.starts_with(b"#!") {
+        let meta = fs::metadata(path)?;
+        let mut perms = meta.permissions();
+        perms.set_mode(perms.mode() | 0o111);
+        fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_executable_if_shebang(_path: &Path, _content: &[u8]) -> Result<(), PullError> {
+    Ok(())
+}
 
 /// Reads `.vai/head`, returning the trimmed version string.
 fn read_local_head(vai_dir: &Path) -> Result<String, PullError> {
@@ -662,5 +685,72 @@ mod tests {
         assert!(written.contains(&"main.rs".to_string()));
         assert_eq!(fs::read(dest.path().join("src/hello.rs")).unwrap(), b"hello world");
         assert_eq!(fs::read(dest.path().join("main.rs")).unwrap(), b"rust code");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn set_executable_if_shebang_sets_execute_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("deploy.sh");
+        let content = b"#!/bin/bash\necho hello\n";
+        fs::write(&script, content).unwrap();
+
+        // Initially not executable (fs::write uses default umask).
+        set_executable_if_shebang(&script, content).unwrap();
+
+        let mode = fs::metadata(&script).unwrap().permissions().mode();
+        assert_ne!(mode & 0o100, 0, "owner execute bit should be set");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn set_executable_if_shebang_ignores_non_shebang() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lib.rs");
+        let content = b"pub fn foo() {}";
+        fs::write(&file, content).unwrap();
+
+        // Record initial mode.
+        let mode_before = fs::metadata(&file).unwrap().permissions().mode();
+        set_executable_if_shebang(&file, content).unwrap();
+        let mode_after = fs::metadata(&file).unwrap().permissions().mode();
+
+        // Mode should be unchanged for non-shebang files.
+        assert_eq!(mode_before, mode_after);
+    }
+
+    #[test]
+    fn tarball_with_shebang_preserves_execute_bit() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut archive = tar::Builder::new(&mut encoder);
+
+            let script = b"#!/bin/bash\necho hi\n";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(script.len() as u64);
+            h.set_mode(0o755); // as the server now sets for shebang files
+            h.set_cksum();
+            archive.append_data(&mut h, "deploy.sh", script.as_slice()).unwrap();
+
+            archive.finish().unwrap();
+        }
+        let gz_bytes = encoder.finish().unwrap();
+
+        let dest = tempfile::tempdir().unwrap();
+        extract_tarball(dest.path(), &gz_bytes).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dest.path().join("deploy.sh")).unwrap().permissions().mode();
+            assert_ne!(mode & 0o100, 0, "execute bit must be set for shebang script");
+        }
     }
 }
