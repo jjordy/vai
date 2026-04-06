@@ -2164,7 +2164,7 @@ mod tests {
             server: "https://vai.example.com".to_string(),
             repo: "myrepo".to_string(),
             prompt_template: None,
-            checks: Some(ChecksConfig { commands: checks_cmds }),
+            checks: Some(ChecksConfig { commands: checks_cmds, setup: vec![], teardown: vec![] }),
             ignore: None,
         };
         let toml = toml::to_string(&cfg).unwrap();
