@@ -1001,6 +1001,7 @@ impl IssueStore {
     }
 
     /// Parse a comment from a row tuple.
+    #[allow(clippy::type_complexity)]
     fn row_to_comment(
         row: (String, String, String, Option<String>, String, String, Option<String>, Option<String>, Option<String>, Option<String>),
     ) -> Result<IssueComment, IssueError> {

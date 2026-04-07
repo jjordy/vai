@@ -268,7 +268,7 @@ pub fn print_diff_result(result: &DiffResult) {
                     "{}",
                     format!("diff --vai /dev/null b/{}", entry.path).bold()
                 );
-                println!("{}", format!("--- /dev/null").red());
+                println!("{}", "--- /dev/null".red());
                 println!("{}", format!("+++ b/{}", entry.path).green());
                 // Read local file and print all lines as additions.
                 if let Some(ref unified) = entry.unified_diff {
@@ -283,7 +283,7 @@ pub fn print_diff_result(result: &DiffResult) {
                     format!("diff --vai a/{} /dev/null", entry.path).bold()
                 );
                 println!("{}", format!("--- a/{}", entry.path).red());
-                println!("{}", format!("+++ /dev/null").green());
+                println!("{}", "+++ /dev/null".green());
                 println!("{}", "(file deleted on server)".dimmed());
             }
         }

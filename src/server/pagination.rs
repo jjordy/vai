@@ -65,7 +65,7 @@ impl<T: Serialize> PaginatedResponse<T> {
         let total_pages = if per_page == 0 || per_page == u32::MAX {
             1
         } else {
-            ((total + per_page as u64 - 1) / per_page as u64) as u32
+            total.div_ceil(per_page as u64) as u32
         };
         Self {
             data: items,

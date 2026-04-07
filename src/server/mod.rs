@@ -126,7 +126,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use std::time::Instant;
 
-use axum::extract::{DefaultBodyLimit, Extension, FromRequest as _, Path as AxumPath, Query as AxumQuery, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query as AxumQuery, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -1105,7 +1105,7 @@ struct ErrorBody {
 }
 
 /// A handler error that carries an HTTP status code and message.
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
 }
