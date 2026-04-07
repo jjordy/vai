@@ -1,0 +1,16 @@
+# Ignored advisories for transitive dependencies we cannot fix directly.
+# Review periodically — remove entries once upstream publishes fixes.
+
+[advisories]
+ignore = [
+    # number_prefix — unmaintained (transitive dep of indicatif)
+    "RUSTSEC-2025-0119",
+    # paste — unmaintained (transitive dep of AWS SDK)
+    "RUSTSEC-2024-0436",
+    # hashlink IterMut unsoundness (transitive dep of rusqlite)
+    "RUSTSEC-2026-0002",
+    # rsa Marvin Attack timing sidechannel (transitive dep of AWS SDK)
+    "RUSTSEC-2023-0071",
+    # atoi truncating/overflowing casts (transitive dep of sqlx)
+    "RUSTSEC-2024-0363",
+]
