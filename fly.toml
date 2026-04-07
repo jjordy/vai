@@ -7,7 +7,7 @@ app = 'vai-server-polished-feather-2668'
 primary_region = 'iad'
 
 [build]
-  dockerfile = 'Dockerfile.server'
+  dockerfile = 'infra/Dockerfile.server'
 
 [env]
   VAI_LOG_LEVEL = 'info'
