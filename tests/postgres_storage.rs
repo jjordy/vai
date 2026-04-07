@@ -897,19 +897,29 @@ async fn test_event_store_notify_delivery() {
 
     // The NOTIFY should arrive promptly.  Give it a generous timeout to avoid
     // flakiness on slow CI machines.
-    let notification = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        listener.recv(),
-    )
-    .await
-    .expect("timed out waiting for NOTIFY")
-    .expect("PgListener recv error");
-
+    //
+    // Because all tests share the same `vai_events` channel, we may receive
+    // notifications from concurrent tests.  Keep draining until we see the
+    // one matching our repo_id, or timeout.
     let expected_payload = format!("{repo_id}:{}", event.id);
-    assert_eq!(
-        notification.payload(),
-        expected_payload,
-        "NOTIFY payload should be '<repo_id>:<event_id>'"
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut found = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, listener.recv()).await {
+            Ok(Ok(notification)) => {
+                if notification.payload() == expected_payload {
+                    found = true;
+                    break;
+                }
+                // Notification from a different concurrent test — skip it.
+            }
+            Ok(Err(e)) => panic!("PgListener recv error: {e}"),
+            Err(_) => break, // timeout
+        }
+    }
+    assert!(
+        found,
+        "expected NOTIFY payload '{expected_payload}' not received within 5s"
     );
 
     teardown(&storage, &repo_id).await;
