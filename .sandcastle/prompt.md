@@ -48,7 +48,7 @@ Then explore the codebase to understand its current state.
 - Structure code as vertical slices with clean module boundaries.
 - Every public function and type gets a doc comment.
 - Write tests for all non-trivial logic.
-- Run `cargo clippy` and `cargo test` before committing. Fix any issues.
+- Run `cargo clippy --features full -- -D warnings` and `cargo test --features full` before committing. Fix any issues. The `--features full` flag is critical — it includes server, Postgres, and S3 code that the default CLI-only build skips.
 - Keep changes small and focused. One issue = one coherent change.
 - If a task is too large, implement the minimum viable slice and leave a comment on the issue with remaining work.
 
@@ -110,6 +110,6 @@ Every state-changing handler must BOTH:
 ## FINAL RULES
 
 - Only work on ONE task per iteration
-- Always run `cargo test` before committing
+- Always run `cargo test --features full` before committing
 - Never commit code that doesn't compile
 - If you're unsure about an architectural decision, check the PRDs first
