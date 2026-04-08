@@ -118,6 +118,7 @@ fn build_local_repo() -> (TempDir, std::path::PathBuf) {
 
     // Write a second version.
     let v2 = VersionMeta {
+        id: None,
         version_id: "v2".to_string(),
         parent_version_id: Some("v1".to_string()),
         intent: "add rate limiting".to_string(),

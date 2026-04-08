@@ -50,6 +50,9 @@ pub enum VersionError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct VersionMeta {
+    /// Database UUID for this version (populated in Postgres/server mode only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<uuid::Uuid>,
     /// Version identifier, e.g. `"v1"`.
     pub version_id: String,
     /// Parent version ID, if any.
@@ -76,6 +79,7 @@ pub fn create_version(
     merge_event_id: Option<u64>,
 ) -> Result<VersionMeta, VersionError> {
     let meta = VersionMeta {
+        id: None,
         version_id: version_id.to_string(),
         parent_version_id: parent_version_id.map(|s| s.to_string()),
         intent: intent.to_string(),

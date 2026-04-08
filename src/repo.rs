@@ -342,6 +342,7 @@ pub fn init(root: &Path) -> Result<InitResult, RepoError> {
 
     // ── Initial version (v1) ─────────────────────────────────────────────────
     let version = VersionMeta {
+        id: None,
         version_id: "v1".to_string(),
         parent_version_id: None,
         intent: "initial repository".to_string(),

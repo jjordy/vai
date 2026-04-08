@@ -50,8 +50,26 @@ impl VersionStore for PostgresStorage {
         repo_id: &Uuid,
         version_id: &str,
     ) -> Result<VersionMeta, StorageError> {
+        // Try UUID lookup first (the API exposes the database UUID as `id`).
+        if let Ok(uuid) = Uuid::parse_str(version_id) {
+            let row = sqlx::query(
+                "SELECT id, version_id, parent_version_id, intent, created_by, merge_event_id, created_at \
+                 FROM versions WHERE repo_id = $1 AND id = $2",
+            )
+            .bind(repo_id)
+            .bind(uuid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+            if let Some(row) = row {
+                return row_to_version(row);
+            }
+        }
+
+        // Fall back to human-readable version_id lookup (e.g. "v1").
         let row = sqlx::query(
-            "SELECT version_id, parent_version_id, intent, created_by, merge_event_id, created_at \
+            "SELECT id, version_id, parent_version_id, intent, created_by, merge_event_id, created_at \
              FROM versions WHERE repo_id = $1 AND version_id = $2",
         )
         .bind(repo_id)
@@ -98,7 +116,7 @@ impl VersionStore for PostgresStorage {
         let total: i64 = count_row.get(0);
 
         let select_sql = format!(
-            "SELECT version_id, parent_version_id, intent, created_by, merge_event_id, created_at \
+            "SELECT id, version_id, parent_version_id, intent, created_by, merge_event_id, created_at \
              FROM versions WHERE repo_id = $1 {order_by}{limit_clause}"
         );
         let rows = sqlx::query(&select_sql)
@@ -120,7 +138,7 @@ impl VersionStore for PostgresStorage {
         // Cast the numeric suffix of version_id (e.g. "v7" → 7) for range filtering.
         // This avoids loading all versions into memory for large repos.
         let rows = sqlx::query(
-            "SELECT version_id, parent_version_id, intent, created_by, merge_event_id, created_at \
+            "SELECT id, version_id, parent_version_id, intent, created_by, merge_event_id, created_at \
              FROM versions \
              WHERE repo_id = $1 \
                AND CAST(SUBSTRING(version_id FROM 2) AS BIGINT) > $2 \
@@ -167,6 +185,7 @@ impl VersionStore for PostgresStorage {
 }
 
 fn row_to_version(row: sqlx::postgres::PgRow) -> Result<VersionMeta, StorageError> {
+    let id: Uuid = row.get("id");
     let version_id: String = row.get("version_id");
     let parent_version_id: Option<String> = row.get("parent_version_id");
     let intent: String = row.get("intent");
@@ -175,6 +194,7 @@ fn row_to_version(row: sqlx::postgres::PgRow) -> Result<VersionMeta, StorageErro
     let created_at: DateTime<Utc> = row.get("created_at");
 
     Ok(VersionMeta {
+        id: Some(id),
         version_id,
         parent_version_id,
         intent,

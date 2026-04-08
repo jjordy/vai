@@ -288,10 +288,20 @@ impl From<crate::issue::IssueComment> for CommentResponse {
 pub(super) struct CreateCommentRequest {
     /// Comment body (Markdown supported).
     body: String,
-    /// Ignored — author is always derived from the authenticated identity.
+    /// Display name for the comment author. When using admin-key auth this
+    /// value is used directly; for API-key and JWT auth the identity name is
+    /// used instead.
     #[serde(default)]
-    #[allow(dead_code)]
     author: Option<String>,
+    /// Author type override (`"human"` or `"agent"`). When provided with
+    /// admin-key auth this value is stored as-is; otherwise it is derived from
+    /// the authentication source.
+    #[serde(default)]
+    author_type: Option<String>,
+    /// Optional structured author identifier (e.g. an agent instance ID).
+    /// Stored as-is when provided.
+    #[serde(default)]
+    author_id: Option<String>,
     /// Optional parent comment UUID for threaded replies.
     #[serde(default)]
     parent_id: Option<String>,
@@ -1221,8 +1231,10 @@ pub(super) async fn create_issue_comment_handler(
         .await
         .map_err(ApiError::from)?;
 
-    // Derive author info from the authenticated identity, ignoring any
-    // client-supplied author field.
+    // Derive author info from the authenticated identity.
+    // For admin-key auth the request body may supply author/author_type/author_id
+    // directly (used in tests and management tooling); for API-key and JWT auth
+    // the identity is authoritative.
     let (author, author_type, author_id) = match identity.auth_source {
         AuthSource::Jwt => {
             let id = identity.user_id.map(|u| u.to_string())
@@ -1233,7 +1245,10 @@ pub(super) async fn create_issue_comment_handler(
             (identity.name.clone(), "agent".to_string(), Some(identity.key_id.clone()))
         }
         AuthSource::AdminKey => {
-            ("admin".to_string(), "human".to_string(), None)
+            let author = body.author.clone().unwrap_or_else(|| "admin".to_string());
+            let author_type = body.author_type.clone().unwrap_or_else(|| "human".to_string());
+            let author_id = body.author_id.clone();
+            (author, author_type, author_id)
         }
     };
 

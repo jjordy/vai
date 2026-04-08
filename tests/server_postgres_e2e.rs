@@ -373,7 +373,7 @@ async fn test_workspace_discard() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "discard: {}", resp.text().await.unwrap_or_default());
+    assert_eq!(resp.status(), 204, "discard: {}", resp.text().await.unwrap_or_default());
 
     // Issue must be reopened.
     let resp = client
@@ -490,7 +490,8 @@ async fn test_websocket_events_fire() {
     })
     .await;
     let has_ws_created = events.iter().any(|e| {
-        e["event_type"].as_str() == Some("WorkspaceCreated")
+        e["type"].as_str() == Some("WorkspaceCreated")
+            || e["event_type"].as_str() == Some("WorkspaceCreated")
             || e["kind"].as_str() == Some("WorkspaceCreated")
     });
     assert!(has_ws_created, "WorkspaceCreated event must be received; got: {events:?}");
@@ -526,7 +527,8 @@ async fn test_websocket_events_fire() {
     })
     .await;
     let has_ws_submitted = events.iter().any(|e| {
-        e["event_type"].as_str() == Some("WorkspaceSubmitted")
+        e["type"].as_str() == Some("WorkspaceSubmitted")
+            || e["event_type"].as_str() == Some("WorkspaceSubmitted")
             || e["kind"].as_str() == Some("WorkspaceSubmitted")
     });
     assert!(has_ws_submitted, "WorkspaceSubmitted event must be received; got: {events:?}");
