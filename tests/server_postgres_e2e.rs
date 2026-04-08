@@ -222,14 +222,14 @@ async fn test_complete_agent_workflow() {
     let versions: serde_json::Value = resp.json().await.unwrap();
     let version_arr = versions["data"].as_array().unwrap();
     assert!(
-        version_arr.iter().any(|v| v["label"].as_str() == Some(&new_version)),
+        version_arr.iter().any(|v| v["version_id"].as_str() == Some(&new_version)),
         "submitted version must appear in version list"
     );
 
     // Find the UUID of the new version for detail checks.
     let version_id = version_arr
         .iter()
-        .find(|v| v["label"].as_str() == Some(&new_version))
+        .find(|v| v["version_id"].as_str() == Some(&new_version))
         .and_then(|v| v["id"].as_str())
         .unwrap()
         .to_string();
@@ -876,7 +876,7 @@ async fn test_version_diff_via_storage() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|v| v["label"].as_str() == Some(&version_label))
+        .find(|v| v["version_id"].as_str() == Some(&version_label))
         .and_then(|v| v["id"].as_str())
         .expect("submitted version must appear in version list")
         .to_string();
@@ -1749,7 +1749,7 @@ async fn test_deletion_round_trip() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|v| v["label"].as_str() == Some(&v2_label))
+        .find(|v| v["version_id"].as_str() == Some(&v2_label))
         .and_then(|v| v["id"].as_str())
         .expect("step-2 version must appear in version list")
         .to_string();
@@ -1853,7 +1853,7 @@ async fn test_deletion_round_trip() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|v| v["label"].as_str() == Some(&v3_label))
+        .find(|v| v["version_id"].as_str() == Some(&v3_label))
         .and_then(|v| v["id"].as_str())
         .expect("step-3 version must appear in version list")
         .to_string();
@@ -2049,13 +2049,13 @@ async fn test_complete_agent_workflow_readonly_repo_root() {
     let versions: serde_json::Value = resp.json().await.unwrap();
     let version_arr = versions["data"].as_array().unwrap();
     assert!(
-        version_arr.iter().any(|v| v["label"].as_str() == Some(&new_version)),
+        version_arr.iter().any(|v| v["version_id"].as_str() == Some(&new_version)),
         "submitted version must appear in version list"
     );
 
     let version_id = version_arr
         .iter()
-        .find(|v| v["label"].as_str() == Some(&new_version))
+        .find(|v| v["version_id"].as_str() == Some(&new_version))
         .and_then(|v| v["id"].as_str())
         .unwrap()
         .to_string();

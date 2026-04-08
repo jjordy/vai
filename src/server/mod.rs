@@ -3556,15 +3556,15 @@ pub async fn start_for_testing_pg(
         .unwrap_or(Path::new("."))
         .to_path_buf();
 
-    // Connect to Postgres and run schema migrations.
-    let storage = crate::storage::StorageBackend::server(database_url, 5)
+    // Connect to Postgres + in-memory file store and run schema migrations.
+    // We use `server_with_mem_fs` rather than plain `server` so that file
+    // upload/download handlers work without requiring real S3.
+    let storage = crate::storage::StorageBackend::server_with_mem_fs(database_url, 5)
         .await
         .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
 
     let pg = match &storage {
-        crate::storage::StorageBackend::Server(pg)
-        | crate::storage::StorageBackend::ServerWithS3(pg, _)
-        | crate::storage::StorageBackend::ServerWithMemFs(pg, _) => pg.clone(),
+        crate::storage::StorageBackend::ServerWithMemFs(pg, _) => pg.clone(),
         _ => unreachable!(),
     };
 
@@ -3651,15 +3651,15 @@ pub async fn start_for_testing_pg_multi_repo(
 ) -> Result<(SocketAddr, tokio::sync::oneshot::Sender<()>), ServerError> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    // Connect to Postgres and run schema migrations.
-    let storage = crate::storage::StorageBackend::server(database_url, 5)
+    // Connect to Postgres + in-memory file store and run schema migrations.
+    // We use `server_with_mem_fs` rather than plain `server` so that file
+    // upload/download handlers work without requiring real S3.
+    let storage = crate::storage::StorageBackend::server_with_mem_fs(database_url, 5)
         .await
         .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
 
     let pg = match &storage {
-        crate::storage::StorageBackend::Server(pg)
-        | crate::storage::StorageBackend::ServerWithS3(pg, _)
-        | crate::storage::StorageBackend::ServerWithMemFs(pg, _) => pg.clone(),
+        crate::storage::StorageBackend::ServerWithMemFs(pg, _) => pg.clone(),
         _ => unreachable!(),
     };
 
