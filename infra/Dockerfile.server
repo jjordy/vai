@@ -38,11 +38,7 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=builder /app/target/release/vai /usr/local/bin/vai
 
-# Create global server config for multi-repo mode
-RUN mkdir -p /root/.vai /data/repos && \
-    printf '[server]\nstorage_root = "/data/repos"\nhost = "0.0.0.0"\n' > /root/.vai/server.toml
-
 EXPOSE 7865
 
 ENTRYPOINT ["vai"]
-CMD ["server", "start"]
+CMD ["server", "start", "--host", "0.0.0.0"]
