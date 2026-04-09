@@ -1636,6 +1636,7 @@ impl StorageBackend {
     /// Returns `Ok(Some((repo_id, name)))` in server (Postgres) mode when a
     /// matching repo exists, `Ok(None)` in local (SQLite) mode (which uses
     /// `registry.json` instead), and an error on database failure.
+    #[allow(unused_variables)]
     pub async fn get_repo_by_name(
         &self,
         name: &str,
