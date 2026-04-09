@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/vai /usr/local/bin/vai
+COPY --from=builder /app/migrations /app/migrations
 
 EXPOSE 7865
 
