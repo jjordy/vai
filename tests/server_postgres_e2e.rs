@@ -2681,8 +2681,8 @@ async fn test_stateless_server_lifecycle() {
         .unwrap();
     assert_eq!(resp.status(), 200, "submit: {}", resp.text().await.unwrap_or_default());
     let submit: serde_json::Value = resp.json().await.unwrap();
-    let new_version = submit["version_id"].as_str().unwrap().to_string();
-    assert!(!new_version.is_empty(), "submit must return a version_id");
+    let new_version = submit["version"].as_str().unwrap().to_string();
+    assert!(!new_version.is_empty(), "submit must return a version");
 
     // ── 5. Status shows correct head_version ──────────────────────────────────
     let resp = client.get(format!("{rp}/status")).bearer_auth(admin).send().await.unwrap();
