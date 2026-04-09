@@ -2575,6 +2575,149 @@ async fn test_delta_tarball_upload() {
     shutdown_tx.send(()).ok();
 }
 
+// ── Stateless server lifecycle ────────────────────────────────────────────────
+
+/// Validates the full stateless server lifecycle — the server starts with only
+/// a `DATABASE_URL` (no `.vai/` directory, no `server.toml`, no `registry.json`)
+/// and all API operations succeed through Postgres + MemFs.
+///
+/// Verifies:
+/// 1. Health check passes immediately after startup
+/// 2. Repo created via `POST /api/repos` — no filesystem state required
+/// 3. Repo appears in `GET /api/repos`
+/// 4. Workspace created, files uploaded, workspace submitted → new version
+/// 5. `GET /api/repos/:repo/status` shows the correct `head_version`
+/// 6. No `.vai/` subdirectory is ever created under the storage root
+#[tokio::test(flavor = "multi_thread")]
+async fn test_stateless_server_lifecycle() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    // Start with a completely empty temp directory — no pre-existing state.
+    assert!(
+        std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
+        "storage root must be empty before server starts"
+    );
+
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start_for_testing_pg_multi_repo failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // ── 1. Health check ───────────────────────────────────────────────────────
+    let resp = client.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "health check must pass");
+
+    // ── 2. Create repo — Postgres only, no filesystem writes ─────────────────
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": "stateless-test" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create repo: {}", resp.text().await.unwrap_or_default());
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let repo_name = repo["name"].as_str().unwrap();
+    let rp = format!("{base}/api/repos/{repo_name}");
+
+    // ── 3. Repo appears in GET /api/repos ─────────────────────────────────────
+    let resp = client.get(format!("{base}/api/repos")).bearer_auth(admin).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let repos_list: serde_json::Value = resp.json().await.unwrap();
+    let repos_arr = repos_list.as_array().unwrap();
+    assert!(
+        repos_arr.iter().any(|r| r["name"].as_str() == Some(repo_name)),
+        "created repo must appear in GET /api/repos"
+    );
+
+    // ── 4. Create issue, claim (workspace), upload files, submit ─────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "stateless test issue",
+            "description": "validates stateless server lifecycle",
+            "priority": "medium"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    let issue_id = issue["id"].as_str().unwrap();
+
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim: {}", resp.text().await.unwrap_or_default());
+    let claim: serde_json::Value = resp.json().await.unwrap();
+    let ws_id = claim["workspace_id"].as_str().unwrap();
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws_id}/files"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "files": [{ "path": "src/hello.rs", "content": b64(b"fn hello() {}\n") }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload files: {}", resp.text().await.unwrap_or_default());
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "message": "stateless submit" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit: {}", resp.text().await.unwrap_or_default());
+    let submit: serde_json::Value = resp.json().await.unwrap();
+    let new_version = submit["version_id"].as_str().unwrap().to_string();
+    assert!(!new_version.is_empty(), "submit must return a version_id");
+
+    // ── 5. Status shows correct head_version ──────────────────────────────────
+    let resp = client.get(format!("{rp}/status")).bearer_auth(admin).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let status: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        status["head_version"].as_str().unwrap_or(""),
+        new_version,
+        "status head_version must match the submitted version"
+    );
+    assert_eq!(
+        status["repo_name"].as_str().unwrap_or(""),
+        repo_name,
+        "status repo_name must match"
+    );
+
+    // ── 6. No .vai/ subdirectory created under storage root ───────────────────
+    // In server (Postgres) mode, all metadata lives in Postgres.  The only
+    // entries under the storage root should be the top-level `.vai` placeholder
+    // that AppState uses as a path (never written to disk) — not a real
+    // per-repo `.vai/` directory.
+    let vai_subdirs: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".vai"))
+        .collect();
+    assert!(
+        vai_subdirs.is_empty(),
+        "no .vai/ directories should exist under the storage root in server mode; found: {:?}",
+        vai_subdirs.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Extracts the content of a file from a gzip tarball by path suffix.
 fn extract_file_from_tarball<'a>(bytes: &'a [u8], path_suffix: &str) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;
