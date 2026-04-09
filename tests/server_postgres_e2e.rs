@@ -2665,7 +2665,7 @@ async fn test_stateless_server_lifecycle() {
         .post(format!("{rp}/workspaces/{ws_id}/files"))
         .bearer_auth(admin)
         .json(&serde_json::json!({
-            "files": [{ "path": "src/hello.rs", "content": b64(b"fn hello() {}\n") }]
+            "files": [{ "path": "src/hello.rs", "content_base64": b64(b"fn hello() {}\n") }]
         }))
         .send()
         .await
