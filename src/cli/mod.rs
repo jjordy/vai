@@ -654,8 +654,8 @@ pub enum ServerCommands {
         ///
         /// When set the server uses the Postgres backend instead of the default
         /// SQLite/filesystem storage. Overrides `[server].database_url` in
-        /// `~/.vai/server.toml`. Also read from the `VAI_DATABASE_URL` environment
-        /// variable when the `env` clap feature is enabled.
+        /// `~/.vai/server.toml`. Also read from the `DATABASE_URL` environment
+        /// variable (standard PaaS convention; lower priority than this flag).
         #[arg(long)]
         database_url: Option<String>,
         /// Maximum number of Postgres connections in the pool (default: 25).

@@ -168,8 +168,8 @@ pub struct GlobalServerSection {
     /// Postgres connection URL for server-mode storage.
     ///
     /// When set the server uses `PostgresStorage`; otherwise the SQLite/filesystem
-    /// backend is used. Can also be supplied via the `VAI_DATABASE_URL` environment
-    /// variable or the `--database-url` CLI flag.
+    /// backend is used. Can also be supplied via the `DATABASE_URL` environment
+    /// variable (standard PaaS convention) or the `--database-url` CLI flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_url: Option<String>,
     /// Maximum number of Postgres connections in the pool (default: 25).

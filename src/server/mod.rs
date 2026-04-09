@@ -3907,7 +3907,10 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         crate::auth::jwt::resolve_jwt_service(jwt_overlap_secs);
     let jwt_service = Arc::new(jwt_service);
 
-    // Resolve CORS origins: config takes priority, then VAI_CORS_ORIGINS env var.
+    // Resolve CORS origins: config.cors_origins is populated by server_cmd.rs from
+    // (in priority order) CLI --cors-origins flag, VAI_CORS_ORIGINS env var, or
+    // ~/.vai/server.toml. Fall back to VAI_CORS_ORIGINS here only when start() is
+    // called directly without going through server_cmd.rs (e.g. in tests).
     let cors_origins_raw = config
         .cors_origins
         .clone()
