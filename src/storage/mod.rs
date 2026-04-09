@@ -1631,6 +1631,26 @@ impl StorageBackend {
         }
     }
 
+    /// Looks up a repository by name from the Postgres `repos` table.
+    ///
+    /// Returns `Ok(Some((repo_id, name)))` in server (Postgres) mode when a
+    /// matching repo exists, `Ok(None)` in local (SQLite) mode (which uses
+    /// `registry.json` instead), and an error on database failure.
+    pub async fn get_repo_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<(Uuid, String)>, StorageError> {
+        match self {
+            StorageBackend::Local(_) => Ok(None),
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(pg) | StorageBackend::ServerWithMemFs(pg, _) => {
+                pg.get_repo_by_name(name).await
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(pg, _) => pg.get_repo_by_name(name).await,
+        }
+    }
+
     /// Checks S3 connectivity by listing a health-check prefix.
     ///
     /// Returns `Ok(())` for backends without an S3 file store.

@@ -23,7 +23,7 @@ pub(super) fn handle(server_cmd: ServerCommands, json: bool) -> Result<(), CliEr
     let is_multi_repo = global_cfg.storage_root.is_some()
         || std::env::var("VAI_STORAGE_ROOT")
             .ok()
-            .map_or(false, |v| !v.is_empty());
+            .is_some_and(|v| !v.is_empty());
 
     // In multi-repo mode the server is not tied to any single
     // repository, so `find_root` would spuriously fail when the

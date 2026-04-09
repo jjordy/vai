@@ -133,6 +133,23 @@ impl PostgresStorage {
         Ok(())
     }
 
+    /// Looks up a repository by name, returning `(repo_id, name)` if found.
+    ///
+    /// Used by [`repo_resolve_middleware`](crate::server) to resolve a repo name
+    /// to its UUID in server mode, without touching the filesystem.
+    pub async fn get_repo_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<(uuid::Uuid, String)>, StorageError> {
+        use sqlx::Row as _;
+        let row = sqlx::query("SELECT id, name FROM repos WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(row.map(|r| (r.get("id"), r.get("name"))))
+    }
+
     /// Creates a [`sqlx::postgres::PgListener`] connected via this pool.
     ///
     /// Used by the WebSocket handler to receive `LISTEN/NOTIFY` signals from

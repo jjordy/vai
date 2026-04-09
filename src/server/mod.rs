@@ -1053,26 +1053,48 @@ async fn repo_resolve_middleware(
         None => return ApiError::bad_request("missing `:repo` path segment").into_response(),
     };
 
-    let (vai_dir, repo_root) = if let Some(storage_root) = state.storage_root.as_ref() {
-        // Multi-repo mode: look up the repo in the registry.
-        let registry = match RepoRegistry::load(storage_root) {
-            Ok(r) => r,
+    let (vai_dir, repo_root, repo_id) = if let Some(storage_root) = state.storage_root.as_ref() {
+        // Multi-repo mode.
+        //
+        // In server (Postgres) mode, query the `repos` table directly — no filesystem
+        // lookup needed.  In local (SQLite) mode, `get_repo_by_name` returns `None`
+        // and we fall back to `registry.json` as before.
+        match state.storage.get_repo_by_name(&repo_name).await {
             Err(e) => {
-                return ApiError::internal(format!("failed to load repo registry: {e}"))
-                    .into_response()
+                return ApiError::internal(format!("failed to query repo: {e}"))
+                    .into_response();
             }
-        };
-
-        let entry = match registry.repos.iter().find(|r| r.name == repo_name) {
-            Some(e) => e.clone(),
-            None => {
-                return ApiError::not_found(format!(
-                    "repository `{repo_name}` is not registered on this server"
-                ))
-                .into_response()
+            Ok(Some((id, _))) => {
+                // Server (Postgres) mode: repo found — no filesystem path required.
+                let repo_root = storage_root.join(&repo_name);
+                let vai_dir = repo_root.join(".vai");
+                (vai_dir, repo_root, id)
             }
-        };
-        (entry.path.join(".vai"), entry.path.clone())
+            Ok(None) => {
+                // Local (SQLite) mode: resolve via registry.json.
+                let registry = match RepoRegistry::load(storage_root) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return ApiError::internal(format!(
+                            "failed to load repo registry: {e}"
+                        ))
+                        .into_response()
+                    }
+                };
+                let entry = match registry.repos.iter().find(|r| r.name == repo_name) {
+                    Some(e) => e.clone(),
+                    None => {
+                        return ApiError::not_found(format!(
+                            "repository `{repo_name}` is not registered on this server"
+                        ))
+                        .into_response()
+                    }
+                };
+                let vai_dir = entry.path.join(".vai");
+                let repo_id = repo_id_from_vai_dir(&vai_dir);
+                (vai_dir, entry.path.clone(), repo_id)
+            }
+        }
     } else {
         // Single-repo mode: only the server's own repository is available.
         if repo_name != state.repo_name {
@@ -1081,10 +1103,11 @@ async fn repo_resolve_middleware(
             ))
             .into_response();
         }
-        (state.vai_dir.clone(), state.repo_root.clone())
+        let vai_dir = state.vai_dir.clone();
+        let repo_id = repo_id_from_vai_dir(&vai_dir);
+        (vai_dir, state.repo_root.clone(), repo_id)
     };
 
-    let repo_id = repo_id_from_vai_dir(&vai_dir);
     let storage = repo_storage(&state.storage, &vai_dir);
     let ctx = RepoCtx {
         vai_dir,
