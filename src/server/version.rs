@@ -563,7 +563,25 @@ pub(super) async fn rollback_handler(
     }
 
     match version::rollback(&ctx.vai_dir, &ctx.repo_root, &body.version, None) {
-        Ok(result) => Json(result).into_response(),
+        Ok(result) => {
+            // Persist the new version and HEAD to the storage trait.  In Postgres
+            // server mode this writes the rollback version to the database; in
+            // local SQLite mode it duplicates what version::rollback already wrote
+            // to disk, which is harmless.
+            let _ = ctx.storage.versions()
+                .create_version(&ctx.repo_id, crate::storage::NewVersion {
+                    version_id: result.new_version.version_id.clone(),
+                    parent_version_id: result.new_version.parent_version_id.clone(),
+                    intent: result.new_version.intent.clone(),
+                    created_by: result.new_version.created_by.clone(),
+                    merge_event_id: result.new_version.merge_event_id,
+                })
+                .await;
+            let _ = ctx.storage.versions()
+                .advance_head(&ctx.repo_id, &result.new_version.version_id)
+                .await;
+            Json(result).into_response()
+        }
         Err(e) => ApiError::from(e).into_response(),
     }
 }

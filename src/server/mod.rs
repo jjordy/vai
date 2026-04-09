@@ -2994,8 +2994,12 @@ async fn migration_stats_handler(
             .await
             .map_err(|e| ApiError::internal(format!("failed to count escalations: {e}")))?;
 
-    // ALLOW_FS: local mode fallback; best-effort, returns None in server mode
-    let head_version = repo::read_head(&ctx.vai_dir).ok();
+    // Read head from storage trait — no filesystem read needed in server mode.
+    let head_version = ctx.storage.versions()
+        .read_head(&ctx.repo_id)
+        .await
+        .ok()
+        .flatten();
 
     Ok(Json(MigrationStatsResponse {
         events,
