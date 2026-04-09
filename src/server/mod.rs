@@ -461,7 +461,7 @@ pub(crate) struct AppState {
     repo_root: PathBuf,
     /// Monotonic timestamp recorded when the server started.
     started_at: Instant,
-    /// Human-readable repository name from `.vai/config.toml`.
+    /// Human-readable repository name. In local mode, from `.vai/config.toml`; in server mode, from the `repos` table.
     repo_name: String,
     /// vai crate version string.
     vai_version: String,
@@ -585,9 +585,10 @@ struct RepoCtx {
     repo_root: PathBuf,
     /// Stable identifier for this repository, used to scope storage trait calls.
     ///
-    /// Read from `.vai/config.toml` at request time. In SQLite mode the value
-    /// is ignored by all trait implementations; in Postgres mode it is used to
-    /// scope every query to the correct tenant.
+    /// In Postgres (server) mode this is populated by `repo_resolve_middleware`
+    /// from the `repos` table — no filesystem read required.  In SQLite (local)
+    /// mode the value is read from `.vai/config.toml` and is otherwise ignored
+    /// by all trait implementations.
     repo_id: uuid::Uuid,
     /// Per-repository storage backend.
     ///
@@ -600,6 +601,9 @@ struct RepoCtx {
 
 /// Reads the `repo_id` from `.vai/config.toml`, returning `Uuid::nil()` on
 /// failure (safe for SQLite mode which ignores the value).
+///
+/// **Only called in local (SQLite) mode.** In server (Postgres) mode, `repo_id`
+/// is resolved from the `repos` table by `repo_resolve_middleware`.
 fn repo_id_from_vai_dir(vai_dir: &Path) -> uuid::Uuid {
     crate::repo::read_config(vai_dir)
         .map(|c| c.repo_id)
@@ -1549,10 +1553,9 @@ async fn status_handler(
         .map(|e| e.len())
         .unwrap_or(0);
 
-    // In multi-repo Postgres mode, look up the repo name from the `repos`
-    // table (keyed by repo_id) rather than from the global `state.repo_name`,
-    // which is set to the storage_root path in that mode.  In single-repo
-    // and local modes, fall back to the config file or state name.
+    // In server (Postgres) mode, look up the repo name from the `repos`
+    // table — no filesystem reads.  In local (SQLite) mode, read from
+    // `.vai/config.toml` or fall back to `state.repo_name`.
     let repo_name = match &state.storage {
         StorageBackend::Server(ref pg)
         | StorageBackend::ServerWithS3(ref pg, _)
@@ -1563,11 +1566,7 @@ async fn status_handler(
                 .await
                 .ok()
                 .flatten()
-                .unwrap_or_else(|| {
-                    repo::read_config(&ctx.vai_dir)
-                        .map(|c| c.name)
-                        .unwrap_or_else(|_| state.repo_name.clone())
-                })
+                .unwrap_or_else(|| state.repo_name.clone())
         }
         StorageBackend::Local(_) => repo::read_config(&ctx.vai_dir)
             .map(|c| c.name)
