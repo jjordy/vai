@@ -79,9 +79,11 @@ docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 echo "Starting container..."
 docker run -d \
   --name "$CONTAINER_NAME" \
+  --network host \
   -v "$REPO_DIR:/home/agent/repo" \
   -e CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN" \
   -e GH_TOKEN="$GH_TOKEN" \
+  -e VAI_TEST_DATABASE_URL="${VAI_TEST_DATABASE_URL:-postgres://vai:vai@localhost:5432/vai_test}" \
   "$IMAGE_NAME"
 
 # Configure git and gh inside container
@@ -153,21 +155,104 @@ $RECENT_COMMITS
   echo "Running Claude Code..."
   echo ""
 
-  # Write prompt to a file inside the container, then pipe it to claude
-  echo "$FULL_PROMPT" | docker exec -i "$CONTAINER_NAME" tee /tmp/ralph_prompt.md > /dev/null
+  MAX_FIX_ATTEMPTS="${MAX_FIX_ATTEMPTS:-5}"
+  PASSED=false
+  ERRORS=""
 
-  docker exec -i "$CONTAINER_NAME" bash -c "
-    cd /home/agent/repo
-    cat /tmp/ralph_prompt.md | claude -p \
-      --allowedTools 'Read,Edit,Write,Bash,Glob,Grep'
-  "
+  for attempt in $(seq 1 "$MAX_FIX_ATTEMPTS"); do
+    echo "--- Attempt $attempt / $MAX_FIX_ATTEMPTS ---"
+    echo ""
 
-  CLAUDE_EXIT=$?
+    if [ "$attempt" -eq 1 ]; then
+      echo "$FULL_PROMPT" | docker exec -i "$CONTAINER_NAME" tee /tmp/ralph_prompt.md > /dev/null
+      docker exec -i "$CONTAINER_NAME" bash -c "
+        cd /home/agent/repo
+        cat /tmp/ralph_prompt.md | claude -p \
+          --allowedTools 'Read,Edit,Write,Bash,Glob,Grep'
+      "
+    else
+      printf "Fix these errors. Run the failing checks yourself to verify they pass before finishing.\n\n%s" "$ERRORS" \
+        | docker exec -i "$CONTAINER_NAME" bash -c "
+          cd /home/agent/repo
+          claude -p --allowedTools 'Read,Edit,Write,Bash,Glob,Grep'
+        "
+    fi
 
-  echo ""
+    CLAUDE_EXIT=$?
+    if [ $CLAUDE_EXIT -ne 0 ]; then
+      ERRORS="Claude exited with non-zero code $CLAUDE_EXIT. The implementation may be incomplete."
+      echo "Claude exited with code $CLAUDE_EXIT."
+      continue
+    fi
 
-  if [ $CLAUDE_EXIT -ne 0 ]; then
-    echo "Claude exited with code $CLAUDE_EXIT. Continuing to next iteration..."
+    # ── Verify ──────────────────────────────────────────────────
+    echo ""
+    echo "Running quality checks..."
+    ERRORS=""
+    ALL_PASSED=true
+
+    # 1. Clippy (full features)
+    echo "  [1/3] Clippy..."
+    CLIPPY_OUTPUT=$(docker exec "$CONTAINER_NAME" bash -c "cd /home/agent/repo && cargo clippy --features full -- -D warnings 2>&1")
+    CLIPPY_EXIT=$?
+    if [ $CLIPPY_EXIT -ne 0 ]; then
+      ALL_PASSED=false
+      ERRORS="${ERRORS}
+=== cargo clippy --features full ===
+${CLIPPY_OUTPUT}
+"
+      echo "  FAIL"
+    else
+      echo "  PASS"
+    fi
+
+    # 2. Test (full features)
+    echo "  [2/3] Tests (full features)..."
+    TEST_OUTPUT=$(docker exec "$CONTAINER_NAME" bash -c "cd /home/agent/repo && cargo test --features full 2>&1")
+    TEST_EXIT=$?
+    if [ $TEST_EXIT -ne 0 ]; then
+      ALL_PASSED=false
+      TEST_TAIL=$(echo "$TEST_OUTPUT" | tail -50)
+      ERRORS="${ERRORS}
+=== cargo test --features full ===
+${TEST_TAIL}
+"
+      echo "  FAIL"
+    else
+      echo "  PASS"
+    fi
+
+    # 3. Test (CLI only)
+    echo "  [3/3] Tests (CLI only)..."
+    CLI_OUTPUT=$(docker exec "$CONTAINER_NAME" bash -c "cd /home/agent/repo && cargo test 2>&1")
+    CLI_EXIT=$?
+    if [ $CLI_EXIT -ne 0 ]; then
+      ALL_PASSED=false
+      CLI_TAIL=$(echo "$CLI_OUTPUT" | tail -50)
+      ERRORS="${ERRORS}
+=== cargo test ===
+${CLI_TAIL}
+"
+      echo "  FAIL"
+    else
+      echo "  PASS"
+    fi
+
+    if [ "$ALL_PASSED" = true ]; then
+      echo ""
+      echo "All checks passed!"
+      PASSED=true
+      break
+    else
+      echo ""
+      echo "Checks failed. Will retry (attempt $attempt of $MAX_FIX_ATTEMPTS)."
+    fi
+  done
+
+  if [ "$PASSED" != true ]; then
+    echo ""
+    echo "Failed after $MAX_FIX_ATTEMPTS attempts. Reverting uncommitted changes."
+    docker exec "$CONTAINER_NAME" bash -c "cd /home/agent/repo && git checkout -- . && git clean -fd"
     echo ""
     continue
   fi
