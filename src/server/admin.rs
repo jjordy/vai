@@ -76,6 +76,17 @@ impl RepoResponse {
 
 // ── Repository management handlers ────────────────────────────────────────────
 
+/// Response body when a user's repo quota has been exceeded.
+#[derive(Debug, Serialize, ToSchema)]
+pub(super) struct QuotaExceededBody {
+    /// Fixed error string: `"repo quota exceeded"`.
+    pub error: String,
+    /// The per-user repo limit.
+    pub limit: u64,
+    /// How many repos the user currently owns.
+    pub current: u64,
+}
+
 #[utoipa::path(
     post,
     path = "/api/repos",
@@ -84,6 +95,7 @@ impl RepoResponse {
         (status = 201, description = "Repository created", body = RepoResponse),
         (status = 400, description = "Bad request or multi-repo mode not enabled", body = super::ErrorBody),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Quota exceeded (non-admin users only)", body = QuotaExceededBody),
         (status = 409, description = "Repository already exists", body = super::ErrorBody),
     ),
     security(("bearer_auth" = [])),
@@ -91,15 +103,24 @@ impl RepoResponse {
 )]
 /// `POST /api/repos` — registers and initialises a new repository.
 ///
-/// Creates `{storage_root}/{name}/`, runs `vai init`, and records the repo in
-/// the server registry. Returns 400 if multi-repo mode is not enabled (i.e.
-/// `storage_root` is not set) or if the name is already taken.
+/// Any authenticated user may create a repo, subject to a per-user quota
+/// (default 100, configurable via `VAI_MAX_REPOS_PER_USER`). Admin keys bypass
+/// the quota. On success the creating user is automatically added as an `admin`
+/// collaborator on the new repo.
+///
+/// Returns 400 if multi-repo mode is not enabled (`storage_root` not set) or
+/// if the name is already taken. Returns 403 if the quota is exceeded.
 pub(super) async fn create_repo_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateRepoRequest>,
 ) -> Result<(StatusCode, Json<RepoResponse>), ApiError> {
-    require_server_admin(&identity)?;
+    // Non-admin users must have an associated user_id to create repos.
+    if !identity.is_admin && identity.user_id.is_none() {
+        return Err(ApiError::forbidden(
+            "this key is not associated with a user; cannot create repositories",
+        ));
+    }
     let storage_root = state.storage_root.as_ref().ok_or_else(|| {
         ApiError::bad_request(
             "server is not in multi-repo mode; set storage_root in ~/.vai/server.toml",
@@ -129,6 +150,24 @@ pub(super) async fn create_repo_handler(
     | crate::storage::StorageBackend::ServerWithS3(ref pg, _)
     | crate::storage::StorageBackend::ServerWithMemFs(ref pg, _) = state.storage
     {
+        // Enforce per-user quota (admins are exempt).
+        if !identity.is_admin {
+            if let Some(user_id) = &identity.user_id {
+                let current = state
+                    .storage
+                    .orgs()
+                    .count_repos_owned_by_user(user_id)
+                    .await
+                    .map_err(|e| ApiError::internal(format!("quota check failed: {e}")))?;
+                if current >= state.max_repos_per_user {
+                    return Err(ApiError::quota_exceeded(
+                        state.max_repos_per_user,
+                        current,
+                    ));
+                }
+            }
+        }
+
         // Duplicate check: query Postgres instead of registry.json.
         let existing = state
             .storage
@@ -178,6 +217,23 @@ pub(super) async fn create_repo_handler(
             .advance_head(&repo_id, "v1")
             .await
             .map_err(|e| ApiError::internal(format!("failed to advance head: {e}")))?;
+
+        // Auto-grant the creating user admin collaborator access.
+        if let Some(user_id) = &identity.user_id {
+            state
+                .storage
+                .orgs()
+                .add_collaborator(&repo_id, user_id, crate::storage::RepoRole::Admin)
+                .await
+                .map_err(|e| {
+                    ApiError::internal(format!("failed to grant creator access: {e}"))
+                })?;
+            tracing::info!(
+                repo_id = %repo_id,
+                user_id = %user_id,
+                "creator granted admin collaborator role"
+            );
+        }
 
         tracing::info!(repo_id = %repo_id, name = %body.name, "repo registered (server mode, no filesystem writes)");
 
@@ -1235,6 +1291,10 @@ pub(super) struct CreateKeyRequest {
     /// Optional expiry timestamp (RFC-3339). `None` means the key never expires.
     #[schema(value_type = Option<String>)]
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Admin-only: create the key on behalf of this user UUID rather than
+    /// the authenticated admin identity. Ignored for non-admin callers.
+    #[schema(value_type = Option<String>)]
+    for_user_id: Option<uuid::Uuid>,
 }
 
 /// Response body for key creation.
@@ -1301,10 +1361,11 @@ pub(super) async fn create_key_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateKeyRequest>,
 ) -> Result<(StatusCode, Json<CreateKeyResponse>), ApiError> {
-    // Admin keys can create keys without a user_id association.
-    // User-linked keys require a user_id on the identity.
+    // Admin keys can create keys without a user_id association, or on behalf
+    // of a specific user via `for_user_id`. User-linked keys require a user_id
+    // on the identity.
     let user_id = if identity.is_admin {
-        None
+        body.for_user_id
     } else {
         match identity.user_id {
             Some(uid) => Some(uid),

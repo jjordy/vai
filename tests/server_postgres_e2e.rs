@@ -34,7 +34,11 @@ use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use vai::server::{start_for_testing_pg_multi_repo, start_for_testing_pg_with_mem_fs};
+use vai::server::{
+    start_for_testing_pg_multi_repo,
+    start_for_testing_pg_multi_repo_with_quota,
+    start_for_testing_pg_with_mem_fs,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -2714,6 +2718,189 @@ async fn test_stateless_server_lifecycle() {
         "no .vai/ directories should exist under the storage root in server mode; found: {:?}",
         vai_subdirs.iter().map(|e| e.path()).collect::<Vec<_>>()
     );
+
+    shutdown_tx.send(()).ok();
+}
+
+// ── Non-admin repo creation and quota enforcement ─────────────────────────────
+
+/// Returns a short unique suffix derived from the current time (microseconds).
+///
+/// Used to give test entities unique names across repeated runs against the
+/// same Postgres instance.
+fn unique_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    format!("{us:x}")
+}
+
+/// Verifies that a non-admin user with a valid API key can create a repo via
+/// `POST /api/repos` and is automatically added as an admin collaborator.
+///
+/// Flow:
+/// 1. Create a user with the admin key: `POST /api/users`
+/// 2. Mint a key for the user: `POST /api/keys` with `for_user_id`
+/// 3. Use the user key to create a repo: `POST /api/repos`
+/// 4. Verify 201 and that the user is an admin collaborator via `GET /api/repos/:repo/me`
+#[tokio::test(flavor = "multi_thread")]
+async fn test_non_admin_repo_creation() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+
+    // 1. Create a user.
+    let resp = client
+        .post(format!("{base}/api/users"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("Alice-{sfx}"),
+            "email": format!("alice-{sfx}@example.com"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create user: {}", resp.text().await.unwrap_or_default());
+    let user: serde_json::Value = resp.json().await.unwrap();
+    let user_id = user["id"].as_str().unwrap().to_string();
+
+    // 2. Create an API key for the user via admin's for_user_id field.
+    let resp = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("alice-key-{sfx}"),
+            "for_user_id": user_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create key: {}", resp.text().await.unwrap_or_default());
+    let key_resp: serde_json::Value = resp.json().await.unwrap();
+    let user_token = key_resp["token"].as_str().unwrap().to_string();
+
+    // 3. Use the user key to create a repo.
+    let repo_name = format!("alice-repo-{sfx}");
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(&user_token)
+        .json(&serde_json::json!({ "name": repo_name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "non-admin create repo: {}", resp.text().await.unwrap_or_default());
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(repo["name"].as_str(), Some(repo_name.as_str()));
+
+    // 4. Verify the user has admin collaborator role via GET /api/repos/:repo/me.
+    let resp = client
+        .get(format!("{base}/api/repos/{repo_name}/me"))
+        .bearer_auth(&user_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "GET /me: {}", resp.text().await.unwrap_or_default());
+    let me: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(me["role"].as_str(), Some("admin"), "creator must have admin role");
+    assert_eq!(me["user_id"].as_str(), Some(user_id.as_str()));
+
+    shutdown_tx.send(()).ok();
+}
+
+/// Verifies that a non-admin user is blocked at the quota limit and receives a
+/// structured 403 response body with `limit` and `current` fields.
+///
+/// Uses a server configured with `max_repos_per_user = 2` so the test only
+/// needs to create 2 repos before hitting the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_non_admin_repo_quota_exceeded() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    // Set quota to 2 so the 3rd creation attempt is rejected.
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo_with_quota(tmp.path(), &url, 2)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+
+    // Create user + key.
+    let resp = client
+        .post(format!("{base}/api/users"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("Bob-{sfx}"),
+            "email": format!("bob-{sfx}@example.com"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create user: {}", resp.text().await.unwrap_or_default());
+    let user: serde_json::Value = resp.json().await.unwrap();
+    let user_id = user["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("bob-key-{sfx}"),
+            "for_user_id": user_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create key: {}", resp.text().await.unwrap_or_default());
+    let key_resp: serde_json::Value = resp.json().await.unwrap();
+    let user_token = key_resp["token"].as_str().unwrap().to_string();
+
+    // Create 2 repos — should succeed.
+    for i in 0..2u32 {
+        let resp = client
+            .post(format!("{base}/api/repos"))
+            .bearer_auth(&user_token)
+            .json(&serde_json::json!({ "name": format!("bob-repo-{sfx}-{i}") }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "repo {i} creation should succeed");
+    }
+
+    // 3rd repo must be rejected with 403 and the quota body.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(&user_token)
+        .json(&serde_json::json!({ "name": format!("bob-repo-{sfx}-overflow") }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "3rd repo must be blocked by quota");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"].as_str(), Some("repo quota exceeded"));
+    assert_eq!(body["limit"].as_u64(), Some(2));
+    assert_eq!(body["current"].as_u64(), Some(2));
+
+    // Admin is never blocked by the quota.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": format!("admin-repo-{sfx}-no-quota") }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "admin must bypass quota");
 
     shutdown_tx.send(()).ok();
 }

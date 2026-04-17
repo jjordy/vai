@@ -546,6 +546,19 @@ impl OrgStore for PostgresStorage {
         Ok(n as u64)
     }
 
+    async fn count_repos_owned_by_user(&self, user_id: &Uuid) -> Result<u64, StorageError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n FROM repo_collaborators WHERE user_id = $1 AND role = 'admin'",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let n: i64 = row.get("n");
+        Ok(n as u64)
+    }
+
     async fn resolve_repo_role(
         &self,
         user_id: &Uuid,

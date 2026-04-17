@@ -1224,6 +1224,10 @@ pub trait OrgStore: Send + Sync {
     /// have no repo access at all.
     async fn count_collaborator_repos(&self, user_id: &Uuid) -> Result<u64, StorageError>;
 
+    /// Returns the number of repos on which `user_id` holds the `admin` collaborator
+    /// role (i.e. repos they created/own).  Used to enforce per-user repo quotas.
+    async fn count_repos_owned_by_user(&self, user_id: &Uuid) -> Result<u64, StorageError>;
+
     // ── Repo collaborators ────────────────────────────────────────────────────
 
     /// Grants a user a role on a specific repository.

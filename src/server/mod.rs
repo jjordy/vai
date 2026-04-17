@@ -500,6 +500,11 @@ pub(crate) struct AppState {
     /// Set via `VAI_DEFAULT_USER_ROLE` (accepted values: `admin`, `write`, `read`).
     /// Defaults to `write` when the variable is absent or unrecognised.
     default_new_user_role: crate::storage::RepoRole,
+    /// Maximum number of repos a non-admin user may own (have `admin` collaborator role on).
+    ///
+    /// Set via `VAI_MAX_REPOS_PER_USER` env var. Defaults to 100.
+    /// Admin keys bypass this quota entirely.
+    max_repos_per_user: u64,
     /// In-memory sliding-window rate limiter shared across all requests.
     rate_limiter: Arc<RateLimiter>,
     /// Parsed CORS allowed origins.
@@ -1135,21 +1140,18 @@ struct ErrorBody {
 pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
+    /// Optional override body. When set, this JSON value is serialised as the
+    /// response body instead of the default `{"error": "..."}` shape.
+    custom_json: Option<serde_json::Value>,
 }
 
 impl ApiError {
     fn not_found(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: msg.into(),
-        }
+        Self { status: StatusCode::NOT_FOUND, message: msg.into(), custom_json: None }
     }
 
     fn conflict(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            message: msg.into(),
-        }
+        Self { status: StatusCode::CONFLICT, message: msg.into(), custom_json: None }
     }
 
     fn internal(msg: impl Into<String>) -> Self {
@@ -1158,51 +1160,52 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "Internal server error".to_string(),
+            custom_json: None,
         }
     }
 
     fn unauthorized(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: msg.into(),
-        }
+        Self { status: StatusCode::UNAUTHORIZED, message: msg.into(), custom_json: None }
     }
 
     fn bad_request(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: msg.into(),
-        }
+        Self { status: StatusCode::BAD_REQUEST, message: msg.into(), custom_json: None }
     }
 
     fn rate_limited(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            message: msg.into(),
-        }
+        Self { status: StatusCode::TOO_MANY_REQUESTS, message: msg.into(), custom_json: None }
     }
 
     fn forbidden(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            message: msg.into(),
-        }
+        Self { status: StatusCode::FORBIDDEN, message: msg.into(), custom_json: None }
     }
 
     fn payload_too_large(msg: impl Into<String>) -> Self {
+        Self { status: StatusCode::PAYLOAD_TOO_LARGE, message: msg.into(), custom_json: None }
+    }
+
+    /// Returns a 403 with the structured quota-exceeded body
+    /// `{"error":"repo quota exceeded","limit":<n>,"current":<n>}`.
+    fn quota_exceeded(limit: u64, current: u64) -> Self {
         Self {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: msg.into(),
+            status: StatusCode::FORBIDDEN,
+            message: "repo quota exceeded".to_string(),
+            custom_json: Some(serde_json::json!({
+                "error": "repo quota exceeded",
+                "limit": limit,
+                "current": current,
+            })),
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(ErrorBody {
-            error: self.message,
-        });
-        let mut resp = (self.status, body).into_response();
+        let mut resp = if let Some(json) = self.custom_json {
+            (self.status, Json(json)).into_response()
+        } else {
+            (self.status, Json(ErrorBody { error: self.message })).into_response()
+        };
         if self.status == StatusCode::TOO_MANY_REQUESTS {
             // Seconds remaining until the next hour boundary.
             let now = chrono::Utc::now();
@@ -3179,6 +3182,7 @@ impl utoipa::Modify for SecurityAddon {
             watcher::DiscoveryOutcomeResponse,
             admin::CreateRepoRequest,
             admin::RepoResponse,
+            admin::QuotaExceededBody,
             admin::CreateOrgRequest,
             admin::CreateUserRequest,
             admin::AddMemberRequest,
@@ -3536,6 +3540,7 @@ pub async fn start_for_testing(
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
         default_new_user_role: crate::storage::RepoRole::Write,
+        max_repos_per_user: 100,
     });
 
     let app = build_app(state);
@@ -3634,6 +3639,7 @@ pub async fn start_for_testing_pg(
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
         default_new_user_role: crate::storage::RepoRole::Write,
+        max_repos_per_user: 100,
     });
 
     let app = build_app(state);
@@ -3723,6 +3729,79 @@ pub async fn start_for_testing_pg_multi_repo(
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
         default_new_user_role: crate::storage::RepoRole::Write,
+        max_repos_per_user: 100,
+    });
+
+    let app = build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .with_graceful_shutdown(async {
+                shutdown_rx.await.ok();
+            })
+            .await
+            .ok();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    Ok((addr, shutdown_tx))
+}
+
+/// Same as [`start_for_testing_pg_multi_repo`] but with a custom per-user repo quota.
+///
+/// Used by integration tests that need to exercise the quota-exceeded code path
+/// without needing to create 100+ repos.
+pub async fn start_for_testing_pg_multi_repo_with_quota(
+    storage_root: &Path,
+    database_url: &str,
+    max_repos_per_user: u64,
+) -> Result<(SocketAddr, tokio::sync::oneshot::Sender<()>), ServerError> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let storage = crate::storage::StorageBackend::server_with_mem_fs(database_url, 5)
+        .await
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    let pg = match &storage {
+        crate::storage::StorageBackend::ServerWithMemFs(pg, _) => pg.clone(),
+        _ => unreachable!(),
+    };
+
+    let migrations_path = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+    pg.migrate(migrations_path)
+        .await
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    let vai_dir = storage_root.join(".vai");
+    let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
+    let state = Arc::new(AppState {
+        vai_dir,
+        repo_root: storage_root.to_path_buf(),
+        started_at: Instant::now(),
+        repo_name: "multi-repo-quota-test".to_string(),
+        vai_version: env!("CARGO_PKG_VERSION").to_string(),
+        event_tx,
+        event_seq: Arc::new(AtomicU64::new(0)),
+        event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
+        conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
+        repo_lock: Arc::new(Mutex::new(())),
+        storage_root: Some(storage_root.to_path_buf()),
+        storage,
+        admin_key: "vai_admin_test".to_string(),
+        jwt_service: Arc::new(crate::auth::jwt::JwtService::new(
+            "test-jwt-secret".to_string(),
+            None,
+            3600,
+        )),
+        rate_limiter: Arc::new(RateLimiter::new()),
+        cors_origins: vec![],
+        default_new_user_role: crate::storage::RepoRole::Write,
+        max_repos_per_user,
     });
 
     let app = build_app(state);
@@ -3798,6 +3877,7 @@ pub async fn start_for_testing_pg_with_mem_fs(
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
         default_new_user_role: crate::storage::RepoRole::Write,
+        max_repos_per_user: 100,
     });
 
     let app = build_app(state);
@@ -3965,6 +4045,12 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         }
     };
 
+    // Per-user repo quota: VAI_MAX_REPOS_PER_USER or 100.
+    let max_repos_per_user: u64 = std::env::var("VAI_MAX_REPOS_PER_USER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+
     let state = Arc::new(AppState {
         vai_dir: vai_dir.to_owned(),
         repo_root,
@@ -3983,6 +4069,7 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins,
         default_new_user_role,
+        max_repos_per_user,
     });
 
     let app = build_app(state);
@@ -4121,6 +4208,7 @@ mod tests {
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins: vec![],
             default_new_user_role: crate::storage::RepoRole::Write,
+            max_repos_per_user: 100,
         });
 
         let app = build_app(Arc::clone(&state));
@@ -6386,6 +6474,7 @@ mod tests {
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins: vec![],
             default_new_user_role: crate::storage::RepoRole::Write,
+            max_repos_per_user: 100,
         });
 
         let app = build_app(Arc::clone(&state));
@@ -6935,6 +7024,7 @@ mod tests {
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins,
             default_new_user_role: crate::storage::RepoRole::Write,
+            max_repos_per_user: 100,
         });
 
         let app = build_app(Arc::clone(&state));

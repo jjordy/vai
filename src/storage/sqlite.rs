@@ -1238,6 +1238,10 @@ impl OrgStore for SqliteStorage {
         Err(org_store_unsupported())
     }
 
+    async fn count_repos_owned_by_user(&self, _user_id: &Uuid) -> Result<u64, StorageError> {
+        Err(org_store_unsupported())
+    }
+
     async fn add_collaborator(
         &self,
         _repo_id: &Uuid,
