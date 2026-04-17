@@ -3112,6 +3112,9 @@ impl utoipa::Modify for SecurityAddon {
         auth::token_exchange_handler,
         auth::refresh_token_handler,
         auth::revoke_token_handler,
+        auth::create_device_code_handler,
+        auth::poll_device_code_handler,
+        auth::authorize_device_code_handler,
         admin::create_key_handler,
         admin::list_keys_handler,
         admin::revoke_key_handler,
@@ -3200,6 +3203,9 @@ impl utoipa::Modify for SecurityAddon {
             auth::RefreshRequest,
             auth::RefreshResponse,
             auth::RevokeRequest,
+            auth::DeviceCodeResponse,
+            auth::DeviceCodeStatusResponse,
+            auth::AuthorizeDeviceCodeRequest,
             admin::CreateKeyRequest,
             admin::CreateKeyResponse,
             admin::ApiKeyResponse,
@@ -3309,7 +3315,10 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/auth/token", post(auth::token_exchange_handler))
         // Refresh and revoke use the refresh token itself as the credential.
         .route("/api/auth/refresh", post(auth::refresh_token_handler))
-        .route("/api/auth/revoke", post(auth::revoke_token_handler));
+        .route("/api/auth/revoke", post(auth::revoke_token_handler))
+        // CLI device code flow (PRD 26 V-3) — unauthenticated endpoints.
+        .route("/api/auth/cli-device", post(auth::create_device_code_handler))
+        .route("/api/auth/cli-device/:code", get(auth::poll_device_code_handler));
 
     // Routes requiring `Authorization: Bearer <key>`.
     let protected = Router::new()
@@ -3336,6 +3345,8 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/keys", get(admin::list_keys_handler))
         .route("/api/keys", delete(admin::bulk_revoke_keys_handler))
         .route("/api/keys/:id", delete(admin::revoke_key_handler))
+        // CLI device code authorization (authenticated — requires a user identity).
+        .route("/api/auth/cli-device/authorize", post(auth::authorize_device_code_handler))
         // Repository collaborator endpoints (PRD 10.3).
         .route(
             "/api/orgs/:org/repos/:repo/collaborators",
@@ -5167,7 +5178,7 @@ mod tests {
         assert_eq!(body["version"]["version_id"], "v2");
         assert_eq!(body["version"]["intent"], "add world function");
         assert!(
-            body["file_changes"].as_array().unwrap().len() > 0,
+            !body["file_changes"].as_array().unwrap().is_empty(),
             "v2 should have file changes"
         );
 

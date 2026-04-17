@@ -1,8 +1,8 @@
 //! AuthStore implementation for PostgresStorage.
 //!
 //! Handles API key creation, validation (with debounced `last_used_at` updates),
-//! revocation, session validation via the Better Auth session table, and
-//! refresh token management.
+//! revocation, session validation via the Better Auth session table, refresh
+//! token management, and CLI device code flow.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -10,7 +10,7 @@ use sqlx::Row;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use super::super::{AuthStore, StorageError};
+use super::super::{AuthStore, DeviceCodeStatus, StorageError};
 use super::{hash_token, random_token, PostgresStorage};
 use crate::auth::ApiKey;
 
@@ -279,6 +279,97 @@ impl AuthStore for PostgresStorage {
         }
         Ok(())
     }
+
+    async fn create_device_code(&self) -> Result<String, StorageError> {
+        let code = generate_device_code();
+        let expires_at = Utc::now() + chrono::Duration::minutes(10);
+
+        sqlx::query(
+            "INSERT INTO cli_device_codes (code, expires_at) VALUES ($1, $2)",
+        )
+        .bind(&code)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(code)
+    }
+
+    async fn poll_device_code(&self, code: &str) -> Result<DeviceCodeStatus, StorageError> {
+        // Opportunistic cleanup of all expired codes.
+        let _ = sqlx::query("DELETE FROM cli_device_codes WHERE expires_at < now()")
+            .execute(&self.pool)
+            .await;
+
+        let row = sqlx::query(
+            "SELECT api_key FROM cli_device_codes \
+             WHERE code = $1 AND expires_at >= now()",
+        )
+        .bind(code)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .ok_or_else(|| StorageError::NotFound("device code not found or expired".to_string()))?;
+
+        let api_key: Option<String> = row.get("api_key");
+
+        match api_key {
+            None => Ok(DeviceCodeStatus::Pending),
+            Some(key) => {
+                // Delete the row so the key is revealed only once.
+                let _ = sqlx::query("DELETE FROM cli_device_codes WHERE code = $1")
+                    .bind(code)
+                    .execute(&self.pool)
+                    .await;
+                Ok(DeviceCodeStatus::Authorized { api_key: key })
+            }
+        }
+    }
+
+    async fn authorize_device_code(
+        &self,
+        code: &str,
+        user_id: &Uuid,
+        api_key: &str,
+    ) -> Result<(), StorageError> {
+        let result = sqlx::query(
+            "UPDATE cli_device_codes \
+             SET user_id = $1, api_key = $2 \
+             WHERE code = $3 AND expires_at >= now() AND api_key IS NULL",
+        )
+        .bind(user_id)
+        .bind(api_key)
+        .bind(code)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(StorageError::NotFound(
+                "device code not found, expired, or already authorized".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Generates a CLI device code in `XXXX-YYYY` format.
+///
+/// Each character is drawn from `[A-Z0-9]` (36 values) using random UUID
+/// bytes so the code has roughly 41 bits of entropy — suitable for a 10-minute TTL.
+fn generate_device_code() -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let bytes = *Uuid::new_v4().as_bytes();
+    let mut code = String::with_capacity(9);
+    for i in 0..4 {
+        code.push(CHARS[bytes[i] as usize % CHARS.len()] as char);
+    }
+    code.push('-');
+    for i in 4..8 {
+        code.push(CHARS[bytes[i] as usize % CHARS.len()] as char);
+    }
+    code
 }
 
 fn row_to_api_key(row: sqlx::postgres::PgRow) -> Result<ApiKey, StorageError> {

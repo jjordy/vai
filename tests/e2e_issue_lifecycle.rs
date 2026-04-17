@@ -17,7 +17,6 @@ use vai::escalation::{
 };
 use vai::event_log::EventLog;
 use vai::issue::{AgentSource, IssueFilter, IssuePriority, IssueStatus, IssueStore};
-use serde_json;
 use vai::merge;
 use vai::repo;
 use vai::work_queue;
@@ -187,7 +186,7 @@ fn test_full_issue_lifecycle() {
     );
     // With no active workspaces, all issues should be available.
     assert!(
-        queue.available_work.len() >= 1,
+        !queue.available_work.is_empty(),
         "at least some issues should be available with no active workspaces"
     );
 

@@ -1847,9 +1847,9 @@ mod tests {
         let mut tar_bytes = Vec::with_capacity(512 + padded_size + 1024);
         tar_bytes.extend_from_slice(&header);
         tar_bytes.extend_from_slice(data);
-        tar_bytes.extend(std::iter::repeat(0u8).take(padded_size - data.len()));
+        tar_bytes.extend(vec![0u8; padded_size - data.len()]);
         // Two 512-byte zero blocks mark end-of-archive.
-        tar_bytes.extend(std::iter::repeat(0u8).take(1024));
+        tar_bytes.extend(vec![0u8; 1024]);
 
         // Compress with gzip.
         let mut enc = GzEncoder::new(Vec::new(), Compression::fast());

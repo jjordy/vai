@@ -951,6 +951,50 @@ pub trait AuthStore: Send + Sync {
     ///
     /// Only meaningful in Postgres (server) mode; SQLite mode returns an error.
     async fn revoke_refresh_token(&self, token: &str) -> Result<(), StorageError>;
+
+    /// Creates a new pending CLI device code with a 10-minute TTL.
+    ///
+    /// Code format: `XXXX-YYYY` — 4 uppercase alphanumeric characters, a
+    /// dash, then 4 more.  Only meaningful in Postgres (server) mode.
+    async fn create_device_code(&self) -> Result<String, StorageError>;
+
+    /// Polls the status of a CLI device code.
+    ///
+    /// Performs opportunistic cleanup of expired rows on each call.
+    /// Returns `StorageError::NotFound` if the code doesn't exist or has expired.
+    /// On the first call after authorization, returns
+    /// `DeviceCodeStatus::Authorized` and atomically deletes the row so that
+    /// the API key is revealed only once.
+    async fn poll_device_code(&self, code: &str) -> Result<DeviceCodeStatus, StorageError>;
+
+    /// Records authorization for a pending device code.
+    ///
+    /// Updates the code row with the authorizing user's UUID and the
+    /// plaintext API key minted for them.
+    /// Returns `StorageError::NotFound` if the code doesn't exist or has expired.
+    async fn authorize_device_code(
+        &self,
+        code: &str,
+        user_id: &Uuid,
+        api_key: &str,
+    ) -> Result<(), StorageError>;
+}
+
+// ── DeviceCodeStatus ──────────────────────────────────────────────────────────
+
+/// Status returned when polling a CLI device code via
+/// `GET /api/auth/cli-device/:code`.
+#[derive(Debug, Clone)]
+pub enum DeviceCodeStatus {
+    /// The code exists but has not yet been authorized by the user.
+    Pending,
+    /// The code was authorized; `api_key` is the plaintext key to hand to the
+    /// CLI.  The row is deleted on first retrieval — subsequent polls return
+    /// `StorageError::NotFound`.
+    Authorized {
+        /// Plaintext API key (shown only once).
+        api_key: String,
+    },
 }
 
 // ── RBAC types ────────────────────────────────────────────────────────────────

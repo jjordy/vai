@@ -1,18 +1,24 @@
-//! Auth token exchange, refresh, and revocation handlers (PRD 18).
+//! Auth token exchange, refresh, revocation, and CLI device code flow handlers
+//! (PRD 18 / PRD 26 V-3).
 //!
 //! Endpoints:
 //!   - `POST /api/auth/token` — exchange credentials for a short-lived JWT
 //!   - `POST /api/auth/refresh` — exchange a refresh token for a new access token
 //!   - `POST /api/auth/revoke` — revoke a refresh token
+//!   - `POST /api/auth/cli-device` — begin a CLI device code session
+//!   - `GET  /api/auth/cli-device/:code` — poll device code status (CLI polls this)
+//!   - `POST /api/auth/cli-device/authorize` — authorize a pending device code
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::Extension;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::{ApiError, AppState};
+use super::{AgentIdentity, ApiError, AppState};
 
 // ── Auth token exchange (PRD 18) ──────────────────────────────────────────────
 
@@ -399,4 +405,184 @@ pub(super) async fn revoke_token_handler(
     tracing::info!(event = "auth.token_revoked", "refresh token revoked");
 
     Ok(axum::http::StatusCode::OK)
+}
+
+// ── CLI device code flow (PRD 26 V-3) ─────────────────────────────────────────
+
+/// Response body for `POST /api/auth/cli-device`.
+#[derive(Debug, Serialize, ToSchema)]
+pub(super) struct DeviceCodeResponse {
+    /// The short-lived device code to display to the user (`XXXX-YYYY` format).
+    pub code: String,
+    /// URL where the user should enter the code in their browser.
+    pub verification_url: String,
+    /// Recommended polling interval in seconds (always 3).
+    pub poll_interval: u32,
+}
+
+/// Response body for `GET /api/auth/cli-device/:code`.
+#[derive(Debug, Serialize, ToSchema)]
+pub(super) struct DeviceCodeStatusResponse {
+    /// One of `"pending"`, `"authorized"`, or `"expired"`.
+    pub status: String,
+    /// Plaintext API key. Present only when `status` is `"authorized"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+/// Request body for `POST /api/auth/cli-device/authorize`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub(super) struct AuthorizeDeviceCodeRequest {
+    /// The device code to authorize (displayed to the user in the CLI).
+    pub code: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/auth/cli-device",
+    responses(
+        (status = 200, description = "Device code created", body = DeviceCodeResponse),
+        (status = 500, description = "Internal error", body = super::ErrorBody),
+    ),
+    tag = "auth"
+)]
+/// `POST /api/auth/cli-device` — begins a CLI device code session.
+///
+/// Unauthenticated. Creates a pending device code with a 10-minute TTL.
+/// The CLI should display `code` to the user, direct them to `verification_url`,
+/// then poll `GET /api/auth/cli-device/:code` every `poll_interval` seconds
+/// until it receives `{"status":"authorized","api_key":"..."}`.
+pub(super) async fn create_device_code_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<DeviceCodeResponse>, ApiError> {
+    let auth = state.storage.auth();
+    let code = auth.create_device_code().await.map_err(ApiError::from)?;
+
+    let public_url = std::env::var("VAI_PUBLIC_URL")
+        .unwrap_or_else(|_| "http://localhost:7865".to_string());
+    let verification_url = format!("{public_url}/cli");
+
+    tracing::info!(event = "auth.device_code_created", code = %code, "CLI device code created");
+
+    Ok(Json(DeviceCodeResponse {
+        code,
+        verification_url,
+        poll_interval: 3,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/auth/cli-device/{code}",
+    params(
+        ("code" = String, Path, description = "The device code to poll")
+    ),
+    responses(
+        (status = 200, description = "Device code status", body = DeviceCodeStatusResponse),
+        (status = 404, description = "Code not found or expired", body = super::ErrorBody),
+    ),
+    tag = "auth"
+)]
+/// `GET /api/auth/cli-device/:code` — polls the status of a CLI device code.
+///
+/// Unauthenticated. Returns `{"status":"pending"}` while waiting, or
+/// `{"status":"authorized","api_key":"..."}` once the user has authorized the
+/// code.  Returns 404 if the code does not exist or has expired.
+///
+/// The API key is revealed exactly once — the row is deleted on the first
+/// authorized response.
+pub(super) async fn poll_device_code_handler(
+    State(state): State<Arc<AppState>>,
+    Path(code): Path<String>,
+) -> Result<Json<DeviceCodeStatusResponse>, ApiError> {
+    let auth = state.storage.auth();
+
+    let status = auth.poll_device_code(&code).await.map_err(|e| match e {
+        crate::storage::StorageError::NotFound(_) => {
+            ApiError::not_found("device code not found or expired")
+        }
+        other => ApiError::from(other),
+    })?;
+
+    match status {
+        crate::storage::DeviceCodeStatus::Pending => {
+            Ok(Json(DeviceCodeStatusResponse {
+                status: "pending".to_string(),
+                api_key: None,
+            }))
+        }
+        crate::storage::DeviceCodeStatus::Authorized { api_key } => {
+            tracing::info!(
+                event = "auth.device_code_authorized",
+                "CLI device code key retrieved — row deleted"
+            );
+            Ok(Json(DeviceCodeStatusResponse {
+                status: "authorized".to_string(),
+                api_key: Some(api_key),
+            }))
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/auth/cli-device/authorize",
+    request_body = AuthorizeDeviceCodeRequest,
+    responses(
+        (status = 200, description = "Device code authorized"),
+        (status = 400, description = "Bad request", body = super::ErrorBody),
+        (status = 401, description = "Unauthorized", body = super::ErrorBody),
+        (status = 404, description = "Code not found or expired", body = super::ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "auth"
+)]
+/// `POST /api/auth/cli-device/authorize` — authorizes a pending device code.
+///
+/// Authenticated (requires a valid Better Auth session or API key with a
+/// `user_id`). Called by the dashboard's `/cli` page after the user enters the
+/// code.  Mints a new write-scoped API key for the user and associates it with
+/// the pending code.  The CLI retrieves the key by polling
+/// `GET /api/auth/cli-device/:code`.
+pub(super) async fn authorize_device_code_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AuthorizeDeviceCodeRequest>,
+) -> Result<StatusCode, ApiError> {
+    let user_id = identity.user_id.ok_or_else(|| {
+        ApiError::unauthorized("this request must be authenticated as a specific user")
+    })?;
+
+    // Mint a new API key for the user with write-level access.
+    let auth = state.storage.auth();
+    let (_key_meta, plaintext) = auth
+        .create_key(
+            None,
+            "CLI (device code)",
+            Some(&user_id),
+            Some("write"),
+            Some("cli"),
+            None,
+        )
+        .await
+        .map_err(ApiError::from)?;
+
+    // Record the authorization — the CLI will retrieve the key on next poll.
+    auth.authorize_device_code(&body.code, &user_id, &plaintext)
+        .await
+        .map_err(|e| match e {
+            crate::storage::StorageError::NotFound(_) => {
+                ApiError::not_found("device code not found, expired, or already authorized")
+            }
+            other => ApiError::from(other),
+        })?;
+
+    tracing::info!(
+        event = "auth.device_code_authorized",
+        user_id = %user_id,
+        code = %body.code,
+        "CLI device code authorized"
+    );
+
+    Ok(StatusCode::OK)
 }

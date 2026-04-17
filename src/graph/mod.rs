@@ -1992,14 +1992,14 @@ export default function App() {
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let kinds: Vec<&EntityKind> = entities.iter().map(|e| &e.kind).collect();
 
-        assert!(names.iter().any(|&n| n == "User"), "missing User interface");
-        assert!(names.iter().any(|&n| n == "UserId"), "missing UserId type alias");
-        assert!(names.iter().any(|&n| n == "Role"), "missing Role enum");
-        assert!(names.iter().any(|&n| n == "UserService"), "missing UserService class");
-        assert!(names.iter().any(|&n| n == "getUser"), "missing getUser method");
-        assert!(names.iter().any(|&n| n == "addUser"), "missing addUser method");
-        assert!(names.iter().any(|&n| n == "formatName"), "missing formatName function");
-        assert!(names.iter().any(|&n| n == "useCounter"), "missing useCounter hook");
+        assert!(names.contains(&"User"), "missing User interface");
+        assert!(names.contains(&"UserId"), "missing UserId type alias");
+        assert!(names.contains(&"Role"), "missing Role enum");
+        assert!(names.contains(&"UserService"), "missing UserService class");
+        assert!(names.contains(&"getUser"), "missing getUser method");
+        assert!(names.contains(&"addUser"), "missing addUser method");
+        assert!(names.contains(&"formatName"), "missing formatName function");
+        assert!(names.contains(&"useCounter"), "missing useCounter hook");
 
         assert!(kinds.contains(&&EntityKind::Interface), "missing Interface kind");
         assert!(kinds.contains(&&EntityKind::TypeAlias), "missing TypeAlias kind");
@@ -2021,10 +2021,10 @@ export default function App() {
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let kinds: Vec<&EntityKind> = entities.iter().map(|e| &e.kind).collect();
 
-        assert!(names.iter().any(|&n| n == "Header"), "missing Header component");
-        assert!(names.iter().any(|&n| n == "App"), "missing App component");
-        assert!(names.iter().any(|&n| n == "useTheme"), "missing useTheme hook");
-        assert!(names.iter().any(|&n| n == "Props"), "missing Props interface");
+        assert!(names.contains(&"Header"), "missing Header component");
+        assert!(names.contains(&"App"), "missing App component");
+        assert!(names.contains(&"useTheme"), "missing useTheme hook");
+        assert!(names.contains(&"Props"), "missing Props interface");
 
         assert!(kinds.contains(&&EntityKind::Component), "missing Component kind");
         assert!(kinds.contains(&&EntityKind::Hook), "missing Hook kind");

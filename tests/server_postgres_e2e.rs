@@ -95,7 +95,7 @@ async fn test_complete_agent_workflow() {
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "e2e-workflow" }))
+        .json(&serde_json::json!({ "name": format!("e2e-workflow-{}", unique_suffix()) }))
         .send()
         .await
         .unwrap();
@@ -335,7 +335,7 @@ async fn test_workspace_discard() {
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "e2e-discard" }))
+        .json(&serde_json::json!({ "name": format!("e2e-discard-{}", unique_suffix()) }))
         .send()
         .await
         .unwrap();
@@ -425,7 +425,7 @@ async fn test_websocket_events_fire() {
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "e2e-ws" }))
+        .json(&serde_json::json!({ "name": format!("e2e-ws-{}", unique_suffix()) }))
         .send()
         .await
         .unwrap();
@@ -459,8 +459,7 @@ async fn test_websocket_events_fire() {
         serde_json::json!({
             "subscribe": { "event_types": [], "paths": [], "entities": [], "workspaces": [] }
         })
-        .to_string()
-        .into(),
+        .to_string(),
     ))
     .await
     .expect("subscribe send failed");
@@ -562,7 +561,7 @@ async fn test_concurrent_agents() {
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "e2e-concurrent" }))
+        .json(&serde_json::json!({ "name": format!("e2e-concurrent-{}", unique_suffix()) }))
         .send()
         .await
         .unwrap();
@@ -686,10 +685,11 @@ async fn test_workspace_file_download_before_submit() {
     let admin = "vai_admin_test";
 
     // Create repo.
+    let repo_name = format!("e2e-file-download-{}", unique_suffix());
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "e2e-file-download" }))
+        .json(&serde_json::json!({ "name": repo_name }))
         .send()
         .await
         .unwrap();
@@ -807,10 +807,11 @@ async fn test_version_diff_via_storage() {
     let admin = "vai_admin_test";
 
     // Create repo.
+    let repo_name = format!("e2e-version-diff-{}", unique_suffix());
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "e2e-version-diff" }))
+        .json(&serde_json::json!({ "name": repo_name }))
         .send()
         .await
         .unwrap();
@@ -950,7 +951,7 @@ async fn test_submit_updates_current_files_match() {
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "e2e-submit-files-match" }))
+        .json(&serde_json::json!({ "name": format!("e2e-submit-files-match-{}", unique_suffix()) }))
         .send()
         .await
         .unwrap();
@@ -1066,10 +1067,11 @@ async fn test_submit_with_deletions_files_absent() {
     let admin = "vai_admin_test";
 
     // Create repo.
+    let repo_name = format!("e2e-submit-deletions-{}", unique_suffix());
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "e2e-submit-deletions" }))
+        .json(&serde_json::json!({ "name": repo_name }))
         .send()
         .await
         .unwrap();
@@ -1242,7 +1244,7 @@ async fn test_sequential_submits_current_reflects_both() {
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "e2e-sequential-submits" }))
+        .json(&serde_json::json!({ "name": format!("e2e-sequential-submits-{}", unique_suffix()) }))
         .send()
         .await
         .unwrap();
@@ -1372,7 +1374,7 @@ async fn test_work_queue_link_blocking() {
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "link-blocking-test" }))
+        .json(&serde_json::json!({ "name": format!("link-blocking-test-{}", unique_suffix()) }))
         .send()
         .await
         .unwrap();
@@ -1604,7 +1606,7 @@ async fn test_deletion_round_trip() {
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "e2e-deletion-roundtrip" }))
+        .json(&serde_json::json!({ "name": format!("e2e-deletion-roundtrip-{}", unique_suffix()) }))
         .send()
         .await
         .unwrap();
@@ -1976,7 +1978,7 @@ async fn test_complete_agent_workflow_readonly_repo_root() {
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "e2e-readonly-root" }))
+        .json(&serde_json::json!({ "name": format!("e2e-readonly-root-{}", unique_suffix()) }))
         .send()
         .await
         .unwrap();
@@ -2145,7 +2147,7 @@ async fn test_comment_author_type() {
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "comment-author-type-test" }))
+        .json(&serde_json::json!({ "name": format!("comment-author-type-test-{}", unique_suffix()) }))
         .send()
         .await
         .unwrap();
@@ -2245,7 +2247,7 @@ async fn test_issue_attachments() {
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "attachment-test-repo" }))
+        .json(&serde_json::json!({ "name": format!("attachment-test-repo-{}", unique_suffix()) }))
         .send()
         .await
         .unwrap();
@@ -2441,10 +2443,11 @@ async fn test_delta_tarball_upload() {
     let admin = "vai_admin_test";
 
     // ── Create repo ───────────────────────────────────────────────────────────
+    let repo_name = format!("delta-test-{}", unique_suffix());
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "delta-test" }))
+        .json(&serde_json::json!({ "name": repo_name }))
         .send()
         .await
         .unwrap();
@@ -2619,7 +2622,7 @@ async fn test_stateless_server_lifecycle() {
     let resp = client
         .post(format!("{base}/api/repos"))
         .bearer_auth(admin)
-        .json(&serde_json::json!({ "name": "stateless-test" }))
+        .json(&serde_json::json!({ "name": format!("stateless-test-{}", unique_suffix()) }))
         .send()
         .await
         .unwrap();
@@ -2905,8 +2908,195 @@ async fn test_non_admin_repo_quota_exceeded() {
     shutdown_tx.send(()).ok();
 }
 
+// ── CLI device code flow ──────────────────────────────────────────────────────
+
+/// Full device code flow:
+///
+/// 1. `POST /api/auth/cli-device` — create a pending code (unauthenticated).
+/// 2. `GET /api/auth/cli-device/:code` — poll while pending.
+/// 3. `POST /api/auth/cli-device/authorize` — authorize (authenticated user).
+/// 4. `GET /api/auth/cli-device/:code` — poll returns authorized + api_key.
+/// 5. `GET /api/auth/cli-device/:code` — second poll returns 404 (key consumed).
+/// 6. Verify the returned api_key is usable against another endpoint.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cli_device_code_flow() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+
+    // Create a user to act as the dashboard-side authorizer.
+    let resp = client
+        .post(format!("{base}/api/users"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("DevUser-{sfx}"),
+            "email": format!("devuser-{sfx}@example.com"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let user: serde_json::Value = resp.json().await.unwrap();
+    let user_id = user["id"].as_str().unwrap().to_string();
+
+    // Mint an API key for the user so they can call the authorize endpoint.
+    let resp = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("devuser-key-{sfx}"),
+            "for_user_id": user_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let key_resp: serde_json::Value = resp.json().await.unwrap();
+    let user_token = key_resp["token"].as_str().unwrap().to_string();
+
+    // 1. Create a device code (unauthenticated).
+    let resp = client
+        .post(format!("{base}/api/auth/cli-device"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "create device code: {}", resp.text().await.unwrap_or_default());
+    let dc: serde_json::Value = resp.json().await.unwrap();
+    let code = dc["code"].as_str().unwrap().to_string();
+    assert!(
+        dc["verification_url"].as_str().is_some(),
+        "verification_url missing"
+    );
+    assert_eq!(dc["poll_interval"].as_u64(), Some(3));
+    // Code format: XXXX-YYYY (4 uppercase alphanumeric, dash, 4 more)
+    assert_eq!(code.len(), 9, "code should be 9 chars");
+    assert_eq!(&code[4..5], "-", "code should have dash at position 4");
+
+    // 2. Poll while pending — should return {"status":"pending"}.
+    let resp = client
+        .get(format!("{base}/api/auth/cli-device/{code}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let status: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status["status"].as_str(), Some("pending"));
+    assert!(status["api_key"].is_null(), "api_key should be absent when pending");
+
+    // 3. Authorize the code as the user (simulates dashboard /cli page).
+    let resp = client
+        .post(format!("{base}/api/auth/cli-device/authorize"))
+        .bearer_auth(&user_token)
+        .json(&serde_json::json!({ "code": code }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "authorize: {}", resp.text().await.unwrap_or_default());
+
+    // 4. Poll again — should now return authorized with an api_key.
+    let resp = client
+        .get(format!("{base}/api/auth/cli-device/{code}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let status: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status["status"].as_str(), Some("authorized"));
+    let minted_key = status["api_key"].as_str().expect("api_key should be present after auth");
+
+    // 5. Second poll must return 404 — the key is consumed on first reveal.
+    let resp = client
+        .get(format!("{base}/api/auth/cli-device/{code}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "second poll should return 404 after key is consumed");
+
+    // 6. Verify the returned API key works by calling /api/keys.
+    let resp = client
+        .get(format!("{base}/api/keys"))
+        .bearer_auth(minted_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "minted key should be usable: {}", resp.text().await.unwrap_or_default());
+
+    shutdown_tx.send(()).ok();
+}
+
+/// Device code returns 404 for unknown or expired codes.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cli_device_code_not_found() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // Poll a code that was never created.
+    let resp = client
+        .get(format!("{base}/api/auth/cli-device/FAKE-CODE"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "non-existent code should return 404");
+
+    // Authorize with a non-existent code must also return 404.
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+    let resp_user = client
+        .post(format!("{base}/api/users"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("Ghost-{sfx}"),
+            "email": format!("ghost-{sfx}@example.com"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_user.status(), 201);
+    let user: serde_json::Value = resp_user.json().await.unwrap();
+    let user_id = user["id"].as_str().unwrap();
+    let resp_key = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("ghost-key-{sfx}"),
+            "for_user_id": user_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_key.status(), 201);
+    let key_resp: serde_json::Value = resp_key.json().await.unwrap();
+    let user_token = key_resp["token"].as_str().unwrap();
+
+    let resp = client
+        .post(format!("{base}/api/auth/cli-device/authorize"))
+        .bearer_auth(user_token)
+        .json(&serde_json::json!({ "code": "FAKE-CODE" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "authorizing non-existent code should return 404");
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Extracts the content of a file from a gzip tarball by path suffix.
-fn extract_file_from_tarball<'a>(bytes: &'a [u8], path_suffix: &str) -> Option<Vec<u8>> {
+fn extract_file_from_tarball(bytes: &[u8], path_suffix: &str) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
     let decoder = GzDecoder::new(std::io::Cursor::new(bytes));

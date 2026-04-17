@@ -671,10 +671,9 @@ mod tests {
         let mut store = MergePatternStore::open(dir.path()).unwrap();
 
         // Build up a promoted pattern.
-        let mut last_conflict_id = Uuid::new_v4();
         for _ in 0..11 {
             let mut r = make_conflict(3, "function body conflict in test module");
-            last_conflict_id = r.conflict_id;
+            let _ = r.conflict_id;
             r.resolved = true;
             store.record_resolution(&r, "manual", false).unwrap();
         }

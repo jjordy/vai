@@ -987,6 +987,32 @@ impl AuthStore for SqliteStorage {
         ))
     }
 
+    async fn create_device_code(&self) -> Result<String, StorageError> {
+        Err(StorageError::Database(
+            "CLI device code flow is not supported in local (SQLite) mode".to_string(),
+        ))
+    }
+
+    async fn poll_device_code(
+        &self,
+        _code: &str,
+    ) -> Result<crate::storage::DeviceCodeStatus, StorageError> {
+        Err(StorageError::Database(
+            "CLI device code flow is not supported in local (SQLite) mode".to_string(),
+        ))
+    }
+
+    async fn authorize_device_code(
+        &self,
+        _code: &str,
+        _user_id: &Uuid,
+        _api_key: &str,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "CLI device code flow is not supported in local (SQLite) mode".to_string(),
+        ))
+    }
+
     async fn revoke_keys_by_repo(&self, _repo_id: &Uuid) -> Result<u64, StorageError> {
         Err(StorageError::Database(
             "bulk revocation by repo is not supported in local (SQLite) mode".to_string(),

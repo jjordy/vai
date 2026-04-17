@@ -1029,7 +1029,7 @@ mod tests {
     use super::truncate;
     use tempfile::TempDir;
 
-    use crate::{graph::GraphSnapshot, repo, version, workspace};
+    use crate::{graph::GraphSnapshot, repo, version};
 
     /// Init a repo, create two workspaces, then verify the status data is correct.
     #[test]
