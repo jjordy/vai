@@ -191,26 +191,28 @@ $RECENT_COMMITS
     ERRORS=""
     ALL_PASSED=true
 
+    # `set -e` would exit the script on a failing $(...) command substitution
+    # before `$?` could be captured, so each quality check is wrapped in an
+    # if-construct which suspends set -e for the failure path.
+
     # 1. Clippy (full features)
     echo "  [1/3] Clippy..."
-    CLIPPY_OUTPUT=$(docker exec "$CONTAINER_NAME" bash -c "cd /home/agent/repo && cargo clippy --features full -- -D warnings 2>&1")
-    CLIPPY_EXIT=$?
-    if [ $CLIPPY_EXIT -ne 0 ]; then
+    if CLIPPY_OUTPUT=$(docker exec "$CONTAINER_NAME" bash -c "cd /home/agent/repo && cargo clippy --features full -- -D warnings 2>&1"); then
+      echo "  PASS"
+    else
       ALL_PASSED=false
       ERRORS="${ERRORS}
 === cargo clippy --features full ===
 ${CLIPPY_OUTPUT}
 "
       echo "  FAIL"
-    else
-      echo "  PASS"
     fi
 
     # 2. Test (full features)
     echo "  [2/3] Tests (full features)..."
-    TEST_OUTPUT=$(docker exec "$CONTAINER_NAME" bash -c "cd /home/agent/repo && cargo test --features full 2>&1")
-    TEST_EXIT=$?
-    if [ $TEST_EXIT -ne 0 ]; then
+    if TEST_OUTPUT=$(docker exec "$CONTAINER_NAME" bash -c "cd /home/agent/repo && cargo test --features full 2>&1"); then
+      echo "  PASS"
+    else
       ALL_PASSED=false
       TEST_TAIL=$(echo "$TEST_OUTPUT" | tail -50)
       ERRORS="${ERRORS}
@@ -218,15 +220,13 @@ ${CLIPPY_OUTPUT}
 ${TEST_TAIL}
 "
       echo "  FAIL"
-    else
-      echo "  PASS"
     fi
 
     # 3. Test (CLI only)
     echo "  [3/3] Tests (CLI only)..."
-    CLI_OUTPUT=$(docker exec "$CONTAINER_NAME" bash -c "cd /home/agent/repo && cargo test 2>&1")
-    CLI_EXIT=$?
-    if [ $CLI_EXIT -ne 0 ]; then
+    if CLI_OUTPUT=$(docker exec "$CONTAINER_NAME" bash -c "cd /home/agent/repo && cargo test 2>&1"); then
+      echo "  PASS"
+    else
       ALL_PASSED=false
       CLI_TAIL=$(echo "$CLI_OUTPUT" | tail -50)
       ERRORS="${ERRORS}
@@ -234,8 +234,6 @@ ${TEST_TAIL}
 ${CLI_TAIL}
 "
       echo "  FAIL"
-    else
-      echo "  PASS"
     fi
 
     if [ "$ALL_PASSED" = true ]; then
