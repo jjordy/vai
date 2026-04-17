@@ -20,16 +20,13 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            archive: tar.gz
+            use_cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
-            archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            archive: tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +37,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: matrix.use_cross
         run: cargo install cross --locked
 
       - name: Cache cargo registry
@@ -55,7 +52,17 @@ jobs:
             ${{ runner.os }}-${{ matrix.target }}-cargo-release-
 
       - name: Build CLI-only release binary
-        run: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'cross' || 'cargo' }} build --release --target ${{ matrix.target }} ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '--features vendored-openssl' || '' }}
+        run: |
+          FEATURES="cli"
+          # vendored-openssl is needed when cross-compiling to aarch64-linux
+          # because reqwest's native-tls requires a system OpenSSL that cross can't
+          # otherwise find. It does not add server functionality.
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            FEATURES="cli,vendored-openssl"
+            cross build --release --target ${{ matrix.target }} --features "$FEATURES"
+          else
+            cargo build --release --target ${{ matrix.target }} --features "$FEATURES"
+          fi
 
       - name: Package binary
         shell: bash
@@ -65,16 +72,13 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf "../../../${ARCHIVE}" vai
           cd ../../..
-          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: vai-${{ matrix.target }}
-          path: |
-            vai-*.tar.gz
-            vai-*.tar.gz.sha256
+          path: vai-*.tar.gz
 
   release:
     name: Create Release
@@ -89,10 +93,16 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum vai-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
             artifacts/vai-*.tar.gz
-            artifacts/vai-*.tar.gz.sha256
+            artifacts/SHA256SUMS
