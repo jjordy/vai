@@ -143,6 +143,24 @@ impl GraphStore for PostgresStorage {
         rows.into_iter().map(row_to_relationship).collect()
     }
 
+    async fn get_inverse_relationships(
+        &self,
+        repo_id: &Uuid,
+        to_entity_id: &str,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT id, kind, from_entity_id, to_entity_id \
+             FROM relationships WHERE repo_id = $1 AND to_entity_id = $2",
+        )
+        .bind(repo_id)
+        .bind(to_entity_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        rows.into_iter().map(row_to_relationship).collect()
+    }
+
     async fn clear_file(&self, repo_id: &Uuid, file_path: &str) -> Result<(), StorageError> {
         // Remove relationships whose source entity lives in this file.
         sqlx::query(

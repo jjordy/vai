@@ -133,11 +133,104 @@ pub(super) struct BlastRadiusResponse {
 /// Parseable file extensions for the semantic graph engine.
 const GRAPH_PARSEABLE_EXTENSIONS: &[&str] = &["rs", "ts", "js", "tsx", "jsx"];
 
-/// Opens the graph snapshot for the repository.
-fn open_graph(vai_dir: &std::path::Path) -> Result<crate::graph::GraphSnapshot, ApiError> {
-    let db_path = vai_dir.join("graph").join("snapshot.db");
-    crate::graph::GraphSnapshot::open(&db_path)
-        .map_err(|e| ApiError::internal(format!("graph error: {e}")))
+/// Forward BFS over outgoing relationship edges via the [`GraphStore`] trait.
+///
+/// Starting from `seed_ids`, follows outgoing edges up to `max_hops` deep.
+/// Returns all reachable entities (including seeds) and the connecting
+/// relationships between them.
+async fn bfs_forward(
+    graph: &dyn crate::storage::GraphStore,
+    repo_id: &uuid::Uuid,
+    seed_ids: &[&str],
+    max_hops: usize,
+) -> Result<(Vec<crate::graph::Entity>, Vec<crate::graph::Relationship>), ApiError> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut entities: HashMap<String, crate::graph::Entity> = HashMap::new();
+    let mut relationships: Vec<crate::graph::Relationship> = Vec::new();
+
+    for &id in seed_ids {
+        if visited.insert(id.to_string()) {
+            queue.push_back((id.to_string(), 0));
+            if let Ok(e) = graph.get_entity(repo_id, id).await {
+                entities.insert(id.to_string(), e);
+            }
+        }
+    }
+
+    while let Some((current, hop)) = queue.pop_front() {
+        if hop >= max_hops {
+            continue;
+        }
+        let rels = graph
+            .get_relationships(repo_id, &current)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        for rel in rels {
+            let neighbor = rel.to_entity.clone();
+            relationships.push(rel);
+            if visited.insert(neighbor.clone()) {
+                queue.push_back((neighbor.clone(), hop + 1));
+                if let Ok(e) = graph.get_entity(repo_id, &neighbor).await {
+                    entities.insert(neighbor, e);
+                }
+            }
+        }
+    }
+
+    Ok((entities.into_values().collect(), relationships))
+}
+
+/// Inverse BFS over incoming relationship edges via the [`GraphStore`] trait.
+///
+/// Starting from `seed_ids`, follows incoming edges (reverse direction) up to
+/// `max_hops` deep. Returns all entities that can reach the seeds within that
+/// depth (the "blast radius") and the connecting relationships.
+async fn bfs_inverse(
+    graph: &dyn crate::storage::GraphStore,
+    repo_id: &uuid::Uuid,
+    seed_ids: &[&str],
+    max_hops: usize,
+) -> Result<(Vec<crate::graph::Entity>, Vec<crate::graph::Relationship>), ApiError> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut entities: HashMap<String, crate::graph::Entity> = HashMap::new();
+    let mut relationships: Vec<crate::graph::Relationship> = Vec::new();
+
+    for &id in seed_ids {
+        if visited.insert(id.to_string()) {
+            queue.push_back((id.to_string(), 0));
+            if let Ok(e) = graph.get_entity(repo_id, id).await {
+                entities.insert(id.to_string(), e);
+            }
+        }
+    }
+
+    while let Some((current, hop)) = queue.pop_front() {
+        if hop >= max_hops {
+            continue;
+        }
+        let rels = graph
+            .get_inverse_relationships(repo_id, &current)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        for rel in rels {
+            let neighbor = rel.from_entity.clone();
+            relationships.push(rel);
+            if visited.insert(neighbor.clone()) {
+                queue.push_back((neighbor.clone(), hop + 1));
+                if let Ok(e) = graph.get_entity(repo_id, &neighbor).await {
+                    entities.insert(neighbor, e);
+                }
+            }
+        }
+    }
+
+    Ok((entities.into_values().collect(), relationships))
 }
 
 /// Rebuilds the semantic graph by reading source files from the `current/`
@@ -385,14 +478,22 @@ pub(super) async fn list_graph_entities_handler(
     AxumQuery(filter): AxumQuery<GraphEntityFilter>,
 ) -> Result<Json<Vec<EntitySummary>>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    let graph = open_graph(&ctx.vai_dir)?;
-    let entities = graph
-        .filter_entities(
-            filter.kind.as_deref(),
-            filter.file.as_deref(),
-            filter.name.as_deref(),
-        )
+    let mut entities = ctx
+        .storage
+        .graph()
+        .list_entities(&ctx.repo_id, filter.file.as_deref())
+        .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Apply in-handler filters for kind and name (not supported in trait).
+    if let Some(kind) = &filter.kind {
+        entities.retain(|e| e.kind.as_str() == kind.as_str());
+    }
+    if let Some(name) = &filter.name {
+        let lower = name.to_lowercase();
+        entities.retain(|e| e.name.to_lowercase().contains(&lower));
+    }
+
     Ok(Json(entities.into_iter().map(Into::into).collect()))
 }
 
@@ -418,14 +519,28 @@ pub(super) async fn get_graph_entity_handler(
     PathId(id): PathId,
 ) -> Result<Json<EntityDetailResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    let graph = open_graph(&ctx.vai_dir)?;
+    let graph = ctx.storage.graph();
     let entity = graph
-        .get_entity_by_id(&id)
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .ok_or_else(|| ApiError::not_found(format!("entity '{id}' not found")))?;
-    let relationships = graph
-        .get_relationships_for_entity(&id)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .get_entity(&ctx.repo_id, &id)
+        .await
+        .map_err(|e| match e {
+            crate::storage::StorageError::NotFound(_) => ApiError::not_found(format!("entity '{id}' not found")),
+            other => ApiError::internal(other.to_string()),
+        })?;
+
+    // Collect both outgoing and incoming relationships.
+    let (outgoing, incoming) = tokio::try_join!(
+        graph.get_relationships(&ctx.repo_id, &id),
+        graph.get_inverse_relationships(&ctx.repo_id, &id),
+    )
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let mut relationships = outgoing;
+    relationships.extend(incoming);
+    // Deduplicate by relationship ID in case the graph has self-loops.
+    relationships.sort_by(|a, b| a.id.cmp(&b.id));
+    relationships.dedup_by(|a, b| a.id == b.id);
+
     Ok(Json(EntityDetailResponse {
         entity: entity.into(),
         relationships: relationships.into_iter().map(Into::into).collect(),
@@ -448,24 +563,27 @@ pub(super) async fn get_graph_entity_handler(
     tag = "graph"
 )]
 /// `GET /api/graph/entities/:id/deps` — all entities transitively reachable
-/// from this entity following any relationship direction.
+/// from this entity following outgoing relationship edges (forward BFS).
 pub(super) async fn get_entity_deps_handler(
     Extension(identity): Extension<AgentIdentity>,
     ctx: RepoCtx,
     PathId(id): PathId,
 ) -> Result<Json<EntityDepsResponse>, ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
-    let graph = open_graph(&ctx.vai_dir)?;
+    let graph = ctx.storage.graph();
+
     // Verify the entity exists before traversal.
     graph
-        .get_entity_by_id(&id)
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .ok_or_else(|| ApiError::not_found(format!("entity '{id}' not found")))?;
+        .get_entity(&ctx.repo_id, &id)
+        .await
+        .map_err(|e| match e {
+            crate::storage::StorageError::NotFound(_) => ApiError::not_found(format!("entity '{id}' not found")),
+            other => ApiError::internal(other.to_string()),
+        })?;
 
-    // Use a generous max-hops so we reach all transitive deps in practice.
-    let (entities, relationships) = graph
-        .reachable_entities(&[id.as_str()], 20)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    // Forward BFS: follow outgoing edges up to 20 hops.
+    let (entities, relationships) =
+        bfs_forward(graph.as_ref(), &ctx.repo_id, &[id.as_str()], 20).await?;
 
     // Exclude the seed entity itself from the deps list.
     let deps = entities
@@ -497,7 +615,8 @@ pub(super) async fn get_entity_deps_handler(
     security(("bearer_auth" = [])),
     tag = "graph"
 )]
-/// `GET /api/graph/blast-radius` — entities reachable from a set of seeds within N hops.
+/// `GET /api/graph/blast-radius` — entities that reach a set of seeds within N hops
+/// following inverse relationship edges (backward BFS).
 ///
 /// Query params:
 /// - `entities` — comma-separated entity IDs
@@ -522,12 +641,11 @@ pub(super) async fn get_blast_radius_handler(
     }
 
     let hops = query.hops;
-    let graph = open_graph(&ctx.vai_dir)?;
+    let graph = ctx.storage.graph();
 
     let seed_refs: Vec<&str> = seed_ids.iter().map(String::as_str).collect();
-    let (entities, relationships) = graph
-        .reachable_entities(&seed_refs, hops)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let (entities, relationships) =
+        bfs_inverse(graph.as_ref(), &ctx.repo_id, &seed_refs, hops).await?;
 
     Ok(Json(BlastRadiusResponse {
         seed_entities: seed_ids,

@@ -708,6 +708,16 @@ impl GraphStore for SqliteStorage {
             .map_err(|e| StorageError::Database(e.to_string()))
     }
 
+    async fn get_inverse_relationships(
+        &self,
+        _repo_id: &Uuid,
+        to_entity_id: &str,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        let snap = self.open_graph()?;
+        snap.get_incoming_relationships(to_entity_id)
+            .map_err(|e| StorageError::Database(e.to_string()))
+    }
+
     async fn clear_file(
         &self,
         _repo_id: &Uuid,

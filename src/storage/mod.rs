@@ -722,6 +722,14 @@ pub trait GraphStore: Send + Sync {
         from_entity_id: &str,
     ) -> Result<Vec<Relationship>, StorageError>;
 
+    /// Returns all relationships where `to_entity_id` is the target (inverse of
+    /// [`get_relationships`]). Used for blast-radius queries.
+    async fn get_inverse_relationships(
+        &self,
+        repo_id: &Uuid,
+        to_entity_id: &str,
+    ) -> Result<Vec<Relationship>, StorageError>;
+
     /// Removes all entities and relationships associated with `file_path`.
     ///
     /// Used before re-parsing a file to avoid stale graph data.
