@@ -7,6 +7,7 @@ mod agent_cmd;
 mod dashboard;
 mod escalation;
 mod graph;
+mod init;
 mod issue;
 mod login;
 mod merge;
@@ -150,7 +151,17 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     /// Initialize a new vai repository in the current directory.
-    Init,
+    Init {
+        /// Initialize locally only — do not register on the server or push.
+        #[arg(long)]
+        local_only: bool,
+        /// Register on the server but skip the initial push.
+        #[arg(long)]
+        no_push: bool,
+        /// Override the inferred repository name (defaults to directory basename).
+        #[arg(long)]
+        remote_name: Option<String>,
+    },
     /// Show repository status, active workspaces, and graph stats.
     Status {
         /// Query the remote server for other agents' active workspaces.
@@ -788,15 +799,8 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
             println!("vai — version control for AI agents");
             println!("Run `vai --help` for usage.");
         }
-        Some(Commands::Init) => {
-            let cwd = std::env::current_dir()
-                .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
-            let result = repo::init(&cwd)?;
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&result).unwrap());
-            } else {
-                repo::print_init_result(&result);
-            }
+        Some(Commands::Init { local_only, no_push, remote_name }) => {
+            init::handle(local_only, no_push, remote_name, cli.json)?;
         }
         Some(Commands::Graph(graph_cmd)) => {
             graph::handle(graph_cmd, cli.json, cli.quiet)?;

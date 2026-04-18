@@ -58,6 +58,10 @@ pub enum RepoError {
 pub struct RemoteServerConfig {
     /// Base HTTP URL of the remote vai server, e.g. `https://vai.example.com`.
     pub url: String,
+    /// Repository name on the server (may differ from the local directory name
+    /// if a collision was resolved during `vai init`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_name: Option<String>,
 }
 
 /// Server bind settings stored in `.vai/config.toml` under `[server]`.

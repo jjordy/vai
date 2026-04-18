@@ -22,7 +22,7 @@ pub(super) fn handle_remote(remote_cmd: RemoteCommands, json: bool) -> Result<()
     match remote_cmd {
         RemoteCommands::Add { url } => {
             let mut config = repo::read_config(&vai_dir)?;
-            config.remote = Some(repo::RemoteServerConfig { url: url.clone() });
+            config.remote = Some(repo::RemoteServerConfig { url: url.clone(), repo_name: None });
             repo::write_config(&vai_dir, &config)?;
             if json {
                 println!("{}", serde_json::json!({"status": "ok", "url": url}));
@@ -477,7 +477,7 @@ pub(super) fn handle_pull(
         remote_pull::PullConfig {
             server_url: remote.url,
             api_key,
-            repo_name: config.name,
+            repo_name: remote.repo_name.unwrap_or(config.name),
         }
     };
 
@@ -525,7 +525,7 @@ pub(super) fn handle_push(
         remote_push::PushConfig {
             server_url: remote.url,
             api_key,
-            repo_name: config.name,
+            repo_name: remote.repo_name.unwrap_or(config.name),
         }
     };
 
