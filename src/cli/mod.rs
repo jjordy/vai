@@ -8,6 +8,7 @@ mod dashboard;
 mod escalation;
 mod graph;
 mod issue;
+mod login;
 mod merge;
 mod remote;
 mod server_cmd;
@@ -309,6 +310,36 @@ pub enum Commands {
     /// Agent workflow commands for autonomous agent loops.
     #[command(subcommand)]
     Agent(AgentCommands),
+    /// Authenticate with a vai server and save credentials to `~/.vai/credentials.toml`.
+    ///
+    /// Opens the default browser to the dashboard's `/cli-auth` page, which
+    /// mints an API key and posts it back to an ephemeral localhost port.
+    ///
+    /// Falls back to device code mode (`--device`) automatically in headless
+    /// environments (no `DISPLAY` / `WAYLAND_DISPLAY` on Linux, or when the
+    /// browser cannot be opened).
+    Login {
+        /// Base URL of the vai server.
+        ///
+        /// Defaults to the `VAI_SERVER_URL` environment variable, or
+        /// `https://vai.example.com` if neither is set.
+        #[arg(long)]
+        server_url: Option<String>,
+        /// Base URL of the dashboard (defaults to `--server-url`).
+        ///
+        /// Override with `VAI_DASHBOARD_URL` or this flag.
+        #[arg(long)]
+        dashboard_url: Option<String>,
+        /// Use the device code flow instead of opening a browser.
+        ///
+        /// Prints a short code and a URL; the user enters the code in their
+        /// browser.  Useful in headless / SSH environments.
+        #[arg(long)]
+        device: bool,
+        /// Human-readable name for the minted API key (default: `CLI on <hostname>`).
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 /// Agent workflow subcommands.
@@ -830,6 +861,9 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
         }
         Some(Commands::Agent(agent_cmd)) => {
             agent_cmd::handle(agent_cmd, cli.json)?;
+        }
+        Some(Commands::Login { server_url, dashboard_url, device, name }) => {
+            login::handle(server_url, dashboard_url, device, name)?;
         }
     }
     Ok(())
