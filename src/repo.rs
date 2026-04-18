@@ -51,74 +51,13 @@ pub enum RepoError {
 /// Remote server configuration stored in `.vai/config.toml` under `[remote]`.
 ///
 /// When present, CLI commands proxy to this server instead of operating on the
-/// local `.vai/` directory directly.
-///
-/// Exactly one of `api_key`, `api_key_env`, or `api_key_cmd` should be set.
-/// Resolution order: env var → command → direct value.
+/// local `.vai/` directory directly.  Authentication is provided by
+/// `~/.vai/credentials.toml` (see [`crate::credentials`]) or the `VAI_API_KEY`
+/// environment variable — **never** stored in this file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteServerConfig {
     /// Base HTTP URL of the remote vai server, e.g. `https://vai.example.com`.
     pub url: String,
-    /// Literal API key value.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-    /// Name of an environment variable that holds the API key.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key_env: Option<String>,
-    /// Shell command whose stdout is the API key (e.g. `pass show vai/api-key`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key_cmd: Option<String>,
-}
-
-impl RemoteServerConfig {
-    /// Resolves the API key using the configured storage method.
-    ///
-    /// Evaluated in order: `api_key_env` (environment variable), `api_key_cmd`
-    /// (command stdout), then `api_key` (literal value).
-    ///
-    /// Returns an error if no key is configured or resolution fails.
-    pub fn resolve_api_key(&self) -> Result<String, ApiKeyError> {
-        // 1. Environment variable reference.
-        if let Some(var_name) = &self.api_key_env {
-            return std::env::var(var_name)
-                .map(|v| v.trim().to_string())
-                .map_err(|_| ApiKeyError::EnvVarNotSet(var_name.clone()));
-        }
-
-        // 2. Command output.
-        if let Some(cmd) = &self.api_key_cmd {
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .output()
-                .map_err(|e| ApiKeyError::CommandFailed(format!("{cmd}: {e}")))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Err(ApiKeyError::CommandFailed(format!("{cmd}: {stderr}")));
-            }
-            let key = String::from_utf8(output.stdout)
-                .map_err(|e| ApiKeyError::CommandFailed(format!("non-UTF-8 output: {e}")))?;
-            return Ok(key.trim().to_string());
-        }
-
-        // 3. Literal value.
-        self.api_key
-            .clone()
-            .ok_or(ApiKeyError::NotConfigured)
-    }
-}
-
-/// Errors that can occur when resolving the API key.
-#[derive(Debug, thiserror::Error)]
-pub enum ApiKeyError {
-    #[error("environment variable `{0}` is not set")]
-    EnvVarNotSet(String),
-
-    #[error("api_key_cmd failed: {0}")]
-    CommandFailed(String),
-
-    #[error("no API key configured — set api_key, api_key_env, or api_key_cmd in [remote]")]
-    NotConfigured,
 }
 
 /// Server bind settings stored in `.vai/config.toml` under `[server]`.
@@ -476,8 +415,37 @@ pub fn read_head(vai_dir: &Path) -> Result<String, RepoError> {
 }
 
 /// Reads the repository configuration from `.vai/config.toml`.
+///
+/// Performs a one-shot migration: if the `[remote]` section contains a legacy
+/// `api_key`, `api_key_env`, or `api_key_cmd` field, those fields are stripped,
+/// a warning is printed, and the cleaned config is written back to disk.
+/// Credentials now live exclusively in `~/.vai/credentials.toml`.
 pub fn read_config(vai_dir: &Path) -> Result<RepoConfig, RepoError> {
     let raw = fs::read_to_string(vai_dir.join("config.toml"))?;
+
+    // Detect legacy api_key fields and migrate on first load.
+    let legacy_fields = ["api_key", "api_key_env", "api_key_cmd"];
+    let has_legacy = raw
+        .lines()
+        .any(|l| legacy_fields.iter().any(|f| l.trim_start().starts_with(f)));
+
+    if has_legacy {
+        // Strip the legacy fields using the raw TOML value.
+        let mut doc: toml::Value = toml::from_str(&raw)?;
+        if let Some(remote) = doc.get_mut("remote").and_then(|v| v.as_table_mut()) {
+            for field in &legacy_fields {
+                remote.remove(*field);
+            }
+        }
+        let cleaned = toml::to_string_pretty(&doc)?;
+        fs::write(vai_dir.join("config.toml"), &cleaned)?;
+        eprintln!(
+            "Removed api_key from .vai/config.toml. \
+             Credentials now live in ~/.vai/credentials.toml."
+        );
+        return Ok(toml::from_str(&cleaned)?);
+    }
+
     Ok(toml::from_str(&raw)?)
 }
 

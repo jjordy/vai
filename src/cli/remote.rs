@@ -3,6 +3,7 @@
 use base64::Engine as _;
 use colored::Colorize;
 
+use crate::credentials;
 use crate::repo;
 use crate::pull as remote_pull;
 use crate::push as remote_push;
@@ -19,24 +20,15 @@ pub(super) fn handle_remote(remote_cmd: RemoteCommands, json: bool) -> Result<()
         .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
     let vai_dir = root.join(".vai");
     match remote_cmd {
-        RemoteCommands::Add { url, key, key_env, key_cmd } => {
-            if key.is_none() && key_env.is_none() && key_cmd.is_none() {
-                return Err(CliError::Other(
-                    "one of --key, --key-env, or --key-cmd is required".to_string(),
-                ));
-            }
+        RemoteCommands::Add { url } => {
             let mut config = repo::read_config(&vai_dir)?;
-            config.remote = Some(repo::RemoteServerConfig {
-                url: url.clone(),
-                api_key: key,
-                api_key_env: key_env,
-                api_key_cmd: key_cmd,
-            });
+            config.remote = Some(repo::RemoteServerConfig { url: url.clone() });
             repo::write_config(&vai_dir, &config)?;
             if json {
                 println!("{}", serde_json::json!({"status": "ok", "url": url}));
             } else {
                 println!("Remote set to {}", url.cyan());
+                println!("Authenticate with `vai login` or set VAI_API_KEY.");
             }
         }
         RemoteCommands::Remove => {
@@ -68,8 +60,9 @@ pub(super) fn handle_remote(remote_cmd: RemoteCommands, json: bool) -> Result<()
                 Some(remote) => {
                     let rt = tokio::runtime::Runtime::new()
                         .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?;
-                    let client = crate::remote_client::RemoteClient::new(remote)
-                        .map_err(|e| CliError::Other(format!("API key error: {e}")))?;
+                    let (api_key, _) = credentials::load_api_key()
+                        .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
+                    let client = crate::remote_client::RemoteClient::new(&remote.url, &api_key);
 
                     // Ping connectivity.
                     let reachable = rt.block_on(async {
@@ -225,8 +218,9 @@ pub(super) fn handle_remote(remote_cmd: RemoteCommands, json: bool) -> Result<()
 
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?;
-            let client = crate::remote_client::RemoteClient::new(remote)
-                .map_err(|e| CliError::Other(format!("API key error: {e}")))?;
+            let (api_key, _) = credentials::load_api_key()
+                .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
+            let client = crate::remote_client::RemoteClient::new(&remote.url, &api_key);
 
             // Try repo-scoped endpoint first; fall back to single-repo.
             let repo_name = &config.name;
@@ -478,8 +472,8 @@ pub(super) fn handle_pull(
     } else {
         let config = repo::read_config(&vai_dir)?;
         let remote = config.remote.ok_or(remote_pull::PullError::NoRemote)?;
-        let api_key = remote.resolve_api_key()
-            .map_err(|e| CliError::Other(format!("API key error: {e}")))?;
+        let (api_key, _) = credentials::load_api_key()
+            .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
         remote_pull::PullConfig {
             server_url: remote.url,
             api_key,
@@ -526,8 +520,8 @@ pub(super) fn handle_push(
     } else {
         let config = repo::read_config(&vai_dir)?;
         let remote = config.remote.ok_or(remote_push::PushError::NoRemote)?;
-        let api_key = remote.resolve_api_key()
-            .map_err(|e| CliError::Other(format!("API key error: {e}")))?;
+        let (api_key, _) = credentials::load_api_key()
+            .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
         remote_push::PushConfig {
             server_url: remote.url,
             api_key,

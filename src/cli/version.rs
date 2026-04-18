@@ -2,6 +2,7 @@
 
 use colored::Colorize;
 
+use crate::credentials;
 use crate::remote_diff;
 use crate::status as remote_status;
 use crate::remote_workspace;
@@ -203,8 +204,8 @@ pub(super) fn handle_diff(
             } else {
                 let config = repo::read_config(&vai_dir)?;
                 let remote = config.remote.ok_or(remote_diff::RemoteDiffError::NoRemote)?;
-                let api_key = remote.resolve_api_key()
-                    .map_err(|e| CliError::Other(format!("API key error: {e}")))?;
+                let (api_key, _) = credentials::load_api_key()
+                    .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
                 remote_diff::DiffConfig {
                     server_url: remote.url,
                     api_key,
@@ -254,8 +255,8 @@ pub(super) fn handle_status(others: bool, json: bool, local: bool) -> Result<(),
                         let cfg = repo::read_config(&vai_dir)
                             .map_err(|e| CliError::Other(format!("cannot read config: {e}")))?;
                         if let Some(remote_cfg) = cfg.remote {
-                            let api_key = remote_cfg.resolve_api_key()
-                                .map_err(|e| CliError::Other(format!("cannot resolve API key: {e}")))?;
+                            let (api_key, _) = credentials::load_api_key()
+                                .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
                             Some(remote_status::StatusConfig {
                                 server_url: remote_cfg.url,
                                 api_key,

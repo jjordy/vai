@@ -730,19 +730,13 @@ pub enum KeysCommands {
 /// Remote server configuration subcommands.
 #[derive(Debug, Subcommand)]
 pub enum RemoteCommands {
-    /// Set the remote server URL and API key.
+    /// Set the remote server URL.
+    ///
+    /// Authentication is provided by `~/.vai/credentials.toml` (run `vai login`
+    /// to set up credentials) or the `VAI_API_KEY` environment variable.
     Add {
         /// Base URL of the remote vai server (e.g. `https://vai.example.com`).
         url: String,
-        /// Literal API key value.
-        #[arg(long)]
-        key: Option<String>,
-        /// Name of an environment variable that holds the API key.
-        #[arg(long, conflicts_with_all = ["key", "key_cmd"])]
-        key_env: Option<String>,
-        /// Shell command whose stdout is the API key (e.g. `pass show vai/api-key`).
-        #[arg(long, conflicts_with_all = ["key", "key_env"])]
-        key_cmd: Option<String>,
     },
     /// Remove the remote server configuration.
     Remove,
@@ -1036,7 +1030,9 @@ pub(super) fn try_remote(
     let config = repo::read_config(vai_dir)?;
     match config.remote {
         Some(remote_cfg) => {
-            let client = crate::remote_client::RemoteClient::new(&remote_cfg)?;
+            let (api_key, _) = crate::credentials::load_api_key()
+                .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
+            let client = crate::remote_client::RemoteClient::new(&remote_cfg.url, &api_key);
             Ok(Some(client))
         }
         None => Ok(None),

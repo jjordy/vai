@@ -16,8 +16,6 @@ use reqwest::{Client, Method};
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 
-use crate::repo::{ApiKeyError, RemoteServerConfig};
-
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors that can occur when communicating with a remote vai server.
@@ -31,10 +29,6 @@ pub enum RemoteClientError {
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 
-    /// The API key could not be resolved from the remote config.
-    #[error("API key error: {0}")]
-    ApiKey(#[from] ApiKeyError),
-
     /// Response body was not valid JSON.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
@@ -44,8 +38,7 @@ pub enum RemoteClientError {
 
 /// A ready-to-use HTTP client for a remote vai server.
 ///
-/// Resolves the API key from `RemoteServerConfig` at construction time and
-/// injects `Authorization: Bearer <key>` into every request.
+/// Injects `Authorization: Bearer <key>` into every request.
 #[derive(Debug)]
 pub struct RemoteClient {
     client: Client,
@@ -55,16 +48,15 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
-    /// Creates a new `RemoteClient` by resolving the API key from `config`.
+    /// Creates a new `RemoteClient` for the given server URL and API key.
     ///
-    /// Resolution order: `api_key_env` → `api_key_cmd` → `api_key`.
-    pub fn new(config: &RemoteServerConfig) -> Result<Self, RemoteClientError> {
-        let api_key = config.resolve_api_key()?;
-        Ok(Self {
+    /// `url` may have a trailing slash — it will be stripped.
+    pub fn new(url: &str, api_key: &str) -> Self {
+        Self {
             client: Client::new(),
-            base_url: config.url.trim_end_matches('/').to_string(),
-            api_key,
-        })
+            base_url: url.trim_end_matches('/').to_string(),
+            api_key: api_key.to_string(),
+        }
     }
 
     /// Sends a `GET` request and deserializes the JSON response body.
@@ -133,63 +125,17 @@ impl RemoteClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo::RemoteServerConfig;
-
-    fn make_config(api_key: Option<&str>) -> RemoteServerConfig {
-        RemoteServerConfig {
-            url: "https://vai.example.com".to_string(),
-            api_key: api_key.map(|s| s.to_string()),
-            api_key_env: None,
-            api_key_cmd: None,
-        }
-    }
 
     #[test]
-    fn client_resolves_literal_key() {
-        let config = make_config(Some("vai_key_test123"));
-        let client = RemoteClient::new(&config).unwrap();
+    fn client_stores_key_and_url() {
+        let client = RemoteClient::new("https://vai.example.com", "vai_key_test123");
         assert_eq!(client.api_key, "vai_key_test123");
         assert_eq!(client.base_url, "https://vai.example.com");
     }
 
     #[test]
     fn client_strips_trailing_slash() {
-        let mut config = make_config(Some("key"));
-        config.url = "https://vai.example.com/".to_string();
-        let client = RemoteClient::new(&config).unwrap();
+        let client = RemoteClient::new("https://vai.example.com/", "key");
         assert_eq!(client.base_url, "https://vai.example.com");
-    }
-
-    #[test]
-    fn client_resolves_env_var() {
-        std::env::set_var("VAI_TEST_API_KEY_REMOTE_CLIENT", "env_key_abc");
-        let config = RemoteServerConfig {
-            url: "https://vai.example.com".to_string(),
-            api_key: None,
-            api_key_env: Some("VAI_TEST_API_KEY_REMOTE_CLIENT".to_string()),
-            api_key_cmd: None,
-        };
-        let client = RemoteClient::new(&config).unwrap();
-        assert_eq!(client.api_key, "env_key_abc");
-        std::env::remove_var("VAI_TEST_API_KEY_REMOTE_CLIENT");
-    }
-
-    #[test]
-    fn client_resolves_cmd() {
-        let config = RemoteServerConfig {
-            url: "https://vai.example.com".to_string(),
-            api_key: None,
-            api_key_env: None,
-            api_key_cmd: Some("echo cmd_key_xyz".to_string()),
-        };
-        let client = RemoteClient::new(&config).unwrap();
-        assert_eq!(client.api_key, "cmd_key_xyz");
-    }
-
-    #[test]
-    fn client_errors_when_no_key_configured() {
-        let config = make_config(None);
-        let err = RemoteClient::new(&config).unwrap_err();
-        assert!(matches!(err, RemoteClientError::ApiKey(_)));
     }
 }
