@@ -4,7 +4,7 @@
 //! Each command handler lives in its own submodule.
 
 mod agent_cmd;
-mod agent_loop;
+pub mod agent_loop;
 mod dashboard;
 mod escalation;
 mod graph;

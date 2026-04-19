@@ -1,0 +1,9 @@
+[checks]
+setup = [
+  "pnpm install --frozen-lockfile",
+]
+commands = [
+  "pnpm tsc --noEmit",
+  "pnpm test",
+]
+teardown = []

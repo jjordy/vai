@@ -1,0 +1,14 @@
+[checks]
+setup = [
+  "pnpm install --frozen-lockfile",
+]
+commands = [
+  "pnpm tsc --noEmit",
+  "pnpm run lint",
+  "pnpm test --run",
+  "pnpm test:e2e",
+]
+teardown = [
+  # Kill the dev server if the agent started it.
+  # "pkill -f 'pnpm dev' || true",
+]

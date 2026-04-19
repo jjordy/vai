@@ -1,0 +1,6 @@
+[checks]
+setup = []
+commands = [
+  # Add your quality-check commands here
+]
+teardown = []

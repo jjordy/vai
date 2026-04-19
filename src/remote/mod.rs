@@ -1112,13 +1112,11 @@ mod tests {
         let vai_dir = root.path().join(".vai");
         fs::create_dir_all(&vai_dir).unwrap();
         // Write a minimal valid config with no [remote] section.
-        let config_toml = format!(
-            r#"repo_id = "00000000-0000-0000-0000-000000000001"
+        let config_toml = r#"repo_id = "00000000-0000-0000-0000-000000000001"
 name = "test"
 created_at = "2025-01-01T00:00:00Z"
 vai_version = "0.1.0"
-"#
-        );
+"#.to_string();
         fs::write(vai_dir.join("config.toml"), config_toml).unwrap();
 
         // Session::open returns Result<Builder, RemoteError>.

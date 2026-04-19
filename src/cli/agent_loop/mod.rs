@@ -5,12 +5,15 @@
 //! subsequent issues (V-8 through V-14).
 
 pub mod detection;
+pub mod templates;
 mod init;
 mod list;
 mod run;
 
 #[allow(unused_imports)]
 pub use detection::{detect_project_type, ProjectType};
+#[allow(unused_imports)]
+pub use templates::{template, TemplateKind};
 
 use crate::cli::{CliError, LoopCommands};
 
