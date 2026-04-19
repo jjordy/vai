@@ -4,9 +4,13 @@
 //! All subcommands are currently stubs; real logic will be filled in by
 //! subsequent issues (V-8 through V-14).
 
+pub mod detection;
 mod init;
 mod list;
 mod run;
+
+#[allow(unused_imports)]
+pub use detection::{detect_project_type, ProjectType};
 
 use crate::cli::{CliError, LoopCommands};
 
