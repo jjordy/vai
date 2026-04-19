@@ -25,14 +25,16 @@ pub enum AgentKind {
     Custom,
 }
 
-impl AgentKind {
+impl std::str::FromStr for AgentKind {
+    type Err = std::convert::Infallible;
+
     /// Infer from a raw agent name string such as `"claude-code"` or `"codex"`.
-    pub fn from_str(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_ascii_lowercase().as_str() {
             "claude-code" | "claude" => AgentKind::ClaudeCode,
             "codex" => AgentKind::Codex,
             _ => AgentKind::Custom,
-        }
+        })
     }
 }
 

@@ -184,7 +184,7 @@ fn preflight(
 
     // 2. Parse .env.
     let env_content = std::fs::read_to_string(&env_path)
-        .map_err(|e| RunError::Io(e))?;
+        .map_err(RunError::Io)?;
     let parsed = parse_env(&env_content);
 
     // 3. VAI_API_KEY must be present and non-empty.
