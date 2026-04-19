@@ -2,6 +2,7 @@
 
 use crate::agent;
 use super::{CliError, AgentCommands};
+use super::agent_loop;
 
 /// Handle all `vai agent` subcommands.
 pub(super) fn handle(agent_cmd: AgentCommands, json: bool) -> Result<(), CliError> {
@@ -120,6 +121,9 @@ pub(super) fn handle(agent_cmd: AgentCommands, json: bool) -> Result<(), CliErro
             } else {
                 agent::print_submit_result(&result);
             }
+        }
+        AgentCommands::Loop(loop_cmd) => {
+            return agent_loop::handle_loop(loop_cmd, json);
         }
         AgentCommands::Verify { dir } => {
             let result = agent::verify(&cwd, &dir)?;

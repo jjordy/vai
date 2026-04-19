@@ -4,6 +4,7 @@
 //! Each command handler lives in its own submodule.
 
 mod agent_cmd;
+mod agent_loop;
 mod dashboard;
 mod escalation;
 mod graph;
@@ -506,6 +507,43 @@ pub enum AgentCommands {
         /// Working directory in which to run checks (the agent's work tree).
         dir: std::path::PathBuf,
     },
+
+    /// Manage agent loop configurations.
+    #[command(subcommand)]
+    Loop(LoopCommands),
+}
+
+/// `vai agent loop` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum LoopCommands {
+    /// Generate a new agent loop configuration.
+    Init {
+        /// Agent type / name (e.g. `claude`, `codex`).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Project type hint (e.g. `rust`, `node`, `python`).
+        #[arg(long)]
+        project_type: Option<String>,
+        /// Scaffold a Docker-based loop (default: true).
+        #[arg(long, default_value_t = true)]
+        docker: bool,
+        /// Overwrite an existing loop configuration if present.
+        #[arg(long)]
+        overwrite: bool,
+        /// Name for this loop configuration (for multi-config repos).
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// Run a configured agent loop.
+    Run {
+        /// Name of the loop configuration to run.
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// List configured agent loops.
+    List,
 }
 
 /// Issue management subcommands.
