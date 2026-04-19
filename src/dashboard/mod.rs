@@ -721,13 +721,11 @@ async fn ws_connection_loop(ws_url: String, tx: mpsc::Sender<WsNotification>) {
                 drop(write);
                 while let Some(msg_result) = read.next().await {
                     match msg_result {
-                        Ok(Message::Text(text)) => {
-                            // Any valid JSON event triggers a full refresh.
+                        Ok(Message::Text(text))
                             if serde_json::from_str::<BroadcastEvent>(&text).is_ok()
-                                && tx.send(WsNotification::Event).is_err()
-                            {
-                                return;
-                            }
+                                && tx.send(WsNotification::Event).is_err() =>
+                        {
+                            return;
                         }
                         Ok(Message::Close(_)) | Err(_) => break,
                         _ => {}
