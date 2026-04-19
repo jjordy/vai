@@ -1,10 +1,10 @@
 //! Agent loop subcommand handlers.
 //!
 //! Entry point for `vai agent loop <SUBCOMMAND>`.
-//! All subcommands are currently stubs; real logic will be filled in by
-//! subsequent issues (V-8 through V-14).
 
 pub mod detection;
+pub mod env;
+pub mod env_writer;
 pub mod templates;
 mod init;
 mod list;

@@ -3,6 +3,8 @@
 //! Inspects the root of a repository to classify it into one of four categories
 //! used to select the appropriate loop template and quality-check configuration.
 
+#![allow(dead_code)]
+
 use std::path::Path;
 
 /// The detected project type for a repository root.
