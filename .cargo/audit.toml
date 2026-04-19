@@ -13,4 +13,16 @@ ignore = [
     "RUSTSEC-2023-0071",
     # atoi truncating/overflowing casts (transitive dep of sqlx)
     "RUSTSEC-2024-0363",
+    # rustls-webpki 0.101.7 URI name constraints / wildcard cert bugs — transitive via
+    # aws-smithy-http-client 1.1.12 → rustls 0.21.12 → rustls-webpki 0.101.7.
+    # Fix requires webpki >=0.103.12, but that's semver-incompatible with rustls 0.21.
+    # aws-smithy-http-client must drop its rustls 0.21 dependency first.
+    # Re-check when aws-smithy-http-client > 1.1.12 is released. (Added 2026-04-19)
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    # rand 0.8.5 unsound with custom logger — transitive via tungstenite 0.24 / sqlx / num-bigint-dig.
+    # rand 0.9.2 was removed by upgrading aws-sdk-s3 to 1.129.0. The 0.8.5 path comes from
+    # tokio-tungstenite 0.24 and sqlx internals; we don't call rand directly.
+    # Re-check when tokio-tungstenite/sqlx updates their rand dependency. (Added 2026-04-19)
+    "RUSTSEC-2026-0097",
 ]
