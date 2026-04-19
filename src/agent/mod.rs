@@ -122,6 +122,14 @@ pub struct AgentConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_template: Option<String>,
 
+    /// Name of the default agent, e.g. `"claude-code"` or `"codex"`.
+    ///
+    /// When set, `vai agent prompt` looks for a base template at
+    /// `.vai/agents/<default_agent>/prompt.md` before falling back to the
+    /// legacy `.vai/prompt.md` path.  Written by `vai agent loop init`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_agent: Option<String>,
+
     /// Quality check commands.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checks: Option<ChecksConfig>,
@@ -258,6 +266,7 @@ pub fn resolve_config(
         server,
         repo,
         prompt_template: file_config.as_ref().and_then(|c| c.prompt_template.clone()),
+        default_agent: file_config.as_ref().and_then(|c| c.default_agent.clone()),
         checks: file_config.as_ref().and_then(|c| c.checks.clone()),
         ignore: file_config.as_ref().and_then(|c| c.ignore.clone()),
     })
@@ -528,6 +537,7 @@ pub fn init(
         server: config.server.clone(),
         repo: config.repo.clone(),
         prompt_template: prompt_template.map(|s| s.to_string()),
+        default_agent: None,
         checks: None,
         ignore: None,
     };
@@ -1358,60 +1368,152 @@ pub struct PromptResult {
     pub template_path: Option<String>,
 }
 
-/// Build a prompt by reading a template file and substituting issue details.
+/// Resolve the base template path and display string for `vai agent prompt`.
 ///
-/// Steps:
-/// 1. Resolve the template path: `template_override` → `config.prompt_template`
-///    → `.vai/prompt.md` (default).
-/// 2. If the template file exists, read it; otherwise use the built-in default.
-/// 3. Replace every occurrence of `{{issue}}` with the JSON representation of
-///    the current issue (fetched from the server via [`fetch_issue_raw`]).
-/// 4. Return the rendered prompt.
+/// Discovery order:
+/// 1. `template_override` (from `--template` flag) — used as-is relative to `dir`.
+/// 2. `.vai/agents/<default_agent>/prompt.md` if `config.default_agent` is set
+///    and the file exists (new layout introduced by PRD 26 V-11).
+/// 3. `config.prompt_template_path(dir)` — defaults to `.vai/prompt.md` (legacy).
 ///
-/// Exits with an error if no agent state exists or the server call fails.
-pub fn prompt(dir: &Path, template_override: Option<&str>) -> Result<PromptResult, AgentError> {
-    // Resolve template path.
-    let (template_path, template_path_str) = if let Some(override_path) = template_override {
+/// Returns `(absolute_path, display_string_if_any)`.
+fn resolve_prompt_base_path(
+    dir: &Path,
+    template_override: Option<&str>,
+) -> Result<(PathBuf, Option<String>), AgentError> {
+    if let Some(override_path) = template_override {
         let p = dir.join(override_path);
-        let s = override_path.to_string();
-        (p, Some(s))
-    } else {
-        let config = load_config(dir)?;
-        let p = config.prompt_template_path(dir);
-        let s = config.prompt_template.clone();
-        (p, s)
-    };
+        return Ok((p, Some(override_path.to_string())));
+    }
 
-    // Fetch issue JSON.
+    let config = load_config(dir)?;
+
+    // New layout: .vai/agents/<default_agent>/prompt.md
+    if let Some(name) = config.default_agent.as_deref() {
+        let p = dir.join(".vai").join("agents").join(name).join("prompt.md");
+        if p.exists() {
+            let s = p.to_string_lossy().into_owned();
+            return Ok((p, Some(s)));
+        }
+    }
+
+    // Legacy layout: .vai/prompt.md (or explicit prompt_template)
+    let p = config.prompt_template_path(dir);
+    let s = config.prompt_template.clone();
+    Ok((p, s))
+}
+
+/// Assemble the final prompt text from its three parts.
+///
+/// Sections are joined with exactly one blank line between them:
+///
+/// ```text
+/// <base>
+///
+/// <overlay>   ← only if Some
+///
+/// <issue_json>
+/// ```
+///
+/// Trailing whitespace is stripped from each section before joining so the
+/// output is consistent regardless of how files are formatted.
+fn assemble_prompt(base: &str, overlay: Option<&str>, issue_json: &str) -> String {
+    let base = base.trim_end();
+    if let Some(ov) = overlay {
+        let ov = ov.trim_end();
+        format!("{base}\n\n{ov}\n\n{issue_json}\n")
+    } else {
+        format!("{base}\n\n{issue_json}\n")
+    }
+}
+
+/// Build a prompt by reading a template file, optionally concatenating a
+/// custom overlay, and substituting issue details.
+///
+/// ## Template discovery
+///
+/// 1. If `template_override` is set, use that path directly (relative to `dir`).
+/// 2. Else if `config.default_agent` is set and
+///    `.vai/agents/<default_agent>/prompt.md` exists, use that file (new layout).
+/// 3. Else fall back to `config.prompt_template_path(dir)`, which defaults to
+///    `.vai/prompt.md` (legacy layout).
+/// 4. If none of the above exist, use the built-in default prompt.
+///
+/// ## Custom overlay
+///
+/// If `.vai/custom-prompt.md` exists it is inserted between the base template
+/// and the rendered issue JSON:
+///
+/// ```text
+/// <base template>
+///
+/// <.vai/custom-prompt.md>
+///
+/// <issue JSON>
+/// ```
+///
+/// When no overlay exists the output is simply `base + "\n\n" + issue_json`.
+pub fn prompt(dir: &Path, template_override: Option<&str>) -> Result<PromptResult, AgentError> {
+    let (base_path, base_path_str) = resolve_prompt_base_path(dir, template_override)?;
+
+    // Fetch issue JSON from server (requires valid state + API key).
     let issue_json = fetch_issue_raw(dir)?;
 
-    // Load template or use built-in default.
-    let template = if template_path.exists() {
-        let content = fs::read_to_string(&template_path)?;
-        PromptResult {
-            prompt: content.replace("{{issue}}", &issue_json),
-            template_path: Some(
-                template_path_str
-                    .unwrap_or_else(|| template_path.to_string_lossy().into_owned()),
-            ),
-        }
+    // Load base template or fall back to the built-in default.
+    let (base_text, resolved_path) = if base_path.exists() {
+        let content = fs::read_to_string(&base_path)?;
+        let display = base_path_str
+            .unwrap_or_else(|| base_path.to_string_lossy().into_owned());
+        (content, Some(display))
     } else {
-        // Built-in default prompt.
-        let default = format!(
-            "You are an AI agent working on a software development issue.\n\
+        let default = "You are an AI agent working on a software development issue.\n\
              \n\
              Here are the details of the issue you need to work on:\n\
              \n\
-             {issue_json}\n\
+             {{issue}}\n\
              \n\
              Please implement the required changes. When you are done, run \
              `vai agent verify` to check your work, then `vai agent submit` \
-             to submit your changes.\n"
-        );
-        PromptResult { prompt: default, template_path: None }
+             to submit your changes."
+            .to_string();
+        (default, None)
     };
 
-    Ok(template)
+    // Read optional custom overlay.
+    let custom_overlay_path = dir.join(".vai").join("custom-prompt.md");
+    let overlay = if custom_overlay_path.exists() {
+        Some(fs::read_to_string(&custom_overlay_path)?)
+    } else {
+        None
+    };
+
+    // Choose assembly strategy based on whether the base uses {{issue}} inline.
+    //
+    // Legacy templates (e.g. .vai/prompt.md) embed the issue JSON via the
+    // {{issue}} token.  For those we substitute in place and do NOT append the
+    // JSON a second time, preserving behaviour for existing users.
+    //
+    // New templates (e.g. .vai/agents/<name>/prompt.md) do not contain
+    // {{issue}}, so we append the issue JSON as the last section.
+    let full_prompt = if base_text.contains("{{issue}}") {
+        // Legacy path: substitute {{issue}} inline; no extra JSON appended.
+        let base_rendered = base_text.replace("{{issue}}", &issue_json);
+        if let Some(ov) = overlay.as_deref() {
+            // Insert overlay between rendered base and nothing (no extra JSON).
+            format!("{}\n\n{}\n", base_rendered.trim_end(), ov.trim_end())
+        } else {
+            // Unchanged legacy behaviour.
+            base_rendered
+        }
+    } else {
+        // New path: base + optional overlay + issue JSON appended at end.
+        assemble_prompt(base_text.trim_end(), overlay.as_deref(), &issue_json)
+    };
+
+    Ok(PromptResult {
+        prompt: full_prompt,
+        template_path: resolved_path,
+    })
 }
 
 // ── verify ────────────────────────────────────────────────────────────────────
@@ -2081,6 +2183,7 @@ mod tests {
             server: "https://vai.example.com".to_string(),
             repo: "myrepo".to_string(),
             prompt_template: None,
+            default_agent: None,
             checks: None,
             ignore: None,
         };
@@ -2122,6 +2225,7 @@ mod tests {
             server: "https://vai.example.com".to_string(),
             repo: "myrepo".to_string(),
             prompt_template: Some("custom/my-prompt.md".to_string()),
+            default_agent: None,
             checks: None,
             ignore: None,
         };
@@ -2164,6 +2268,7 @@ mod tests {
             server: "https://vai.example.com".to_string(),
             repo: "myrepo".to_string(),
             prompt_template: None,
+            default_agent: None,
             checks: Some(ChecksConfig { commands: checks_cmds, setup: vec![], teardown: vec![] }),
             ignore: None,
         };
@@ -2181,6 +2286,7 @@ mod tests {
             server: "https://vai.example.com".to_string(),
             repo: "myrepo".to_string(),
             prompt_template: None,
+            default_agent: None,
             checks: None,
             ignore: None,
         };
@@ -2245,5 +2351,110 @@ mod tests {
 
         let result = verify(dir, work_dir.path()).unwrap();
         assert!(result.all_passed, "check should find sentinel.txt in work_dir");
+    }
+
+    // ── prompt helpers ────────────────────────────────────────────────────────
+
+    /// Write a minimal `agent.toml` to `<dir>/.vai/agent.toml`.
+    fn write_agent_toml(dir: &std::path::Path, default_agent: Option<&str>) {
+        fs::create_dir_all(dir.join(".vai")).unwrap();
+        let extra = match default_agent {
+            Some(name) => format!("default_agent = \"{name}\"\n"),
+            None => String::new(),
+        };
+        fs::write(
+            dir.join(".vai").join("agent.toml"),
+            format!(
+                "server = \"https://vai.example.com\"\nrepo = \"myrepo\"\n{extra}"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn assemble_prompt_new_layout_no_overlay() {
+        // New layout: base (no {{issue}}) + issue JSON appended.
+        let base = "Do the work.";
+        let issue = "{\"id\":\"1\"}";
+        let result = assemble_prompt(base, None, issue);
+        // Exactly one blank line between base and issue JSON; ends with \n.
+        assert_eq!(result, "Do the work.\n\n{\"id\":\"1\"}\n");
+    }
+
+    #[test]
+    fn assemble_prompt_new_layout_with_overlay() {
+        // New layout: base + overlay + issue JSON, exactly one blank line each.
+        let base = "Do the work.";
+        let overlay = "Extra rules.";
+        let issue = "{\"id\":\"2\"}";
+        let result = assemble_prompt(base, Some(overlay), issue);
+        assert_eq!(result, "Do the work.\n\nExtra rules.\n\n{\"id\":\"2\"}\n");
+    }
+
+    #[test]
+    fn resolve_prompt_base_path_new_layout() {
+        // When default_agent is set and .vai/agents/<name>/prompt.md exists,
+        // resolve_prompt_base_path should return that path.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_agent_toml(dir, Some("claude-code"));
+
+        let prompt_dir = dir.join(".vai").join("agents").join("claude-code");
+        fs::create_dir_all(&prompt_dir).unwrap();
+        fs::write(prompt_dir.join("prompt.md"), "New layout base.\n").unwrap();
+
+        let (path, _display) = resolve_prompt_base_path(dir, None).unwrap();
+        assert!(path.ends_with("agents/claude-code/prompt.md"), "expected new layout path, got {path:?}");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn resolve_prompt_base_path_legacy_fallback() {
+        // When no default_agent is set, resolve_prompt_base_path should fall
+        // back to .vai/prompt.md.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_agent_toml(dir, None); // no default_agent
+        fs::write(dir.join(".vai").join("prompt.md"), "Legacy base.\n").unwrap();
+
+        let (path, _display) = resolve_prompt_base_path(dir, None).unwrap();
+        assert!(path.ends_with("prompt.md"), "expected legacy path, got {path:?}");
+    }
+
+    #[test]
+    fn resolve_prompt_base_path_template_override() {
+        // --template flag takes precedence over everything.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_agent_toml(dir, Some("claude-code"));
+
+        // Even if .vai/agents/claude-code/prompt.md exists, override wins.
+        let prompt_dir = dir.join(".vai").join("agents").join("claude-code");
+        fs::create_dir_all(&prompt_dir).unwrap();
+        fs::write(prompt_dir.join("prompt.md"), "New layout.\n").unwrap();
+
+        let custom = dir.join("custom.md");
+        fs::write(&custom, "Override base.\n").unwrap();
+
+        let (path, display) = resolve_prompt_base_path(dir, Some("custom.md")).unwrap();
+        assert!(path.ends_with("custom.md"), "expected override path, got {path:?}");
+        assert_eq!(display.as_deref(), Some("custom.md"));
+    }
+
+    #[test]
+    fn resolve_prompt_base_path_legacy_falls_back_when_agents_dir_missing() {
+        // default_agent is set in agent.toml but the .vai/agents/<name>/prompt.md
+        // file does not exist — should fall back to legacy .vai/prompt.md.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_agent_toml(dir, Some("claude-code"));
+        // No .vai/agents/claude-code/prompt.md created.
+        fs::write(dir.join(".vai").join("prompt.md"), "Legacy fallback.\n").unwrap();
+
+        let (path, _display) = resolve_prompt_base_path(dir, None).unwrap();
+        assert!(
+            path.ends_with(".vai/prompt.md"),
+            "should fall back to legacy path, got {path:?}"
+        );
     }
 }
