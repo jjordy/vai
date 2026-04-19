@@ -357,7 +357,7 @@ pub fn infer_with_history(
     // Most influential records first.
     result
         .history_influences
-        .sort_by(|a, b| b.term_overlap.cmp(&a.term_overlap));
+        .sort_by_key(|b| std::cmp::Reverse(b.term_overlap));
 
     Ok(result)
 }

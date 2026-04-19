@@ -834,7 +834,7 @@ fn merge_by_entity_substitution(
     }
 
     // Sort replacements by start position descending so offsets stay valid.
-    replacements.sort_by(|a, b| b.0.cmp(&a.0));
+    replacements.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     let mut result = head.to_vec();
     for (start, end, replacement) in &replacements {

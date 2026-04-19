@@ -223,7 +223,7 @@ fn list_filtered(vai_dir: &Path, include_inactive: bool) -> Result<Vec<Workspace
     }
 
     // Sort by creation time, newest first
-    results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    results.sort_by_key(|b| std::cmp::Reverse(b.created_at));
     Ok(results)
 }
 

@@ -132,7 +132,7 @@ pub(super) fn handle(
             .iter()
             .filter_map(|p| std::fs::metadata(p).ok().map(|m| (m.len(), p)))
             .collect();
-        sized.sort_by(|a, b| b.0.cmp(&a.0));
+        sized.sort_by_key(|b| std::cmp::Reverse(b.0));
 
         eprintln!(
             "Warning: total size is {:.1} MB (> 100 MB limit).",

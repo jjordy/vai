@@ -436,16 +436,12 @@ impl App {
                         self.view = View::Overview;
                         self.refresh();
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if !opts.is_empty() {
-                            *resolution_cursor = resolution_cursor.saturating_sub(1);
-                        }
+                    KeyCode::Up | KeyCode::Char('k') if !opts.is_empty() => {
+                        *resolution_cursor = resolution_cursor.saturating_sub(1);
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if !opts.is_empty() {
-                            *resolution_cursor =
-                                (*resolution_cursor + 1).min(opts.len() - 1);
-                        }
+                    KeyCode::Down | KeyCode::Char('j') if !opts.is_empty() => {
+                        *resolution_cursor =
+                            (*resolution_cursor + 1).min(opts.len() - 1);
                     }
                     KeyCode::Enter => {
                         // Confirm resolution.
