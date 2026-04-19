@@ -8,7 +8,7 @@ use colored::Colorize;
 
 use crate::credentials;
 use crate::ignore_rules;
-use crate::push::{self as remote_push, PushConfig};
+use crate::remote::{RemoteError, Session};
 use crate::repo;
 
 use super::{CliError, make_rt};
@@ -156,20 +156,20 @@ pub(super) fn handle(
     }
 
     // ── Step 8: push initial snapshot ────────────────────────────────────────
-    let push_config = PushConfig {
-        server_url: server_url.clone(),
-        api_key,
-        repo_name: registered_name.clone(),
-    };
+    let session = Session::builder(&cwd)
+        .remote_url(server_url.clone())
+        .api_key(api_key)
+        .repo(registered_name.clone())
+        .build()?;
 
     let rt = make_rt()?;
-    match rt.block_on(remote_push::push(&cwd, push_config, "initial commit", false)) {
-        Err(remote_push::PushError::NothingToPush) => {
+    match rt.block_on(session.push("initial commit", false)) {
+        Err(RemoteError::NothingToPush) => {
             if !json {
                 println!("Repo registered (no files to push).");
             }
         }
-        Err(e) => return Err(CliError::Push(e)),
+        Err(e) => return Err(CliError::RemoteOps(e)),
         Ok(push_result) => {
             if !json {
                 println!(

@@ -5,9 +5,8 @@ use colored::Colorize;
 
 use crate::credentials;
 use crate::repo;
-use crate::pull as remote_pull;
-use crate::push as remote_push;
-use crate::sync as remote_sync;
+use crate::remote::{RemoteError, Session};
+use crate::remote as remote_ops;
 
 use super::{CliError, RemoteCommands};
 use super::make_rt;
@@ -462,35 +461,19 @@ pub(super) fn handle_pull(
         .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
     let root = repo::find_root(&cwd)
         .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
-    let vai_dir = root.join(".vai");
 
-    // Build PullConfig from explicit flags or the configured remote.
-    let pull_config = if let Some(server_url) = from {
-        let api_key = key.ok_or(remote_pull::PullError::MissingKey)?;
-        let repo_name = repo.ok_or(remote_pull::PullError::MissingRepo)?;
-        remote_pull::PullConfig { server_url, api_key, repo_name }
-    } else {
-        let config = repo::read_config(&vai_dir)?;
-        let remote = config.remote.ok_or(remote_pull::PullError::NoRemote)?;
-        let (api_key, _) = credentials::load_api_key()
-            .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
-        remote_pull::PullConfig {
-            server_url: remote.url,
-            api_key,
-            repo_name: remote.repo_name.unwrap_or(config.name),
-        }
-    };
+    let session = build_session(&root, from, key, repo)?;
 
     let result = if force {
-        make_rt()?.block_on(remote_pull::pull_force(&root, pull_config))?
+        make_rt()?.block_on(session.pull_force())?
     } else {
-        make_rt()?.block_on(remote_pull::pull(&root, pull_config))?
+        make_rt()?.block_on(session.pull())?
     };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
     } else {
-        remote_pull::print_pull_result(&result);
+        result.print();
     }
     Ok(())
 }
@@ -508,33 +491,16 @@ pub(super) fn handle_push(
         .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
     let root = repo::find_root(&cwd)
         .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
-    let vai_dir = root.join(".vai");
 
-    let msg = message.ok_or(remote_push::PushError::MissingMessage)?;
+    let msg = message.ok_or(RemoteError::MissingMessage)?;
+    let session = build_session(&root, to, key, repo)?;
 
-    // Build PushConfig from explicit flags or the configured remote.
-    let push_config = if let Some(server_url) = to {
-        let api_key = key.ok_or(remote_push::PushError::MissingKey)?;
-        let repo_name = repo.ok_or(remote_push::PushError::MissingRepo)?;
-        remote_push::PushConfig { server_url, api_key, repo_name }
-    } else {
-        let config = repo::read_config(&vai_dir)?;
-        let remote = config.remote.ok_or(remote_push::PushError::NoRemote)?;
-        let (api_key, _) = credentials::load_api_key()
-            .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
-        remote_push::PushConfig {
-            server_url: remote.url,
-            api_key,
-            repo_name: remote.repo_name.unwrap_or(config.name),
-        }
-    };
-
-    let result = make_rt()?.block_on(remote_push::push(&root, push_config, &msg, dry_run))?;
+    let result = make_rt()?.block_on(session.push(&msg, dry_run))?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
     } else {
-        remote_push::print_push_result(&result, dry_run);
+        result.print();
     }
     Ok(())
 }
@@ -546,15 +512,44 @@ pub(super) fn handle_sync(json: bool) -> Result<(), CliError> {
     let root = repo::find_root(&cwd)
         .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
 
-    let result = tokio::runtime::Runtime::new()
-        .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?
-        .block_on(remote_sync::sync(&root))?;
+    let result = make_rt()?.block_on(remote_ops::sync(&root))?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
     } else {
-        remote_sync::print_sync_result(&result);
+        result.print();
     }
     Ok(())
+}
+
+/// Builds a [`Session`] from explicit CLI flags or `.vai/config.toml`.
+fn build_session(
+    root: &std::path::Path,
+    server_url: Option<String>,
+    api_key: Option<String>,
+    repo_name: Option<String>,
+) -> Result<Session, CliError> {
+    let session = if let Some(url) = server_url {
+        let key = api_key.ok_or(RemoteError::MissingKey)?;
+        let repo = repo_name.ok_or(RemoteError::MissingRepo)?;
+        Session::builder(root)
+            .remote_url(url)
+            .api_key(key)
+            .repo(repo)
+            .build()?
+    } else {
+        let vai_dir = root.join(".vai");
+        let config = repo::read_config(&vai_dir)?;
+        let remote_cfg = config.remote.ok_or(RemoteError::NoRemote)?;
+        let (key, _) = credentials::load_api_key()
+            .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
+        let repo = remote_cfg.repo_name.unwrap_or(config.name);
+        Session::builder(root)
+            .remote_url(remote_cfg.url)
+            .api_key(key)
+            .repo(repo)
+            .build()?
+    };
+    Ok(session)
 }
 

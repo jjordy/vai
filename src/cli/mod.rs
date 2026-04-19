@@ -37,11 +37,9 @@ use crate::remote_workspace;
 use crate::repo;
 #[cfg(feature = "server")]
 use crate::server;
-use crate::pull as remote_pull;
-use crate::push as remote_push;
+use crate::remote as remote_ops;
 use crate::remote_diff;
 use crate::status as remote_status;
-use crate::sync as remote_sync;
 use crate::version::VersionMeta;
 use crate::version as crate_version;
 use crate::work_queue as crate_work_queue;
@@ -79,20 +77,14 @@ pub enum CliError {
     #[error("Clone error: {0}")]
     Clone(#[from] remote_clone::CloneError),
 
-    #[error("Pull error: {0}")]
-    Pull(#[from] remote_pull::PullError),
-
-    #[error("Push error: {0}")]
-    Push(#[from] remote_push::PushError),
+    #[error("Remote error: {0}")]
+    RemoteOps(#[from] remote_ops::RemoteError),
 
     #[error("Status error: {0}")]
     Status(#[from] remote_status::StatusError),
 
     #[error("Diff error (remote): {0}")]
     RemoteDiff(#[from] remote_diff::RemoteDiffError),
-
-    #[error("Sync error: {0}")]
-    Sync(#[from] remote_sync::SyncError),
 
     #[error("Remote workspace error: {0}")]
     RemoteWorkspace(#[from] remote_workspace::RemoteWorkspaceError),
