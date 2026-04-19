@@ -510,15 +510,19 @@ pub enum AgentCommands {
 pub enum LoopCommands {
     /// Generate a new agent loop configuration.
     Init {
-        /// Agent type / name (e.g. `claude`, `codex`).
+        /// Agent type / name (`claude-code`, `codex`, `custom`). Prompts if omitted.
         #[arg(long)]
         agent: Option<String>,
-        /// Project type hint (e.g. `rust`, `node`, `python`).
+        /// Project type (`frontend-react`, `backend-rust`, `backend-typescript`, `generic`).
+        /// Auto-detected when omitted.
         #[arg(long)]
         project_type: Option<String>,
-        /// Scaffold a Docker-based loop (default: true).
-        #[arg(long, default_value_t = true)]
+        /// Force Docker mode (run agent in an isolated container).
+        #[arg(long, overrides_with = "no_docker")]
         docker: bool,
+        /// Force bare-shell mode (run agent directly on the host).
+        #[arg(long, overrides_with = "docker")]
+        no_docker: bool,
         /// Overwrite an existing loop configuration if present.
         #[arg(long)]
         overwrite: bool,

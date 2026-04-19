@@ -1,0 +1,40 @@
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+  git \
+  curl \
+  jq \
+  ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root agent user
+RUN useradd -m -s /bin/bash agent
+
+USER agent
+ENV PATH="/home/agent/.local/bin:$PATH"
+
+# Install Claude Code CLI
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# Switch back to root to install the vai binary
+USER root
+
+# Copy the vai binary from the host build context.
+# Build vai first: cargo build --release
+# Then run: docker build -t vai-agent-claude-code .vai/agents/claude-code/ \
+#              --build-context repo=. (or copy the binary manually)
+COPY --chown=agent:agent vai /usr/local/bin/vai
+RUN chmod +x /usr/local/bin/vai
+
+USER agent
+
+WORKDIR /home/agent/repo
+
+# The repo is mounted as a volume at runtime:
+#   docker run -v /path/to/repo:/home/agent/repo ...
+VOLUME /home/agent/repo
+
+# Run the bare loop script inside the container.
+# The host docker script (loop.sh) invokes this image with the repo mounted.
+ENTRYPOINT ["/bin/bash", ".vai/agents/claude-code/loop.sh"]

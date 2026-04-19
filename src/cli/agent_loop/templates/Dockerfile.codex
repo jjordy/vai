@@ -1,0 +1,34 @@
+# Dockerfile for OpenAI Codex agent loop
+# NOTE: This is experimental. Codex CLI packaging varies; adjust as needed.
+#
+# At the time of writing, Codex CLI can be installed via:
+#   npm install -g @openai/codex
+# Check https://github.com/openai/codex for the latest installation method.
+
+FROM node:20-bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+  git \
+  curl \
+  jq \
+  ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install Codex CLI
+RUN npm install -g @openai/codex
+
+# Create a non-root agent user
+RUN useradd -m -s /bin/bash agent
+
+# Copy the vai binary from the host build context.
+# Build vai first: cargo build --release
+COPY --chown=agent:agent vai /usr/local/bin/vai
+RUN chmod +x /usr/local/bin/vai
+
+USER agent
+
+WORKDIR /home/agent/repo
+VOLUME /home/agent/repo
+
+ENTRYPOINT ["/bin/bash", ".vai/agents/codex/loop.sh"]

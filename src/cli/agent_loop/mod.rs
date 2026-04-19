@@ -5,6 +5,7 @@
 pub mod detection;
 pub mod env;
 pub mod env_writer;
+pub mod generate;
 pub mod templates;
 mod init;
 mod list;
@@ -24,12 +25,14 @@ pub(crate) fn handle_loop(cmd: LoopCommands, json: bool) -> Result<(), CliError>
             agent,
             project_type,
             docker,
+            no_docker,
             overwrite,
             name,
         } => init::handle(
             agent.as_deref(),
             project_type.as_deref(),
             docker,
+            no_docker,
             overwrite,
             name.as_deref(),
             json,
