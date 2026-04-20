@@ -107,6 +107,17 @@ Key files:
 
 The API key (`VAI_API_KEY`) is **never** stored on disk. See `docs/agent-cli.md` for the full guide including loop scripts for Claude, Codex, and custom Python agents.
 
+### Rust Toolchain
+
+The pinned Rust version lives in `rust-toolchain.toml` at the repo root. Both CI and RALPH's Docker container use this version — `rustup` reads it automatically.
+
+**To upgrade the pinned version:**
+1. Update `channel` in `rust-toolchain.toml` to the new version (e.g., `"1.95.0"`).
+2. Run `cargo clippy --features full -- -D warnings` locally on the new version.
+3. Fix any new lints in the same PR as the version bump.
+4. Update `.sandcastle/Dockerfile` base image to match (e.g., `rust:1.95.0-bookworm`).
+5. Push — CI and RALPH now agree on the new version.
+
 ### Security
 
 Run `cargo audit` periodically to check for known vulnerabilities in dependencies. CI automatically runs `cargo audit --deny warnings` and fails the build on any advisory. If you add a new dependency, run `cargo audit` locally before committing.

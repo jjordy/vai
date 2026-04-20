@@ -1,4 +1,4 @@
-FROM rust:1-bookworm
+FROM rust:1.94.0-bookworm
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
