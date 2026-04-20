@@ -22,6 +22,9 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # Install common Rust tools
 RUN rustup component add clippy rustfmt
 RUN cargo install cargo-watch
+# Install cargo-audit so `vai agent verify` can run `cargo audit --deny warnings`
+# matching the Security audit job in CI.
+RUN cargo install cargo-audit --locked
 
 # Create a non-root user for Claude to run as
 RUN useradd -m -s /bin/bash agent

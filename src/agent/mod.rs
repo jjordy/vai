@@ -2353,6 +2353,60 @@ mod tests {
         assert!(result.all_passed, "check should find sentinel.txt in work_dir");
     }
 
+    /// Verify catches a simulated `cargo clippy --features full` failure.
+    ///
+    /// This test confirms that feature-gated clippy errors—the kind that slip
+    /// through a CLI-only `cargo clippy` run—are captured and reported when the
+    /// verify step runs the full-features variant.
+    #[test]
+    fn verify_catches_feature_gated_clippy_failure() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // The first command simulates CLI-only clippy passing; the second
+        // simulates `cargo clippy --features full` failing with a lint error
+        // emitted on stderr, matching the real clippy output shape.
+        write_config_with_checks(dir, vec![
+            "true",  // CLI-only clippy: passes
+            "echo 'error: use of deprecated ...' >&2; exit 1",  // full-features clippy: fails
+        ]);
+
+        let result = verify(dir, dir).unwrap();
+        assert!(!result.all_passed);
+        let failed: Vec<_> = result.checks.iter().filter(|c| !c.passed).collect();
+        assert_eq!(failed.len(), 1, "exactly the full-features check should fail");
+        assert!(
+            failed[0].stderr.contains("error:"),
+            "stderr should contain the lint error text"
+        );
+    }
+
+    /// Verify catches a simulated `cargo audit --deny warnings` failure.
+    ///
+    /// This test confirms that a security advisory (the kind CI catches via the
+    /// `cargo audit --deny warnings` step) is surfaced as a labelled failure by
+    /// `vai agent verify`, so the error is fed back to the next Claude attempt.
+    #[test]
+    fn verify_catches_audit_advisory_failure() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // Simulate the audit step failing with a RustSec advisory message.
+        write_config_with_checks(dir, vec![
+            "true",  // clippy: passes
+            "true",  // tests: passes
+            "echo 'error[RUSTSEC-2026-0099]: ...' >&2; exit 1",  // audit: fails
+        ]);
+
+        let result = verify(dir, dir).unwrap();
+        assert!(!result.all_passed);
+        let failed: Vec<_> = result.checks.iter().filter(|c| !c.passed).collect();
+        assert_eq!(failed.len(), 1, "only the audit step should fail");
+        assert!(
+            failed[0].stderr.contains("RUSTSEC"),
+            "stderr should contain the advisory identifier"
+        );
+        assert_ne!(failed[0].exit_code, 0);
+    }
+
     // ── prompt helpers ────────────────────────────────────────────────────────
 
     /// Write a minimal `agent.toml` to `<dir>/.vai/agent.toml`.

@@ -205,25 +205,50 @@ vai agent verify <DIR>
 - `0` — all checks passed (or no checks are configured)
 - `1` — one or more checks failed
 
-On failure, prints structured output to stderr formatted for AI consumption:
+On failure, prints structured output to stderr formatted for AI consumption.
+Every failing check is wrapped in a labelled section:
 
 ```
-=== cargo build ===
-error[E0382]: borrow of moved value: `foo`
-  --> src/main.rs:10:5
+=== cargo clippy --features full -- -D warnings ===
+error: this match arm has an identical body to the `_` wildcard arm
+  --> src/server/mod.rs:42:9
 
-=== cargo test ===
-test auth::tests::test_token_expiry ... FAILED
+  exit code: 1
+
+=== cargo audit --deny warnings ===
+error[RUSTSEC-2026-0099]: ...
+
+  exit code: 1
 ```
+
+**RALPH / Rust CI verify contract**
+
+For vai itself, `.vai/agent.toml` configures verify to mirror the full CI
+check matrix exactly:
+
+| Step | Command | Mirrors CI job |
+|------|---------|----------------|
+| 1 | `cargo clippy -- -D warnings` | `Test (CLI only)` — Clippy |
+| 2 | `cargo test` | `Test (CLI only)` — Tests |
+| 3 | `cargo clippy --features full -- -D warnings` | `Test (full features)` — Clippy |
+| 4 | `cargo test --features full -- --skip server_postgres_e2e` | `Test (full features)` — Tests (Postgres E2E skipped locally; CI runs them via `VAI_TEST_DATABASE_URL`) |
+| 5 | `cargo audit --deny warnings` | `Security audit` |
+
+> **Gap**: Postgres E2E tests (`tests/server_postgres_e2e.rs`) are excluded in
+> step 4 because the sandcastle container has no Postgres service.  CI still
+> runs them.  If step 4 passes locally but CI fails with a Postgres E2E error,
+> check that test file manually.
 
 Configure checks in `.vai/agent.toml`:
 
 ```toml
 [checks]
 commands = [
-    "cargo build",
-    "cargo test",
     "cargo clippy -- -D warnings",
+    "cargo test",
+    "cargo clippy --features full -- -D warnings",
+    "cargo test --features full -- --skip server_postgres_e2e",
+    "cargo audit --deny warnings",
 ]
 ```
 
