@@ -3434,6 +3434,126 @@ async fn test_ws_events_rejects_non_collaborator() {
     shutdown_tx.send(()).ok();
 }
 
+/// Tests the onboarding state endpoints: GET /api/me/onboarding and
+/// POST /api/me/onboarding-complete.
+///
+/// Covers:
+/// - Fresh user returns `{ completed_at: null }` on GET.
+/// - POST flips the flag and returns a timestamp.
+/// - Subsequent GET returns the same timestamp.
+/// - POST is idempotent — second call returns the same timestamp.
+/// - Unauthenticated requests get 401.
+/// - Admin-key requests get 401 (no user identity).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_user_onboarding_endpoints() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+
+    // Create a user + API key.
+    let (_user_id, user_token) =
+        create_test_user(&client, &base, admin, &sfx, "onboard").await;
+
+    // 1. Fresh user has no onboarding record — completed_at must be null.
+    let resp = client
+        .get(format!("{base}/api/me/onboarding"))
+        .bearer_auth(&user_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "GET onboarding: {}", resp.text().await.unwrap_or_default());
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["completed_at"].is_null(),
+        "fresh user should have null completed_at, got: {body}"
+    );
+
+    // 2. POST marks onboarding complete and returns a timestamp.
+    let resp = client
+        .post(format!("{base}/api/me/onboarding-complete"))
+        .bearer_auth(&user_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "POST onboarding-complete: {}", resp.text().await.unwrap_or_default());
+    let body1: serde_json::Value = resp.json().await.unwrap();
+    let ts1 = body1["completed_at"].as_str().expect("completed_at must be a string");
+    assert!(!ts1.is_empty(), "completed_at must not be empty");
+
+    // 3. GET now returns the same timestamp.
+    let resp = client
+        .get(format!("{base}/api/me/onboarding"))
+        .bearer_auth(&user_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["completed_at"].as_str(),
+        Some(ts1),
+        "GET after POST should return same timestamp"
+    );
+
+    // 4. POST again is idempotent — same timestamp.
+    let resp = client
+        .post(format!("{base}/api/me/onboarding-complete"))
+        .bearer_auth(&user_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body2: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body2["completed_at"].as_str(),
+        Some(ts1),
+        "second POST should return original timestamp"
+    );
+
+    // 5. Unauthenticated GET returns 401.
+    let resp = client
+        .get(format!("{base}/api/me/onboarding"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "unauthenticated GET must return 401");
+
+    // 6. Unauthenticated POST returns 401.
+    let resp = client
+        .post(format!("{base}/api/me/onboarding-complete"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "unauthenticated POST must return 401");
+
+    // 7. Admin key has no user identity — must return 401.
+    let resp = client
+        .get(format!("{base}/api/me/onboarding"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "admin key GET must return 401");
+
+    let resp = client
+        .post(format!("{base}/api/me/onboarding-complete"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "admin key POST must return 401");
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Extracts the content of a file from a gzip tarball by path suffix.
 fn extract_file_from_tarball(bytes: &[u8], path_suffix: &str) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;

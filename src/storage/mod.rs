@@ -1477,6 +1477,32 @@ impl FileStore for MemFileStore {
     }
 }
 
+// ── OnboardingStore ───────────────────────────────────────────────────────────
+
+/// Storage for per-user onboarding state.
+///
+/// Tracks whether a dashboard user has completed the welcome walkthrough.
+/// Only meaningful in Postgres (server) mode — SQLite returns errors on all
+/// methods since onboarding is a dashboard/server-only concept.
+#[async_trait]
+pub trait OnboardingStore: Send + Sync {
+    /// Returns the timestamp when the user completed onboarding, or `None` if
+    /// they haven't completed it yet.
+    async fn get_user_onboarding(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, StorageError>;
+
+    /// Records that the user completed onboarding.
+    ///
+    /// Idempotent: if the user already has a row, returns the existing
+    /// timestamp unchanged without modifying it.
+    async fn complete_user_onboarding(
+        &self,
+        user_id: &str,
+    ) -> Result<DateTime<Utc>, StorageError>;
+}
+
 // ── WatcherRegistryStore ──────────────────────────────────────────────────────
 
 /// Storage for watcher registration and discovery event records.
@@ -1885,6 +1911,22 @@ impl StorageBackend {
             StorageBackend::ServerWithS3(_, f) => Arc::clone(f) as Arc<dyn FileStore>,
             #[cfg(feature = "postgres")]
             StorageBackend::ServerWithMemFs(_, f) => Arc::clone(f) as Arc<dyn FileStore>,
+        }
+    }
+
+    /// Returns the user onboarding store.
+    ///
+    /// Only meaningful for Postgres-backed variants — SQLite returns a stub
+    /// that errors on use (onboarding is a dashboard/server-only concept).
+    pub fn onboarding(&self) -> Arc<dyn OnboardingStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn OnboardingStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn OnboardingStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn OnboardingStore>,
         }
     }
 

@@ -41,6 +41,7 @@ mod graph;
 mod auth;
 mod file;
 mod org;
+mod onboarding;
 mod watcher;
 
 // ── PostgresStorage ───────────────────────────────────────────────────────────

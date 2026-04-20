@@ -1463,6 +1463,35 @@ impl WatcherRegistryStore for SqliteStorage {
     }
 }
 
+// ── OnboardingStore (stub) ────────────────────────────────────────────────────
+//
+// Onboarding is a dashboard/server-only concept. SQLite (local CLI) mode
+// returns a clear error so accidental usage is surfaced immediately.
+
+fn onboarding_store_unsupported() -> StorageError {
+    StorageError::InvalidTransition(
+        "OnboardingStore is not supported in local CLI mode; use the hosted server backend"
+            .to_string(),
+    )
+}
+
+#[async_trait]
+impl crate::storage::OnboardingStore for SqliteStorage {
+    async fn get_user_onboarding(
+        &self,
+        _user_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, StorageError> {
+        Err(onboarding_store_unsupported())
+    }
+
+    async fn complete_user_onboarding(
+        &self,
+        _user_id: &str,
+    ) -> Result<DateTime<Utc>, StorageError> {
+        Err(onboarding_store_unsupported())
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
