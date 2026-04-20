@@ -3359,6 +3359,81 @@ async fn test_admin_sees_all_repos() {
     shutdown_tx.send(()).ok();
 }
 
+/// Verifies that the per-repo WebSocket endpoint enforces `RepoAccess`.
+///
+/// Alice creates a repo; Bob (no collaborator row) tries to upgrade a WebSocket
+/// connection to `GET /api/repos/:repo/ws/events?key=<bob_key>` and must be
+/// rejected with a non-101 response (403 Forbidden).
+/// Alice herself must be able to connect successfully.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ws_events_rejects_non_collaborator() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+
+    let (_alice_id, alice_token) = create_test_user(&client, &base, admin, &sfx, "ws-alice").await;
+    let (_bob_id, bob_token) = create_test_user(&client, &base, admin, &sfx, "ws-bob").await;
+
+    let alice_repo = format!("ws-alice-repo-{sfx}");
+
+    // Alice creates a repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(&alice_token)
+        .json(&serde_json::json!({ "name": &alice_repo }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "Alice create repo");
+
+    // Bob tries to connect to Alice's per-repo WS endpoint — must be rejected.
+    let bob_ws_url = format!("ws://{addr}/api/repos/{alice_repo}/ws/events?key={bob_token}");
+    let result = connect_async(&bob_ws_url).await;
+    match result {
+        Err(_) => {
+            // Connection rejected outright (HTTP 403 before upgrade) — correct.
+        }
+        Ok((mut stream, resp)) => {
+            // If the handshake "succeeded" the server must close quickly with
+            // a non-101 status or an immediate close frame.
+            assert_ne!(
+                resp.status(),
+                tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS,
+                "Bob must not receive 101 Switching Protocols on Alice's repo WS"
+            );
+            // Drain any close frame.
+            let _ = timeout(Duration::from_secs(1), stream.next()).await;
+        }
+    }
+
+    // Alice can connect to her own repo WS endpoint.
+    let alice_ws_url = format!("ws://{addr}/api/repos/{alice_repo}/ws/events?key={alice_token}");
+    let (mut alice_stream, _) = connect_async(&alice_ws_url)
+        .await
+        .expect("Alice's WebSocket connection must succeed");
+
+    // Send a subscribe message to confirm the connection is live.
+    alice_stream
+        .send(Message::Text(
+            serde_json::json!({ "subscribe": { "event_types": [] } }).to_string(),
+        ))
+        .await
+        .expect("Alice subscribe send failed");
+
+    // Close cleanly.
+    let _ = alice_stream.close(None).await;
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Extracts the content of a file from a gzip tarball by path suffix.
 fn extract_file_from_tarball(bytes: &[u8], path_suffix: &str) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;

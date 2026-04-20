@@ -33,7 +33,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
 use utoipa::ToSchema;
 
-use super::{ApiError, AppState, BroadcastEvent, EventBuffer, RepoCtx};
+use super::{AgentIdentity, ApiError, AppState, AuthSource, BroadcastEvent, EventBuffer, RepoCtx};
+use super::require_repo_permission;
 use crate::storage::{EventFilter, EventStore as _};
 
 // ── Subscription types ────────────────────────────────────────────────────────
@@ -129,13 +130,25 @@ pub(super) async fn ws_events_handler(
     //   1. JWT — if the key contains '.' treat it as a JWT token.
     //   2. Admin key — compare against the bootstrap admin key.
     //   3. API key — hash and look up via storage backend.
-    let agent_name = if key_str.contains('.') {
+    //
+    // Build a full AgentIdentity so we can call require_repo_permission below.
+    let identity: AgentIdentity = if key_str.contains('.') {
         // (1) JWT check — validate with JwtService; no database hit.
         use crate::auth::jwt::JwtError;
         match state.jwt_service.verify(&key_str) {
             Ok(claims) => {
                 tracing::debug!(actor = %claims.sub, "WebSocket connection authenticated via JWT");
-                claims.sub
+                let user_id = uuid::Uuid::parse_str(&claims.sub).ok();
+                let is_admin = claims.role.as_deref() == Some("admin");
+                let name = claims.name.unwrap_or_else(|| claims.sub.clone());
+                AgentIdentity {
+                    key_id: format!("jwt:{}", claims.sub),
+                    name,
+                    is_admin,
+                    user_id,
+                    role_override: claims.role,
+                    auth_source: AuthSource::Jwt,
+                }
             }
             Err(JwtError::Expired) => {
                 return ApiError::unauthorized("JWT token has expired").into_response();
@@ -145,14 +158,28 @@ pub(super) async fn ws_events_handler(
             }
         }
     } else if key_str == state.admin_key {
-        // (2) Admin key.
-        "admin".to_string()
+        // (2) Admin key — full server access.
+        AgentIdentity {
+            key_id: "admin".to_string(),
+            name: "admin".to_string(),
+            is_admin: true,
+            user_id: None,
+            role_override: None,
+            auth_source: AuthSource::AdminKey,
+        }
     } else {
         // (3) Validate via storage backend (handles both SQLite and Postgres).
         match state.storage.auth().validate_key(&key_str).await {
             Ok(api_key) => {
                 tracing::debug!(agent = %api_key.name, "WebSocket connection authenticated");
-                api_key.name
+                AgentIdentity {
+                    key_id: api_key.id,
+                    name: api_key.name,
+                    is_admin: false,
+                    user_id: api_key.user_id,
+                    role_override: api_key.role_override,
+                    auth_source: AuthSource::ApiKey,
+                }
             }
             Err(crate::storage::StorageError::NotFound(_)) => {
                 return ApiError::unauthorized("invalid or revoked API key").into_response();
@@ -162,6 +189,22 @@ pub(super) async fn ws_events_handler(
             }
         }
     };
+
+    // Verify the caller has at least Read access to this repo before upgrading.
+    // In SQLite (local) mode this is a no-op; in Postgres mode it checks the
+    // collaborator table so cross-tenant WS connections are rejected.
+    if let Err(e) = require_repo_permission(
+        &ctx.storage,
+        &identity,
+        &ctx.repo_id,
+        crate::storage::RepoRole::Read,
+    )
+    .await
+    {
+        return e.into_response();
+    }
+
+    let agent_name = identity.name;
 
     let last_event_id = params.last_event_id;
 
