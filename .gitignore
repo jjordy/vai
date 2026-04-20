@@ -10,7 +10,13 @@ cargo-build.sh
 
 # Docker Compose local config (contains secrets)
 infra/configs/server.toml
-infra/.env
+
+# Env files (any path, any suffix — e.g. .env, .env.local, .env.production).
+# Explicitly keep .env.example / .env.sample trackable as templates.
+.env
+.env.*
+!.env.example
+!.env.sample
 
 # Terraform state and secrets
 infra/terraform/.terraform/
