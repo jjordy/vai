@@ -682,4 +682,88 @@ mod tests {
         assert_eq!(collected[1].0, "src/main.rs");
         assert_eq!(collected[1].1, b"fn main() { println!(\"v2\"); }");
     }
+
+    /// Files that exist in the repo dir but NOT in the overlay dir must not
+    /// appear in the delta tarball. This guards against the incident where
+    /// the delta tarball accidentally included the full working tree (which
+    /// would cause the server to treat unchanged files as "modified").
+    #[test]
+    fn build_delta_tarball_excludes_repo_only_files() {
+        use flate2::read::GzDecoder;
+
+        // `overlay` contains only the 1 file the agent actually changed.
+        let overlay = TempDir::new().unwrap();
+        std::fs::write(overlay.path().join("changed.rs"), b"// changed").unwrap();
+
+        let tarball = build_delta_tarball(overlay.path(), "v5", &[]).unwrap();
+
+        // Walk all entries; the tarball must contain exactly `.vai-delta.json`
+        // and `changed.rs` — nothing else.
+        let gz = GzDecoder::new(tarball.as_slice());
+        let mut archive = tar::Archive::new(gz);
+        let mut paths: Vec<String> = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let e = entry.unwrap();
+            paths.push(e.path().unwrap().to_string_lossy().to_string());
+        }
+        paths.sort();
+
+        assert_eq!(
+            paths,
+            vec![".vai-delta.json", "changed.rs"],
+            "delta tarball must contain only overlay files + manifest, got: {paths:?}"
+        );
+    }
+
+    /// `deleted_paths` passed to `build_delta_tarball` must appear verbatim in
+    /// the manifest and nowhere else — the tarball must NOT include entries for
+    /// deleted paths (they would confuse the server into treating them as additions).
+    #[test]
+    fn build_delta_tarball_deleted_paths_in_manifest_only() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let overlay = TempDir::new().unwrap();
+        std::fs::write(overlay.path().join("kept.rs"), b"// kept").unwrap();
+
+        let deleted = vec!["src/gone.rs".to_string(), "docs/old.md".to_string()];
+        let tarball = build_delta_tarball(overlay.path(), "v3", &deleted).unwrap();
+
+        let gz = GzDecoder::new(tarball.as_slice());
+        let mut archive = tar::Archive::new(gz);
+        let mut manifest_deleted: Vec<String> = Vec::new();
+        let mut tar_paths: Vec<String> = Vec::new();
+
+        for entry in archive.entries().unwrap() {
+            let mut e = entry.unwrap();
+            let p = e.path().unwrap().to_string_lossy().to_string();
+            if p == ".vai-delta.json" {
+                let mut buf = String::new();
+                e.read_to_string(&mut buf).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&buf).unwrap();
+                manifest_deleted = v["deleted_paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_str().unwrap().to_string())
+                    .collect();
+            } else {
+                tar_paths.push(p);
+            }
+        }
+
+        // Manifest must contain exactly the paths we passed.
+        let mut expected = deleted.clone();
+        expected.sort();
+        manifest_deleted.sort();
+        assert_eq!(manifest_deleted, expected, "manifest deleted_paths mismatch");
+
+        // The tarball entries (excluding manifest) must NOT include deleted paths.
+        for dp in &deleted {
+            assert!(
+                !tar_paths.iter().any(|p| p.contains(dp.as_str())),
+                "deleted path {dp} must not appear as a tar entry"
+            );
+        }
+    }
 }

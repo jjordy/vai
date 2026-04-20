@@ -161,6 +161,17 @@ pub(super) struct DeltaManifest {
     pub(super) deleted_paths: Vec<String>,
 }
 
+/// Query parameters for `POST /api/workspaces/:id/upload-snapshot`.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub(super) struct UploadSnapshotQuery {
+    /// When `true`, allow uploads that would delete more than 50% of the
+    /// current repository files.  Defaults to `false`.  Intended for
+    /// intentional mass-delete operations (e.g., repo restructuring) where
+    /// the caller has explicitly confirmed the destructive intent.
+    #[serde(default)]
+    pub(super) allow_destructive: bool,
+}
+
 /// Response body for file download endpoints.
 #[derive(Debug, Serialize, ToSchema)]
 pub(super) struct FileDownloadResponse {
@@ -1069,6 +1080,7 @@ pub(super) async fn upload_workspace_files_handler(
     params(
         ("repo" = String, Path, description = "Repository name"),
         ("id" = String, Path, description = "Workspace ID"),
+        ("allow_destructive" = Option<bool>, Query, description = "Allow uploads that delete >50% of current files (default: false)"),
     ),
     request_body(
         content = String,
@@ -1080,6 +1092,7 @@ pub(super) async fn upload_workspace_files_handler(
         (status = 400, description = "Bad request or invalid tarball", body = ErrorBody),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Workspace not found", body = ErrorBody),
+        (status = 409, description = "Upload would delete >50% of current files; use allow_destructive=true to override", body = ErrorBody),
         (status = 413, description = "Tarball exceeds 100 MiB limit", body = ErrorBody),
     ),
     security(("bearer_auth" = [])),
@@ -1121,6 +1134,7 @@ pub(super) async fn upload_snapshot_handler(
     State(state): State<Arc<AppState>>,
     ctx: RepoCtx,
     PathId(id): PathId,
+    AxumQuery(query): AxumQuery<UploadSnapshotQuery>,
     body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<UploadSnapshotResponse>), ApiError> {
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, RepoRole::Write).await?;
@@ -1254,6 +1268,23 @@ pub(super) async fn upload_snapshot_handler(
             .collect()
     };
     let deleted = deleted_paths.len();
+
+    // Safety rail: reject uploads that would delete more than half of the
+    // current repository files unless the caller explicitly opts in.
+    //
+    // A legitimate commit never wipes half a repo; mass deletion is almost
+    // always the result of an incorrect overlay or a full-mode tarball that
+    // is missing most files (e.g., due to excluded directories whose files
+    // were previously stored in `current/`). Requiring explicit opt-in via
+    // `?allow_destructive=true` prevents silent data loss.
+    let current_count = current_map.len();
+    if !query.allow_destructive && deleted > 0 && current_count > 0 && deleted * 2 > current_count {
+        return Err(ApiError::conflict(format!(
+            "upload would delete {deleted} of {current_count} files \
+             (>{pct:.0}% threshold); set ?allow_destructive=true to proceed",
+            pct = (deleted as f64 / current_count as f64) * 100.0,
+        )));
+    }
 
     // Merge snapshot deletions into workspace row and transition Created → Active.
     {

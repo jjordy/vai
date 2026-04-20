@@ -4190,6 +4190,515 @@ async fn test_init_reads_credentials_from_file_not_env_vars() {
     shutdown_tx.send(()).ok();
 }
 
+/// Verifies that a delta upload preserves files that were not in the overlay.
+///
+/// Scenario:
+/// 1. Seed 100 files (file_000.txt … file_099.txt) into a repo via workspace submit.
+/// 2. Open a new workspace and upload a delta tarball that touches only file_000.txt
+///    (no deleted_paths).
+/// 3. Submit → download the repo.
+/// 4. Assert all 100 files are present in the downloaded tarball.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_delta_preserves_unchanged_files() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start server");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    let repo_name = format!("delta-preserve-{}", unique_suffix());
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": repo_name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // ── Seed workspace ────────────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "title": "seed", "description": "", "priority": "low" }))
+        .send()
+        .await
+        .unwrap();
+    let issue1: serde_json::Value = resp.json().await.unwrap();
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue1["id"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let claim1: serde_json::Value = resp.json().await.unwrap();
+    let ws1_id = claim1["workspace_id"].as_str().unwrap().to_string();
+
+    // Upload 100 files via the files endpoint.
+    let files_json: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            serde_json::json!({
+                "path": format!("file_{i:03}.txt"),
+                "content_base64": b64(format!("content of file {i}\n").as_bytes()),
+            })
+        })
+        .collect();
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws1_id}/files"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "files": files_json }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload seed files: {}", resp.text().await.unwrap_or_default());
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws1_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "seed 100 files" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit seed: {}", resp.text().await.unwrap_or_default());
+    let seed_submit: serde_json::Value = resp.json().await.unwrap();
+    let seed_version = seed_submit["version"].as_str().unwrap_or("v2").to_string();
+
+    // ── Delta workspace: modify only file_000.txt ─────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "title": "delta", "description": "", "priority": "low" }))
+        .send()
+        .await
+        .unwrap();
+    let issue2: serde_json::Value = resp.json().await.unwrap();
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue2["id"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let claim2: serde_json::Value = resp.json().await.unwrap();
+    let ws2_id = claim2["workspace_id"].as_str().unwrap().to_string();
+
+    let manifest = serde_json::json!({
+        "base_version": seed_version,
+        "deleted_paths": []
+    })
+    .to_string();
+    let delta_tb = make_tarball(&[
+        (".vai-delta.json", manifest.as_bytes()),
+        ("file_000.txt", b"modified content\n"),
+    ]);
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws2_id}/upload-snapshot"))
+        .bearer_auth(admin)
+        .header("content-type", "application/gzip")
+        .body(delta_tb)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload delta: {}", resp.text().await.unwrap_or_default());
+    let snap: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(snap["is_delta"], serde_json::json!(true), "must be a delta upload");
+    assert_eq!(snap["modified"], serde_json::json!(1), "only file_000 modified");
+    assert_eq!(snap["deleted"], serde_json::json!(0), "no deletions");
+
+    // ── Submit and download ───────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws2_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "delta patch" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit delta: {}", resp.text().await.unwrap_or_default());
+
+    let resp = client
+        .get(format!("{rp}/files/download"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "download");
+    let tarball = resp.bytes().await.unwrap();
+    let paths = tarball_paths(&tarball);
+
+    // All 100 files must be present.
+    for i in 0..100 {
+        let name = format!("file_{i:03}.txt");
+        assert!(
+            paths.iter().any(|p| p.contains(&name)),
+            "{name} must be present after delta upload (got {} files)",
+            paths.len()
+        );
+    }
+    // file_000.txt must have the updated content.
+    let f0 = extract_file_from_tarball(&tarball, "file_000.txt");
+    assert_eq!(f0.as_deref(), Some(b"modified content\n".as_ref()), "file_000 must have new content");
+
+    shutdown_tx.send(()).ok();
+}
+
+/// Verifies that the server-side safety rail rejects uploads that would delete
+/// more than 50% of the current repository files (unless `?allow_destructive=true`).
+///
+/// Scenario:
+/// 1. Seed 100 files into a repo.
+/// 2. Upload a full-mode tarball (no `.vai-delta.json`) containing only 1 file —
+///    the server would effectively delete 99 files.
+/// 3. Assert the response is 409 Conflict.
+/// 4. Repeat with `?allow_destructive=true` and assert 200.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_delta_safety_rail_rejects_mass_delete() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start server");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    let repo_name = format!("delta-safety-{}", unique_suffix());
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": repo_name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // ── Seed 100 files ────────────────────────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "title": "seed", "description": "", "priority": "low" }))
+        .send()
+        .await
+        .unwrap();
+    let issue1: serde_json::Value = resp.json().await.unwrap();
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue1["id"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let claim1: serde_json::Value = resp.json().await.unwrap();
+    let ws1_id = claim1["workspace_id"].as_str().unwrap().to_string();
+
+    let files_json: Vec<serde_json::Value> = (0..100)
+        .map(|i| {
+            serde_json::json!({
+                "path": format!("file_{i:03}.txt"),
+                "content_base64": b64(format!("content {i}\n").as_bytes()),
+            })
+        })
+        .collect();
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws1_id}/files"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "files": files_json }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload seed files: {}", resp.text().await.unwrap_or_default());
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws1_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "seed 100 files" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit seed: {}", resp.text().await.unwrap_or_default());
+
+    // ── Attempt destructive upload (full-mode tarball with only 1 file) ───────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "title": "wipe", "description": "", "priority": "low" }))
+        .send()
+        .await
+        .unwrap();
+    let issue2: serde_json::Value = resp.json().await.unwrap();
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue2["id"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let claim2: serde_json::Value = resp.json().await.unwrap();
+    let ws2_id = claim2["workspace_id"].as_str().unwrap().to_string();
+
+    // Full-mode tarball: only file_000.txt, no .vai-delta.json.
+    // This would implicitly delete the other 99 files on the server (>50%).
+    let full_tb = make_tarball(&[("file_000.txt", b"survivor\n")]);
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws2_id}/upload-snapshot"))
+        .bearer_auth(admin)
+        .header("content-type", "application/gzip")
+        .body(full_tb.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        409,
+        "safety rail must reject mass delete; body: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    // ── Retry with allow_destructive=true → must succeed ─────────────────────
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws2_id}/upload-snapshot?allow_destructive=true"))
+        .bearer_auth(admin)
+        .header("content-type", "application/gzip")
+        .body(full_tb)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "allow_destructive=true must bypass safety rail; body: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
+/// Verifies that chained delta submits produce a coherent version history and
+/// that `GET /files/download?version=<older>` reconstructs an earlier snapshot.
+///
+/// Scenario:
+/// 1. Seed files a.txt, b.txt, c.txt → v2.
+/// 2. Delta: modify a.txt → v3.
+/// 3. Delta: modify b.txt, delete c.txt → v4.
+/// 4. Download at latest — verify a.txt (v2 content modified), b.txt (modified), c.txt absent.
+/// 5. Download at v3 — verify a.txt modified, b.txt original, c.txt present.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_delta_preserves_chain_reconstruction() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start server");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    let repo_name = format!("delta-chain-{}", unique_suffix());
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": repo_name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // ── Seed: a.txt, b.txt, c.txt → v2 ──────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "title": "seed", "description": "", "priority": "low" }))
+        .send()
+        .await
+        .unwrap();
+    let issue1: serde_json::Value = resp.json().await.unwrap();
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue1["id"] }))
+        .send()
+        .await
+        .unwrap();
+    let claim1: serde_json::Value = resp.json().await.unwrap();
+    let ws1_id = claim1["workspace_id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws1_id}/files"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "files": [
+                { "path": "a.txt", "content_base64": b64(b"a-v2\n") },
+                { "path": "b.txt", "content_base64": b64(b"b-v2\n") },
+                { "path": "c.txt", "content_base64": b64(b"c-v2\n") },
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws1_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "seed" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit seed: {}", resp.text().await.unwrap_or_default());
+    let v2_resp: serde_json::Value = resp.json().await.unwrap();
+    let v2 = v2_resp["version"].as_str().unwrap_or("v2").to_string();
+
+    // ── Delta 1: modify a.txt → v3 ────────────────────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "title": "d1", "description": "", "priority": "low" }))
+        .send()
+        .await
+        .unwrap();
+    let issue2: serde_json::Value = resp.json().await.unwrap();
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue2["id"] }))
+        .send()
+        .await
+        .unwrap();
+    let claim2: serde_json::Value = resp.json().await.unwrap();
+    let ws2_id = claim2["workspace_id"].as_str().unwrap().to_string();
+
+    let manifest2 = serde_json::json!({ "base_version": v2, "deleted_paths": [] }).to_string();
+    let delta2_tb = make_tarball(&[
+        (".vai-delta.json", manifest2.as_bytes()),
+        ("a.txt", b"a-v3\n"),
+    ]);
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws2_id}/upload-snapshot"))
+        .bearer_auth(admin)
+        .header("content-type", "application/gzip")
+        .body(delta2_tb)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload delta2: {}", resp.text().await.unwrap_or_default());
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws2_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "delta1 a.txt" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit delta2: {}", resp.text().await.unwrap_or_default());
+    let v3_resp: serde_json::Value = resp.json().await.unwrap();
+    let v3 = v3_resp["version"].as_str().unwrap_or("v3").to_string();
+
+    // ── Delta 2: modify b.txt, delete c.txt → v4 ─────────────────────────────
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "title": "d2", "description": "", "priority": "low" }))
+        .send()
+        .await
+        .unwrap();
+    let issue3: serde_json::Value = resp.json().await.unwrap();
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue3["id"] }))
+        .send()
+        .await
+        .unwrap();
+    let claim3: serde_json::Value = resp.json().await.unwrap();
+    let ws3_id = claim3["workspace_id"].as_str().unwrap().to_string();
+
+    let manifest3 = serde_json::json!({ "base_version": v3, "deleted_paths": ["c.txt"] }).to_string();
+    let delta3_tb = make_tarball(&[
+        (".vai-delta.json", manifest3.as_bytes()),
+        ("b.txt", b"b-v4\n"),
+    ]);
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws3_id}/upload-snapshot"))
+        .bearer_auth(admin)
+        .header("content-type", "application/gzip")
+        .body(delta3_tb)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload delta3: {}", resp.text().await.unwrap_or_default());
+
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws3_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "summary": "delta2 b.txt+del c.txt" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "submit delta3: {}", resp.text().await.unwrap_or_default());
+
+    // ── Verify latest (v4): a=v3, b=v4, c absent ─────────────────────────────
+    let resp = client
+        .get(format!("{rp}/files/download"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let latest_tb = resp.bytes().await.unwrap();
+    let latest_paths = tarball_paths(&latest_tb);
+
+    assert!(latest_paths.iter().any(|p| p.contains("a.txt")), "a.txt must be in latest");
+    assert!(latest_paths.iter().any(|p| p.contains("b.txt")), "b.txt must be in latest");
+    assert!(!latest_paths.iter().any(|p| p.contains("c.txt")), "c.txt must be deleted in latest");
+
+    let a_latest = extract_file_from_tarball(&latest_tb, "a.txt");
+    assert_eq!(a_latest.as_deref(), Some(b"a-v3\n".as_ref()), "a.txt must be a-v3 at latest");
+    let b_latest = extract_file_from_tarball(&latest_tb, "b.txt");
+    assert_eq!(b_latest.as_deref(), Some(b"b-v4\n".as_ref()), "b.txt must be b-v4 at latest");
+
+    // ── Verify at v3: a=v3, b=v2, c present ──────────────────────────────────
+    let resp = client
+        .get(format!("{rp}/files/download?version={v3}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "download at {v3}");
+    let v3_tb = resp.bytes().await.unwrap();
+    let v3_paths = tarball_paths(&v3_tb);
+
+    assert!(v3_paths.iter().any(|p| p.contains("a.txt")), "a.txt must be in v3");
+    assert!(v3_paths.iter().any(|p| p.contains("b.txt")), "b.txt must be in v3");
+    assert!(v3_paths.iter().any(|p| p.contains("c.txt")), "c.txt must be in v3 (not yet deleted)");
+
+    let a_v3 = extract_file_from_tarball(&v3_tb, "a.txt");
+    assert_eq!(a_v3.as_deref(), Some(b"a-v3\n".as_ref()), "a.txt must be a-v3 at version v3");
+    let b_v3 = extract_file_from_tarball(&v3_tb, "b.txt");
+    assert_eq!(b_v3.as_deref(), Some(b"b-v2\n".as_ref()), "b.txt must be b-v2 at version v3");
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Extracts the content of a file from a gzip tarball by path suffix.
 fn extract_file_from_tarball(bytes: &[u8], path_suffix: &str) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;
