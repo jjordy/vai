@@ -2,3 +2,9 @@
 channel = "1.94.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
+# Cross-compile targets not native to any CI runner.
+# x86_64-apple-darwin is needed because GitHub's `macos-latest` is now arm64.
+# Other release targets are either host-native (x86_64-unknown-linux-gnu on
+# `ubuntu-latest`, aarch64-apple-darwin on `macos-latest`) or installed inside
+# the `cross` docker image (aarch64-unknown-linux-gnu).
+targets = ["x86_64-apple-darwin"]
