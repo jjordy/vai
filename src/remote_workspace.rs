@@ -17,14 +17,16 @@
 //!
 //! `upload_snapshot` chooses between two modes automatically:
 //!
-//! - **Full mode** (repo ≤ 50 MiB uncompressed): the entire working directory
+//! - **Full mode** (repo ≤ 500 KiB uncompressed): the entire working directory
 //!   is packed into a tarball and uploaded. The server replaces `current/`
 //!   entirely and derives the workspace overlay by diffing against the old HEAD.
 //!
-//! - **Delta mode** (repo > 50 MiB): only the files present in `overlay_dir`
+//! - **Delta mode** (repo > 500 KiB): only the files present in `overlay_dir`
 //!   are packed, plus a `.vai-delta.json` manifest listing the base version and
 //!   any deleted paths. The server applies only the uploaded files on top of
 //!   `current/`, leaving untouched files intact.
+//!
+//! Override with `VAI_DELTA_THRESHOLD_BYTES` env var (bytes) for testing or tuning.
 
 use std::path::Path;
 
@@ -40,9 +42,24 @@ use crate::clone::RemoteConfig;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Repos whose uncompressed size exceeds this threshold are uploaded in delta
-/// mode to avoid sending the full working tree over the wire.
-const DELTA_THRESHOLD_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
+/// Default threshold: repos larger than this use delta mode (upload only changed
+/// files + a manifest of deletions). Small enough that any non-trivial repo
+/// benefits from incremental uploads; large enough to keep truly tiny repos on
+/// the simpler full-mode path.
+///
+/// Override with `VAI_DELTA_THRESHOLD_BYTES` env var for testing or tuning.
+const DELTA_THRESHOLD_BYTES: u64 = 500 * 1024; // 500 KiB
+
+/// Returns the active delta threshold in bytes.
+///
+/// Reads `VAI_DELTA_THRESHOLD_BYTES` from the environment; falls back to
+/// [`DELTA_THRESHOLD_BYTES`] when the var is absent or unparseable.
+fn delta_threshold_bytes() -> u64 {
+    std::env::var("VAI_DELTA_THRESHOLD_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DELTA_THRESHOLD_BYTES)
+}
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -194,14 +211,16 @@ pub async fn upload_overlay_files(
 /// Automatically chooses between full and delta upload modes based on the
 /// uncompressed size of `repo_dir`:
 ///
-/// - **Full mode** (≤ 50 MiB): packs the entire `repo_dir` into a gzip tarball
+/// - **Full mode** (≤ 500 KiB): packs the entire `repo_dir` into a gzip tarball
 ///   (excluding `.vai/`, `.git/`, and common build artefacts) and uploads it.
 ///   The server replaces `current/` and derives the workspace overlay by diffing.
 ///
-/// - **Delta mode** (> 50 MiB): packs only the files under `overlay_dir`, adds
+/// - **Delta mode** (> 500 KiB): packs only the files under `overlay_dir`, adds
 ///   a `.vai-delta.json` manifest with `base_version` and `deleted_paths`, and
 ///   uploads the compact tarball. The server applies only the uploaded files on
 ///   top of `current/`, leaving untouched files intact.
+///
+/// The threshold can be overridden via `VAI_DELTA_THRESHOLD_BYTES` (in bytes).
 ///
 /// Returns a [`SnapshotUploadResult`] with counts of added/modified/deleted/
 /// unchanged files as reported by the server.
@@ -214,7 +233,7 @@ pub async fn upload_snapshot(
     deleted_paths: &[String],
 ) -> Result<SnapshotUploadResult, RemoteWorkspaceError> {
     let repo_size = dir_uncompressed_size(repo_dir)?;
-    let use_delta = repo_size > DELTA_THRESHOLD_BYTES;
+    let use_delta = repo_size > delta_threshold_bytes();
 
     let tarball = if use_delta {
         build_delta_tarball(overlay_dir, base_version, deleted_paths)?
@@ -347,7 +366,7 @@ fn dir_size_inner(dir: &Path, total: &mut u64) -> Result<(), RemoteWorkspaceErro
             let meta = std::fs::metadata(&path).map_err(RemoteWorkspaceError::Io)?;
             *total += meta.len();
             // Short-circuit: once above threshold exact size doesn't matter.
-            if *total > DELTA_THRESHOLD_BYTES {
+            if *total > delta_threshold_bytes() {
                 return Ok(());
             }
         }
@@ -577,12 +596,90 @@ mod tests {
     #[test]
     fn dir_size_threshold_detection() {
         let dir = TempDir::new().unwrap();
-        // Write 1 byte — well below 50 MiB threshold.
+        // Write 1 byte — well below 500 KiB threshold.
         std::fs::write(dir.path().join("tiny.txt"), b"x").unwrap();
         let size = dir_uncompressed_size(dir.path()).unwrap();
         assert!(size <= DELTA_THRESHOLD_BYTES);
 
-        // Verify threshold constant is sensible (50 MiB).
-        assert_eq!(DELTA_THRESHOLD_BYTES, 50 * 1024 * 1024);
+        // Verify threshold constant is sensible (500 KiB).
+        assert_eq!(DELTA_THRESHOLD_BYTES, 500 * 1024);
+    }
+
+    /// Repo exactly at threshold → full mode (`>` not `>=`).
+    /// Repo at threshold + 1 byte → delta mode.
+    #[test]
+    fn threshold_boundary_logic() {
+        let dir = TempDir::new().unwrap();
+        let threshold = DELTA_THRESHOLD_BYTES;
+
+        // Just below: threshold - 1 bytes → full mode.
+        let below = dir.path().join("below.bin");
+        std::fs::write(&below, vec![0u8; (threshold - 1) as usize]).unwrap();
+        let size_below = dir_uncompressed_size(dir.path()).unwrap();
+        assert!(
+            size_below <= threshold,
+            "size {size_below} should be ≤ threshold {threshold} (full mode)"
+        );
+        std::fs::remove_file(&below).unwrap();
+
+        // Exactly at threshold → full mode (> not >=).
+        let at = dir.path().join("at.bin");
+        std::fs::write(&at, vec![0u8; threshold as usize]).unwrap();
+        let size_at = dir_uncompressed_size(dir.path()).unwrap();
+        // size_at == threshold, so `size_at > threshold` is false → full mode.
+        assert!(
+            !(size_at > threshold),
+            "size exactly at threshold should not trigger delta mode"
+        );
+        std::fs::remove_file(&at).unwrap();
+
+        // Just above: threshold + 1 bytes → delta mode.
+        let above = dir.path().join("above.bin");
+        std::fs::write(&above, vec![0u8; (threshold + 1) as usize]).unwrap();
+        let size_above = dir_uncompressed_size(dir.path()).unwrap();
+        assert!(
+            size_above > threshold,
+            "size {size_above} should be > threshold {threshold} (delta mode)"
+        );
+    }
+
+    /// `dir_uncompressed_size` skips `.vai`, `.git`, `target`, `node_modules`.
+    #[test]
+    fn dir_size_excludes_ignored_dirs() {
+        let dir = TempDir::new().unwrap();
+
+        // Write a large file into an ignored directory.
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("huge.bin"), vec![0u8; 600 * 1024]).unwrap();
+
+        // Real content is just 1 byte.
+        std::fs::write(dir.path().join("lib.rs"), b"x").unwrap();
+
+        let size = dir_uncompressed_size(dir.path()).unwrap();
+        // Only lib.rs counted → well below threshold.
+        assert!(size < DELTA_THRESHOLD_BYTES);
+    }
+
+    /// Overlay files written before `upload_snapshot` are captured by
+    /// `collect_overlay_files` — the "overlay completeness" invariant.
+    #[test]
+    fn overlay_population_captured_by_collect() {
+        let overlay = TempDir::new().unwrap();
+        let sub = overlay.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Simulate modified files written into the overlay.
+        std::fs::write(sub.join("main.rs"), b"fn main() { println!(\"v2\"); }").unwrap();
+        std::fs::write(overlay.path().join("Cargo.toml"), b"[package]\nname = \"test\"\n").unwrap();
+
+        let mut collected = Vec::new();
+        collect_overlay_files(overlay.path(), overlay.path(), &mut collected).unwrap();
+        collected.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(collected.len(), 2, "both overlay files must be collected");
+        assert_eq!(collected[0].0, "Cargo.toml");
+        assert_eq!(collected[1].0, "src/main.rs");
+        assert_eq!(collected[1].1, b"fn main() { println!(\"v2\"); }");
     }
 }
