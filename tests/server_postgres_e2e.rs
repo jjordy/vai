@@ -3095,6 +3095,270 @@ async fn test_cli_device_code_not_found() {
     shutdown_tx.send(()).ok();
 }
 
+// ── Multi-tenancy isolation tests ────────────────────────────────────────────
+
+/// Creates a test user and returns (user_id, api_token).
+async fn create_test_user(
+    client: &reqwest::Client,
+    base: &str,
+    admin: &str,
+    sfx: &str,
+    label: &str,
+) -> (String, String) {
+    let resp = client
+        .post(format!("{base}/api/users"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("{label}-{sfx}"),
+            "email": format!("{label}-{sfx}@example.com"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create user {label}: {}", resp.text().await.unwrap_or_default());
+    let user: serde_json::Value = resp.json().await.unwrap();
+    let user_id = user["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("{label}-key-{sfx}"),
+            "for_user_id": &user_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create key for {label}: {}", resp.text().await.unwrap_or_default());
+    let key_resp: serde_json::Value = resp.json().await.unwrap();
+    let token = key_resp["token"].as_str().unwrap().to_string();
+
+    (user_id, token)
+}
+
+/// Verifies that `GET /api/repos` only returns repos the caller is a collaborator on.
+///
+/// Flow:
+/// 1. Create two users (Alice, Bob) with distinct API keys.
+/// 2. Alice creates `alice-repo-<sfx>`.
+/// 3. Bob creates `bob-repo-<sfx>`.
+/// 4. Alice's `GET /api/repos` returns only her repo.
+/// 5. Bob's `GET /api/repos` returns only his repo.
+/// 6. Admin's `GET /api/repos` returns both repos.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_list_repos_filters_by_collaborator() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+
+    let (_alice_id, alice_token) = create_test_user(&client, &base, admin, &sfx, "alice").await;
+    let (_bob_id, bob_token) = create_test_user(&client, &base, admin, &sfx, "bob").await;
+
+    let alice_repo = format!("alice-repo-{sfx}");
+    let bob_repo = format!("bob-repo-{sfx}");
+
+    // Alice creates her repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(&alice_token)
+        .json(&serde_json::json!({ "name": &alice_repo }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "Alice create repo: {}", resp.text().await.unwrap_or_default());
+
+    // Bob creates his repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(&bob_token)
+        .json(&serde_json::json!({ "name": &bob_repo }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "Bob create repo: {}", resp.text().await.unwrap_or_default());
+
+    // Alice sees only her repo.
+    let resp = client
+        .get(format!("{base}/api/repos"))
+        .bearer_auth(&alice_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let repos: serde_json::Value = resp.json().await.unwrap();
+    let arr = repos.as_array().unwrap();
+    assert!(
+        arr.iter().any(|r| r["name"].as_str() == Some(&alice_repo)),
+        "Alice must see her own repo"
+    );
+    assert!(
+        !arr.iter().any(|r| r["name"].as_str() == Some(&bob_repo)),
+        "Alice must NOT see Bob's repo"
+    );
+    // path field must not be present for non-admin.
+    for r in arr {
+        assert!(r.get("path").is_none(), "path must be absent for non-admin user");
+    }
+
+    // Bob sees only his repo.
+    let resp = client
+        .get(format!("{base}/api/repos"))
+        .bearer_auth(&bob_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let repos: serde_json::Value = resp.json().await.unwrap();
+    let arr = repos.as_array().unwrap();
+    assert!(
+        arr.iter().any(|r| r["name"].as_str() == Some(&bob_repo)),
+        "Bob must see his own repo"
+    );
+    assert!(
+        !arr.iter().any(|r| r["name"].as_str() == Some(&alice_repo)),
+        "Bob must NOT see Alice's repo"
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
+/// Verifies that a non-collaborator receives 403 on per-repo endpoints.
+///
+/// Alice creates a repo; Bob (no collaborator row) calls `GET /api/repos/:repo/issues`
+/// and must get 403.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_repo_access_returns_403_for_non_collaborator() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+
+    let (_alice_id, alice_token) = create_test_user(&client, &base, admin, &sfx, "alice2").await;
+    let (_bob_id, bob_token) = create_test_user(&client, &base, admin, &sfx, "bob2").await;
+
+    let alice_repo = format!("alice-private-{sfx}");
+
+    // Alice creates a repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(&alice_token)
+        .json(&serde_json::json!({ "name": &alice_repo }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "Alice create repo: {}", resp.text().await.unwrap_or_default());
+
+    // Bob tries to list Alice's issues — must get 403.
+    let resp = client
+        .get(format!("{base}/api/repos/{alice_repo}/issues"))
+        .bearer_auth(&bob_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "Bob must get 403 on Alice's issues");
+
+    // Bob tries to list Alice's versions — must get 403.
+    let resp = client
+        .get(format!("{base}/api/repos/{alice_repo}/versions"))
+        .bearer_auth(&bob_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "Bob must get 403 on Alice's versions");
+
+    // Bob tries to list Alice's workspaces — must get 403.
+    let resp = client
+        .get(format!("{base}/api/repos/{alice_repo}/workspaces"))
+        .bearer_auth(&bob_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "Bob must get 403 on Alice's workspaces");
+
+    // Alice can still access her own repo.
+    let resp = client
+        .get(format!("{base}/api/repos/{alice_repo}/issues"))
+        .bearer_auth(&alice_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "Alice must access her own repo issues");
+
+    shutdown_tx.send(()).ok();
+}
+
+/// Verifies that the bootstrap admin key sees all repos via `GET /api/repos`.
+///
+/// Creates two repos owned by two different users and asserts the admin response
+/// contains both, plus that the `path` field is present for admin.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_admin_sees_all_repos() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+
+    let (_u1_id, u1_token) = create_test_user(&client, &base, admin, &sfx, "u1").await;
+    let (_u2_id, u2_token) = create_test_user(&client, &base, admin, &sfx, "u2").await;
+
+    let repo1 = format!("admin-vis-repo1-{sfx}");
+    let repo2 = format!("admin-vis-repo2-{sfx}");
+
+    for (token, name) in [(&u1_token, &repo1), (&u2_token, &repo2)] {
+        let resp = client
+            .post(format!("{base}/api/repos"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "create repo {name}: {}", resp.text().await.unwrap_or_default());
+    }
+
+    // Admin sees all repos (at minimum both just created).
+    let resp = client
+        .get(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let repos: serde_json::Value = resp.json().await.unwrap();
+    let arr = repos.as_array().unwrap();
+    assert!(
+        arr.iter().any(|r| r["name"].as_str() == Some(repo1.as_str())),
+        "admin must see repo1"
+    );
+    assert!(
+        arr.iter().any(|r| r["name"].as_str() == Some(repo2.as_str())),
+        "admin must see repo2"
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Extracts the content of a file from a gzip tarball by path suffix.
 fn extract_file_from_tarball(bytes: &[u8], path_suffix: &str) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;

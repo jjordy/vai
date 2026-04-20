@@ -136,51 +136,8 @@ pub(super) async fn token_exchange_handler(
                 Err(other) => return Err(ApiError::from(other)),
             };
 
-            // Grant the user a default collaborator role on every repo they are
-            // not yet a collaborator on.  This runs for both newly provisioned
-            // users and existing users who were created before auto-provisioning
-            // was in place (i.e. they have zero collaborator records).  The
-            // check is cheap and the grant loop is a no-op when the user is
-            // already a member of every repo.
-            let needs_grant = orgs
-                .count_collaborator_repos(&user_id)
-                .await
-                .unwrap_or(0)
-                == 0;
-            if needs_grant {
-                let default_role = state.default_new_user_role.clone();
-                let repo_ids = orgs.list_all_repo_ids().await.unwrap_or_default();
-                for repo_id in repo_ids {
-                    // Ignore conflicts (already a collaborator) and other
-                    // non-fatal errors — provisioning must not fail the login.
-                    match orgs
-                        .add_collaborator(&repo_id, &user_id, default_role.clone())
-                        .await
-                    {
-                        Ok(_) => {
-                            tracing::info!(
-                                event = "auth.collaborator_granted",
-                                vai_user_id = %user_id,
-                                repo_id = %repo_id,
-                                role = %default_role.as_str(),
-                                "Granted default repo role to user"
-                            );
-                        }
-                        Err(crate::storage::StorageError::Conflict(_)) => {
-                            // Already a collaborator — harmless.
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                event = "auth.collaborator_grant_failed",
-                                vai_user_id = %user_id,
-                                repo_id = %repo_id,
-                                error = %e,
-                                "Failed to grant default repo role to user"
-                            );
-                        }
-                    }
-                }
-            }
+            // No automatic repo grants on login — users see only repos they
+            // created or were explicitly added to as collaborators.
 
             // Resolve the user's repo role if repo_id was supplied.
             let role: Option<String> = if let Some(repo_id) = &body.repo_id {

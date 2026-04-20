@@ -495,11 +495,6 @@ pub(crate) struct AppState {
     /// Used to mint short-lived access tokens (via `POST /api/auth/token`)
     /// and to validate JWT Bearer tokens in the auth middleware.
     pub(crate) jwt_service: Arc<crate::auth::jwt::JwtService>,
-    /// Default repo role assigned to newly auto-provisioned users.
-    ///
-    /// Set via `VAI_DEFAULT_USER_ROLE` (accepted values: `admin`, `write`, `read`).
-    /// Defaults to `write` when the variable is absent or unrecognised.
-    default_new_user_role: crate::storage::RepoRole,
     /// Maximum number of repos a non-admin user may own (have `admin` collaborator role on).
     ///
     /// Set via `VAI_MAX_REPOS_PER_USER` env var. Defaults to 100.
@@ -3550,7 +3545,6 @@ pub async fn start_for_testing(
         )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
-        default_new_user_role: crate::storage::RepoRole::Write,
         max_repos_per_user: 100,
     });
 
@@ -3649,7 +3643,6 @@ pub async fn start_for_testing_pg(
         )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
-        default_new_user_role: crate::storage::RepoRole::Write,
         max_repos_per_user: 100,
     });
 
@@ -3739,7 +3732,6 @@ pub async fn start_for_testing_pg_multi_repo(
         )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
-        default_new_user_role: crate::storage::RepoRole::Write,
         max_repos_per_user: 100,
     });
 
@@ -3811,7 +3803,6 @@ pub async fn start_for_testing_pg_multi_repo_with_quota(
         )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
-        default_new_user_role: crate::storage::RepoRole::Write,
         max_repos_per_user,
     });
 
@@ -3887,7 +3878,6 @@ pub async fn start_for_testing_pg_with_mem_fs(
         )),
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
-        default_new_user_role: crate::storage::RepoRole::Write,
         max_repos_per_user: 100,
     });
 
@@ -4042,20 +4032,6 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         .unwrap_or_default();
     let cors_origins = parse_cors_origins(&cors_origins_raw);
 
-    // Resolve default role for auto-provisioned users: VAI_DEFAULT_USER_ROLE or "write".
-    let default_new_user_role = {
-        use crate::storage::RepoRole;
-        match std::env::var("VAI_DEFAULT_USER_ROLE")
-            .unwrap_or_default()
-            .to_lowercase()
-            .as_str()
-        {
-            "admin" => RepoRole::Admin,
-            "read" => RepoRole::Read,
-            _ => RepoRole::Write,
-        }
-    };
-
     // Per-user repo quota: VAI_MAX_REPOS_PER_USER or 100.
     let max_repos_per_user: u64 = std::env::var("VAI_MAX_REPOS_PER_USER")
         .ok()
@@ -4079,7 +4055,6 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         jwt_service,
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins,
-        default_new_user_role,
         max_repos_per_user,
     });
 
@@ -4218,7 +4193,6 @@ mod tests {
             )),
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins: vec![],
-            default_new_user_role: crate::storage::RepoRole::Write,
             max_repos_per_user: 100,
         });
 
@@ -6484,7 +6458,6 @@ mod tests {
             )),
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins: vec![],
-            default_new_user_role: crate::storage::RepoRole::Write,
             max_repos_per_user: 100,
         });
 
@@ -7034,7 +7007,6 @@ mod tests {
             )),
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins,
-            default_new_user_role: crate::storage::RepoRole::Write,
             max_repos_per_user: 100,
         });
 

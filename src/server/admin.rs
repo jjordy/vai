@@ -49,7 +49,10 @@ pub(super) struct RepoResponse {
     /// Short name of the repository.
     name: String,
     /// Absolute filesystem path to the repository root.
-    path: String,
+    ///
+    /// Only present for bootstrap admin callers; omitted for regular users.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
     /// ISO-8601 timestamp when the repo was registered.
     created_at: String,
     /// Current HEAD version string (e.g. `"v1"`).
@@ -66,7 +69,9 @@ impl RepoResponse {
         let workspace_count = crate::workspace::list(&vai_dir).map(|w| w.len()).unwrap_or(0);
         RepoResponse {
             name: entry.name.clone(),
-            path: entry.path.display().to_string(),
+            // Only local-mode admin listing; path is safe here but we hide it
+            // for consistency — non-admin users never call this path.
+            path: Some(entry.path.display().to_string()),
             created_at: entry.created_at.to_rfc3339(),
             head_version,
             workspace_count,
@@ -239,7 +244,7 @@ pub(super) async fn create_repo_handler(
 
         let response = RepoResponse {
             name: body.name.clone(),
-            path: String::new(),
+            path: None,
             created_at: created_at.to_rfc3339(),
             head_version: "v1".to_string(),
             workspace_count: 0,
@@ -284,7 +289,8 @@ pub(super) async fn create_repo_handler(
 
     let response = RepoResponse {
         name: entry.name.clone(),
-        path: entry.path.display().to_string(),
+        // Admin-only: local mode exposes path for backward compat.
+        path: if identity.is_admin { Some(entry.path.display().to_string()) } else { None },
         created_at: entry.created_at.to_rfc3339(),
         head_version: "v1".to_string(),
         workspace_count: 0,
@@ -381,15 +387,19 @@ pub(super) async fn list_repos_handler(
                 .map(|r| r.total as usize)
                 .unwrap_or(0);
 
-            let path = state
-                .storage_root
-                .as_ref()
-                .map(|sr| sr.join(&name))
-                .unwrap_or_default();
+            // Expose internal path only to bootstrap admin callers.
+            let path = if identity.is_admin {
+                state
+                    .storage_root
+                    .as_ref()
+                    .map(|sr| sr.join(&name).display().to_string())
+            } else {
+                None
+            };
 
             responses.push(RepoResponse {
                 name,
-                path: path.display().to_string(),
+                path,
                 created_at: created_at.to_rfc3339(),
                 head_version,
                 workspace_count,
