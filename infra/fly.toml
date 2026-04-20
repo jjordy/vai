@@ -12,6 +12,9 @@ primary_region = 'iad'
 [env]
   VAI_LOG_LEVEL = 'info'
   VAI_PORT = '7865'
+  # URL of the dashboard /cli page shown to users during `vai login --device`.
+  # Set this to your actual dashboard URL before deploying to production.
+  VAI_DASHBOARD_URL = 'https://dashboard.blocksynth.ai'
 
 [http_service]
   internal_port = 7865

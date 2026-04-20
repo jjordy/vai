@@ -53,6 +53,8 @@ struct DeviceCodeResponse {
 struct DeviceCodeStatus {
     status: String,
     api_key: Option<String>,
+    user_id: Option<String>,
+    user_email: Option<String>,
 }
 
 // ── Helper functions ──────────────────────────────────────────────────────────
@@ -315,8 +317,8 @@ async fn run_device_flow(server_url: &str) -> Result<Credentials, LoginError> {
                 let creds = Credentials {
                     server_url: server_url.to_string(),
                     api_key,
-                    user_id: None,
-                    user_email: None,
+                    user_id: status.user_id,
+                    user_email: status.user_email,
                 };
                 credentials::write(&creds)?;
                 return Ok(creds);

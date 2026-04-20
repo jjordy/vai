@@ -303,8 +303,10 @@ impl AuthStore for PostgresStorage {
             .await;
 
         let row = sqlx::query(
-            "SELECT api_key FROM cli_device_codes \
-             WHERE code = $1 AND expires_at >= now()",
+            "SELECT d.api_key, d.user_id, u.email AS user_email \
+             FROM cli_device_codes d \
+             LEFT JOIN users u ON u.id = d.user_id \
+             WHERE d.code = $1 AND d.expires_at >= now()",
         )
         .bind(code)
         .fetch_optional(&self.pool)
@@ -317,12 +319,23 @@ impl AuthStore for PostgresStorage {
         match api_key {
             None => Ok(DeviceCodeStatus::Pending),
             Some(key) => {
+                let user_id: uuid::Uuid = row
+                    .get::<Option<uuid::Uuid>, _>("user_id")
+                    .ok_or_else(|| StorageError::Database("device code has no user_id".to_string()))?;
+                let user_email: String = row
+                    .get::<Option<String>, _>("user_email")
+                    .ok_or_else(|| StorageError::Database("authorized user not found".to_string()))?;
+
                 // Delete the row so the key is revealed only once.
                 let _ = sqlx::query("DELETE FROM cli_device_codes WHERE code = $1")
                     .bind(code)
                     .execute(&self.pool)
                     .await;
-                Ok(DeviceCodeStatus::Authorized { api_key: key })
+                Ok(DeviceCodeStatus::Authorized {
+                    api_key: key,
+                    user_id,
+                    user_email,
+                })
             }
         }
     }

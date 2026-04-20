@@ -1002,6 +1002,10 @@ pub enum DeviceCodeStatus {
     Authorized {
         /// Plaintext API key (shown only once).
         api_key: String,
+        /// UUID of the user who authorized the code.
+        user_id: uuid::Uuid,
+        /// Email address of the authorizing user.
+        user_email: String,
     },
 }
 

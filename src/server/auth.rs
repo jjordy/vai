@@ -385,6 +385,12 @@ pub(super) struct DeviceCodeStatusResponse {
     /// Plaintext API key. Present only when `status` is `"authorized"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// UUID of the user who authorized the code. Present only when `status` is `"authorized"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// Email of the user who authorized the code. Present only when `status` is `"authorized"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_email: Option<String>,
 }
 
 /// Request body for `POST /api/auth/cli-device/authorize`.
@@ -415,9 +421,12 @@ pub(super) async fn create_device_code_handler(
     let auth = state.storage.auth();
     let code = auth.create_device_code().await.map_err(ApiError::from)?;
 
-    let public_url = std::env::var("VAI_PUBLIC_URL")
-        .unwrap_or_else(|_| "http://localhost:7865".to_string());
-    let verification_url = format!("{public_url}/cli");
+    // Use VAI_DASHBOARD_URL (where the /cli page lives) for the verification URL.
+    // Falls back to VAI_PUBLIC_URL for backward compatibility, then a placeholder default.
+    let dashboard_url = std::env::var("VAI_DASHBOARD_URL")
+        .or_else(|_| std::env::var("VAI_PUBLIC_URL"))
+        .unwrap_or_else(|_| "https://vai.example.com".to_string());
+    let verification_url = format!("{dashboard_url}/cli");
 
     tracing::info!(event = "auth.device_code_created", code = %code, "CLI device code created");
 
@@ -466,9 +475,15 @@ pub(super) async fn poll_device_code_handler(
             Ok(Json(DeviceCodeStatusResponse {
                 status: "pending".to_string(),
                 api_key: None,
+                user_id: None,
+                user_email: None,
             }))
         }
-        crate::storage::DeviceCodeStatus::Authorized { api_key } => {
+        crate::storage::DeviceCodeStatus::Authorized {
+            api_key,
+            user_id,
+            user_email,
+        } => {
             tracing::info!(
                 event = "auth.device_code_authorized",
                 "CLI device code key retrieved — row deleted"
@@ -476,6 +491,8 @@ pub(super) async fn poll_device_code_handler(
             Ok(Json(DeviceCodeStatusResponse {
                 status: "authorized".to_string(),
                 api_key: Some(api_key),
+                user_id: Some(user_id.to_string()),
+                user_email: Some(user_email),
             }))
         }
     }
