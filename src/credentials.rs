@@ -120,21 +120,40 @@ pub fn read() -> Result<Credentials, CredentialsError> {
 
 /// Loads an API key using the standard resolution order:
 ///
-/// 1. `VAI_API_KEY` environment variable (highest priority).
-/// 2. `~/.vai/credentials.toml` `[default]` profile.
-/// 3. Returns [`CredentialsError::NotLoggedIn`].
+/// 1. If **both** `VAI_API_KEY` and `VAI_SERVER_URL` env vars are set and
+///    non-empty, return them immediately (env-first fast path).
+/// 2. Otherwise read `~/.vai/credentials.toml` `[default]` profile, using any
+///    present env var to override the corresponding file value.
+/// 3. Returns [`CredentialsError::NotLoggedIn`] when neither source yields an
+///    API key.
 ///
-/// Returns `(api_key, server_url)`. When the key comes from the env var,
-/// `server_url` is taken from `VAI_SERVER_URL` (may be `None`).
+/// This means `VAI_API_KEY` alone (without `VAI_SERVER_URL`) still works — the
+/// server URL is filled in from the credentials file.
 pub fn load_api_key() -> Result<(String, Option<String>), CredentialsError> {
-    if let Ok(key) = std::env::var("VAI_API_KEY") {
-        if !key.is_empty() {
-            let server_url = std::env::var("VAI_SERVER_URL").ok();
-            return Ok((key, server_url));
-        }
+    let env_key = std::env::var("VAI_API_KEY").ok().filter(|k| !k.is_empty());
+    let env_url = std::env::var("VAI_SERVER_URL").ok().filter(|u| !u.is_empty());
+
+    // Fast path: both env vars present → skip the file entirely.
+    if let (Some(key), Some(url)) = (&env_key, &env_url) {
+        return Ok((key.clone(), Some(url.clone())));
     }
-    let creds = read()?;
-    Ok((creds.api_key, Some(creds.server_url)))
+
+    // Fall back to credentials file, letting env vars override individual fields.
+    match read() {
+        Ok(creds) => {
+            let api_key = env_key.unwrap_or(creds.api_key);
+            let server_url = env_url.or(Some(creds.server_url));
+            Ok((api_key, server_url))
+        }
+        Err(CredentialsError::NotLoggedIn) => {
+            // No credentials file — use whatever env vars provided, or error.
+            match env_key {
+                Some(key) => Ok((key, env_url)),
+                None => Err(CredentialsError::NotLoggedIn),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -314,6 +333,52 @@ mod tests {
         assert!(
             matches!(result, Err(CredentialsError::NotLoggedIn)),
             "expected NotLoggedIn, got: {result:?}"
+        );
+    }
+
+    /// When only `VAI_API_KEY` is set (no `VAI_SERVER_URL`), the server URL
+    /// should come from credentials.toml rather than returning `None`.
+    #[test]
+    fn load_api_key_uses_file_server_url_when_env_url_missing() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_key = std::env::var("VAI_API_KEY");
+        let original_url = std::env::var("VAI_SERVER_URL");
+
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("VAI_API_KEY", "vai_envkey_only");
+        std::env::remove_var("VAI_SERVER_URL");
+
+        let creds = Credentials {
+            server_url: "https://file.example.com".to_string(),
+            api_key: "vai_filekey".to_string(),
+            user_id: None,
+            user_email: None,
+        };
+        write(&creds).expect("write should succeed");
+
+        let result = load_api_key();
+
+        match original_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_key {
+            Ok(v) => std::env::set_var("VAI_API_KEY", v),
+            Err(_) => std::env::remove_var("VAI_API_KEY"),
+        }
+        match original_url {
+            Ok(v) => std::env::set_var("VAI_SERVER_URL", v),
+            Err(_) => std::env::remove_var("VAI_SERVER_URL"),
+        }
+
+        let (key, url) = result.expect("load_api_key should succeed: env key + file server_url");
+        assert_eq!(key, "vai_envkey_only", "env VAI_API_KEY should override file api_key");
+        assert_eq!(
+            url,
+            Some("https://file.example.com".to_string()),
+            "server_url should fall back to credentials file when VAI_SERVER_URL is absent"
         );
     }
 
