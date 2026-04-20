@@ -3993,6 +3993,71 @@ async fn test_delta_tarball_many_files() {
     shutdown_tx.send(()).ok();
 }
 
+/// Verifies that `POST /api/repos` returns the server-assigned `id` UUID in the
+/// 201 response body (issue #302 regression guard).
+///
+/// The client (`vai init`) must persist this `id` as the local `repo_id` so
+/// that subsequent API calls using `repo_id` in their request body (e.g.
+/// `POST /api/keys`) use the correct server-side UUID.
+#[tokio::test]
+async fn test_create_repo_returns_server_id() {
+    let Some(db_url) = db_url() else { return };
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &db_url)
+        .await
+        .expect("start_for_testing_pg_multi_repo failed");
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    let repo_name = format!("id-check-{}", unique_suffix());
+
+    // 1. Create repo via POST /api/repos.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": repo_name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create repo: {}", resp.text().await.unwrap_or_default());
+    let create_body: serde_json::Value = resp.json().await.unwrap();
+
+    // 2. The response must include the `id` field (a valid UUID string).
+    let server_id_str = create_body["id"]
+        .as_str()
+        .expect("POST /api/repos 201 response must contain 'id' field");
+    let server_id: uuid::Uuid = server_id_str
+        .parse()
+        .expect("'id' field must be a valid UUID");
+
+    // 3. GET /api/repos list must contain the repo; extract its `id` and verify
+    //    it matches the `id` returned by the create endpoint.
+    let resp = client
+        .get(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let repos: Vec<serde_json::Value> = resp.json().await.unwrap();
+    let list_entry = repos
+        .iter()
+        .find(|r| r["name"].as_str() == Some(&repo_name))
+        .expect("created repo must appear in GET /api/repos");
+    let list_id_str = list_entry["id"]
+        .as_str()
+        .expect("GET /api/repos entries must contain 'id' field");
+    let list_id: uuid::Uuid = list_id_str.parse().expect("list 'id' must be a valid UUID");
+
+    assert_eq!(
+        server_id, list_id,
+        "id from POST /api/repos must match id from GET /api/repos for the same repo"
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Extracts the content of a file from a gzip tarball by path suffix.
 fn extract_file_from_tarball(bytes: &[u8], path_suffix: &str) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;

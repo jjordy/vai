@@ -85,12 +85,16 @@ pub(super) fn handle(
     }
 
     // ── Step 4: register with the server (with collision retry) ───────────────
-    let registered_name =
+    let (registered_name, server_repo_id) =
         register_with_retry(&cwd, &server_url, &api_key, initial_name)?;
 
-    // ── Step 5: persist remote config ─────────────────────────────────────────
+    // ── Step 5: persist remote config + server-assigned repo_id ──────────────
     let vai_dir = cwd.join(".vai");
     let mut config = repo::read_config(&vai_dir)?;
+    // Overwrite the client-generated UUID with the server's canonical id.
+    // All subsequent API calls that pass repo_id in the request body will now
+    // use the correct UUID and match the server's repos table.
+    config.repo_id = server_repo_id;
     config.remote = Some(repo::RemoteServerConfig {
         url: server_url.clone(),
         repo_name: Some(registered_name.clone()),
@@ -204,14 +208,14 @@ fn is_valid_repo_name(name: &str) -> bool {
 
 /// Registers the repo on the server, retrying on 409 Name Conflict up to 3 times.
 ///
-/// Returns the final accepted name, or exits the process if all retries fail or
-/// a quota error (403) is received.
+/// Returns `(registered_name, server_repo_id)`. The caller MUST persist
+/// `server_repo_id` as the local `repo_id` — it is the canonical identifier.
 fn register_with_retry(
     _cwd: &Path,
     server_url: &str,
     api_key: &str,
     initial_name: String,
-) -> Result<String, CliError> {
+) -> Result<(String, uuid::Uuid), CliError> {
     let rt = make_rt()?;
     let client = reqwest::Client::new();
     let base_url = server_url.trim_end_matches('/');
@@ -225,7 +229,7 @@ fn register_with_retry(
 
         // Perform the HTTP call and read the response body inside a single block_on.
         enum RegisterOutcome {
-            Success(String),
+            Success(String, uuid::Uuid),
             Conflict,
             Quota,
             Err(String),
@@ -247,9 +251,12 @@ fn register_with_retry(
 
             if status == reqwest::StatusCode::CREATED {
                 #[derive(serde::Deserialize)]
-                struct Reg { name: String }
+                struct Reg { id: Option<uuid::Uuid>, name: String }
                 match resp.json::<Reg>().await {
-                    Ok(r) => return RegisterOutcome::Success(r.name),
+                    Ok(r) => {
+                        let id = r.id.unwrap_or_else(uuid::Uuid::new_v4);
+                        return RegisterOutcome::Success(r.name, id);
+                    }
                     Err(e) => return RegisterOutcome::Err(format!("invalid server response: {e}")),
                 }
             }
@@ -267,7 +274,7 @@ fn register_with_retry(
         });
 
         match outcome {
-            RegisterOutcome::Success(registered) => return Ok(registered),
+            RegisterOutcome::Success(registered, server_id) => return Ok((registered, server_id)),
             RegisterOutcome::Quota => {
                 eprintln!(
                     "You've hit the 100-repo limit for your account. \

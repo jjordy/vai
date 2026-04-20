@@ -46,6 +46,12 @@ pub(super) struct CreateRepoRequest {
 /// Response body for repo list and creation endpoints.
 #[derive(Debug, Serialize, ToSchema)]
 pub(super) struct RepoResponse {
+    /// Server-assigned repository UUID.
+    ///
+    /// Present on `POST /api/repos` (201 Created) and any endpoint that knows
+    /// the UUID. Clients MUST overwrite their local `repo_id` with this value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<uuid::Uuid>,
     /// Short name of the repository.
     name: String,
     /// Absolute filesystem path to the repository root.
@@ -68,6 +74,7 @@ impl RepoResponse {
         let head_version = crate::repo::read_head(&vai_dir).unwrap_or_else(|_| "unknown".to_string());
         let workspace_count = crate::workspace::list(&vai_dir).map(|w| w.len()).unwrap_or(0);
         RepoResponse {
+            id: None,
             name: entry.name.clone(),
             // Only local-mode admin listing; path is safe here but we hide it
             // for consistency — non-admin users never call this path.
@@ -243,6 +250,7 @@ pub(super) async fn create_repo_handler(
         tracing::info!(repo_id = %repo_id, name = %body.name, "repo registered (server mode, no filesystem writes)");
 
         let response = RepoResponse {
+            id: Some(repo_id),
             name: body.name.clone(),
             path: None,
             created_at: created_at.to_rfc3339(),
@@ -288,6 +296,7 @@ pub(super) async fn create_repo_handler(
     tracing::info!(repo_id = %repo_id, name = %entry.name, path = %entry.path.display(), "repo registered");
 
     let response = RepoResponse {
+        id: Some(repo_id),
         name: entry.name.clone(),
         // Admin-only: local mode exposes path for backward compat.
         path: if identity.is_admin { Some(entry.path.display().to_string()) } else { None },
@@ -398,6 +407,7 @@ pub(super) async fn list_repos_handler(
             };
 
             responses.push(RepoResponse {
+                id: Some(repo_id),
                 name,
                 path,
                 created_at: created_at.to_rfc3339(),
