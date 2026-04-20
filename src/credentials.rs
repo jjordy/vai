@@ -143,6 +143,12 @@ pub fn load_api_key() -> Result<(String, Option<String>), CredentialsError> {
 mod tests {
     use super::*;
 
+    /// Mutex that serializes tests which read or write process-global env vars
+    /// (`HOME`, `VAI_API_KEY`, `VAI_SERVER_URL`).  Without serialization the
+    /// tests race: one test's `set_var("HOME", ...)` can corrupt another's
+    /// `read()` mid-flight.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Serialize and deserialize a `Credentials` value through the TOML file format.
     #[test]
     fn round_trip_credentials_toml() {
@@ -179,6 +185,7 @@ mod tests {
     /// Write and read back credentials through an actual temp file.
     #[test]
     fn write_and_read_credentials() {
+        let _env = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
         // Override HOME so credentials are written to the temp dir.
         let original_home = std::env::var_os("HOME");
@@ -220,6 +227,7 @@ mod tests {
     /// Reading from a missing file returns `NotLoggedIn`.
     #[test]
     fn read_missing_returns_not_logged_in() {
+        let _env = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
         let original_home = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());
@@ -231,5 +239,123 @@ mod tests {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    /// `load_api_key` reads from credentials.toml when env vars are absent.
+    #[test]
+    fn load_api_key_falls_back_to_credentials_file() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_key = std::env::var("VAI_API_KEY");
+        let original_url = std::env::var("VAI_SERVER_URL");
+
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("VAI_API_KEY");
+        std::env::remove_var("VAI_SERVER_URL");
+
+        let creds = Credentials {
+            server_url: "https://vai.example.com".to_string(),
+            api_key: "vai_fromfile123".to_string(),
+            user_id: None,
+            user_email: None,
+        };
+        write(&creds).expect("write should succeed");
+
+        let result = load_api_key();
+
+        // Restore environment.
+        match original_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_key {
+            Ok(v) => std::env::set_var("VAI_API_KEY", v),
+            Err(_) => std::env::remove_var("VAI_API_KEY"),
+        }
+        match original_url {
+            Ok(v) => std::env::set_var("VAI_SERVER_URL", v),
+            Err(_) => std::env::remove_var("VAI_SERVER_URL"),
+        }
+
+        let (key, url) = result.expect("load_api_key should succeed with credentials.toml");
+        assert_eq!(key, "vai_fromfile123");
+        assert_eq!(url, Some("https://vai.example.com".to_string()));
+    }
+
+    /// `load_api_key` returns `NotLoggedIn` when neither env vars nor file are present.
+    #[test]
+    fn load_api_key_not_logged_in_without_any_credentials() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_key = std::env::var("VAI_API_KEY");
+        let original_url = std::env::var("VAI_SERVER_URL");
+
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("VAI_API_KEY");
+        std::env::remove_var("VAI_SERVER_URL");
+
+        let result = load_api_key();
+
+        match original_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_key {
+            Ok(v) => std::env::set_var("VAI_API_KEY", v),
+            Err(_) => std::env::remove_var("VAI_API_KEY"),
+        }
+        match original_url {
+            Ok(v) => std::env::set_var("VAI_SERVER_URL", v),
+            Err(_) => std::env::remove_var("VAI_SERVER_URL"),
+        }
+
+        assert!(
+            matches!(result, Err(CredentialsError::NotLoggedIn)),
+            "expected NotLoggedIn, got: {result:?}"
+        );
+    }
+
+    /// Env vars take priority over credentials.toml when both are present.
+    #[test]
+    fn load_api_key_env_var_takes_priority() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_key = std::env::var("VAI_API_KEY");
+        let original_url = std::env::var("VAI_SERVER_URL");
+
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("VAI_API_KEY", "vai_envkey");
+        std::env::set_var("VAI_SERVER_URL", "https://env.example.com");
+
+        // Write different credentials to the file — they should be ignored.
+        let creds = Credentials {
+            server_url: "https://file.example.com".to_string(),
+            api_key: "vai_filekey".to_string(),
+            user_id: None,
+            user_email: None,
+        };
+        write(&creds).ok();
+
+        let result = load_api_key();
+
+        match original_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_key {
+            Ok(v) => std::env::set_var("VAI_API_KEY", v),
+            Err(_) => std::env::remove_var("VAI_API_KEY"),
+        }
+        match original_url {
+            Ok(v) => std::env::set_var("VAI_SERVER_URL", v),
+            Err(_) => std::env::remove_var("VAI_SERVER_URL"),
+        }
+
+        let (key, url) = result.expect("load_api_key should succeed with env vars");
+        assert_eq!(key, "vai_envkey");
+        assert_eq!(url, Some("https://env.example.com".to_string()));
     }
 }

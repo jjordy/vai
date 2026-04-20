@@ -15,13 +15,7 @@ use super::{CliError, make_rt};
 
 /// Execute `vai init`.
 ///
-/// 1. Initialises the local `.vai/` structure via [`repo::init`].
-/// 2. If `local_only`, stops here and prints the result.
-/// 3. Loads credentials; exits 1 if not logged in.
-/// 4. Registers the repo on the server (with collision retry).
-/// 5. Persists `remote.url` and `remote.repo_name` to `.vai/config.toml`.
-/// 6. Ensures `.env` is listed in `.gitignore`.
-/// 7. Unless `no_push`, collects and pushes the initial snapshot.
+/// Delegates to [`run_init`] after resolving the current working directory.
 pub(super) fn handle(
     local_only: bool,
     no_push: bool,
@@ -30,9 +24,27 @@ pub(super) fn handle(
 ) -> Result<(), CliError> {
     let cwd = std::env::current_dir()
         .map_err(|e| CliError::Other(format!("cannot determine working directory: {e}")))?;
+    run_init(&cwd, local_only, no_push, remote_name, json)
+}
 
+/// Core init logic, parameterised by directory.
+///
+/// 1. Initialises the local `.vai/` structure via [`repo::init`].
+/// 2. If `local_only`, stops here and prints the result.
+/// 3. Loads credentials; exits 1 if not logged in.
+/// 4. Registers the repo on the server (with collision retry).
+/// 5. Persists `remote.url` and `remote.repo_name` to `.vai/config.toml`.
+/// 6. Ensures `.env` is listed in `.gitignore`.
+/// 7. Unless `no_push`, collects and pushes the initial snapshot.
+pub fn run_init(
+    cwd: &Path,
+    local_only: bool,
+    no_push: bool,
+    remote_name: Option<String>,
+    json: bool,
+) -> Result<(), CliError> {
     // ── Step 1: local init ────────────────────────────────────────────────────
-    let result = repo::init(&cwd)?;
+    let result = repo::init(cwd)?;
 
     if local_only {
         if json {
@@ -62,7 +74,7 @@ pub(super) fn handle(
     let server_url = match server_url_opt {
         Some(u) if !u.is_empty() => u,
         _ => {
-            eprintln!("No server URL configured. Run 'vai login --server-url <url>' first.");
+            eprintln!("No server URL configured. Run 'vai login' first.");
             std::process::exit(1);
         }
     };
@@ -86,7 +98,7 @@ pub(super) fn handle(
 
     // ── Step 4: register with the server (with collision retry) ───────────────
     let (registered_name, server_repo_id) =
-        register_with_retry(&cwd, &server_url, &api_key, initial_name)?;
+        register_with_retry(cwd, &server_url, &api_key, initial_name)?;
 
     // ── Step 5: persist remote config + server-assigned repo_id ──────────────
     let vai_dir = cwd.join(".vai");
@@ -111,7 +123,7 @@ pub(super) fn handle(
     }
 
     // ── Step 6: ensure .env is in .gitignore ─────────────────────────────────
-    ensure_env_in_gitignore(&cwd);
+    ensure_env_in_gitignore(cwd);
 
     if no_push {
         if !json {
@@ -122,7 +134,7 @@ pub(super) fn handle(
     }
 
     // ── Step 7: collect files and check size ──────────────────────────────────
-    let files = ignore_rules::collect_all_files(&cwd, &[]);
+    let files = ignore_rules::collect_all_files(cwd, &[]);
     let total_bytes: u64 = files
         .iter()
         .filter_map(|p| std::fs::metadata(p).ok())
@@ -144,7 +156,7 @@ pub(super) fn handle(
         );
         eprintln!("Top 5 largest files:");
         for (size, path) in sized.iter().take(5) {
-            let rel = path.strip_prefix(&cwd).unwrap_or(path);
+            let rel = path.strip_prefix(cwd).unwrap_or(path);
             eprintln!("  {:.1} MB  {}", *size as f64 / (1024.0 * 1024.0), rel.display());
         }
 
@@ -160,7 +172,7 @@ pub(super) fn handle(
     }
 
     // ── Step 8: push initial snapshot ────────────────────────────────────────
-    let session = Session::builder(&cwd)
+    let session = Session::builder(cwd)
         .remote_url(server_url.clone())
         .api_key(api_key)
         .repo(registered_name.clone())

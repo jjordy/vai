@@ -4058,6 +4058,138 @@ async fn test_create_repo_returns_server_id() {
     shutdown_tx.send(()).ok();
 }
 
+/// `vai init` must read credentials from `~/.vai/credentials.toml` when no env vars are set.
+///
+/// Acceptance criteria (PRD 26 V-5 / issue #301):
+/// - With valid credentials.toml and NO `VAI_API_KEY`/`VAI_SERVER_URL` env vars,
+///   `vai init` registers the repo on the server and writes a `[remote]` block to
+///   `.vai/config.toml`.
+/// - The repo is visible in `GET /api/repos`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_init_reads_credentials_from_file_not_env_vars() {
+    let Some(db_url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &db_url)
+        .await
+        .expect("server start failed");
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+
+    // Create a user who will own the repo.
+    let resp = client
+        .post(format!("{base}/api/users"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("InitFileUser-{sfx}"),
+            "email": format!("initfile-{sfx}@example.com"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create user: {}", resp.text().await.unwrap_or_default());
+    let user: serde_json::Value = resp.json().await.unwrap();
+    let user_id = user["id"].as_str().unwrap().to_string();
+
+    // Mint an API key for the user.
+    let resp = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("init-file-key-{sfx}"),
+            "for_user_id": user_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create key: {}", resp.text().await.unwrap_or_default());
+    let key_body: serde_json::Value = resp.json().await.unwrap();
+    let api_key = key_body["token"].as_str().unwrap().to_string();
+
+    // Build the repo directory in a temp location.
+    let repo_tmp = TempDir::new().unwrap();
+    let repo_dir = repo_tmp.path().to_path_buf();
+
+    // Set up credentials.toml in a separate temp HOME dir.
+    let home_tmp = TempDir::new().unwrap();
+    let vai_cfg_dir = home_tmp.path().join(".vai");
+    std::fs::create_dir_all(&vai_cfg_dir).unwrap();
+    let creds_content = format!(
+        "[default]\nserver_url = \"{base}\"\napi_key = \"{api_key}\"\n"
+    );
+    std::fs::write(vai_cfg_dir.join("credentials.toml"), &creds_content).unwrap();
+
+    // Capture current env state.
+    let original_home = std::env::var_os("HOME");
+    let original_key = std::env::var("VAI_API_KEY").ok();
+    let original_url = std::env::var("VAI_SERVER_URL").ok();
+
+    // Point HOME at our temp dir and clear the API-key env vars so that
+    // run_init MUST read credentials from the file.
+    std::env::set_var("HOME", home_tmp.path());
+    std::env::remove_var("VAI_API_KEY");
+    std::env::remove_var("VAI_SERVER_URL");
+
+    // Derive a valid repo name (must match ^[a-zA-Z0-9][a-zA-Z0-9-_]*$).
+    let repo_name = format!("init-creds-test-{sfx}");
+
+    // run_init calls make_rt() internally which creates a new tokio Runtime.
+    // That is not allowed from inside an async tokio worker, so we delegate
+    // to spawn_blocking which runs on a separate thread pool.
+    let result = tokio::task::spawn_blocking(move || {
+        vai::cli::run_init(&repo_dir, false, true, Some(repo_name), false)
+    })
+    .await
+    .expect("spawn_blocking panicked");
+
+    // Restore env.
+    match original_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    match original_key {
+        Some(v) => std::env::set_var("VAI_API_KEY", v),
+        None => std::env::remove_var("VAI_API_KEY"),
+    }
+    match original_url {
+        Some(v) => std::env::set_var("VAI_SERVER_URL", v),
+        None => std::env::remove_var("VAI_SERVER_URL"),
+    }
+
+    result.expect("run_init should succeed with credentials.toml");
+
+    // The config.toml must contain a [remote] block with the server URL.
+    let config_path = repo_tmp.path().join(".vai/config.toml");
+    assert!(config_path.exists(), ".vai/config.toml must exist after init");
+    let config_text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        config_text.contains("[remote]"),
+        "config.toml must have [remote] block; got:\n{config_text}"
+    );
+    assert!(
+        config_text.contains(&base),
+        "config.toml must contain the server URL; got:\n{config_text}"
+    );
+
+    // The repo must be visible on the server.
+    let repos_resp = client
+        .get(format!("{base}/api/repos"))
+        .bearer_auth(&api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(repos_resp.status(), 200);
+    let repos: Vec<serde_json::Value> = repos_resp.json().await.unwrap();
+    assert!(
+        !repos.is_empty(),
+        "at least one repo should appear in GET /api/repos after init"
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Extracts the content of a file from a gzip tarball by path suffix.
 fn extract_file_from_tarball(bytes: &[u8], path_suffix: &str) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;

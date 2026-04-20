@@ -18,6 +18,8 @@ mod version;
 mod work_queue;
 mod workspace;
 
+pub use init::run_init;
+
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
