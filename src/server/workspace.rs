@@ -1278,7 +1278,7 @@ pub(super) async fn upload_snapshot_handler(
     // were previously stored in `current/`). Requiring explicit opt-in via
     // `?allow_destructive=true` prevents silent data loss.
     let current_count = current_map.len();
-    if !query.allow_destructive && deleted > 0 && current_count > 0 && deleted * 2 > current_count {
+    if !query.allow_destructive && deleted > 0 && current_count >= 3 && deleted * 2 > current_count {
         return Err(ApiError::conflict(format!(
             "upload would delete {deleted} of {current_count} files \
              (>{pct:.0}% threshold); set ?allow_destructive=true to proceed",
