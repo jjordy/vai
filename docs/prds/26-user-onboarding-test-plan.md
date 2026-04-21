@@ -49,7 +49,7 @@ Fresh machine, no vai account, no CLI, no credentials. This is the flow PRD 26 i
 - [ ] Each step has a copy-to-clipboard button on its command. Click step 1's button, paste into terminal — exact command appears. *(D-1)*
 - [ ] "Skip" link visible bottom-right. *(D-1)*
 - [ ] Open devtools → Network. Confirm polling every ~3 seconds on: `GET /api/keys`, `GET /api/repos`. *(D-1)*
-- [ ] `user.onboarding_completed_at` is `NULL` — confirm via SQL: `psql ... -c "SELECT onboarding_completed_at FROM \"user\" WHERE email='<test-email>'"`. *(D-2)*
+- [ ] `user_onboarding` row does not exist for this user — confirm via SQL: `psql ... -c "SELECT uo.completed_at FROM \"user\" u LEFT JOIN user_onboarding uo ON uo.user_id = u.id WHERE u.email = '<test-email>'"` — expect `completed_at` to be `NULL` (no row = onboarding not completed). *(D-2)*
 
 ### Stage 2 — Install CLI (V-1)
 
@@ -98,7 +98,7 @@ Run on the VM with browser disabled: `unset DISPLAY WAYLAND_DISPLAY && vai login
 
 In a fresh project directory on the VM (e.g. `mkdir ~/test-app && cd ~/test-app && npm init -y`).
 
-- [ ] `vai init` prints `Initializing vai repo in <path>...` followed by `✓ Created .vai/`, `✓ Wrote vai.toml and .vai/config.toml`, `✓ Registered repo "<basename>"`, `✓ Pushed initial snapshot (N files, N.N MB)`. *(V-5)*
+- [ ] `vai init` prints output in this order (exact wording as of v0.1.5): `✓ Initialized vai repository <name>` followed by `Repository ID  : <uuid>`, `Initial version: v1 "initial repository"`, `Directory      : .vai/`, graph stats, `✓ Registered repo <name> on <server>`, `.env` gitignore notice, `✓ Pushed initial snapshot (N files)`, `Repo ready: <url>`, `Next: vai agent loop init`. *(V-5)*
 - [ ] `.vai/config.toml` contains `repo_id` + `[remote]` block with `url` and `repo_name`. *(V-5)*
 - [ ] **`.vai/config.toml` contains NO `api_key` field anywhere.** Confirm with `grep -i api_key .vai/config.toml` — empty output. *(V-6)*
 - [ ] Dashboard `/$repoSlug/` shows the repo exists and has an initial version. *(V-2)*
@@ -156,7 +156,7 @@ In `~/test-app` (still a fresh React-ish project: `npm init -y && npm install re
 - [ ] Click step 5's CTA button → navigates to `/<repoSlug>/issues/new`. *(D-1)*
 - [ ] Create an issue. Back on `/welcome`: step 5 flips complete within 5 seconds. *(D-1)*
 - [ ] Once all 5 steps complete, page auto-POSTs to `/api/me/skip-onboarding` — confirm via devtools → Network. *(D-2)*
-- [ ] `user.onboarding_completed_at` is now set (not NULL). *(D-2)*
+- [ ] `user_onboarding` row now exists — rerun the SQL join from Stage 1; `completed_at` should be non-NULL. *(D-2)*
 - [ ] Refresh `/welcome` → redirects to `/`. *(D-2)*
 - [ ] Explicitly visit `/welcome?force=1` → page still renders (bypass works). *(D-2)*
 
@@ -194,7 +194,7 @@ User already has an account + some repos. Tests key reuse, skip-onboarding, exis
 
 - [ ] From a different fresh VM: `curl install.sh | sh && vai login`. New API key minted, named `CLI on <new-hostname>`. Old keys still visible in `/settings/keys`. *(V-4, D-3)*
 - [ ] Visit `/welcome?force=1`. Step 2 already complete (previous key matches `CLI on *`). Step 3 already complete (has a repo). Step 5 already complete (has an issue). Only steps 1 + 4 pending/current. *(D-1)*
-- [ ] `user.onboarding_completed_at` was set on first account → `/welcome` without `?force=1` redirects to `/`. *(D-2)*
+- [ ] `user_onboarding.completed_at` was set on first account → `/welcome` without `?force=1` redirects to `/`. *(D-2)*
 - [ ] Sidebar shows "Getting Started" + "Help" entries always visible. Click Getting Started → navigates to `/welcome?force=1`. *(D-6)*
 - [ ] Click Help → navigates to `/help` → shows platform docs README. *(D-4, D-6)*
 - [ ] On `vai init` in a new local dir with same basename as existing repo → rename prompt triggers. *(V-5)*
