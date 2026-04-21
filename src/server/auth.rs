@@ -465,7 +465,7 @@ pub(super) async fn poll_device_code_handler(
 
     let status = auth.poll_device_code(&code).await.map_err(|e| match e {
         crate::storage::StorageError::NotFound(_) => {
-            ApiError::not_found("device code not found or expired")
+            ApiError::not_found("device code not found")
         }
         other => ApiError::from(other),
     })?;
@@ -474,6 +474,14 @@ pub(super) async fn poll_device_code_handler(
         crate::storage::DeviceCodeStatus::Pending => {
             Ok(Json(DeviceCodeStatusResponse {
                 status: "pending".to_string(),
+                api_key: None,
+                user_id: None,
+                user_email: None,
+            }))
+        }
+        crate::storage::DeviceCodeStatus::Expired => {
+            Ok(Json(DeviceCodeStatusResponse {
+                status: "expired".to_string(),
                 api_key: None,
                 user_id: None,
                 user_email: None,

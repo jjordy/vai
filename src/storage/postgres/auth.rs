@@ -297,22 +297,37 @@ impl AuthStore for PostgresStorage {
     }
 
     async fn poll_device_code(&self, code: &str) -> Result<DeviceCodeStatus, StorageError> {
-        // Opportunistic cleanup of all expired codes.
-        let _ = sqlx::query("DELETE FROM cli_device_codes WHERE expires_at < now()")
+        // Opportunistic cleanup of other expired codes (not the one we're about
+        // to inspect, so we can still distinguish "expired" from "never existed").
+        let _ = sqlx::query("DELETE FROM cli_device_codes WHERE expires_at < now() AND code != $1")
+            .bind(code)
             .execute(&self.pool)
             .await;
 
         let row = sqlx::query(
-            "SELECT d.api_key, d.user_id, u.email AS user_email \
+            "SELECT d.api_key, d.user_id, d.expires_at, u.email AS user_email \
              FROM cli_device_codes d \
              LEFT JOIN users u ON u.id = d.user_id \
-             WHERE d.code = $1 AND d.expires_at >= now()",
+             WHERE d.code = $1",
         )
         .bind(code)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| StorageError::Database(e.to_string()))?
-        .ok_or_else(|| StorageError::NotFound("device code not found or expired".to_string()))?;
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let Some(row) = row else {
+            return Err(StorageError::NotFound("device code not found".to_string()));
+        };
+
+        let expires_at: chrono::DateTime<chrono::Utc> = row.get("expires_at");
+        if expires_at < chrono::Utc::now() {
+            // Delete the expired row and tell the caller it has expired.
+            let _ = sqlx::query("DELETE FROM cli_device_codes WHERE code = $1")
+                .bind(code)
+                .execute(&self.pool)
+                .await;
+            return Ok(DeviceCodeStatus::Expired);
+        }
 
         let api_key: Option<String> = row.get("api_key");
 

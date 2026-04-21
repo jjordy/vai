@@ -1007,6 +1007,10 @@ pub enum DeviceCodeStatus {
         /// Email address of the authorizing user.
         user_email: String,
     },
+    /// The code existed but its 10-minute TTL has elapsed.  The row is deleted
+    /// on first retrieval.  Codes that were never created return
+    /// `StorageError::NotFound` instead.
+    Expired,
 }
 
 // ── RBAC types ────────────────────────────────────────────────────────────────

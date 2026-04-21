@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::{SinkExt, StreamExt};
+use sqlx::PgPool;
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
@@ -3195,7 +3196,57 @@ async fn test_device_code_key_grants_creator_collaborator() {
     shutdown_tx.send(()).ok();
 }
 
-/// Device code returns 404 for unknown or expired codes.
+/// Device code returns 404 for codes that were never created, and
+/// `{"status":"expired"}` (HTTP 200) for codes that existed but have elapsed.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cli_device_code_expired_returns_json() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // Insert an already-expired device code directly into the database.
+    let pool = PgPool::connect(&url).await.unwrap();
+    let expired_code = "EXPD-TEST";
+    let past = chrono::Utc::now() - chrono::Duration::hours(1);
+    sqlx::query(
+        "INSERT INTO cli_device_codes (code, expires_at) VALUES ($1, $2) \
+         ON CONFLICT (code) DO UPDATE SET expires_at = excluded.expires_at",
+    )
+    .bind(expired_code)
+    .bind(past)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let resp = client
+        .get(format!("{base}/api/auth/cli-device/{expired_code}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "expired code should return 200");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "expired", "expired code body should have status=expired");
+    assert!(body.get("api_key").is_none(), "expired response should not include api_key");
+
+    // A second poll of the same code should return 404 (row was deleted on first expired poll).
+    let resp2 = client
+        .get(format!("{base}/api/auth/cli-device/{expired_code}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), 404, "expired code should be deleted after first poll");
+
+    shutdown_tx.send(()).ok();
+}
+
+/// Device code returns 404 for codes that were never created.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cli_device_code_not_found() {
     let Some(url) = db_url() else { return };
