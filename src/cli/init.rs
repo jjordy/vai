@@ -44,7 +44,7 @@ pub fn run_init(
     json: bool,
 ) -> Result<(), CliError> {
     // ── Step 1: local init ────────────────────────────────────────────────────
-    let result = repo::init(cwd)?;
+    let mut result = repo::init(cwd)?;
 
     if local_only {
         if json {
@@ -53,11 +53,6 @@ pub fn run_init(
             repo::print_init_result(&result);
         }
         return Ok(());
-    }
-
-    // Print the local init result before proceeding with server registration.
-    if !json {
-        repo::print_init_result(&result);
     }
 
     // ── Step 2: load credentials ──────────────────────────────────────────────
@@ -113,7 +108,11 @@ pub fn run_init(
     });
     repo::write_config(&vai_dir, &config)?;
 
+    // Now that we have the canonical server-assigned UUID, update the result
+    // and print it — ensures stdout matches config.toml.
+    result.config.repo_id = server_repo_id;
     if !json {
+        repo::print_init_result(&result);
         println!(
             "{} Registered repo {} on {}",
             "✓".green().bold(),
