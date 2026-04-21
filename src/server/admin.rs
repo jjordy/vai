@@ -195,58 +195,93 @@ pub(super) async fn create_repo_handler(
 
         let repo_id = uuid::Uuid::new_v4();
         let created_at = chrono::Utc::now();
+        let version_uuid = uuid::Uuid::new_v4();
 
-        // Insert repo row into Postgres.
+        // All four inserts (repo, version, head, collaborator) happen in a
+        // single transaction so there is no window where the repo exists but
+        // the creator has no access to it.
+        let mut tx = pg
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to begin transaction: {e}")))?;
+
         sqlx::query(
-            "INSERT INTO repos (id, name, created_at) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO repos (id, name, created_at) VALUES ($1, $2, $3)",
         )
         .bind(repo_id)
         .bind(&body.name)
         .bind(created_at)
-        .execute(pg.pool())
+        .execute(&mut *tx)
         .await
-        .map_err(|e| ApiError::internal(format!("failed to insert repo into Postgres: {e}")))?;
-        tracing::debug!(repo_id = %repo_id, name = %body.name, "repo inserted into Postgres");
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db_err) = e {
+                if db_err.constraint().is_some() {
+                    return ApiError::conflict(format!(
+                        "repository '{}' is already registered",
+                        body.name
+                    ));
+                }
+            }
+            ApiError::internal(format!("failed to insert repo: {e}"))
+        })?;
 
-        // Seed the initial v1 version and HEAD in Postgres so version
-        // queries never return empty for a brand-new repo.
-        let v1 = crate::storage::NewVersion {
-            version_id: "v1".to_string(),
-            parent_version_id: None,
-            intent: "initial repository".to_string(),
-            created_by: "system".to_string(),
-            merge_event_id: None,
-        };
-        state
-            .storage
-            .versions()
-            .create_version(&repo_id, v1)
-            .await
-            .map_err(|e| ApiError::internal(format!("failed to create initial version: {e}")))?;
-        state
-            .storage
-            .versions()
-            .advance_head(&repo_id, "v1")
-            .await
-            .map_err(|e| ApiError::internal(format!("failed to advance head: {e}")))?;
+        // Seed the initial v1 version and HEAD so version queries never
+        // return empty for a brand-new repo.
+        sqlx::query(
+            "INSERT INTO versions \
+             (id, repo_id, version_id, parent_version_id, intent, created_by, merge_event_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(version_uuid)
+        .bind(repo_id)
+        .bind("v1")
+        .bind(Option::<String>::None)
+        .bind("initial repository")
+        .bind("system")
+        .bind(Option::<i64>::None)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to create initial version: {e}")))?;
 
-        // Auto-grant the creating user admin collaborator access.
+        sqlx::query(
+            "INSERT INTO version_head (repo_id, version_id) VALUES ($1, $2) \
+             ON CONFLICT (repo_id) DO UPDATE SET version_id = EXCLUDED.version_id",
+        )
+        .bind(repo_id)
+        .bind("v1")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to set HEAD: {e}")))?;
+
+        // Auto-grant the creating user admin collaborator access so they can
+        // immediately call GET /api/repos and repo-scoped endpoints.
         if let Some(user_id) = &identity.user_id {
-            state
-                .storage
-                .orgs()
-                .add_collaborator(&repo_id, user_id, crate::storage::RepoRole::Admin)
-                .await
-                .map_err(|e| {
-                    ApiError::internal(format!("failed to grant creator access: {e}"))
-                })?;
+            sqlx::query(
+                "INSERT INTO repo_collaborators (repo_id, user_id, role) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(repo_id)
+            .bind(user_id)
+            .bind("admin")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                ApiError::internal(format!("failed to grant creator access: {e}"))
+            })?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to commit repo creation: {e}")))?;
+
+        if let Some(user_id) = &identity.user_id {
             tracing::info!(
                 repo_id = %repo_id,
                 user_id = %user_id,
                 "creator granted admin collaborator role"
             );
         }
-
         tracing::info!(repo_id = %repo_id, name = %body.name, "repo registered (server mode, no filesystem writes)");
 
         let response = RepoResponse {

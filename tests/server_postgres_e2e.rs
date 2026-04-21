@@ -3032,6 +3032,169 @@ async fn test_cli_device_code_flow() {
     shutdown_tx.send(()).ok();
 }
 
+/// Verifies the full PRD 26 issue #305 scenario: a key minted via the device
+/// code flow carries the user's id, so `POST /api/repos` inserts a
+/// `repo_collaborators` row and the user can immediately list and access the
+/// repo.
+///
+/// Flow:
+/// 1. Create user + user key (simulates admin provisioning).
+/// 2. Run the full device code cycle — obtain a second key via authorize.
+/// 3. Use the *device-code-minted* key (not the original user key) to create
+///    a repo via `POST /api/repos`.
+/// 4. Assert `GET /api/repos` returns the new repo (non-empty list).
+/// 5. Assert `GET /api/repos/:repo/me` returns `role = "admin"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_device_code_key_grants_creator_collaborator() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+
+    // 1. Create user + initial key (admin-minted).
+    let resp = client
+        .post(format!("{base}/api/users"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("Carol-{sfx}"),
+            "email": format!("carol-{sfx}@example.com"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let user: serde_json::Value = resp.json().await.unwrap();
+    let user_id = user["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("carol-initial-{sfx}"),
+            "for_user_id": user_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let initial_key = resp.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Full device code cycle: the user (authenticated via their initial key)
+    //    authorizes a new device code, simulating the dashboard /cli page.
+    let resp = client
+        .post(format!("{base}/api/auth/cli-device"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let code = resp.json::<serde_json::Value>().await.unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = client
+        .post(format!("{base}/api/auth/cli-device/authorize"))
+        .bearer_auth(&initial_key)
+        .json(&serde_json::json!({ "code": code }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "authorize: {}", resp.text().await.unwrap_or_default());
+
+    let resp = client
+        .get(format!("{base}/api/auth/cli-device/{code}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let device_key = resp.json::<serde_json::Value>().await.unwrap()["api_key"]
+        .as_str()
+        .expect("api_key present after authorization")
+        .to_string();
+
+    // 3. Use the device-code-minted key to register a repo (simulates `vai init`).
+    let repo_name = format!("carol-repo-{sfx}");
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(&device_key)
+        .json(&serde_json::json!({ "name": repo_name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        201,
+        "POST /api/repos with device key: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    // 4. GET /api/repos must return the created repo (not an empty list).
+    let resp = client
+        .get(format!("{base}/api/repos"))
+        .bearer_auth(&device_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let repos: serde_json::Value = resp.json().await.unwrap();
+    let repos_arr = repos.as_array().expect("repos list");
+    assert!(
+        !repos_arr.is_empty(),
+        "GET /api/repos must return the created repo — got empty list (issue #305)"
+    );
+    assert_eq!(
+        repos_arr[0]["name"].as_str(),
+        Some(repo_name.as_str()),
+        "repo name mismatch"
+    );
+
+    // 5. GET /api/repos/:repo/me with the *initial* key (no role cap) must show
+    //    that the collaborator row was inserted with "admin" role.  The device
+    //    key itself has role_override="write" which correctly caps the effective
+    //    role to "write"; we want the underlying row to be "admin".
+    let resp = client
+        .get(format!("{base}/api/repos/{repo_name}/me"))
+        .bearer_auth(&initial_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "GET /me (initial key): {}", resp.text().await.unwrap_or_default());
+    let me: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        me["role"].as_str(),
+        Some("admin"),
+        "collaborator row must be admin role (issue #305)"
+    );
+    assert_eq!(me["user_id"].as_str(), Some(user_id.as_str()));
+
+    // Also verify the device key itself can access the repo (capped to "write").
+    let resp = client
+        .get(format!("{base}/api/repos/{repo_name}/me"))
+        .bearer_auth(&device_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "device key must have repo access");
+    let me_dev: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        me_dev["role"].as_str(),
+        Some("write"),
+        "device key (role_override=write) must be capped to write"
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Device code returns 404 for unknown or expired codes.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cli_device_code_not_found() {
