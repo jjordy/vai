@@ -21,10 +21,11 @@ WORKDIR /app
 RUN corepack enable
 
 # Copy manifests first for better layer caching
-COPY package.json pnpm-lock.yaml ./
+COPY package.json pnpm-lock.yaml* ./
 
 # Install all dependencies (including devDependencies needed for the build)
-RUN pnpm install --frozen-lockfile
+# Use --frozen-lockfile when pnpm-lock.yaml is present, otherwise let pnpm resolve
+RUN if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile; else pnpm install; fi
 
 # Copy the rest of the source and build
 COPY . .
