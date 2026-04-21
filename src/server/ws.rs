@@ -6,8 +6,12 @@
 //!     [`SubscriptionFilter`].
 //!
 //! ## Authentication
-//! WebSocket connections authenticate via the `key` query parameter (JWT, admin
-//! key, or plain API key — same precedence as the REST middleware).
+//! WebSocket connections authenticate via the `key` query parameter. Precedence:
+//! 1. vai JWT (HMAC-SHA256, signed by `VAI_JWT_SECRET`)
+//! 2. Better Auth session token — fallback when vai JWT verification fails.
+//!    Covers dashboard users whose browser session is backed by Better Auth.
+//! 3. Bootstrap admin key (`VAI_ADMIN_KEY`)
+//! 4. Long-lived vai API key (looked up in the key store)
 //!
 //! ## Subscription
 //! After connecting the client must send a subscribe message:
@@ -84,8 +88,9 @@ pub(super) struct WsQueryParams {
 /// begins streaming events matching the client's subscription filter.
 ///
 /// Authentication is via the `key` query parameter. Accepted formats (checked
-/// in this order): JWT access token (contains `'.'`), admin bootstrap key,
-/// or a plain API key string looked up in the key store.
+/// in this order): vai JWT access token, Better Auth session token (fallback
+/// for dashboard users — token is validated against the Better Auth `session`
+/// table), admin bootstrap key, or a plain vai API key.
 ///
 /// After connecting, the client must send a subscribe message:
 ///
@@ -127,13 +132,17 @@ pub(super) async fn ws_events_handler(
 
     // Authenticate the WebSocket connection using the same precedence as
     // `auth_middleware`:
-    //   1. JWT — if the key contains '.' treat it as a JWT token.
-    //   2. Admin key — compare against the bootstrap admin key.
-    //   3. API key — hash and look up via storage backend.
+    //   1. vai JWT — if the key contains '.' try it as a vai JWT first.
+    //   2. Better Auth session — if vai JWT verification fails (wrong key),
+    //      fall back to validating the token as a Better Auth session token.
+    //      Better Auth may store the JWT itself as the session token column,
+    //      so this covers both opaque session tokens and JWT-mode sessions.
+    //   3. Admin key — compare against the bootstrap admin key.
+    //   4. API key — hash and look up via storage backend.
     //
     // Build a full AgentIdentity so we can call require_repo_permission below.
     let identity: AgentIdentity = if key_str.contains('.') {
-        // (1) JWT check — validate with JwtService; no database hit.
+        // (1) vai JWT check — validate with JwtService; no database hit.
         use crate::auth::jwt::JwtError;
         match state.jwt_service.verify(&key_str) {
             Ok(claims) => {
@@ -154,11 +163,46 @@ pub(super) async fn ws_events_handler(
                 return ApiError::unauthorized("JWT token has expired").into_response();
             }
             Err(_) => {
-                return ApiError::unauthorized("invalid JWT token").into_response();
+                // (2) Not a valid vai JWT — try as a Better Auth session token.
+                // The dashboard passes its Better Auth session JWT as `?key=`;
+                // `validate_session` looks it up in the Better Auth `session`
+                // table so this works whether the token is an opaque string or
+                // a JWT-mode session token.
+                match state.storage.auth().validate_session(&key_str).await {
+                    Ok(ba_user_id) => {
+                        match state
+                            .storage
+                            .orgs()
+                            .get_user_by_external_id(&ba_user_id)
+                            .await
+                        {
+                            Ok(user) => {
+                                tracing::debug!(
+                                    user_id = %user.id,
+                                    "WebSocket connection authenticated via Better Auth session"
+                                );
+                                AgentIdentity {
+                                    key_id: format!("session:{ba_user_id}"),
+                                    name: user.name,
+                                    is_admin: false,
+                                    user_id: Some(user.id),
+                                    role_override: None,
+                                    auth_source: AuthSource::Jwt,
+                                }
+                            }
+                            Err(_) => {
+                                return ApiError::unauthorized("invalid JWT token").into_response();
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        return ApiError::unauthorized("invalid JWT token").into_response();
+                    }
+                }
             }
         }
     } else if key_str == state.admin_key {
-        // (2) Admin key — full server access.
+        // (3) Admin key — full server access.
         AgentIdentity {
             key_id: "admin".to_string(),
             name: "admin".to_string(),
@@ -168,7 +212,7 @@ pub(super) async fn ws_events_handler(
             auth_source: AuthSource::AdminKey,
         }
     } else {
-        // (3) Validate via storage backend (handles both SQLite and Postgres).
+        // (4) Validate via storage backend (handles both SQLite and Postgres).
         match state.storage.auth().validate_key(&key_str).await {
             Ok(api_key) => {
                 tracing::debug!(agent = %api_key.name, "WebSocket connection authenticated");
