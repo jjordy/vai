@@ -355,7 +355,7 @@ pub(super) fn handle(
 
     let dashboard_url = dashboard_url
         .or_else(|| std::env::var("VAI_DASHBOARD_URL").ok())
-        .unwrap_or_else(|| server_url.clone());
+        .unwrap_or_else(|| crate::defaults::DEFAULT_DASHBOARD_URL.to_string());
 
     let host = hostname();
     let key_name = name.unwrap_or_else(|| format!("CLI on {host}"));

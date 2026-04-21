@@ -328,12 +328,15 @@ pub enum Commands {
         /// Base URL of the vai server.
         ///
         /// Defaults to the `VAI_SERVER_URL` environment variable, or the
-        /// compile-time `VAI_DEFAULT_SERVER_URL` constant (dev: `http://localhost:8080`).
+        /// compile-time `VAI_DEFAULT_SERVER_URL` constant
+        /// (`https://vai-server-polished-feather-2668.fly.dev` in release builds).
         #[arg(long)]
         server_url: Option<String>,
-        /// Base URL of the dashboard (defaults to `--server-url`).
+        /// Base URL of the dashboard.
         ///
-        /// Override with `VAI_DASHBOARD_URL` or this flag.
+        /// Defaults to the `VAI_DASHBOARD_URL` environment variable, or the
+        /// compile-time `VAI_DEFAULT_DASHBOARD_URL` constant (`http://localhost:3000`
+        /// in release builds).
         #[arg(long)]
         dashboard_url: Option<String>,
         /// Use the device code flow instead of opening a browser.
