@@ -24,6 +24,20 @@ Before starting, confirm these preconditions. If any fail, stop and fix before p
 
 ---
 
+## Refreshing between fix cycles
+
+Testing typically uncovers bugs that get fixed and re-released mid-run. Before resuming any stage after a new vai release lands:
+
+1. Confirm the new release tag exists on GitHub and the CI build is green.
+2. On the test VM, re-run `curl -fsSL https://vai.dev/install.sh | sh`.
+3. `vai --version` should print the new tag — if it prints the old one, the install script served a cached tarball; `rm ~/.local/bin/vai` and retry.
+4. If you're mid-journey (credentials already set, repo already initialised), **keep** `~/.vai/credentials.toml` and the repo — only the binary needs refreshing. Re-running `vai login` or `vai init` would invalidate earlier test results.
+5. For dashboard-side fixes, a hard refresh (`Ctrl+Shift+R`) of `localhost:3000` is usually enough. If a Better Auth session breaks, clear cookies for the dashboard origin and re-login through the UI (not via CLI).
+
+Note the new release tag next to the stage checkbox where you resumed, so the results log shows which binary version each check ran under.
+
+---
+
 ## Journey 1: Brand-new user (the happy path)
 
 Fresh machine, no vai account, no CLI, no credentials. This is the flow PRD 26 is designed for.

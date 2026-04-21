@@ -27,3 +27,6 @@ infra/terraform/terraform.tfvars
 
 # Claude Code user-local settings
 .claude/settings.local.json
+
+# Playwright MCP test artifacts
+.playwright-mcp/
