@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod auth;
 pub mod credentials;
+pub mod defaults;
 pub mod cli;
 pub mod ignore_rules;
 pub mod storage;

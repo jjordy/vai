@@ -422,10 +422,10 @@ pub(super) async fn create_device_code_handler(
     let code = auth.create_device_code().await.map_err(ApiError::from)?;
 
     // Use VAI_DASHBOARD_URL (where the /cli page lives) for the verification URL.
-    // Falls back to VAI_PUBLIC_URL for backward compatibility, then a placeholder default.
+    // Falls back to VAI_PUBLIC_URL for backward compatibility, then the build-time default.
     let dashboard_url = std::env::var("VAI_DASHBOARD_URL")
         .or_else(|_| std::env::var("VAI_PUBLIC_URL"))
-        .unwrap_or_else(|_| "https://vai.example.com".to_string());
+        .unwrap_or_else(|_| crate::defaults::DEFAULT_SERVER_URL.to_string());
     let verification_url = format!("{dashboard_url}/cli");
 
     tracing::info!(event = "auth.device_code_created", code = %code, "CLI device code created");

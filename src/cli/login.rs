@@ -351,7 +351,7 @@ pub(super) fn handle(
 ) -> Result<(), super::CliError> {
     let server_url = server_url
         .or_else(|| std::env::var("VAI_SERVER_URL").ok())
-        .unwrap_or_else(|| "https://vai.example.com".to_string());
+        .unwrap_or_else(|| crate::defaults::DEFAULT_SERVER_URL.to_string());
 
     let dashboard_url = dashboard_url
         .or_else(|| std::env::var("VAI_DASHBOARD_URL").ok())

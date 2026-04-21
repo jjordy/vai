@@ -308,7 +308,7 @@ pub(super) fn handle(
         .as_ref()
         .map(|r| r.url.clone())
         .or_else(|| std::env::var("VAI_SERVER_URL").ok())
-        .unwrap_or_else(|| "https://vai.example.com".to_string());
+        .unwrap_or_else(|| crate::defaults::DEFAULT_SERVER_URL.to_string());
 
     // ── Project type ──────────────────────────────────────────────────────────
 

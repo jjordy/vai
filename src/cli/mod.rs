@@ -327,8 +327,8 @@ pub enum Commands {
     Login {
         /// Base URL of the vai server.
         ///
-        /// Defaults to the `VAI_SERVER_URL` environment variable, or
-        /// `https://vai.example.com` if neither is set.
+        /// Defaults to the `VAI_SERVER_URL` environment variable, or the
+        /// compile-time `VAI_DEFAULT_SERVER_URL` constant (dev: `http://localhost:8080`).
         #[arg(long)]
         server_url: Option<String>,
         /// Base URL of the dashboard (defaults to `--server-url`).
