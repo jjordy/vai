@@ -284,6 +284,12 @@ impl AuthStore for PostgresStorage {
         let code = generate_device_code();
         let expires_at = Utc::now() + chrono::Duration::minutes(10);
 
+        // Purge stale expired codes on write, not on poll, to avoid race
+        // conditions where one poll's cleanup deletes another poll's code.
+        let _ = sqlx::query("DELETE FROM cli_device_codes WHERE expires_at < now()")
+            .execute(&self.pool)
+            .await;
+
         sqlx::query(
             "INSERT INTO cli_device_codes (code, expires_at) VALUES ($1, $2)",
         )
@@ -297,13 +303,6 @@ impl AuthStore for PostgresStorage {
     }
 
     async fn poll_device_code(&self, code: &str) -> Result<DeviceCodeStatus, StorageError> {
-        // Opportunistic cleanup of other expired codes (not the one we're about
-        // to inspect, so we can still distinguish "expired" from "never existed").
-        let _ = sqlx::query("DELETE FROM cli_device_codes WHERE expires_at < now() AND code != $1")
-            .bind(code)
-            .execute(&self.pool)
-            .await;
-
         let row = sqlx::query(
             "SELECT d.api_key, d.user_id, d.expires_at, u.email AS user_email \
              FROM cli_device_codes d \
