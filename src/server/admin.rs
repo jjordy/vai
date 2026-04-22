@@ -257,6 +257,13 @@ pub(super) async fn create_repo_handler(
         // Auto-grant the creating user admin collaborator access so they can
         // immediately call GET /api/repos and repo-scoped endpoints.
         if let Some(user_id) = &identity.user_id {
+            tracing::info!(
+                event = "repo.creator_collab_insert",
+                repo_id = %repo_id,
+                user_id = %user_id,
+                auth_source = ?identity.auth_source,
+                "inserting creator admin collaborator row"
+            );
             sqlx::query(
                 "INSERT INTO repo_collaborators (repo_id, user_id, role) \
                  VALUES ($1, $2, $3)",
@@ -269,6 +276,25 @@ pub(super) async fn create_repo_handler(
             .map_err(|e| {
                 ApiError::internal(format!("failed to grant creator access: {e}"))
             })?;
+        } else {
+            // Admin-key requests have is_admin=true and no user_id — skip the
+            // collaborator row (admin key has implicit full access).  Any other
+            // path reaching here without a user_id is a bug.
+            if !identity.is_admin {
+                tracing::error!(
+                    event = "repo.creator_collab_missing_user",
+                    repo_id = %repo_id,
+                    key_id = %identity.key_id,
+                    auth_source = ?identity.auth_source,
+                    "BUG: non-admin request has no user_id at collaborator insert — row will be missing"
+                );
+            } else {
+                tracing::debug!(
+                    event = "repo.creator_collab_skipped",
+                    repo_id = %repo_id,
+                    "admin key — no user_id — skipping creator collaborator row"
+                );
+            }
         }
 
         tx.commit()
@@ -277,6 +303,7 @@ pub(super) async fn create_repo_handler(
 
         if let Some(user_id) = &identity.user_id {
             tracing::info!(
+                event = "repo.creator_collab_committed",
                 repo_id = %repo_id,
                 user_id = %user_id,
                 "creator granted admin collaborator role"
