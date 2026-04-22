@@ -7935,4 +7935,29 @@ mod tests {
 
         shutdown_tx.send(()).ok();
     }
+
+    /// The startup guard must reject the config rather than silently falling
+    /// back to SQLite when storage_root is set but database_url is absent.
+    /// This is the root cause of the repeated issue #305 production failures.
+    #[tokio::test]
+    async fn start_rejects_storage_root_without_database_url() {
+        let tmp = TempDir::new().unwrap();
+        let vai_dir = tmp.path().join(".vai");
+        // ALLOW_FS: test setup only — not a server handler
+        std::fs::create_dir_all(&vai_dir).unwrap();
+
+        let config = ServerConfig {
+            storage_root: Some(tmp.path().to_path_buf()),
+            database_url: None,
+            ..ServerConfig::default()
+        };
+
+        let result = start(&vai_dir, config).await;
+        assert!(result.is_err(), "start() must Err when storage_root set without database_url");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("DATABASE_URL") || msg.contains("database_url"),
+            "error message should name DATABASE_URL, got: {msg}"
+        );
+    }
 }
