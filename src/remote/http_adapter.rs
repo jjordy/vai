@@ -317,8 +317,13 @@ impl RemoteAdapter for HttpAdapter {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("unknown")
             .to_string();
+        let expected_file_count = resp
+            .headers()
+            .get("X-Vai-Expected-Files")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<usize>().ok());
         let tarball_gz = resp.bytes().await?.to_vec();
-        Ok(FullDownload { head_version, tarball_gz })
+        Ok(FullDownload { head_version, tarball_gz, expected_file_count })
     }
 
     async fn get_server_head(&self, _repo: &str) -> Result<String, RemoteError> {

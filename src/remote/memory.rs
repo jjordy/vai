@@ -258,8 +258,9 @@ impl RemoteAdapter for InMemoryAdapter {
             archive.finish().ok();
         }
         let tarball_gz = encoder.finish().unwrap_or_default();
+        let expected_file_count = Some(state.files.len());
 
-        Ok(FullDownload { head_version, tarball_gz })
+        Ok(FullDownload { head_version, tarball_gz, expected_file_count })
     }
 
     async fn get_server_head(&self, _repo: &str) -> Result<String, RemoteError> {

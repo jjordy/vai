@@ -57,6 +57,13 @@ pub enum AgentError {
     #[error("no agent state found — run `vai agent claim` first")]
     NoState,
 
+    /// Server returned fewer files than declared in `X-Vai-Expected-Files`.
+    ///
+    /// This indicates a mid-stream server error (e.g. Postgres disconnect).
+    /// The partial workspace directory has been discarded.
+    #[error("partial download: server declared {expected} files but only {downloaded} were received; the partial workspace has been discarded")]
+    PartialDownload { downloaded: usize, expected: usize },
+
     #[error("{0}")]
     Other(String),
 }
@@ -811,6 +818,15 @@ pub struct DownloadResult {
     pub version: Option<String>,
 }
 
+/// Maximum download attempts before giving up on a partial-download mismatch.
+const DOWNLOAD_MAX_ATTEMPTS: u32 = 3;
+/// Base delay in milliseconds for download retry backoff.
+#[cfg(not(test))]
+const DOWNLOAD_BASE_DELAY_MS: u64 = 500;
+/// Near-zero delay in tests so the retry loop doesn't slow the suite.
+#[cfg(test)]
+const DOWNLOAD_BASE_DELAY_MS: u64 = 1;
+
 /// Download the repository tarball into `target_dir` and update agent state.
 ///
 /// Reads the workspace ID, issue ID, and server config from the state and
@@ -820,54 +836,89 @@ pub struct DownloadResult {
 /// comparison during submit, and advances the state phase to
 /// [`AgentPhase::Downloaded`].
 ///
-/// `target_dir` is created if it does not exist.
+/// If the server declares `X-Vai-Expected-Files: N` and fewer than N files
+/// are extracted (indicating a mid-stream server error), the partial directory
+/// is discarded and the download is retried with exponential backoff up to
+/// [`DOWNLOAD_MAX_ATTEMPTS`] times.  A [`AgentError::PartialDownload`] is
+/// returned if all attempts fail.
+///
+/// `target_dir` is created (and re-created on retry) as needed.
 pub fn download(dir: &Path, target_dir: &Path) -> Result<DownloadResult, AgentError> {
     let config = load_config(dir)?;
     let state = load_state(dir)?;
     let api_key = AgentConfig::resolve_api_key();
 
-    // Create target directory if needed.
-    if !target_dir.exists() {
-        fs::create_dir_all(target_dir)?;
-    }
-
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| AgentError::Other(format!("cannot create tokio runtime: {e}")))?;
 
-    let gz_bytes = rt.block_on(async {
-        fetch_files_tarball(&config.server, &config.repo, api_key.as_deref()).await
-    })?;
+    let mut last_partial: Option<AgentError> = None;
 
-    // Parse the Content-Disposition / version header if present (best-effort).
-    // We extract a version hint from a sentinel in the tarball name later; for
-    // now we just record None and let the manifest carry the count.
-    let file_count = extract_tarball_to_dir(&gz_bytes, target_dir)?;
+    for attempt in 1..=DOWNLOAD_MAX_ATTEMPTS {
+        // Start each attempt with a clean target directory.
+        if target_dir.exists() {
+            fs::remove_dir_all(target_dir)?;
+        }
+        fs::create_dir_all(target_dir)?;
 
-    // Save a manifest of files present after extraction for submit diff.
-    let manifest = build_file_manifest(target_dir)?;
-    let manifest_path = dir.join(".vai").join("download-manifest.json");
-    let manifest_json = serde_json::to_string_pretty(&manifest)?;
-    fs::write(&manifest_path, manifest_json)
-        .map_err(|e| AgentError::Other(format!("cannot write download manifest: {e}")))?;
+        let (gz_bytes, expected_count) = rt.block_on(async {
+            fetch_files_tarball(&config.server, &config.repo, api_key.as_deref()).await
+        })?;
 
-    // Advance phase to Downloaded.
-    let mut updated_state = state;
-    updated_state.phase = AgentPhase::Downloaded;
-    save_state(dir, &updated_state)?;
+        let file_count = extract_tarball_to_dir(&gz_bytes, target_dir)?;
 
-    Ok(DownloadResult {
-        file_count,
-        target_dir: target_dir.to_path_buf(),
-        version: None,
-    })
+        // Integrity check: server tells us exactly how many files to expect.
+        if let Some(expected) = expected_count {
+            if file_count != expected {
+                eprintln!(
+                    "  partial download detected: received {file_count} of {expected} files \
+                     (attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS})"
+                );
+                let err = AgentError::PartialDownload { downloaded: file_count, expected };
+                if attempt < DOWNLOAD_MAX_ATTEMPTS {
+                    let delay_ms =
+                        std::cmp::min(DOWNLOAD_BASE_DELAY_MS * (1 << attempt), 5_000);
+                    eprintln!("  retrying in {delay_ms}ms…");
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    last_partial = Some(err);
+                    continue;
+                }
+                // All attempts exhausted — discard partial dir and surface error.
+                let _ = fs::remove_dir_all(target_dir);
+                return Err(err);
+            }
+        }
+
+        // Download is complete and consistent — save manifest and advance state.
+        let manifest = build_file_manifest(target_dir)?;
+        let manifest_path = dir.join(".vai").join("download-manifest.json");
+        let manifest_json = serde_json::to_string_pretty(&manifest)?;
+        fs::write(&manifest_path, manifest_json)
+            .map_err(|e| AgentError::Other(format!("cannot write download manifest: {e}")))?;
+
+        let mut updated_state = state.clone();
+        updated_state.phase = AgentPhase::Downloaded;
+        save_state(dir, &updated_state)?;
+
+        return Ok(DownloadResult {
+            file_count,
+            target_dir: target_dir.to_path_buf(),
+            version: None,
+        });
+    }
+
+    // Reached only when every attempt saw a partial download.
+    Err(last_partial.unwrap_or_else(|| AgentError::Other("download failed".to_string())))
 }
 
 /// Fetch the repository tarball bytes from the server.
+///
+/// Returns the raw gzip bytes and the expected file count declared by the
+/// server in the `X-Vai-Expected-Files` response header (if present).
 async fn fetch_files_tarball(
     server: &str,
     repo: &str,
     api_key: Option<&str>,
-) -> Result<Vec<u8>, AgentError> {
+) -> Result<(Vec<u8>, Option<usize>), AgentError> {
     let url = format!(
         "{}/api/repos/{}/files/download",
         server.trim_end_matches('/'),
@@ -887,10 +938,18 @@ async fn fetch_files_tarball(
         let body = resp.text().await.unwrap_or_default();
         return Err(AgentError::Other(format!("server returned {status}: {body}")));
     }
-    resp.bytes()
+    // Read the expected file count before consuming the body.
+    let expected_count = resp
+        .headers()
+        .get("X-Vai-Expected-Files")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+    let bytes = resp
+        .bytes()
         .await
         .map(|b| b.to_vec())
-        .map_err(|e| AgentError::Other(format!("failed to read response body: {e}")))
+        .map_err(|e| AgentError::Other(format!("failed to read response body: {e}")))?;
+    Ok((bytes, expected_count))
 }
 
 /// Extract a gzip-compressed tarball into `target_dir`.

@@ -2185,7 +2185,7 @@ async fn build_file_map_at_version(
         ("version" = Option<String>, Query, description = "Version to download (default: HEAD)"),
     ),
     responses(
-        (status = 200, description = "Tar-gzip archive of all repo files", content_type = "application/gzip"),
+        (status = 200, description = "Tar-gzip archive of all repo files. Response headers include `X-Vai-Head` (version) and `X-Vai-Expected-Files` (total file count for integrity verification).", content_type = "application/gzip"),
         (status = 400, description = "No files in storage — run migration first", body = ErrorBody),
         (status = 401, description = "Unauthorized"),
         (status = 404, description = "Repository not found", body = ErrorBody),
@@ -2303,6 +2303,7 @@ async fn files_download_handler(
         .unwrap_or("repo");
     let filename = format!("{repo_name}-{head_version}.tar.gz");
 
+    let file_count = sorted_paths.len();
     let response = axum::response::Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, "application/gzip")
@@ -2311,6 +2312,7 @@ async fn files_download_handler(
             format!("attachment; filename=\"{filename}\""),
         )
         .header("X-Vai-Head", head_version.clone())
+        .header("X-Vai-Expected-Files", file_count.to_string())
         .body(axum::body::Body::from(gz_bytes))
         .map_err(|e| ApiError::internal(format!("build response: {e}")))?;
 

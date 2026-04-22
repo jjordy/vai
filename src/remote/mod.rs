@@ -105,6 +105,13 @@ pub enum RemoteError {
 
     #[error("local HEAD version not found on server — full re-clone may be needed")]
     LocalVersionNotFound,
+
+    /// Server declared N files in `X-Vai-Expected-Files` but fewer arrived.
+    ///
+    /// Indicates a mid-stream server error (e.g. database disconnect).  The
+    /// partial local state has been discarded; retry `vai pull --force`.
+    #[error("partial download: server declared {expected} files but only {downloaded} were received — retry `vai pull --force`")]
+    PartialDownload { downloaded: usize, expected: usize },
 }
 
 // ── Adapter I/O types ─────────────────────────────────────────────────────────
@@ -168,6 +175,12 @@ pub struct IncrementalPullResult {
 pub struct FullDownload {
     pub head_version: String,
     pub tarball_gz: Vec<u8>,
+    /// Total file count declared by the server (`X-Vai-Expected-Files` header).
+    ///
+    /// `None` when talking to an older server that does not set the header.
+    /// Callers should verify `extracted_count == expected_file_count` to detect
+    /// mid-stream truncation caused by server-side errors.
+    pub expected_file_count: Option<usize>,
 }
 
 /// A version entry returned by the versions list endpoint.
@@ -633,6 +646,20 @@ impl Session {
         let dl = self.adapter.download_full(&self.repo_name).await?;
 
         let server_paths = tarball::tarball_paths(&dl.tarball_gz)?;
+
+        // Integrity check: verify the tarball contains the expected number of
+        // files before touching the working tree.  A mismatch means the server
+        // closed the connection mid-stream (e.g. Postgres OOM).
+        if let Some(expected) = dl.expected_file_count {
+            let received = server_paths.len();
+            if received != expected {
+                return Err(RemoteError::PartialDownload {
+                    downloaded: received,
+                    expected,
+                });
+            }
+        }
+
         let server_path_set: HashSet<&str> = server_paths.iter().map(String::as_str).collect();
 
         let files_removed =
