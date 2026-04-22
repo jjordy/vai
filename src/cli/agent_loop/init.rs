@@ -63,6 +63,8 @@ struct CreateKeyRequest {
     repo_id: Option<uuid::Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     role_override: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_type: Option<String>,
 }
 
 /// Relevant part of the `POST /api/keys` response.
@@ -86,6 +88,7 @@ async fn create_api_key(
         name: format!("loop-{repo_name}"),
         repo_id: Some(repo_id),
         role_override: Some("write".to_string()),
+        agent_type: Some("agent".to_string()),
     };
 
     let resp = client
@@ -369,7 +372,26 @@ pub(super) fn handle(
         overwrite,
     };
 
-    let gen_out = generate::generate(&gen_cfg, &vai_dir).map_err(|e| CliError::Other(e.to_string()))?;
+    let gen_out = match generate::generate(&gen_cfg, &vai_dir) {
+        Ok(out) => out,
+        Err(generate::GenerateError::AlreadyExists(path)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "already_exists", "path": path.display().to_string()})
+                );
+            } else {
+                println!(
+                    "{} Loop configuration already exists at {}. No changes.",
+                    "✓".green().bold(),
+                    path.display()
+                );
+                println!("  To regenerate, re-run with --overwrite.");
+            }
+            return Ok(());
+        }
+        Err(e) => return Err(CliError::Other(e.to_string())),
+    };
 
     // ── .env handling ─────────────────────────────────────────────────────────
 

@@ -83,7 +83,7 @@ pub fn build_block(existing: &str, vai_api_key: &str, agent: AgentKind, date: &s
         }
     }
 
-    out.push_str(&format!("{SENTINEL}{date} ---\n"));
+    out.push_str(&format!("{SENTINEL}{date}) ---\n"));
     out.push_str(&format!("VAI_API_KEY={vai_api_key}\n"));
 
     for &line in provider_lines(agent) {
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn sentinel_detected() {
-        let content = "FOO=bar\n# --- vai loop (added 2026-01-01 ---\nVAI_API_KEY=vk_x\n";
+        let content = "FOO=bar\n# --- vai loop (added 2026-01-01) ---\nVAI_API_KEY=vk_x\n";
         assert!(has_vai_block(content));
     }
 
@@ -162,6 +162,8 @@ mod tests {
         assert!(block.contains("2026-04-19"));
         // Should start with the sentinel (no leading blank when file was empty).
         assert!(block.starts_with(SENTINEL));
+        // Header must include the closing paren before the trailing dashes.
+        assert!(block.contains("# --- vai loop (added 2026-04-19) ---"));
     }
 
     #[test]
