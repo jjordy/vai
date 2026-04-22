@@ -99,6 +99,12 @@ impl IssueStore for PostgresStorage {
             conditions.push(format!("creator = ${param_idx}"));
             param_idx += 1;
         }
+        if filter.blocked_by.is_some() {
+            conditions.push(format!(
+                "id IN (SELECT target_id FROM issue_links WHERE source_id = ${param_idx} AND relationship = 'blocks')"
+            ));
+            param_idx += 1;
+        }
         let _ = param_idx; // suppress unused warning after last use
 
         let where_clause = conditions.join(" AND ");
@@ -154,6 +160,9 @@ impl IssueStore for PostgresStorage {
                 }
                 if let Some(ref c) = filter.creator {
                     q = q.bind(c.clone());
+                }
+                if let Some(ref b) = filter.blocked_by {
+                    q = q.bind(*b);
                 }
                 q
             }};

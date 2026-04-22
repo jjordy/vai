@@ -564,6 +564,9 @@ pub enum IssueCommands {
         /// Label to apply (can be repeated, or use comma-separated values).
         #[arg(long)]
         label: Vec<String>,
+        /// Issue ID that blocks this issue (can be repeated).
+        #[arg(long)]
+        blocked_by: Vec<String>,
     },
     /// List issues with optional filters.
     List {
@@ -579,6 +582,9 @@ pub enum IssueCommands {
         /// Filter by creator (human username or agent ID).
         #[arg(long)]
         created_by: Option<String>,
+        /// Only show issues blocked by this issue ID.
+        #[arg(long)]
+        blocked_by: Option<String>,
     },
     /// Show details of a specific issue.
     Show {
@@ -601,6 +607,9 @@ pub enum IssueCommands {
         /// New body / description text (Markdown supported).
         #[arg(long)]
         body: Option<String>,
+        /// Mark this issue as blocked by another issue (can be repeated).
+        #[arg(long)]
+        blocked_by: Vec<String>,
     },
     /// Close an issue with a resolution.
     Close {

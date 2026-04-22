@@ -25,12 +25,13 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
             .map(|c| c.name)
             .unwrap_or_default();
         match issue_cmd {
-            IssueCommands::List { status, priority, label, created_by } => {
+            IssueCommands::List { status, priority, label, created_by, blocked_by } => {
                 let mut params: Vec<String> = vec![];
                 if let Some(s) = status { params.push(format!("status={s}")); }
                 if let Some(p) = priority { params.push(format!("priority={p}")); }
                 if let Some(l) = label { params.push(format!("label={l}")); }
                 if let Some(c) = created_by { params.push(format!("created_by={c}")); }
+                if let Some(b) = blocked_by { params.push(format!("blocked_by={b}")); }
                 let path = if params.is_empty() {
                     format!("/api/repos/{repo_name}/issues")
                 } else {
@@ -64,7 +65,7 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
                     }
                 }
             }
-            IssueCommands::Create { title, body, priority, label } => {
+            IssueCommands::Create { title, body, priority, label, blocked_by } => {
                 let labels: Vec<String> = label.iter()
                     .flat_map(|s| s.split(','))
                     .map(|s| s.trim().to_string())
@@ -75,6 +76,7 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
                     "description": body,
                     "priority": priority,
                     "labels": labels,
+                    "blocked_by": blocked_by,
                 });
                 let issue: serde_json::Value = rt.block_on(client.post(&format!("/api/repos/{repo_name}/issues"), &req))?;
                 if json {
@@ -125,7 +127,7 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
                     }
                 }
             }
-            IssueCommands::Update { id, priority, label, title, body } => {
+            IssueCommands::Update { id, priority, label, title, body, blocked_by } => {
                 let new_labels: Option<Vec<String>> = if label.is_empty() {
                     None
                 } else {
@@ -135,11 +137,17 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
                         .filter(|s| !s.is_empty())
                         .collect())
                 };
+                let blocked_by_opt: Option<Vec<String>> = if blocked_by.is_empty() {
+                    None
+                } else {
+                    Some(blocked_by)
+                };
                 let req = serde_json::json!({
                     "priority": priority,
                     "title": title,
                     "description": body,
                     "labels": new_labels,
+                    "blocked_by": blocked_by_opt,
                 });
                 let path = format!("/api/repos/{repo_name}/issues/{id}");
                 let issue: serde_json::Value = rt.block_on(client.patch(&path, &req))?;
@@ -173,7 +181,7 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
     // ── Local dispatch ─────────────────────────────────────────────────
 
     match issue_cmd {
-        IssueCommands::Create { title, body, priority, label } => {
+        IssueCommands::Create { title, body, priority, label, blocked_by } => {
             let prio = IssuePriority::from_db_str(&priority)
                 .ok_or_else(|| CliError::Other(format!("unknown priority: {priority}")))?;
             // Expand comma-separated label values (e.g. --label "a,b" or --label a --label b).
@@ -194,6 +202,10 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
                 whoami(),
                 &mut event_log,
             )?;
+            for blocker_str in &blocked_by {
+                let blocker = resolve_issue(&store, blocker_str)?;
+                store.add_dependency(issue.id, blocker.id)?;
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&issue).unwrap());
             } else {
@@ -205,7 +217,7 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
                 print_issue_summary(&issue);
             }
         }
-        IssueCommands::List { status, priority, label, created_by } => {
+        IssueCommands::List { status, priority, label, created_by, blocked_by } => {
             let status_filter = if let Some(s) = status {
                 Some(IssueStatus::from_db_str(&s)
                     .ok_or_else(|| CliError::Other(format!("unknown status: {s}")))?)
@@ -218,13 +230,20 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
             } else {
                 None
             };
+            let store = IssueStore::open(&vai_dir)?;
+            let blocked_by_id = if let Some(ref b) = blocked_by {
+                let blocker = resolve_issue(&store, b)?;
+                Some(blocker.id)
+            } else {
+                None
+            };
             let filter = IssueFilter {
                 status: status_filter,
                 priority: priority_filter,
                 label,
                 creator: created_by,
+                blocked_by: blocked_by_id,
             };
-            let store = IssueStore::open(&vai_dir)?;
             let issues = store.list(&filter)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&issues).unwrap());
@@ -287,7 +306,7 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
                 }
             }
         }
-        IssueCommands::Update { id, priority, label, title, body } => {
+        IssueCommands::Update { id, priority, label, title, body, blocked_by } => {
             let prio = if let Some(p) = priority {
                 Some(IssuePriority::from_db_str(&p)
                     .ok_or_else(|| CliError::Other(format!("unknown priority: {p}")))?)
@@ -307,6 +326,10 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
                 new_labels,
                 &mut event_log,
             )?;
+            for blocker_str in &blocked_by {
+                let blocker = resolve_issue(&store, blocker_str)?;
+                store.add_dependency(updated.id, blocker.id)?;
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&updated).unwrap());
             } else {

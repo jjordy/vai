@@ -120,6 +120,9 @@ pub(super) struct UpdateIssueRequest {
     labels: Option<Vec<String>>,
     /// Testable conditions that define when the issue is complete.
     acceptance_criteria: Option<Vec<String>>,
+    /// Add blockers: issue IDs that block this issue (appends; does not remove existing).
+    #[serde(default)]
+    blocked_by: Vec<String>,
 }
 
 /// Request body for `POST /api/issues/:id/close`.
@@ -136,6 +139,8 @@ pub(super) struct ListIssuesQuery {
     priority: Option<String>,
     label: Option<String>,
     created_by: Option<String>,
+    /// Filter: only show issues blocked by this issue ID.
+    blocked_by: Option<String>,
     page: Option<u32>,
     per_page: Option<u32>,
     sort: Option<String>,
@@ -859,6 +864,7 @@ pub(super) async fn create_issue_handler(
         ("priority" = Option<String>, Query, description = "Filter by priority"),
         ("label" = Option<String>, Query, description = "Filter by label"),
         ("created_by" = Option<String>, Query, description = "Filter by creator"),
+        ("blocked_by" = Option<String>, Query, description = "Filter: only issues blocked by this issue ID"),
         ("page" = Option<u32>, Query, description = "Page number (1-indexed, default 1)"),
         ("per_page" = Option<u32>, Query, description = "Items per page (default 25, max 100)"),
         ("sort" = Option<String>, Query, description = "Sort fields, e.g. `created_at:desc,priority:asc`"),
@@ -886,11 +892,16 @@ pub(super) async fn list_issues_handler(
         .map(|p| IssuePriority::from_db_str(p).ok_or_else(|| ApiError::bad_request(format!("unknown priority `{p}`"))))
         .transpose()?;
 
+    let blocked_by_id = query.blocked_by.as_deref()
+        .map(|b| uuid::Uuid::parse_str(b).map_err(|_| ApiError::bad_request(format!("invalid blocked_by ID `{b}`"))))
+        .transpose()?;
+
     let filter = IssueFilter {
         status,
         priority,
         label: query.label,
         creator: query.created_by,
+        blocked_by: blocked_by_id,
     };
 
     const ALLOWED_SORT: &[&str] = &["created_at", "updated_at", "priority", "status", "title", "creator", "id"];
@@ -1108,10 +1119,36 @@ pub(super) async fn update_issue_handler(
         ..Default::default()
     };
 
+    // Parse and validate any new blocked_by IDs (each blocker must exist).
+    let mut new_blocker_ids: Vec<uuid::Uuid> = Vec::new();
+    for blocker_str in &body.blocked_by {
+        let blocker_id = uuid::Uuid::parse_str(blocker_str)
+            .map_err(|_| ApiError::bad_request(format!("invalid blocker ID `{blocker_str}`")))?;
+        ctx.storage.issues()
+            .get_issue(&ctx.repo_id, &blocker_id)
+            .await
+            .map_err(|_| ApiError::bad_request(format!("blocker issue `{blocker_id}` not found")))?;
+        new_blocker_ids.push(blocker_id);
+    }
+
     let issue = ctx.storage.issues()
         .update_issue(&ctx.repo_id, &issue_id, update)
         .await
         .map_err(ApiError::from)?;
+
+    // Create `blocks` links for each new blocker.
+    for blocker_id in &new_blocker_ids {
+        let _ = ctx.storage.links()
+            .create_link(
+                &ctx.repo_id,
+                blocker_id,
+                crate::storage::NewIssueLink {
+                    target_id: issue_id,
+                    relationship: crate::storage::IssueLinkRelationship::Blocks,
+                },
+            )
+            .await;
+    }
 
     // Append event to event store — triggers pg_notify in Postgres mode.
     let _ = ctx.storage.events()

@@ -258,6 +258,8 @@ pub struct IssueFilter {
     pub label: Option<String>,
     /// Filter by creator (human or agent ID).
     pub creator: Option<String>,
+    /// Only show issues blocked by this issue ID.
+    pub blocked_by: Option<Uuid>,
 }
 
 // ── IssueStore ────────────────────────────────────────────────────────────────
@@ -671,6 +673,13 @@ impl IssueStore {
             conditions.push(format!("creator = ?{}", conditions.len() + 1));
             values.push(Box::new(creator.clone()));
         }
+        if let Some(blocker_id) = &filter.blocked_by {
+            conditions.push(format!(
+                "id IN (SELECT issue_id FROM issue_dependencies WHERE depends_on_id = ?{})",
+                conditions.len() + 1
+            ));
+            values.push(Box::new(blocker_id.to_string()));
+        }
 
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -1021,6 +1030,36 @@ impl IssueStore {
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
         Ok(IssueComment { id, issue_id, author, body, author_type, author_id, created_at, parent_id, edited_at, deleted_at })
+    }
+
+    /// Record that `issue_id` is blocked by `blocker_id`.
+    ///
+    /// Idempotent — inserting the same pair twice is a no-op.
+    pub fn add_dependency(&self, issue_id: Uuid, blocker_id: Uuid) -> Result<(), IssueError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO issue_dependencies (issue_id, depends_on_id) VALUES (?1, ?2)",
+            params![issue_id.to_string(), blocker_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Return all issue IDs that block `issue_id`.
+    pub fn list_blockers(&self, issue_id: Uuid) -> Result<Vec<Uuid>, IssueError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT depends_on_id FROM issue_dependencies WHERE issue_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![issue_id.to_string()], |row| {
+            let s: String = row.get(0)?;
+            Ok(s)
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let s = row?;
+            if let Ok(id) = Uuid::parse_str(&s) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 
     /// List workspaces linked to an issue.
@@ -1381,6 +1420,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dup2, Some(first.id), "should detect similar open issue as potential duplicate");
+    }
+
+    #[test]
+    fn test_blocked_by_dependency() {
+        let (_tmp, store, mut log) = setup();
+        let blocker = store.create("Blocker", "", IssuePriority::High, vec![], "alice", &mut log).unwrap();
+        let blocked = store.create("Blocked", "", IssuePriority::Low, vec![], "alice", &mut log).unwrap();
+
+        store.add_dependency(blocked.id, blocker.id).unwrap();
+
+        // list_blockers returns the blocker.
+        let blockers = store.list_blockers(blocked.id).unwrap();
+        assert_eq!(blockers, vec![blocker.id]);
+
+        // filter: issues blocked by blocker.
+        let filter = IssueFilter { blocked_by: Some(blocker.id), ..Default::default() };
+        let results = store.list(&filter).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, blocked.id);
+
+        // Idempotent add.
+        store.add_dependency(blocked.id, blocker.id).unwrap();
+        let blockers2 = store.list_blockers(blocked.id).unwrap();
+        assert_eq!(blockers2.len(), 1);
     }
 
     #[test]
