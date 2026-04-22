@@ -3,6 +3,7 @@
 //! Endpoints:
 //!   - `POST /api/repos` — register a new repository
 //!   - `GET /api/repos` — list registered repositories
+//!   - `GET /api/repos/:name` — get a single repository by name
 //!   - `POST /api/users` — create a new user account
 //!   - `GET /api/users/:user` — get user by UUID or email
 //!   - `GET /api/repos/:repo/me` — authenticated caller's identity and effective role
@@ -511,6 +512,133 @@ pub(super) async fn list_repos_handler(
         .collect();
 
     Ok(Json(responses))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/repos/{name}",
+    params(
+        ("name" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Repository details", body = RepoResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Repo not found or no access"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
+/// `GET /api/repos/:name` — fetch a single repository by name.
+///
+/// Returns 200 with the repo JSON when the authenticated user has a
+/// `repo_collaborators` row (or is an org owner/admin). Admin keys can
+/// see any repo. Returns 404 when the repo does not exist or the caller
+/// has no access (no information leakage).
+pub(super) async fn get_repo_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<RepoResponse>, ApiError> {
+    if let crate::storage::StorageBackend::Server(ref pg)
+    | crate::storage::StorageBackend::ServerWithS3(ref pg, _)
+    | crate::storage::StorageBackend::ServerWithMemFs(ref pg, _) = state.storage
+    {
+        use sqlx::Row as _;
+
+        let row = if identity.is_admin {
+            sqlx::query(
+                "SELECT id, name, created_at FROM repos WHERE name = $1",
+            )
+            .bind(&name)
+            .fetch_optional(pg.pool())
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to query repo: {e}")))?
+        } else if let Some(user_id) = identity.user_id {
+            sqlx::query(
+                "SELECT r.id, r.name, r.created_at
+                 FROM repos r
+                 WHERE r.name = $1
+                   AND (
+                       EXISTS (
+                           SELECT 1 FROM repo_collaborators rc
+                           WHERE rc.repo_id = r.id AND rc.user_id = $2
+                       )
+                       OR EXISTS (
+                           SELECT 1 FROM org_members om
+                           WHERE om.org_id = r.org_id
+                             AND om.user_id = $2
+                             AND om.role IN ('owner', 'admin')
+                       )
+                   )",
+            )
+            .bind(&name)
+            .bind(user_id)
+            .fetch_optional(pg.pool())
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to query repo: {e}")))?
+        } else {
+            None
+        };
+
+        let row = row.ok_or_else(|| ApiError::not_found("repo not found or no access"))?;
+
+        let repo_id: uuid::Uuid = row.get("id");
+        let repo_name: String = row.get("name");
+        let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+
+        let head_version = state
+            .storage
+            .versions()
+            .read_head(&repo_id)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| "v1".to_string());
+
+        let workspace_count = state
+            .storage
+            .workspaces()
+            .list_workspaces(&repo_id, false, &crate::storage::ListQuery::default())
+            .await
+            .map(|r| r.total as usize)
+            .unwrap_or(0);
+
+        let path = if identity.is_admin {
+            state
+                .storage_root
+                .as_ref()
+                .map(|sr| sr.join(&repo_name).display().to_string())
+        } else {
+            None
+        };
+
+        return Ok(Json(RepoResponse {
+            id: Some(repo_id),
+            name: repo_name,
+            path,
+            created_at: created_at.to_rfc3339(),
+            head_version,
+            workspace_count,
+        }));
+    }
+
+    // Local mode: only admin callers can look up a repo by name.
+    if !identity.is_admin {
+        return Err(ApiError::not_found("repo not found or no access"));
+    }
+
+    let storage_root = state
+        .storage_root
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("repo not found or no access"))?;
+
+    let registry = super::RepoRegistry::load(storage_root).map_err(|e| ApiError::internal(e.to_string()))?;
+    let entry = registry
+        .repos
+        .iter()
+        .find(|e| e.name == name)
+        .ok_or_else(|| ApiError::not_found("repo not found or no access"))?;
+
+    Ok(Json(RepoResponse::from_entry(entry)))
 }
 
 // ── Org / User API types ──────────────────────────────────────────────────────

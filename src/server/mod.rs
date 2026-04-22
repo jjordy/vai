@@ -3089,6 +3089,7 @@ impl utoipa::Modify for SecurityAddon {
         watcher::submit_discovery_handler,
         admin::create_repo_handler,
         admin::list_repos_handler,
+        admin::get_repo_handler,
         admin::create_org_handler,
         admin::list_orgs_handler,
         admin::get_org_handler,
@@ -3326,6 +3327,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         // Multi-repo management endpoints.
         .route("/api/repos", post(admin::create_repo_handler))
         .route("/api/repos", get(admin::list_repos_handler))
+        .route("/api/repos/:name", get(admin::get_repo_handler))
         // User management endpoints.
         .route("/api/users", post(admin::create_user_handler))
         .route("/api/users/:user", get(admin::get_user_handler))

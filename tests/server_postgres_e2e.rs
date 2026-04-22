@@ -3196,6 +3196,132 @@ async fn test_device_code_key_grants_creator_collaborator() {
     shutdown_tx.send(()).ok();
 }
 
+/// `GET /api/repos/:name` returns the repo JSON for the creating user.
+///
+/// Parallel to `test_device_code_key_grants_creator_collaborator` — verifies
+/// the single-repo lookup (issue #322).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_repo_by_name_returns_200_for_creator() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+
+    // Create a user + API key.
+    let resp = client
+        .post(format!("{base}/api/users"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("Dave-{sfx}"),
+            "email": format!("dave-{sfx}@example.com"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let user_id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("dave-key-{sfx}"),
+            "for_user_id": user_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let user_key = resp.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // User creates a repo — should auto-grant admin collaborator row.
+    let repo_name = format!("dave-repo-{sfx}");
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(&user_key)
+        .json(&serde_json::json!({ "name": repo_name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "POST /api/repos: {}", resp.text().await.unwrap_or_default());
+
+    // GET /api/repos/:name must return 200 for the creator (issue #322).
+    let resp = client
+        .get(format!("{base}/api/repos/{repo_name}"))
+        .bearer_auth(&user_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "GET /api/repos/:name must return 200 for creator (issue #322): {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(repo["name"].as_str(), Some(repo_name.as_str()), "repo name mismatch");
+
+    // A second user must get 404 (no collaborator row).
+    let resp2 = client
+        .post(format!("{base}/api/users"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("Eve-{sfx}"),
+            "email": format!("eve-{sfx}@example.com"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), 201);
+    let other_id = resp2.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp2 = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("eve-key-{sfx}"),
+            "for_user_id": other_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), 201);
+    let other_key = resp2.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp2 = client
+        .get(format!("{base}/api/repos/{repo_name}"))
+        .bearer_auth(&other_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp2.status(),
+        404,
+        "non-collaborator must get 404 on GET /api/repos/:name"
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Device code returns 404 for codes that were never created, and
 /// `{"status":"expired"}` (HTTP 200) for codes that existed but have elapsed.
 #[tokio::test(flavor = "multi_thread")]
