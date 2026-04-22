@@ -127,6 +127,18 @@ pub(super) async fn create_repo_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateRepoRequest>,
 ) -> Result<(StatusCode, Json<RepoResponse>), ApiError> {
+    // Log at the top of the handler so any invocation is visible in fly logs,
+    // even if the request fails before reaching the collaborator-insert block.
+    tracing::info!(
+        event = "repo.create_requested",
+        key_id = %identity.key_id,
+        user_id = ?identity.user_id,
+        is_admin = identity.is_admin,
+        auth_source = ?identity.auth_source,
+        repo_name = %body.name,
+        "POST /api/repos handler invoked"
+    );
+
     // Non-admin users must have an associated user_id to create repos.
     if !identity.is_admin && identity.user_id.is_none() {
         return Err(ApiError::forbidden(

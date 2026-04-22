@@ -3965,8 +3965,21 @@ fn resolve_admin_key() -> String {
 /// the repository at `vai_dir`, and serves requests until a SIGINT or SIGTERM
 /// is received. Uses axum's built-in graceful shutdown.
 pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), ServerError> {
-    // Initialise structured logging if not already set up.
-    let _ = tracing_subscriber::fmt::try_init();
+    // Initialise structured logging.
+    //
+    // Priority order: RUST_LOG > VAI_LOG_LEVEL > "info".
+    // The fly.toml sets VAI_LOG_LEVEL = 'info'; without this fallback the
+    // tracing subscriber silently drops INFO events when RUST_LOG is not set.
+    let log_filter = std::env::var("RUST_LOG")
+        .ok()
+        .or_else(|| std::env::var("VAI_LOG_LEVEL").ok())
+        .unwrap_or_else(|| "info".to_string());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_new(&log_filter)
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
 
     // In multi-repo mode there is no per-repo config file; derive a display
     // name from the storage root path instead.  In single-repo mode read the
@@ -3988,6 +4001,18 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
 
     let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
+    // Guard: multi-repo mode (storage_root set) requires a Postgres database.
+    // If DATABASE_URL is missing the server falls back to local SQLite mode,
+    // which silently skips the collaborator insert and returns empty repo lists
+    // for non-admin users — a production foot-gun that is very hard to debug.
+    if config.storage_root.is_some() && config.database_url.is_none() {
+        return Err(ServerError::Io(std::io::Error::other(
+            "VAI_STORAGE_ROOT is set but DATABASE_URL (or --database-url) is not configured. \
+             Multi-repo mode requires a Postgres database. \
+             Set DATABASE_URL in Fly secrets or ~/.vai/server.toml.",
+        )));
+    }
+
     // Build the storage backend: Postgres when a database URL is configured,
     // SQLite otherwise (legacy local mode).  When an S3 config is also present,
     // use the full ServerWithS3 variant so file uploads are durably stored.
@@ -3999,6 +4024,29 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         (Some(url), None) => crate::storage::StorageBackend::server(url, pool_size).await?,
         _ => crate::storage::StorageBackend::local(vai_dir),
     };
+
+    // Log the storage backend so startup logs make the mode unambiguous.
+    match &storage {
+        crate::storage::StorageBackend::Local(_) => {
+            tracing::warn!(
+                event = "server.storage_mode",
+                mode = "local_sqlite",
+                "storage: local SQLite mode — RBAC and multi-repo features are disabled"
+            );
+        }
+        #[cfg(feature = "postgres")]
+        crate::storage::StorageBackend::Server(_) => {
+            tracing::info!(event = "server.storage_mode", mode = "postgres", "storage: Postgres mode");
+        }
+        #[cfg(feature = "s3")]
+        crate::storage::StorageBackend::ServerWithS3(_, _) => {
+            tracing::info!(event = "server.storage_mode", mode = "postgres_s3", "storage: Postgres + S3 mode");
+        }
+        #[cfg(feature = "postgres")]
+        crate::storage::StorageBackend::ServerWithMemFs(_, _) => {
+            tracing::info!(event = "server.storage_mode", mode = "postgres_memfs", "storage: Postgres + in-memory FS mode");
+        }
+    }
 
     // Run schema migrations when using a Postgres backend so the server is
     // always up-to-date (including the file_index table required by S3 mode).
