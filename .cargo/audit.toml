@@ -25,4 +25,11 @@ ignore = [
     # tokio-tungstenite 0.24 and sqlx internals; we don't call rand directly.
     # Re-check when tokio-tungstenite/sqlx updates their rand dependency. (Added 2026-04-19)
     "RUSTSEC-2026-0097",
+    # rustls-webpki 0.101.7 CRL parsing panic — transitive via
+    # aws-smithy-http-client 1.1.12 → rustls 0.21.12 → rustls-webpki 0.101.7.
+    # The 0.101.x line has no fix; fix only exists in >=0.103.13 (semver-incompatible with rustls 0.21).
+    # aws-smithy-http-client must drop its rustls 0.21 backend before we can resolve this.
+    # vai does not parse certificate revocation lists, so the panic is not reachable.
+    # Re-check when aws-smithy-http-client > 1.1.12 is released. (Added 2026-04-22)
+    "RUSTSEC-2026-0104",
 ]
