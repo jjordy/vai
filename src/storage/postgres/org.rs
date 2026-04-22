@@ -117,13 +117,12 @@ impl OrgStore for PostgresStorage {
 
     async fn create_user(&self, user: NewUser) -> Result<User, StorageError> {
         let row = sqlx::query(
-            "INSERT INTO users (email, name, better_auth_id)
-             VALUES ($1, $2, $3)
-             RETURNING id, email, name, created_at, better_auth_id",
+            "INSERT INTO users (email, name)
+             VALUES ($1, $2)
+             RETURNING id, email, name, created_at",
         )
         .bind(&user.email)
         .bind(&user.name)
-        .bind(&user.better_auth_id)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
@@ -143,13 +142,12 @@ impl OrgStore for PostgresStorage {
             email: row.get("email"),
             name: row.get("name"),
             created_at: row.get("created_at"),
-            better_auth_id: row.get("better_auth_id"),
         })
     }
 
     async fn get_user(&self, user_id: &Uuid) -> Result<User, StorageError> {
         let row = sqlx::query(
-            "SELECT id, email, name, created_at, better_auth_id FROM users WHERE id = $1",
+            "SELECT id, email, name, created_at FROM users WHERE id = $1",
         )
         .bind(user_id)
         .fetch_optional(&self.pool)
@@ -162,13 +160,12 @@ impl OrgStore for PostgresStorage {
             email: row.get("email"),
             name: row.get("name"),
             created_at: row.get("created_at"),
-            better_auth_id: row.get("better_auth_id"),
         })
     }
 
     async fn get_user_by_email(&self, email: &str) -> Result<User, StorageError> {
         let row = sqlx::query(
-            "SELECT id, email, name, created_at, better_auth_id FROM users WHERE email = $1",
+            "SELECT id, email, name, created_at FROM users WHERE email = $1",
         )
         .bind(email)
         .fetch_optional(&self.pool)
@@ -181,29 +178,6 @@ impl OrgStore for PostgresStorage {
             email: row.get("email"),
             name: row.get("name"),
             created_at: row.get("created_at"),
-            better_auth_id: row.get("better_auth_id"),
-        })
-    }
-
-    async fn get_user_by_external_id(&self, external_id: &str) -> Result<User, StorageError> {
-        let row = sqlx::query(
-            "SELECT id, email, name, created_at, better_auth_id \
-             FROM users WHERE better_auth_id = $1",
-        )
-        .bind(external_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StorageError::Database(e.to_string()))?
-        .ok_or_else(|| {
-            StorageError::NotFound(format!("user with better_auth_id '{external_id}'"))
-        })?;
-
-        Ok(User {
-            id: row.get("id"),
-            email: row.get("email"),
-            name: row.get("name"),
-            created_at: row.get("created_at"),
-            better_auth_id: row.get("better_auth_id"),
         })
     }
 

@@ -94,8 +94,9 @@ pub(super) async fn token_exchange_handler(
                 ApiError::bad_request("session_token is required for session_exchange grant")
             })?;
 
-            // Validate the Better Auth session and extract the BA user ID (opaque string).
-            let ba_user_id = auth.validate_session(session_token).await.map_err(|e| {
+            // Validate the Better Auth session and extract the user ID.
+            // After PRD 27 Phase 1, session.userId IS users.id (uuid) directly.
+            let user_id_str = auth.validate_session(session_token).await.map_err(|e| {
                 match e {
                     crate::storage::StorageError::NotFound(_) => {
                         ApiError::unauthorized("invalid or expired session token")
@@ -104,37 +105,19 @@ pub(super) async fn token_exchange_handler(
                 }
             })?;
 
-            // Resolve or auto-provision the vai user for this Better Auth identity.
+            let user_uuid = uuid::Uuid::parse_str(&user_id_str)
+                .map_err(|_| ApiError::unauthorized("invalid or expired session token"))?;
+
+            // Look up the user directly by UUID — Better Auth writes the users row on signup.
+            // A missing row means the session is forged or stale; never auto-provision.
             let orgs = state.storage.orgs();
-            let (user_id, user_name) = match orgs.get_user_by_external_id(&ba_user_id).await {
-                Ok(existing) => (existing.id, existing.name),
-                Err(crate::storage::StorageError::NotFound(_)) => {
-                    // First login — fetch BA profile and create a vai user record.
-                    let (email, name) = auth
-                        .get_better_auth_user(&ba_user_id)
-                        .await
-                        .map_err(ApiError::from)?;
-
-                    let new_user = orgs
-                        .create_user(crate::storage::NewUser {
-                            email,
-                            name,
-                            better_auth_id: Some(ba_user_id.clone()),
-                        })
-                        .await
-                        .map_err(ApiError::from)?;
-
-                    tracing::info!(
-                        event = "auth.user_provisioned",
-                        ba_user_id = %ba_user_id,
-                        vai_user_id = %new_user.id,
-                        "Auto-provisioned vai user from Better Auth identity"
-                    );
-
-                    (new_user.id, new_user.name)
+            let user = orgs.get_user(&user_uuid).await.map_err(|e| match e {
+                crate::storage::StorageError::NotFound(_) => {
+                    ApiError::unauthorized("session does not correspond to a known user")
                 }
-                Err(other) => return Err(ApiError::from(other)),
-            };
+                other => ApiError::from(other),
+            })?;
+            let (user_id, user_name) = (user.id, user.name);
 
             // No automatic repo grants on login — users see only repos they
             // created or were explicitly added to as collaborators.

@@ -169,20 +169,18 @@ pub(super) async fn ws_events_handler(
                 // table so this works whether the token is an opaque string or
                 // a JWT-mode session token.
                 match state.storage.auth().validate_session(&key_str).await {
-                    Ok(ba_user_id) => {
-                        match state
-                            .storage
-                            .orgs()
-                            .get_user_by_external_id(&ba_user_id)
-                            .await
-                        {
+                    Ok(user_id_str) => {
+                        let Ok(user_uuid) = uuid::Uuid::parse_str(&user_id_str) else {
+                            return ApiError::unauthorized("invalid JWT token").into_response();
+                        };
+                        match state.storage.orgs().get_user(&user_uuid).await {
                             Ok(user) => {
                                 tracing::debug!(
                                     user_id = %user.id,
                                     "WebSocket connection authenticated via Better Auth session"
                                 );
                                 AgentIdentity {
-                                    key_id: format!("session:{ba_user_id}"),
+                                    key_id: format!("session:{user_id_str}"),
                                     name: user.name,
                                     is_admin: false,
                                     user_id: Some(user.id),

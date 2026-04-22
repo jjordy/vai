@@ -913,7 +913,7 @@ pub(super) async fn create_user_handler(
     let user = state
         .storage
         .orgs()
-        .create_user(NewUser { email: body.email, name: body.name, better_auth_id: None })
+        .create_user(NewUser { email: body.email, name: body.name })
         .await
         .map_err(ApiError::from)?;
 

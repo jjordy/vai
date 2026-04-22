@@ -184,8 +184,10 @@ impl AuthStore for PostgresStorage {
     async fn validate_session(&self, session_token: &str) -> Result<String, StorageError> {
         // Query the Better Auth `session` table. Better Auth uses camelCase
         // column names: "userId", "expiresAt", "token".
+        // Cast "userId" to text so this works whether the column is text or uuid
+        // (after PRD 27 Phase 1, it is uuid).
         let row = sqlx::query(
-            r#"SELECT "userId" FROM session WHERE token = $1 AND "expiresAt" > now()"#,
+            r#"SELECT "userId"::text AS user_id FROM session WHERE token = $1 AND "expiresAt" > now()"#,
         )
         .bind(session_token)
         .fetch_optional(&self.pool)
@@ -193,26 +195,7 @@ impl AuthStore for PostgresStorage {
         .map_err(|e| StorageError::Database(e.to_string()))?
         .ok_or_else(|| StorageError::NotFound("invalid or expired session".to_string()))?;
 
-        Ok(row.get("userId"))
-    }
-
-    async fn get_better_auth_user(
-        &self,
-        ba_user_id: &str,
-    ) -> Result<(String, String), StorageError> {
-        // Query the Better Auth `user` table (camelCase columns).
-        let row = sqlx::query(r#"SELECT email, name FROM "user" WHERE id = $1"#)
-            .bind(ba_user_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| StorageError::Database(e.to_string()))?
-            .ok_or_else(|| {
-                StorageError::NotFound(format!("Better Auth user '{ba_user_id}'"))
-            })?;
-
-        let email: String = row.get("email");
-        let name: String = row.get("name");
-        Ok((email, name))
+        Ok(row.get("user_id"))
     }
 
     async fn create_refresh_token(
