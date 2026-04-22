@@ -9,8 +9,8 @@ use serde::Deserialize;
 
 use super::{
     ChangeKind, FullDownload, IncrementalPullResult, ManifestEntry, ManifestResult,
-    RemoteAdapter, RemoteError, SubmitResult, UploadStats, VersionFileChange, VersionSummary,
-    FilePullEntry,
+    RemoteAdapter, RemoteError, RemoteVersionMeta, SubmitResult, UploadStats, VersionFileChange,
+    VersionSummary, FilePullEntry,
 };
 
 // ── Server response shapes ────────────────────────────────────────────────────
@@ -101,6 +101,29 @@ enum SyncChangeType {
 #[derive(Deserialize)]
 struct FileDownloadResponse {
     content_base64: String,
+}
+
+/// JSON shape of a single version returned by `GET /api/repos/:repo/versions`.
+#[derive(Deserialize)]
+struct VersionMetaJson {
+    version_id: String,
+    parent_version_id: Option<String>,
+    intent: String,
+    created_by: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    merge_event_id: Option<u64>,
+}
+
+/// Pagination envelope returned by all paginated list endpoints.
+#[derive(Deserialize)]
+struct PaginatedVersionsResponse {
+    data: Vec<VersionMetaJson>,
+    pagination: PaginationMetaJson,
+}
+
+#[derive(Deserialize)]
+struct PaginationMetaJson {
+    total_pages: u32,
 }
 
 // ── HttpAdapter ───────────────────────────────────────────────────────────────
@@ -338,6 +361,45 @@ impl RemoteAdapter for HttpAdapter {
         let url = format!("{}/api/files/{}", self.base_url, encoded);
         let resp: FileDownloadResponse = self.get_json(&url).await?;
         Ok(BASE64.decode(resp.content_base64.as_bytes())?)
+    }
+
+    async fn fetch_versions_since(
+        &self,
+        repo: &str,
+        since_version_num: u64,
+    ) -> Result<Vec<RemoteVersionMeta>, RemoteError> {
+        let mut all = Vec::new();
+        let mut page = 1u32;
+        const PER_PAGE: u32 = 100;
+
+        loop {
+            let url = format!(
+                "{}/api/repos/{}/versions?page={}&per_page={}&sort=created_at:asc",
+                self.base_url, repo, page, PER_PAGE
+            );
+            let resp: PaginatedVersionsResponse = self.get_json(&url).await?;
+            let total_pages = resp.pagination.total_pages;
+
+            for item in resp.data {
+                if super::parse_version_num_str(&item.version_id) > since_version_num {
+                    all.push(RemoteVersionMeta {
+                        version_id: item.version_id,
+                        parent_version_id: item.parent_version_id,
+                        intent: item.intent,
+                        created_by: item.created_by,
+                        created_at: item.created_at,
+                        merge_event_id: item.merge_event_id,
+                    });
+                }
+            }
+
+            if page >= total_pages {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(all)
     }
 }
 

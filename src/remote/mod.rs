@@ -52,6 +52,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::prelude::{Engine, BASE64_STANDARD as BASE64};
+use chrono::{DateTime, Utc};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -182,6 +183,20 @@ pub struct VersionFileChange {
     pub change: ChangeKind,
 }
 
+/// Full version metadata returned by the server's versions list endpoint.
+///
+/// Used by [`RemoteAdapter::fetch_versions_since`] to populate
+/// `.vai/versions/<id>.toml` files locally after a pull.
+#[derive(Debug)]
+pub struct RemoteVersionMeta {
+    pub version_id: String,
+    pub parent_version_id: Option<String>,
+    pub intent: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub merge_event_id: Option<u64>,
+}
+
 // ── RemoteAdapter trait ───────────────────────────────────────────────────────
 
 /// The port that separates operation logic (push/pull/sync) from transport.
@@ -242,6 +257,17 @@ pub trait RemoteAdapter: Send + Sync {
 
     /// Downloads the latest content of a file by its repo-relative path.
     async fn download_file(&self, repo: &str, path: &str) -> Result<Vec<u8>, RemoteError>;
+
+    /// Returns full version metadata for all versions whose numeric suffix
+    /// exceeds `since_version_num`.
+    ///
+    /// Used during pull to write `.vai/versions/<id>.toml` files so that
+    /// `vai log` remains accurate after fetching server changes.
+    async fn fetch_versions_since(
+        &self,
+        repo: &str,
+        since_version_num: u64,
+    ) -> Result<Vec<RemoteVersionMeta>, RemoteError>;
 }
 
 // ── Outcome types ─────────────────────────────────────────────────────────────
@@ -579,6 +605,16 @@ impl Session {
 
         std::fs::write(vai_dir.join("head"), format!("{}\n", result.head_version))?;
 
+        // Fetch version metadata for each version in (local_head, new_head] and
+        // write it to .vai/versions/<id>.toml so that `vai log` stays accurate.
+        write_version_metas(
+            &vai_dir,
+            &self.adapter,
+            &self.repo_name,
+            parse_version_num_str(&local_head),
+        )
+        .await?;
+
         Ok(PullOutcome {
             previous_version: local_head,
             new_version: result.head_version,
@@ -606,6 +642,9 @@ impl Session {
         if dl.head_version != "unknown" {
             std::fs::write(vai_dir.join("head"), format!("{}\n", dl.head_version))?;
         }
+
+        // Fetch all version metadata (full re-sync: since v0) and write TOML files.
+        write_version_metas(&vai_dir, &self.adapter, &self.repo_name, 0).await?;
 
         Ok(PullOutcome {
             previous_version: local_head,
@@ -811,6 +850,47 @@ pub async fn sync(repo_root: &Path) -> Result<SyncOutcome, RemoteError> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Fetches version metadata for all versions newer than `since_version_num`
+/// and writes each as a TOML file to `.vai/versions/<id>.toml`.
+///
+/// This keeps `vai log` accurate after a `vai pull` that crosses multiple
+/// server versions — see GitHub issue #320.
+async fn write_version_metas(
+    vai_dir: &Path,
+    adapter: &Arc<dyn RemoteAdapter>,
+    repo: &str,
+    since_version_num: u64,
+) -> Result<(), RemoteError> {
+    let metas = adapter.fetch_versions_since(repo, since_version_num).await?;
+    if metas.is_empty() {
+        return Ok(());
+    }
+    let versions_dir = vai_dir.join("versions");
+    std::fs::create_dir_all(&versions_dir)?;
+    for m in metas {
+        let vm = crate::version::VersionMeta {
+            id: None,
+            version_id: m.version_id.clone(),
+            parent_version_id: m.parent_version_id,
+            intent: m.intent,
+            created_by: m.created_by,
+            created_at: m.created_at,
+            merge_event_id: m.merge_event_id,
+        };
+        let toml_str = toml::to_string_pretty(&vm)
+            .map_err(|e| RemoteError::Server(format!("failed to serialize version metadata: {e}")))?;
+        std::fs::write(versions_dir.join(format!("{}.toml", m.version_id)), toml_str)?;
+    }
+    Ok(())
+}
+
+/// Parses the numeric suffix from a version identifier (e.g. `"v63"` → `63`).
+///
+/// Returns `0` for any string that doesn't contain a parseable trailing integer.
+pub(crate) fn parse_version_num_str(version_id: &str) -> u64 {
+    version_id.trim_start_matches('v').parse().unwrap_or(0)
+}
 
 /// Reads `.vai/head`, returning the trimmed version string.
 fn read_local_head(vai_dir: &Path) -> Result<String, RemoteError> {
@@ -1026,6 +1106,58 @@ mod tests {
         assert!(outcome.files_removed.contains(&"old.rs".to_string()));
         assert!(root.path().join("new.rs").exists());
         assert!(!root.path().join("old.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn pull_writes_version_metadata_for_new_versions() {
+        let root = tempfile::tempdir().unwrap();
+        setup_repo(root.path(), "v1");
+
+        let adapter = Arc::new(InMemoryAdapter::new());
+        adapter.seed_file("a.rs", b"new content");
+        adapter.seed_version("v1", vec![]);
+        adapter.seed_version("v2", vec![("a.rs", ChangeKind::Added)]);
+        adapter.seed_version("v3", vec![]);
+
+        let session = make_session(root.path(), adapter);
+        let outcome = session.pull().await.unwrap();
+
+        assert_eq!(outcome.new_version, "v3");
+
+        // Both v2 and v3 metadata files must be written; v1 was local already.
+        let v2_toml = root.path().join(".vai/versions/v2.toml");
+        let v3_toml = root.path().join(".vai/versions/v3.toml");
+        assert!(v2_toml.exists(), ".vai/versions/v2.toml should exist after pull");
+        assert!(v3_toml.exists(), ".vai/versions/v3.toml should exist after pull");
+
+        // The files must be parseable as VersionMeta.
+        let raw2 = fs::read_to_string(&v2_toml).unwrap();
+        let _: crate::version::VersionMeta = toml::from_str(&raw2).unwrap();
+
+        // v1.toml should NOT have been written by this pull (it was the base).
+        let v1_toml = root.path().join(".vai/versions/v1.toml");
+        assert!(!v1_toml.exists(), "v1.toml should not be written — it was already local");
+    }
+
+    #[tokio::test]
+    async fn pull_force_writes_all_version_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        setup_repo(root.path(), "v1");
+
+        let adapter = Arc::new(InMemoryAdapter::new());
+        adapter.seed_file("a.rs", b"content");
+        adapter.seed_version("v1", vec![("a.rs", ChangeKind::Added)]);
+        adapter.seed_version("v2", vec![]);
+        adapter.seed_version("v3", vec![]);
+
+        let session = make_session(root.path(), adapter);
+        session.pull_force().await.unwrap();
+
+        // All three versions should be written for a force pull.
+        for v in &["v1", "v2", "v3"] {
+            let p = root.path().join(format!(".vai/versions/{v}.toml"));
+            assert!(p.exists(), "{v}.toml should exist after pull_force");
+        }
     }
 
     #[tokio::test]

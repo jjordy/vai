@@ -12,7 +12,8 @@ use base64::prelude::{Engine, BASE64_STANDARD as BASE64};
 
 use super::{
     ChangeKind, FullDownload, IncrementalPullResult, ManifestEntry, ManifestResult, RemoteAdapter,
-    RemoteError, SubmitResult, UploadStats, VersionFileChange, VersionSummary, FilePullEntry,
+    RemoteError, RemoteVersionMeta, SubmitResult, UploadStats, VersionFileChange, VersionSummary,
+    FilePullEntry,
 };
 
 // ── Inner state ───────────────────────────────────────────────────────────────
@@ -303,6 +304,28 @@ impl RemoteAdapter for InMemoryAdapter {
             .get(path)
             .cloned()
             .ok_or_else(|| RemoteError::Server(format!("file '{path}' not found")))
+    }
+
+    async fn fetch_versions_since(
+        &self,
+        _repo: &str,
+        since_version_num: u64,
+    ) -> Result<Vec<RemoteVersionMeta>, RemoteError> {
+        use chrono::Utc;
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .versions
+            .iter()
+            .filter(|v| super::parse_version_num_str(&v.version_id) > since_version_num)
+            .map(|v| RemoteVersionMeta {
+                version_id: v.version_id.clone(),
+                parent_version_id: None,
+                intent: String::new(),
+                created_by: "unknown".to_string(),
+                created_at: Utc::now(),
+                merge_event_id: None,
+            })
+            .collect())
     }
 }
 
