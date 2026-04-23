@@ -807,6 +807,17 @@ pub enum RemoteCommands {
     /// streams it to the remote server, and writes a `.vai/migrated_at` marker
     /// on success.  All subsequent CLI commands will proxy to the remote.
     Migrate,
+    /// Re-link this repository to the server, correcting a stale `repo_id`.
+    ///
+    /// Fetches the server's canonical id for the configured repo name and
+    /// updates `repo_id` in `.vai/config.toml`.  Use this when `vai remote
+    /// status` warns about a repo_id mismatch (e.g. after the server was
+    /// re-initialised).
+    Link {
+        /// Apply the update without asking for confirmation.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Graph subcommands.
@@ -1072,6 +1083,10 @@ pub(super) fn colorize_severity(
 
 /// Returns a `RemoteClient` if a remote server is configured and `--local` was
 /// not passed.  Returns `None` if local-only mode should be used.
+///
+/// As a side effect, prints a warning to stderr when the local `repo_id` in
+/// `.vai/config.toml` does not match the id the server has on record for the
+/// same repo name (drift detection).
 pub(super) fn try_remote(
     vai_dir: &std::path::Path,
     local: bool,
@@ -1085,10 +1100,57 @@ pub(super) fn try_remote(
             let (api_key, _) = crate::credentials::load_api_key()
                 .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
             let client = crate::remote_client::RemoteClient::new(&remote_cfg.url, &api_key);
+            // Best-effort drift check — print a warning if the local repo_id has drifted
+            // from the server's id for this repo name.  A small temporary runtime is used
+            // so the check can be async without changing the sync signature of try_remote.
+            let repo_name = remote_cfg.repo_name.as_deref().unwrap_or(&config.name).to_string();
+            let local_repo_id = config.repo_id;
+            if let Ok(rt) = tokio::runtime::Runtime::new() {
+                rt.block_on(warn_if_repo_id_drifted(&client, &repo_name, local_repo_id));
+            }
             Ok(Some(client))
         }
         None => Ok(None),
     }
+}
+
+/// Checks whether the local `repo_id` matches the server's id for the given repo name.
+///
+/// If they differ, prints a clear warning to stderr with a recovery command.
+/// Best-effort — all errors are silently ignored so they never interrupt the
+/// main command.  Returns `true` when drift was detected.
+pub(super) async fn warn_if_repo_id_drifted(
+    client: &crate::remote_client::RemoteClient,
+    repo_name: &str,
+    local_repo_id: uuid::Uuid,
+) -> bool {
+    let path = format!("/api/repos/{}", repo_name);
+    let info: serde_json::Value = match client.get(&path).await {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let server_id_str = match info["id"].as_str() {
+        Some(s) => s,
+        None => return false,
+    };
+    let server_id = match server_id_str.parse::<uuid::Uuid>() {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    if server_id != local_repo_id {
+        eprintln!(
+            "{} repo_id mismatch for '{}': local {} ≠ server {}",
+            "warning:".yellow().bold(),
+            repo_name,
+            &local_repo_id.to_string()[..8],
+            &server_id.to_string()[..8],
+        );
+        eprintln!(
+            "  Your .vai/config.toml has a stale repo_id. Run `vai remote link` to fix."
+        );
+        return true;
+    }
+    false
 }
 
 /// Creates a single-threaded blocking Tokio runtime for async remote calls.

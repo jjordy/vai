@@ -187,6 +187,88 @@ pub(super) fn handle_remote(remote_cmd: RemoteCommands, json: bool) -> Result<()
                 }
             }
         }
+        RemoteCommands::Link { force } => {
+            let config = repo::read_config(&vai_dir)?;
+            let remote = config.remote.as_ref().ok_or_else(|| {
+                CliError::Other("no remote configured — run `vai remote add <url>` first".to_string())
+            })?;
+            let repo_name = remote.repo_name.as_deref().unwrap_or(&config.name);
+
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?;
+            let (api_key, _) = credentials::load_api_key()
+                .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
+            let client = crate::remote_client::RemoteClient::new(&remote.url, &api_key);
+
+            // Fetch the server's canonical repo_id.
+            let info: serde_json::Value = rt
+                .block_on(client.get::<serde_json::Value>(&format!("/api/repos/{repo_name}")))
+                .map_err(|e| CliError::Other(format!("failed to fetch repo info: {e}")))?;
+
+            let server_id_str = info["id"].as_str().ok_or_else(|| {
+                CliError::Other("server response missing 'id' field".to_string())
+            })?;
+            let server_id = server_id_str
+                .parse::<uuid::Uuid>()
+                .map_err(|e| CliError::Other(format!("invalid server repo_id: {e}")))?;
+
+            if server_id == config.repo_id {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "ok",
+                            "repo_id": server_id.to_string(),
+                            "changed": false,
+                        })
+                    );
+                } else {
+                    println!("repo_id is already in sync ({}).", &server_id.to_string()[..8]);
+                }
+                return Ok(());
+            }
+
+            if !force && !json {
+                println!(
+                    "repo_id mismatch for '{repo_name}':\n  local:  {}\n  server: {}",
+                    config.repo_id,
+                    server_id,
+                );
+                print!("Update local config? [y/N] ");
+                use std::io::Write as _;
+                std::io::stdout().flush().ok();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).ok();
+                if !matches!(input.trim(), "y" | "Y") {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            // Write updated config.
+            let mut new_config = config.clone();
+            new_config.repo_id = server_id;
+            repo::write_config(&vai_dir, &new_config)?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "ok",
+                        "old_repo_id": config.repo_id.to_string(),
+                        "new_repo_id": server_id.to_string(),
+                        "changed": true,
+                    })
+                );
+            } else {
+                println!(
+                    "{} repo_id updated: {} → {}",
+                    "✓".green().bold(),
+                    &config.repo_id.to_string()[..8],
+                    &server_id.to_string()[..8],
+                );
+            }
+        }
         RemoteCommands::Migrate => {
             let config = repo::read_config(&vai_dir)?;
             let remote = config.remote.as_ref().ok_or_else(|| {
@@ -523,6 +605,10 @@ pub(super) fn handle_sync(json: bool) -> Result<(), CliError> {
 }
 
 /// Builds a [`Session`] from explicit CLI flags or `.vai/config.toml`.
+///
+/// When loading from config (no explicit `--to`/`--key`/`--repo` flags),
+/// performs a best-effort repo_id drift check and prints a warning to stderr
+/// if the local id differs from the server's.
 fn build_session(
     root: &std::path::Path,
     server_url: Option<String>,
@@ -543,7 +629,12 @@ fn build_session(
         let remote_cfg = config.remote.ok_or(RemoteError::NoRemote)?;
         let (key, _) = credentials::load_api_key()
             .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
-        let repo = remote_cfg.repo_name.unwrap_or(config.name);
+        let repo = remote_cfg.repo_name.as_deref().unwrap_or(&config.name).to_string();
+        // Best-effort drift check before proceeding with the remote operation.
+        let client = crate::remote_client::RemoteClient::new(&remote_cfg.url, &key);
+        if let Ok(rt) = tokio::runtime::Runtime::new() {
+            rt.block_on(super::warn_if_repo_id_drifted(&client, &repo, config.repo_id));
+        }
         Session::builder(root)
             .remote_url(remote_cfg.url)
             .api_key(key)
