@@ -140,6 +140,7 @@ use tokio::sync::broadcast;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
+pub mod compute;
 pub mod pagination;
 pub use pagination::{PaginatedResponse, PaginationMeta, PaginationParams};
 
