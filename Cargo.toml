@@ -17,7 +17,7 @@ path = "src/lib.rs"
 default = ["cli"]
 cli = []
 server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:utoipa", "dep:utoipa-swagger-ui", "dep:utoipa-axum", "dep:tracing", "dep:tracing-subscriber", "dep:jsonwebtoken"]
-postgres = ["server", "dep:sqlx"]
+postgres = ["server", "dep:sqlx", "dep:aes-gcm"]
 s3 = ["server", "dep:aws-sdk-s3", "dep:aws-config"]
 full = ["cli", "server", "postgres", "s3"]
 vendored-openssl = ["dep:openssl"]
@@ -52,6 +52,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 tokio-tungstenite = "0.24"
 async-trait = "0.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-native-tls", "postgres", "uuid", "chrono", "json", "migrate"], optional = true }
+aes-gcm = { version = "0.10", features = ["getrandom"], optional = true }
 aws-config = { version = "1", optional = true }
 aws-sdk-s3 = { version = "1", optional = true }
 webbrowser = "1"

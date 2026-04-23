@@ -159,6 +159,8 @@ mod worker_registry;
 mod work_queue;
 mod workspace;
 mod ws;
+#[cfg(feature = "postgres")]
+pub(crate) mod secrets;
 
 use crate::auth as crate_auth;
 use crate::conflict;
