@@ -4591,7 +4591,7 @@ dependencies = [
 
 [[package]]
 name = "vai"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "aws-config",
