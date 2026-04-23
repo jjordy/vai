@@ -4188,6 +4188,13 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         compute,
     });
 
+    // Start the dead-worker reconciliation background task when a compute
+    // provider is configured (i.e., cloud mode).  The task is a no-op in
+    // local SQLite mode — list_stale_workers returns [] there.
+    if state.compute.is_some() {
+        worker_registry::run_reconciliation_loop(state.storage.clone());
+    }
+
     let app = build_app(state);
 
     let addr = config.socket_addr()?;

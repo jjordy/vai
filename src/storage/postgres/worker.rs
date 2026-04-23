@@ -236,4 +236,22 @@ impl WorkerStore for PostgresStorage {
         }
         Ok(())
     }
+
+    async fn list_stale_workers(&self, stale_secs: u32) -> Result<Vec<AgentWorker>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, repo_id, provider, machine_id, state, workspace_id,
+                   last_heartbeat_at, started_at, ended_at
+            FROM agent_workers
+            WHERE state IN ('spawning', 'running')
+              AND COALESCE(last_heartbeat_at, started_at) < NOW() - ($1 || ' seconds')::INTERVAL
+            "#,
+        )
+        .bind(stale_secs as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        rows.into_iter().map(row_to_worker).collect()
+    }
 }

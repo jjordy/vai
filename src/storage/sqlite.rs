@@ -1545,6 +1545,10 @@ impl super::WorkerStore for SqliteStorage {
     ) -> Result<(), StorageError> {
         Err(worker_store_unsupported())
     }
+
+    async fn list_stale_workers(&self, _stale_secs: u32) -> Result<Vec<super::AgentWorker>, StorageError> {
+        Ok(vec![])
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

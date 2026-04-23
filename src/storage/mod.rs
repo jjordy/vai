@@ -1700,6 +1700,15 @@ pub trait WorkerStore: Send + Sync {
         worker_id: &Uuid,
         reason: WorkerDoneReason,
     ) -> Result<(), StorageError>;
+
+    /// Return all workers in `spawning` or `running` state whose last activity
+    /// (heartbeat or creation) is older than `stale_secs` seconds.
+    ///
+    /// Used by the dead-worker reconciliation background task.
+    async fn list_stale_workers(
+        &self,
+        stale_secs: u32,
+    ) -> Result<Vec<AgentWorker>, StorageError>;
 }
 
 // ── StorageBackend factory ────────────────────────────────────────────────────
