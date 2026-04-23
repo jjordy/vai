@@ -38,6 +38,7 @@ use tokio_tungstenite::tungstenite::Message;
 use vai::server::{
     start_for_testing_pg_multi_repo,
     start_for_testing_pg_multi_repo_with_quota,
+    start_for_testing_pg_with_compute,
     start_for_testing_pg_with_mem_fs,
 };
 
@@ -5124,6 +5125,341 @@ async fn test_submit_empty_workspace_returns_409() {
         "response must include a hint field; got: {body}"
     );
 
+    shutdown_tx.send(()).ok();
+}
+
+// ── Cloud agent worker tests (PRD 28) ─────────────────────────────────────────
+
+/// PATCH /api/repos/:name — toggle cloud_agent_enabled.
+///
+/// Verifies that an admin can flip the cloud_agent_enabled flag on a repo and
+/// that the resulting GET reflects the new value.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_patch_repo_cloud_agent_enabled() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start server");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create a repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": format!("e2e-cloud-toggle-{}", unique_suffix()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let repo_name = repo["name"].as_str().unwrap();
+
+    // By default cloud_agent_enabled should be false.
+    let resp = client
+        .get(format!("{base}/api/repos/{repo_name}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["cloud_agent_enabled"].as_bool(),
+        Some(false),
+        "default cloud_agent_enabled should be false"
+    );
+
+    // Enable cloud agents via PATCH.
+    let resp = client
+        .patch(format!("{base}/api/repos/{repo_name}"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "cloud_agent_enabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "PATCH should succeed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    // Confirm the flag is now true.
+    let resp = client
+        .get(format!("{base}/api/repos/{repo_name}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["cloud_agent_enabled"].as_bool(),
+        Some(true),
+        "cloud_agent_enabled should be true after PATCH"
+    );
+
+    // Disable again.
+    let resp = client
+        .patch(format!("{base}/api/repos/{repo_name}"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "cloud_agent_enabled": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Confirm via GET that the flag is false again.
+    let resp = client
+        .get(format!("{base}/api/repos/{repo_name}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["cloud_agent_enabled"].as_bool(), Some(false));
+
+    shutdown_tx.send(()).ok();
+}
+
+/// Worker lifecycle: heartbeat → append logs → mark done → read back.
+///
+/// Drives the full agent-worker HTTP lifecycle through the API without
+/// touching Fly or any external compute provider.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_worker_lifecycle_endpoints() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx, _provider) = start_for_testing_pg_with_compute(tmp.path(), &url)
+        .await
+        .expect("start server");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create a repo so we have a repo_id for the worker row.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": format!("e2e-worker-lifecycle-{}", unique_suffix()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let repo_id = repo["id"].as_str().unwrap();
+
+    // Directly insert an agent_workers row via the Postgres pool so we can
+    // test the lifecycle endpoints without triggering a real spawn.
+    let pg_pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let worker_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO agent_workers (repo_id, provider, state) VALUES ($1::uuid, 'fly', 'running')
+         RETURNING id",
+    )
+    .bind(repo_id)
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+
+    // GET /api/agent-workers/:id — should return the worker in 'running' state.
+    let resp = client
+        .get(format!("{base}/api/agent-workers/{worker_id}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "get worker");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["state"].as_str(), Some("running"));
+
+    // POST /api/agent-workers/:id/heartbeat — 204 No Content.
+    let resp = client
+        .post(format!("{base}/api/agent-workers/{worker_id}/heartbeat"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "heartbeat");
+
+    // Confirm last_heartbeat_at is now populated.
+    let resp = client
+        .get(format!("{base}/api/agent-workers/{worker_id}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["last_heartbeat_at"].is_string(),
+        "last_heartbeat_at should be populated after heartbeat"
+    );
+
+    // POST /api/agent-workers/:id/logs — append stdout chunks.
+    let resp = client
+        .post(format!("{base}/api/agent-workers/{worker_id}/logs"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "stream": "stdout",
+            "chunks": ["claiming issue…", "downloading workspace…", "running claude…"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "append logs");
+
+    // GET /api/agent-workers/:id/logs — chunks should be present.
+    let resp = client
+        .get(format!("{base}/api/agent-workers/{worker_id}/logs"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "get logs");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let logs = body["logs"].as_array().unwrap();
+    assert_eq!(logs.len(), 3, "should have 3 log chunks");
+    assert_eq!(logs[0]["chunk"].as_str(), Some("claiming issue…"));
+    let last_id = body["last_id"].as_i64().unwrap();
+
+    // Pagination cursor: since_id should return only newer chunks.
+    let resp = client
+        .get(format!(
+            "{base}/api/agent-workers/{worker_id}/logs?since_id={last_id}"
+        ))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["logs"].as_array().unwrap().len(),
+        0,
+        "since_id=last_id should return empty"
+    );
+
+    // POST /api/agent-workers/:id/done — mark completed.
+    let resp = client
+        .post(format!("{base}/api/agent-workers/{worker_id}/done"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "reason": "completed" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "mark done");
+
+    // Final state should be 'completed'.
+    let resp = client
+        .get(format!("{base}/api/agent-workers/{worker_id}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["state"].as_str(), Some("completed"));
+
+    // 404 for unknown worker.
+    let resp = client
+        .get(format!("{base}/api/agent-workers/{}", uuid::Uuid::new_v4()))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "unknown worker should be 404");
+
+    pg_pool.close().await;
+    shutdown_tx.send(()).ok();
+}
+
+/// spawn_if_capacity: creating an issue on a cloud-enabled repo with an
+/// InMemoryProvider should result in a worker row in the database.
+///
+/// This test verifies the issue-creation → spawn_if_capacity → InMemoryProvider
+/// path end-to-end without a real compute provider.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_spawn_if_capacity_on_issue_create() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx, provider) = start_for_testing_pg_with_compute(tmp.path(), &url)
+        .await
+        .expect("start server");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": format!("e2e-spawn-cap-{}", unique_suffix()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let repo_name = repo["name"].as_str().unwrap();
+
+    // Enable cloud agents on the repo.
+    let resp = client
+        .patch(format!("{base}/api/repos/{repo_name}"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "cloud_agent_enabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "enable cloud agent");
+
+    // No machines yet.
+    assert_eq!(provider.worker_count(), 0);
+
+    // Create an issue — should trigger spawn_if_capacity.
+    let resp = client
+        .post(format!("{base}/api/repos/{repo_name}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "spawn test",
+            "description": "echo hello",
+            "priority": "high"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create issue");
+
+    // Allow async spawn to complete.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // InMemoryProvider should have exactly one machine.
+    assert_eq!(
+        provider.worker_count(),
+        1,
+        "one machine should have been spawned in the InMemoryProvider"
+    );
+
+    // Also verify an agent_workers row was persisted in Postgres.
+    let pg_pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_workers WHERE repo_id = $1::uuid AND state IN ('spawning','running')",
+    )
+    .bind(repo["id"].as_str().unwrap())
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "one agent_workers row should exist");
+
+    pg_pool.close().await;
     shutdown_tx.send(()).ok();
 }
 

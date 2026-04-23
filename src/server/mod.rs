@@ -518,6 +518,16 @@ pub(crate) struct AppState {
     /// triggers [`worker_registry::spawn_if_capacity`] if the repo has
     /// `cloud_agent_enabled = true`.
     pub(crate) compute: Option<std::sync::Arc<dyn compute::ComputeProvider>>,
+    /// Public URL of this server, injected as `VAI_SERVER_URL` into spawned workers.
+    ///
+    /// Read from the `VAI_SERVER_URL` environment variable at startup.
+    /// Empty string means "not configured" — spawn will be skipped.
+    pub(crate) worker_server_url: String,
+    /// Anthropic API key injected into spawned workers as `ANTHROPIC_API_KEY`.
+    ///
+    /// Read from `ANTHROPIC_API_KEY` at startup.
+    /// Empty string means "not configured" — spawn will be skipped.
+    pub(crate) worker_anthropic_key: String,
 }
 
 impl AppState {
@@ -3613,6 +3623,8 @@ pub async fn start_for_testing(
         cors_origins: vec![],
         max_repos_per_user: 100,
         compute: None,
+        worker_server_url: String::new(),
+        worker_anthropic_key: String::new(),
     });
 
     let app = build_app(state);
@@ -3712,6 +3724,8 @@ pub async fn start_for_testing_pg(
         cors_origins: vec![],
         max_repos_per_user: 100,
         compute: None,
+        worker_server_url: String::new(),
+        worker_anthropic_key: String::new(),
     });
 
     let app = build_app(state);
@@ -3802,6 +3816,8 @@ pub async fn start_for_testing_pg_multi_repo(
         cors_origins: vec![],
         max_repos_per_user: 100,
         compute: None,
+        worker_server_url: String::new(),
+        worker_anthropic_key: String::new(),
     });
 
     let app = build_app(state);
@@ -3874,6 +3890,8 @@ pub async fn start_for_testing_pg_multi_repo_with_quota(
         cors_origins: vec![],
         max_repos_per_user,
         compute: None,
+        worker_server_url: String::new(),
+        worker_anthropic_key: String::new(),
     });
 
     let app = build_app(state);
@@ -3950,6 +3968,8 @@ pub async fn start_for_testing_pg_with_mem_fs(
         cors_origins: vec![],
         max_repos_per_user: 100,
         compute: None,
+        worker_server_url: String::new(),
+        worker_anthropic_key: String::new(),
     });
 
     let app = build_app(state);
@@ -3969,6 +3989,91 @@ pub async fn start_for_testing_pg_with_mem_fs(
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     Ok((addr, shutdown_tx))
+}
+
+/// Same as [`start_for_testing_pg_with_mem_fs`] but with an injected
+/// [`compute::ComputeProvider`] so tests can exercise spawn_if_capacity and
+/// the agent-worker lifecycle endpoints.
+///
+/// Returns the server address, shutdown sender, and a shared handle to the
+/// injected [`compute::in_memory::InMemoryProvider`] so callers can inspect
+/// or advance worker state.
+pub async fn start_for_testing_pg_with_compute(
+    storage_root: &Path,
+    database_url: &str,
+) -> Result<
+    (
+        SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::Arc<compute::in_memory::InMemoryProvider>,
+    ),
+    ServerError,
+> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let storage = crate::storage::StorageBackend::server_with_mem_fs(database_url, 5)
+        .await
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    let pg = match &storage {
+        crate::storage::StorageBackend::ServerWithMemFs(pg, _) => pg.clone(),
+        _ => unreachable!(),
+    };
+
+    let migrations_path = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+    pg.migrate(migrations_path)
+        .await
+        .map_err(|e| ServerError::Io(std::io::Error::other(e.to_string())))?;
+
+    let vai_dir = storage_root.join(".vai");
+    let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
+    let provider = std::sync::Arc::new(compute::in_memory::InMemoryProvider::new());
+
+    let state = Arc::new(AppState {
+        vai_dir,
+        repo_root: storage_root.to_path_buf(),
+        started_at: Instant::now(),
+        repo_name: "multi-repo-test-compute".to_string(),
+        vai_version: env!("CARGO_PKG_VERSION").to_string(),
+        event_tx,
+        event_seq: Arc::new(AtomicU64::new(0)),
+        event_buffer: Arc::new(StdMutex::new(EventBuffer::new())),
+        conflict_engine: Arc::new(Mutex::new(conflict::ConflictEngine::new())),
+        repo_lock: Arc::new(Mutex::new(())),
+        storage_root: Some(storage_root.to_path_buf()),
+        storage,
+        admin_key: "vai_admin_test".to_string(),
+        jwt_service: Arc::new(crate::auth::jwt::JwtService::new(
+            "test-jwt-secret".to_string(),
+            None,
+            3600,
+        )),
+        rate_limiter: Arc::new(RateLimiter::new()),
+        cors_origins: vec![],
+        max_repos_per_user: 100,
+        compute: Some(provider.clone() as std::sync::Arc<dyn compute::ComputeProvider>),
+        worker_server_url: "http://test-server.local".to_string(),
+        worker_anthropic_key: "test-anthropic-key".to_string(),
+    });
+
+    let app = build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .with_graceful_shutdown(async {
+                shutdown_rx.await.ok();
+            })
+            .await
+            .ok();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    Ok((addr, shutdown_tx, provider))
 }
 
 // ── CORS helpers ──────────────────────────────────────────────────────────────
@@ -4192,6 +4297,8 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         cors_origins,
         max_repos_per_user,
         compute,
+        worker_server_url: std::env::var("VAI_SERVER_URL").unwrap_or_default(),
+        worker_anthropic_key: std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
     });
 
     // Start the dead-worker reconciliation background task when a compute
@@ -4338,6 +4445,8 @@ mod tests {
             cors_origins: vec![],
             max_repos_per_user: 100,
             compute: None,
+        worker_server_url: String::new(),
+        worker_anthropic_key: String::new(),
         });
 
         let app = build_app(Arc::clone(&state));
@@ -6604,6 +6713,8 @@ mod tests {
             cors_origins: vec![],
             max_repos_per_user: 100,
             compute: None,
+        worker_server_url: String::new(),
+        worker_anthropic_key: String::new(),
         });
 
         let app = build_app(Arc::clone(&state));
@@ -7154,6 +7265,8 @@ mod tests {
             cors_origins,
             max_repos_per_user: 100,
             compute: None,
+        worker_server_url: String::new(),
+        worker_anthropic_key: String::new(),
         });
 
         let app = build_app(Arc::clone(&state));

@@ -855,8 +855,8 @@ pub(super) async fn create_issue_handler(
     // enabled on the repo.  Fire-and-continue: we don't block the response on
     // provider latency and treat spawn errors as non-fatal.
     if let Some(ref compute) = state.compute {
-        let server_url = std::env::var("VAI_SERVER_URL").unwrap_or_default();
-        let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+        let server_url = &state.worker_server_url;
+        let anthropic_key = &state.worker_anthropic_key;
         if !server_url.is_empty() && !anthropic_key.is_empty() {
             // Mint a scoped JWT for the worker (uses the default 24-hour TTL).
             let worker_token = state.jwt_service
@@ -872,10 +872,10 @@ pub(super) async fn create_issue_handler(
                     "ghcr.io/jjordy/vai-worker:{}",
                     env!("CARGO_PKG_VERSION")
                 ),
-                server_url: &server_url,
+                server_url,
                 repo_name: &ctx.repo_name,
                 vai_api_key: &worker_token,
-                anthropic_api_key: &anthropic_key,
+                anthropic_api_key: anthropic_key,
             };
             let workers = ctx.storage.workers();
             let compute_ref = compute.as_ref();

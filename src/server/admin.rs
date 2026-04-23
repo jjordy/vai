@@ -67,6 +67,9 @@ pub(super) struct RepoResponse {
     head_version: String,
     /// Number of active workspaces.
     workspace_count: usize,
+    /// Whether cloud-agent spawning is enabled for this repo (PRD 28).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cloud_agent_enabled: Option<bool>,
 }
 
 impl RepoResponse {
@@ -84,6 +87,7 @@ impl RepoResponse {
             created_at: entry.created_at.to_rfc3339(),
             head_version,
             workspace_count,
+            cloud_agent_enabled: None,
         }
     }
 }
@@ -332,6 +336,7 @@ pub(super) async fn create_repo_handler(
             created_at: created_at.to_rfc3339(),
             head_version: "v1".to_string(),
             workspace_count: 0,
+            cloud_agent_enabled: Some(false),
         };
         return Ok((StatusCode::CREATED, Json(response)));
     }
@@ -379,6 +384,7 @@ pub(super) async fn create_repo_handler(
         created_at: entry.created_at.to_rfc3339(),
         head_version: "v1".to_string(),
         workspace_count: 0,
+        cloud_agent_enabled: None,
     };
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -489,6 +495,7 @@ pub(super) async fn list_repos_handler(
                 created_at: created_at.to_rfc3339(),
                 head_version,
                 workspace_count,
+                cloud_agent_enabled: None,
             });
         }
         return Ok(Json(responses));
@@ -548,7 +555,7 @@ pub(super) async fn get_repo_handler(
 
         let row = if identity.is_admin {
             sqlx::query(
-                "SELECT id, name, created_at FROM repos WHERE name = $1",
+                "SELECT id, name, created_at, cloud_agent_enabled FROM repos WHERE name = $1",
             )
             .bind(&name)
             .fetch_optional(pg.pool())
@@ -556,7 +563,7 @@ pub(super) async fn get_repo_handler(
             .map_err(|e| ApiError::internal(format!("failed to query repo: {e}")))?
         } else if let Some(user_id) = identity.user_id {
             sqlx::query(
-                "SELECT r.id, r.name, r.created_at
+                "SELECT r.id, r.name, r.created_at, r.cloud_agent_enabled
                  FROM repos r
                  WHERE r.name = $1
                    AND (
@@ -586,6 +593,7 @@ pub(super) async fn get_repo_handler(
         let repo_id: uuid::Uuid = row.get("id");
         let repo_name: String = row.get("name");
         let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+        let cloud_agent_enabled: bool = row.get("cloud_agent_enabled");
 
         let head_version = state
             .storage
@@ -619,6 +627,7 @@ pub(super) async fn get_repo_handler(
             created_at: created_at.to_rfc3339(),
             head_version,
             workspace_count,
+            cloud_agent_enabled: Some(cloud_agent_enabled),
         }));
     }
 
