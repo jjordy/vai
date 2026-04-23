@@ -47,6 +47,8 @@ jobs:
           tags: |
             ghcr.io/jjordy/vai-worker:${{ steps.version.outputs.version }}
             ghcr.io/jjordy/vai-worker:latest
+          build-args: |
+            VAI_VERSION=${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
