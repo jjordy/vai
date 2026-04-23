@@ -28,6 +28,8 @@ pub struct SpawnConfig<'a> {
     pub worker_image: &'a str,
     /// Public URL of the vai server, injected as `VAI_SERVER_URL` in the worker.
     pub server_url: &'a str,
+    /// Human-readable repository name, injected as `VAI_REPO` in the worker.
+    pub repo_name: &'a str,
     /// Short-lived API key the worker will use to authenticate against this server.
     pub vai_api_key: &'a str,
     /// Anthropic API key injected as `ANTHROPIC_API_KEY` in the worker.
@@ -74,15 +76,29 @@ pub async fn spawn_if_capacity(
         return Ok(None);
     }
 
+    // Insert the worker row in 'spawning' state before calling the provider,
+    // so a crash after spawn but before insert doesn't orphan a live machine.
+    // We need the worker UUID before building the env so it can be injected
+    // as VAI_WORKER_ID for the worker's heartbeat / log / done calls.
+    let worker = workers
+        .create_worker(NewWorker {
+            repo_id: *repo_id,
+            provider: "fly".to_string(),
+            machine_id: None,
+        })
+        .await?;
+
     // Mint a unique idempotency key for this spawn attempt.
     let idempotency_key = Uuid::new_v4().to_string();
 
     // Build environment for the worker.
     let mut env = std::collections::HashMap::new();
     env.insert("VAI_SERVER_URL".into(), config.server_url.to_string());
+    env.insert("VAI_REPO".into(), config.repo_name.to_string());
     env.insert("VAI_API_KEY".into(), config.vai_api_key.to_string());
     env.insert("ANTHROPIC_API_KEY".into(), config.anthropic_api_key.to_string());
     env.insert("VAI_REPO_ID".into(), repo_id.to_string());
+    env.insert("VAI_WORKER_ID".into(), worker.id.to_string());
 
     let spec = WorkerSpec {
         image: config.worker_image.to_string(),
@@ -95,16 +111,6 @@ pub async fn spawn_if_capacity(
         },
         idempotency_key,
     };
-
-    // Insert the worker row in 'spawning' state before calling the provider,
-    // so a crash after spawn but before insert doesn't orphan a live machine.
-    let worker = workers
-        .create_worker(NewWorker {
-            repo_id: *repo_id,
-            provider: "fly".to_string(),
-            machine_id: None,
-        })
-        .await?;
 
     // Spawn the machine.  On failure we leave the row in 'spawning'; the
     // dead-worker reconciliation cron will clean it up.

@@ -601,6 +601,8 @@ struct RepoCtx {
     /// mode the value is read from `.vai/config.toml` and is otherwise ignored
     /// by all trait implementations.
     repo_id: uuid::Uuid,
+    /// Human-readable repository name (the `:repo` path segment).
+    repo_name: String,
     /// Per-repository storage backend.
     ///
     /// In single-repo mode this is a clone of [`AppState::storage`].
@@ -661,6 +663,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for RepoCtx {
             vai_dir,
             repo_root: state.repo_root.clone(),
             repo_id,
+            repo_name: state.repo_name.clone(),
             storage,
         })
     }
@@ -1128,6 +1131,7 @@ async fn repo_resolve_middleware(
         vai_dir,
         repo_root,
         repo_id,
+        repo_name,
         storage,
     };
     request.extensions_mut().insert(ctx);

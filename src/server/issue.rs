@@ -873,6 +873,7 @@ pub(super) async fn create_issue_handler(
                     env!("CARGO_PKG_VERSION")
                 ),
                 server_url: &server_url,
+                repo_name: &ctx.repo_name,
                 vai_api_key: &worker_token,
                 anthropic_api_key: &anthropic_key,
             };
