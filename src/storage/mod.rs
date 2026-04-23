@@ -1593,12 +1593,77 @@ pub enum WorkerDoneReason {
     Terminated,
 }
 
+/// Parameters for creating a new agent worker row.
+#[derive(Debug, Clone)]
+pub struct NewWorker {
+    /// Repository that owns this worker.
+    pub repo_id: Uuid,
+    /// Compute provider name (e.g. `"fly"`).
+    pub provider: String,
+    /// Opaque provider-assigned machine identifier.
+    pub machine_id: Option<String>,
+}
+
+/// A persisted agent worker record from `agent_workers`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "full", derive(utoipa::ToSchema))]
+pub struct AgentWorker {
+    pub id: Uuid,
+    pub repo_id: Uuid,
+    pub provider: String,
+    pub machine_id: Option<String>,
+    /// Lifecycle state: `spawning`, `running`, `completed`, `failed`, `dead`.
+    pub state: String,
+    pub workspace_id: Option<Uuid>,
+    pub last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A single log chunk emitted by an agent worker.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "full", derive(utoipa::ToSchema))]
+pub struct WorkerLog {
+    pub id: i64,
+    pub worker_id: Uuid,
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub stream: LogStream,
+    pub chunk: String,
+}
+
 /// Manages agent worker lifecycle events and log persistence.
 ///
 /// Backed by `agent_workers` and `agent_worker_logs` Postgres tables (PRD 28).
 /// Not available in local SQLite mode.
 #[async_trait::async_trait]
 pub trait WorkerStore: Send + Sync {
+    /// Insert a new `agent_workers` row in state `spawning`.
+    ///
+    /// Returns the newly created [`AgentWorker`].
+    async fn create_worker(&self, worker: NewWorker) -> Result<AgentWorker, StorageError>;
+
+    /// Fetch the `agent_workers` row for the given worker ID.
+    ///
+    /// Returns `StorageError::NotFound` if no such worker exists.
+    async fn get_worker(&self, worker_id: &Uuid) -> Result<AgentWorker, StorageError>;
+
+    /// Count workers for `repo_id` whose state is `spawning` or `running`.
+    async fn count_running_workers(&self, repo_id: &Uuid) -> Result<u64, StorageError>;
+
+    /// Return whether `cloud_agent_enabled` is set on the given repo.
+    ///
+    /// Returns `false` when the repo does not exist.
+    async fn is_cloud_agent_enabled(&self, repo_id: &Uuid) -> Result<bool, StorageError>;
+
+    /// Fetch ordered log chunks for a worker, optionally paginated by `since_id`.
+    ///
+    /// Returns at most 1 000 rows in ascending `id` order.
+    async fn list_logs(
+        &self,
+        worker_id: &Uuid,
+        since_id: Option<i64>,
+    ) -> Result<Vec<WorkerLog>, StorageError>;
+
     /// Update `last_heartbeat_at` to now for the given worker.
     ///
     /// Returns `StorageError::NotFound` if no worker with that ID exists.
@@ -1612,6 +1677,16 @@ pub trait WorkerStore: Send + Sync {
         worker_id: &Uuid,
         stream: LogStream,
         chunks: &[String],
+    ) -> Result<(), StorageError>;
+
+    /// Set the provider-assigned `machine_id` on an existing worker row.
+    ///
+    /// Called immediately after a successful [`ComputeProvider::spawn`] to
+    /// record the opaque machine identifier.
+    async fn set_machine_id(
+        &self,
+        worker_id: &Uuid,
+        machine_id: &str,
     ) -> Result<(), StorageError>;
 
     /// Mark a worker as terminal and record its end time.

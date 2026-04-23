@@ -1493,6 +1493,38 @@ fn worker_store_unsupported() -> StorageError {
 
 #[async_trait]
 impl super::WorkerStore for SqliteStorage {
+    async fn create_worker(&self, _worker: super::NewWorker) -> Result<super::AgentWorker, StorageError> {
+        Err(worker_store_unsupported())
+    }
+
+    async fn get_worker(&self, _worker_id: &Uuid) -> Result<super::AgentWorker, StorageError> {
+        Err(worker_store_unsupported())
+    }
+
+    async fn count_running_workers(&self, _repo_id: &Uuid) -> Result<u64, StorageError> {
+        Err(worker_store_unsupported())
+    }
+
+    async fn is_cloud_agent_enabled(&self, _repo_id: &Uuid) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    async fn list_logs(
+        &self,
+        _worker_id: &Uuid,
+        _since_id: Option<i64>,
+    ) -> Result<Vec<super::WorkerLog>, StorageError> {
+        Err(worker_store_unsupported())
+    }
+
+    async fn set_machine_id(
+        &self,
+        _worker_id: &Uuid,
+        _machine_id: &str,
+    ) -> Result<(), StorageError> {
+        Err(worker_store_unsupported())
+    }
+
     async fn update_heartbeat(&self, _worker_id: &Uuid) -> Result<(), StorageError> {
         Err(worker_store_unsupported())
     }

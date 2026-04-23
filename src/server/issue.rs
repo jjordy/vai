@@ -851,6 +851,62 @@ pub(super) async fn create_issue_handler(
             .await;
     }
 
+    // Attempt to spawn a cloud worker for this issue when cloud agents are
+    // enabled on the repo.  Fire-and-continue: we don't block the response on
+    // provider latency and treat spawn errors as non-fatal.
+    if let Some(ref compute) = state.compute {
+        let server_url = std::env::var("VAI_SERVER_URL").unwrap_or_default();
+        let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+        if !server_url.is_empty() && !anthropic_key.is_empty() {
+            // Mint a scoped JWT for the worker (uses the default 24-hour TTL).
+            let worker_token = state.jwt_service
+                .sign(
+                    "cloud-worker".to_string(),
+                    None,
+                    Some(ctx.repo_id.to_string()),
+                    Some("worker".to_string()),
+                )
+                .unwrap_or_default();
+            let config = super::worker_registry::SpawnConfig {
+                worker_image: &format!(
+                    "ghcr.io/jjordy/vai-worker:{}",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                server_url: &server_url,
+                vai_api_key: &worker_token,
+                anthropic_api_key: &anthropic_key,
+            };
+            let workers = ctx.storage.workers();
+            let compute_ref = compute.as_ref();
+            match super::worker_registry::spawn_if_capacity(
+                &ctx.repo_id,
+                compute_ref,
+                workers,
+                &config,
+            )
+            .await
+            {
+                Ok(Some(worker_id)) => {
+                    tracing::info!(
+                        event = "worker.spawned",
+                        worker_id = %worker_id,
+                        issue_id = %issue_id,
+                        "cloud worker spawned for new issue"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        event = "worker.spawn_failed",
+                        issue_id = %issue_id,
+                        error = %e,
+                        "failed to spawn cloud worker"
+                    );
+                }
+            }
+        }
+    }
+
     let mut resp = IssueResponse::from_issue(issue, vec![], blocker_ids, vec![]);
     resp.possible_duplicate_of = possible_duplicate_id.map(|id| id.to_string());
 

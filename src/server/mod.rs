@@ -155,6 +155,7 @@ mod me;
 mod version;
 mod watcher;
 mod worker;
+mod worker_registry;
 mod work_queue;
 mod workspace;
 mod ws;
@@ -510,6 +511,13 @@ pub(crate) struct AppState {
     /// Empty means "allow any origin" (`*`).  Non-empty restricts to the listed
     /// origins.  Set from `ServerConfig::cors_origins` or `VAI_CORS_ORIGINS`.
     cors_origins: Vec<axum::http::HeaderValue>,
+    /// Cloud compute provider for spawning per-issue agent workers (PRD 28).
+    ///
+    /// `None` means cloud agent spawning is disabled (local/test mode or no
+    /// `VAI_COMPUTE_FLY_TOKEN` set).  When `Some`, each new issue creation
+    /// triggers [`worker_registry::spawn_if_capacity`] if the repo has
+    /// `cloud_agent_enabled = true`.
+    pub(crate) compute: Option<std::sync::Arc<dyn compute::ComputeProvider>>,
 }
 
 impl AppState {
@@ -3107,6 +3115,8 @@ impl utoipa::Modify for SecurityAddon {
         watcher::pause_watcher_handler,
         watcher::resume_watcher_handler,
         watcher::submit_discovery_handler,
+        worker::get_worker_handler,
+        worker::get_logs_handler,
         worker::heartbeat_handler,
         worker::append_logs_handler,
         worker::mark_done_handler,
@@ -3208,6 +3218,10 @@ impl utoipa::Modify for SecurityAddon {
             worker::AppendLogsRequest,
             worker::MarkDoneRequest,
             worker::WorkerAckResponse,
+            worker::LogsQuery,
+            worker::LogsResponse,
+            crate::storage::AgentWorker,
+            crate::storage::WorkerLog,
             crate::storage::LogStream,
             crate::storage::WorkerDoneReason,
             admin::CreateRepoRequest,
@@ -3377,7 +3391,9 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/keys", get(admin::list_keys_handler))
         .route("/api/keys", delete(admin::bulk_revoke_keys_handler))
         .route("/api/keys/:id", delete(admin::revoke_key_handler))
-        // Agent worker lifecycle — heartbeat, log ingest, terminal state (PRD 28).
+        // Agent worker lifecycle — read, heartbeat, log ingest, terminal state (PRD 28).
+        .route("/api/agent-workers/:id", get(worker::get_worker_handler))
+        .route("/api/agent-workers/:id/logs", get(worker::get_logs_handler))
         .route("/api/agent-workers/:id/heartbeat", post(worker::heartbeat_handler))
         .route("/api/agent-workers/:id/logs", post(worker::append_logs_handler))
         .route("/api/agent-workers/:id/done", post(worker::mark_done_handler))
@@ -3590,6 +3606,7 @@ pub async fn start_for_testing(
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
         max_repos_per_user: 100,
+        compute: None,
     });
 
     let app = build_app(state);
@@ -3688,6 +3705,7 @@ pub async fn start_for_testing_pg(
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
         max_repos_per_user: 100,
+        compute: None,
     });
 
     let app = build_app(state);
@@ -3777,6 +3795,7 @@ pub async fn start_for_testing_pg_multi_repo(
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
         max_repos_per_user: 100,
+        compute: None,
     });
 
     let app = build_app(state);
@@ -3848,6 +3867,7 @@ pub async fn start_for_testing_pg_multi_repo_with_quota(
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
         max_repos_per_user,
+        compute: None,
     });
 
     let app = build_app(state);
@@ -3923,6 +3943,7 @@ pub async fn start_for_testing_pg_with_mem_fs(
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins: vec![],
         max_repos_per_user: 100,
+        compute: None,
     });
 
     let app = build_app(state);
@@ -4130,6 +4151,22 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
 
+    // Cloud compute provider: wire FlyMachinesProvider when VAI_COMPUTE_FLY_TOKEN is set.
+    let compute: Option<std::sync::Arc<dyn compute::ComputeProvider>> = {
+        let app_name = std::env::var("VAI_COMPUTE_FLY_APP")
+            .unwrap_or_else(|_| "vai-workers".to_string());
+        let region = std::env::var("VAI_COMPUTE_FLY_REGION")
+            .unwrap_or_else(|_| "iad".to_string());
+        compute::fly::FlyMachinesProvider::from_env(app_name, region)
+            .map(|p| std::sync::Arc::new(p) as std::sync::Arc<dyn compute::ComputeProvider>)
+    };
+
+    if compute.is_some() {
+        tracing::info!(event = "server.compute", provider = "fly", "cloud compute provider enabled");
+    } else {
+        tracing::info!(event = "server.compute", provider = "none", "cloud compute provider disabled (VAI_COMPUTE_FLY_TOKEN not set)");
+    }
+
     let state = Arc::new(AppState {
         vai_dir: vai_dir.to_owned(),
         repo_root,
@@ -4148,6 +4185,7 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         rate_limiter: Arc::new(RateLimiter::new()),
         cors_origins,
         max_repos_per_user,
+        compute,
     });
 
     let app = build_app(state);
@@ -4286,6 +4324,7 @@ mod tests {
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins: vec![],
             max_repos_per_user: 100,
+            compute: None,
         });
 
         let app = build_app(Arc::clone(&state));
@@ -6551,6 +6590,7 @@ mod tests {
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins: vec![],
             max_repos_per_user: 100,
+            compute: None,
         });
 
         let app = build_app(Arc::clone(&state));
@@ -7100,6 +7140,7 @@ mod tests {
             rate_limiter: Arc::new(RateLimiter::new()),
             cors_origins,
             max_repos_per_user: 100,
+            compute: None,
         });
 
         let app = build_app(Arc::clone(&state));
