@@ -856,8 +856,7 @@ pub(super) async fn create_issue_handler(
     // provider latency and treat spawn errors as non-fatal.
     if let Some(ref compute) = state.compute {
         let server_url = &state.worker_server_url;
-        let anthropic_key = &state.worker_anthropic_key;
-        if !server_url.is_empty() && !anthropic_key.is_empty() {
+        if !server_url.is_empty() {
             // Mint a scoped JWT for the worker (uses the default 24-hour TTL).
             let worker_token = state.jwt_service
                 .sign(
@@ -867,6 +866,25 @@ pub(super) async fn create_issue_handler(
                     Some("worker".to_string()),
                 )
                 .unwrap_or_default();
+
+            // Build a secrets store from the current storage backend.
+            // In Postgres mode the vault is used first; falls back to the
+            // server-wide ANTHROPIC_API_KEY env var via `fallback_key`.
+            #[cfg(feature = "postgres")]
+            let secrets: std::sync::Arc<dyn super::worker_registry::SecretsStore> = {
+                match &ctx.storage {
+                    crate::storage::StorageBackend::Server(pg)
+                    | crate::storage::StorageBackend::ServerWithS3(pg, _)
+                    | crate::storage::StorageBackend::ServerWithMemFs(pg, _) => {
+                        std::sync::Arc::new(pg.pool().clone())
+                    }
+                    _ => std::sync::Arc::new(super::worker_registry::NoopSecretsStore),
+                }
+            };
+            #[cfg(not(feature = "postgres"))]
+            let secrets: std::sync::Arc<dyn super::worker_registry::SecretsStore> =
+                std::sync::Arc::new(super::worker_registry::NoopSecretsStore);
+
             let config = super::worker_registry::SpawnConfig {
                 worker_image: &format!(
                     "ghcr.io/jjordy/vai-worker:{}",
@@ -875,7 +893,6 @@ pub(super) async fn create_issue_handler(
                 server_url,
                 repo_name: &ctx.repo_name,
                 vai_api_key: &worker_token,
-                anthropic_api_key: anthropic_key,
             };
             let workers = ctx.storage.workers();
             let compute_ref = compute.as_ref();
@@ -883,6 +900,8 @@ pub(super) async fn create_issue_handler(
                 &ctx.repo_id,
                 compute_ref,
                 workers,
+                secrets,
+                &state.worker_anthropic_key,
                 &config,
             )
             .await

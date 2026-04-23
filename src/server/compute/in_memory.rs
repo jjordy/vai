@@ -89,6 +89,14 @@ impl InMemoryProvider {
     pub fn worker_count(&self) -> usize {
         self.workers.lock().expect("in-memory provider lock poisoned").len()
     }
+
+    /// Return the environment variables from the spawn spec of `id`, if known.
+    ///
+    /// Used in tests to verify that the correct API keys were injected.
+    pub fn get_worker_env(&self, id: &MachineId) -> Option<HashMap<String, String>> {
+        let map = self.workers.lock().expect("in-memory provider lock poisoned");
+        map.get(id).map(|r| r.spec.env.clone())
+    }
 }
 
 #[async_trait]

@@ -5463,6 +5463,111 @@ async fn test_spawn_if_capacity_on_issue_create() {
     shutdown_tx.send(()).ok();
 }
 
+/// When a per-repo `ANTHROPIC_API_KEY` is provisioned in the vault, it takes
+/// precedence over the server-wide fallback key set at startup.
+///
+/// Provisions the secret via the agent-secrets endpoint, creates an issue,
+/// then inspects the spawned machine's environment to confirm the vault value
+/// was injected rather than the fallback "test-anthropic-key".
+#[tokio::test(flavor = "multi_thread")]
+async fn test_spawn_uses_vault_key_when_provisioned() {
+    let Some(url) = db_url() else { return };
+
+    // Set a valid 32-byte AES-256-GCM master key for the secrets vault.
+    std::env::set_var(
+        "VAI_SECRETS_MASTER_KEY",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx, provider) = start_for_testing_pg_with_compute(tmp.path(), &url)
+        .await
+        .expect("start server");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let vault_key_value = "vault-anthropic-key-unique-abc123";
+
+    // Create a repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": format!("e2e-vault-spawn-{}", unique_suffix()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let repo_name = repo["name"].as_str().unwrap();
+
+    // Enable cloud agents on the repo.
+    let resp = client
+        .patch(format!("{base}/api/repos/{repo_name}"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "cloud_agent_enabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "enable cloud agent");
+
+    // Provision ANTHROPIC_API_KEY in the per-repo vault.
+    let resp = client
+        .post(format!("{base}/api/repos/{repo_name}/agent-secrets"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "key": "ANTHROPIC_API_KEY",
+            "value": vault_key_value
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "provision secret");
+
+    // Create an issue — should trigger spawn_if_capacity with the vault key.
+    let resp = client
+        .post(format!("{base}/api/repos/{repo_name}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "vault key spawn test",
+            "description": "test",
+            "priority": "high"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create issue");
+
+    // Allow async spawn to complete.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(provider.worker_count(), 1, "one worker should be spawned");
+
+    // Retrieve the machine_id assigned by the InMemoryProvider.
+    let pg_pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let machine_id: Option<String> = sqlx::query_scalar(
+        "SELECT machine_id FROM agent_workers WHERE repo_id = $1::uuid LIMIT 1",
+    )
+    .bind(repo["id"].as_str().unwrap())
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    pg_pool.close().await;
+
+    let machine_id = machine_id.expect("machine_id should be set after spawn");
+    let env = provider
+        .get_worker_env(&vai::server::compute::MachineId(machine_id))
+        .expect("worker env should be available in InMemoryProvider");
+
+    assert_eq!(
+        env.get("ANTHROPIC_API_KEY").map(String::as_str),
+        Some(vault_key_value),
+        "vault key should take precedence over the server-wide fallback"
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
 /// DELETE /api/agent-workers/:id — admin can forcibly terminate a running worker.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_destroy_worker_endpoint() {
