@@ -254,4 +254,25 @@ impl WorkerStore for PostgresStorage {
 
         rows.into_iter().map(row_to_worker).collect()
     }
+
+    async fn set_cloud_agent_enabled(
+        &self,
+        repo_id: &Uuid,
+        enabled: bool,
+    ) -> Result<(), StorageError> {
+        let rows_affected = sqlx::query(
+            "UPDATE repos SET cloud_agent_enabled = $1 WHERE id = $2",
+        )
+        .bind(enabled)
+        .bind(repo_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(StorageError::NotFound(format!("repo {repo_id}")));
+        }
+        Ok(())
+    }
 }

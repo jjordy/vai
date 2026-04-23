@@ -1709,6 +1709,15 @@ pub trait WorkerStore: Send + Sync {
         &self,
         stale_secs: u32,
     ) -> Result<Vec<AgentWorker>, StorageError>;
+
+    /// Set `cloud_agent_enabled` on a repo row.
+    ///
+    /// Returns `StorageError::NotFound` if no repo with that UUID exists.
+    async fn set_cloud_agent_enabled(
+        &self,
+        repo_id: &Uuid,
+        enabled: bool,
+    ) -> Result<(), StorageError>;
 }
 
 // ── StorageBackend factory ────────────────────────────────────────────────────

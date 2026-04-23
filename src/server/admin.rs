@@ -4,6 +4,7 @@
 //!   - `POST /api/repos` — register a new repository
 //!   - `GET /api/repos` — list registered repositories
 //!   - `GET /api/repos/:name` — get a single repository by name
+//!   - `PATCH /api/repos/:name` — update repo settings (admin: cloud_agent_enabled)
 //!   - `POST /api/users` — create a new user account
 //!   - `GET /api/users/:user` — get user by UUID or email
 //!   - `GET /api/repos/:repo/me` — authenticated caller's identity and effective role
@@ -639,6 +640,76 @@ pub(super) async fn get_repo_handler(
         .ok_or_else(|| ApiError::not_found("repo not found or no access"))?;
 
     Ok(Json(RepoResponse::from_entry(entry)))
+}
+
+/// Request body for `PATCH /api/repos/:name`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub(super) struct UpdateRepoRequest {
+    /// Set to `true` to enable cloud-agent spawning for this repo, `false` to disable.
+    ///
+    /// When enabled, creating a high-priority issue triggers `spawn_if_capacity`
+    /// which creates a Fly machine running the canonical vai-worker image.
+    cloud_agent_enabled: Option<bool>,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/repos/{name}",
+    params(
+        ("name" = String, Path, description = "Repository name"),
+    ),
+    request_body = UpdateRepoRequest,
+    responses(
+        (status = 200, description = "Repo updated", body = super::ErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin access required", body = super::ErrorBody),
+        (status = 404, description = "Repo not found", body = super::ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "repos"
+)]
+/// `PATCH /api/repos/:name` — update repo settings (admin only).
+///
+/// Currently supports toggling `cloud_agent_enabled`. Only server-admin keys
+/// may call this endpoint.
+pub(super) async fn update_repo_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    State(state): State<Arc<AppState>>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<UpdateRepoRequest>,
+) -> Result<StatusCode, ApiError> {
+    require_server_admin(&identity)?;
+
+    if let crate::storage::StorageBackend::Server(ref pg)
+    | crate::storage::StorageBackend::ServerWithS3(ref pg, _)
+    | crate::storage::StorageBackend::ServerWithMemFs(ref pg, _) = state.storage
+    {
+        use sqlx::Row as _;
+
+        let row = sqlx::query("SELECT id FROM repos WHERE name = $1")
+            .bind(&name)
+            .fetch_optional(pg.pool())
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to query repo: {e}")))?
+            .ok_or_else(|| ApiError::not_found("repo not found"))?;
+
+        let repo_id: uuid::Uuid = row.get("id");
+
+        if let Some(enabled) = body.cloud_agent_enabled {
+            state
+                .storage
+                .workers()
+                .set_cloud_agent_enabled(&repo_id, enabled)
+                .await
+                .map_err(ApiError::from)?;
+        }
+
+        return Ok(StatusCode::OK);
+    }
+
+    Err(ApiError::bad_request(
+        "repo settings update requires server (Postgres) mode",
+    ))
 }
 
 // ── Org / User API types ──────────────────────────────────────────────────────
