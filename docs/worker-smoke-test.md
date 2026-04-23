@@ -53,10 +53,10 @@ UPDATE repos SET cloud_agent_enabled = TRUE WHERE name = '<repo-name>';
 ```bash
 # Replace values as appropriate
 VAI_ADMIN_KEY=<your-admin-key>
-REPO_ID=<uuid>
+REPO_NAME=<repo-name>   # the short name, e.g. "myapp" (not the UUID)
 SERVER=https://vai-staging.example.com
 
-curl -s -X PATCH "$SERVER/api/repos/$REPO_ID" \
+curl -s -X PATCH "$SERVER/api/repos/$REPO_NAME" \
   -H "Authorization: Bearer $VAI_ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{"cloud_agent_enabled": true}'
@@ -64,7 +64,7 @@ curl -s -X PATCH "$SERVER/api/repos/$REPO_ID" \
 
 Confirm the flag is set:
 ```bash
-curl -s "$SERVER/api/repos/$REPO_ID" \
+curl -s "$SERVER/api/repos/$REPO_NAME" \
   -H "Authorization: Bearer $VAI_ADMIN_KEY" | jq .cloud_agent_enabled
 ```
 
@@ -72,13 +72,15 @@ curl -s "$SERVER/api/repos/$REPO_ID" \
 
 ## 3. Running the bare E2E smoke test
 
+> Assumes `VAI_ADMIN_KEY`, `REPO_NAME`, and `SERVER` are set from §2 above.
+
 ### Step 1 — Create a test issue
 
 ```bash
-curl -s -X POST "$SERVER/api/issues" \
+curl -s -X POST "$SERVER/api/repos/$REPO_NAME/issues" \
   -H "Authorization: Bearer $VAI_ADMIN_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"repo_id":"<REPO_ID>","title":"smoke test","body":"echo hello and submit","priority":"high"}' \
+  -d '{"title":"smoke test","description":"echo hello and submit","priority":"high"}' \
   | jq .id
 ```
 
@@ -173,7 +175,7 @@ the repo — `mise` runs automatically in `loop.sh`.
 UPDATE repos SET cloud_agent_enabled = FALSE WHERE name = '<repo-name>';
 
 # Or via admin API:
-curl -s -X PATCH "$SERVER/api/repos/$REPO_ID" \
+curl -s -X PATCH "$SERVER/api/repos/$REPO_NAME" \
   -H "Authorization: Bearer $VAI_ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{"cloud_agent_enabled": false}'
