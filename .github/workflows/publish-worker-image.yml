@@ -1,8 +1,20 @@
 name: Publish Worker Image
 
 on:
-  push:
-    tags: ["v*"]
+  # Fires AFTER release.yml publishes the GitHub Release with binary tarballs.
+  # Triggering on `push: tags` would race with release.yml and the Dockerfile's
+  # curl step hits a 404 before the release assets exist.
+  release:
+    types: [published]
+  # Allow manual rebuilds against an already-published tag, e.g. when the
+  # worker image fails for an infrastructure reason and we don't want to cut
+  # a new release just to retry.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.1.11)"
+        required: true
+        type: string
 
 # NOTE: After the first successful publish, the package is private by default.
 # Go to github.com/jjordy?tab=packages → vai-worker → Package settings →
@@ -19,6 +31,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # For workflow_dispatch, check out the requested tag so we build
+          # from the Dockerfile state at that point. For release-triggered
+          # runs, default checkout (the tag ref) is correct.
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up QEMU (multi-arch emulation)
         uses: docker/setup-qemu-action@v3
@@ -35,7 +52,9 @@ jobs:
 
       - name: Derive image version from tag
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
