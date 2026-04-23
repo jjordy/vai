@@ -1466,14 +1466,14 @@ fn onboarding_store_unsupported() -> StorageError {
 impl crate::storage::OnboardingStore for SqliteStorage {
     async fn get_user_onboarding(
         &self,
-        _user_id: &str,
+        _user_id: &uuid::Uuid,
     ) -> Result<Option<DateTime<Utc>>, StorageError> {
         Err(onboarding_store_unsupported())
     }
 
     async fn complete_user_onboarding(
         &self,
-        _user_id: &str,
+        _user_id: &uuid::Uuid,
     ) -> Result<DateTime<Utc>, StorageError> {
         Err(onboarding_store_unsupported())
     }

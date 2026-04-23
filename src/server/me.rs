@@ -13,6 +13,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 use super::{AgentIdentity, ApiError, AppState};
 
@@ -35,15 +36,13 @@ pub struct OnboardingCompleteResponse {
 
 // ── Helper ─────────────────────────────────────────────────────────────────────
 
-/// Extracts the caller's user ID string from the identity.
+/// Extracts the caller's user UUID from the identity.
 ///
 /// Returns 401 if the request was made with the bootstrap admin key, which
 /// has no associated user identity.
-fn require_user_id(identity: &AgentIdentity) -> Result<String, ApiError> {
+fn require_user_id(identity: &AgentIdentity) -> Result<Uuid, ApiError> {
     identity
         .user_id
-        .as_ref()
-        .map(|id| id.to_string())
         .ok_or_else(|| ApiError::unauthorized("user identity required for this endpoint"))
 }
 

@@ -1478,7 +1478,7 @@ pub trait OnboardingStore: Send + Sync {
     /// they haven't completed it yet.
     async fn get_user_onboarding(
         &self,
-        user_id: &str,
+        user_id: &uuid::Uuid,
     ) -> Result<Option<DateTime<Utc>>, StorageError>;
 
     /// Records that the user completed onboarding.
@@ -1487,7 +1487,7 @@ pub trait OnboardingStore: Send + Sync {
     /// timestamp unchanged without modifying it.
     async fn complete_user_onboarding(
         &self,
-        user_id: &str,
+        user_id: &uuid::Uuid,
     ) -> Result<DateTime<Utc>, StorageError>;
 }
 
