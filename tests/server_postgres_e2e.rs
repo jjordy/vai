@@ -5039,6 +5039,94 @@ async fn test_delta_preserves_chain_reconstruction() {
     shutdown_tx.send(()).ok();
 }
 
+// ── Empty workspace submit → 409 workspace_empty ─────────────────────────────
+
+/// Verifies that submitting a workspace with no file changes returns HTTP 409
+/// with `{"error": "workspace_empty", ...}` instead of 500.
+///
+/// Flow: create repo → create issue → claim → submit immediately (no file
+/// upload) → expect 409 with structured error body.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_submit_empty_workspace_returns_409() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_with_mem_fs(tmp.path(), &url)
+        .await
+        .expect("start server");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": format!("e2e-empty-submit-{}", unique_suffix()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create repo: {}", resp.text().await.unwrap_or_default());
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // Create issue.
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "empty fix",
+            "description": "already done",
+            "priority": "low"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    let issue_id = issue["id"].as_str().unwrap();
+
+    // Claim (creates workspace, no files uploaded).
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim: {}", resp.text().await.unwrap_or_default());
+    let claim: serde_json::Value = resp.json().await.unwrap();
+    let ws_id = claim["workspace_id"].as_str().unwrap().to_string();
+
+    // Submit with no file changes → must be 409.
+    let resp = client
+        .post(format!("{rp}/workspaces/{ws_id}/submit"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        409,
+        "empty-workspace submit must return 409, got: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body.get("error").and_then(|v| v.as_str()),
+        Some("workspace_empty"),
+        "error field must be workspace_empty; got: {body}"
+    );
+    assert!(
+        body.get("hint").is_some(),
+        "response must include a hint field; got: {body}"
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Extracts the content of a file from a gzip tarball by path suffix.
 fn extract_file_from_tarball(bytes: &[u8], path_suffix: &str) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;

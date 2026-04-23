@@ -115,11 +115,33 @@ pub(super) fn handle(agent_cmd: AgentCommands, json: bool) -> Result<(), CliErro
             }
         }
         AgentCommands::Submit { dir } => {
-            let result = agent::submit(&cwd, &dir)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&result).unwrap());
-            } else {
-                agent::print_submit_result(&result);
+            match agent::submit(&cwd, &dir) {
+                Ok(result) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        agent::print_submit_result(&result);
+                    }
+                }
+                Err(agent::AgentError::WorkspaceEmpty) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "error": "workspace_empty",
+                                "message": "No changes to submit — the issue appears already resolved."
+                            })
+                        );
+                    } else {
+                        eprintln!("No changes to submit — the issue appears already resolved.");
+                        eprintln!(
+                            "Hint: run `vai issue close <id>` to close it permanently \
+                             instead of resetting (which re-opens it)."
+                        );
+                    }
+                    std::process::exit(3);
+                }
+                Err(e) => return Err(e.into()),
             }
         }
         AgentCommands::Loop(loop_cmd) => {

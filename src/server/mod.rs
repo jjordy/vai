@@ -1173,6 +1173,21 @@ impl ApiError {
         Self { status: StatusCode::TOO_MANY_REQUESTS, message: msg.into(), custom_json: None }
     }
 
+    /// Returns a 409 with the structured `workspace_empty` body indicating the
+    /// submitted workspace had no file changes.  The client should close the
+    /// issue permanently rather than resetting and re-claiming it.
+    fn workspace_empty() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: "workspace has no file changes to submit".to_string(),
+            custom_json: Some(serde_json::json!({
+                "error": "workspace_empty",
+                "message": "workspace has no file changes to submit",
+                "hint": "if the issue is already resolved, call POST /api/repos/:r/issues/:id/close instead"
+            })),
+        }
+    }
+
     fn forbidden(msg: impl Into<String>) -> Self {
         Self { status: StatusCode::FORBIDDEN, message: msg.into(), custom_json: None }
     }
@@ -1229,6 +1244,7 @@ impl From<merge::MergeError> for ApiError {
     fn from(e: merge::MergeError) -> Self {
         match &e {
             merge::MergeError::SemanticConflicts { .. } => ApiError::conflict(e.to_string()),
+            merge::MergeError::EmptyWorkspace => ApiError::workspace_empty(),
             merge::MergeError::Workspace(vai_workspace::WorkspaceError::NotFound(_)) => {
                 ApiError::not_found(e.to_string())
             }

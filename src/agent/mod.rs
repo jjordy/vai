@@ -64,6 +64,14 @@ pub enum AgentError {
     #[error("partial download: server declared {expected} files but only {downloaded} were received; the partial workspace has been discarded")]
     PartialDownload { downloaded: usize, expected: usize },
 
+    /// Server rejected the submit because the workspace has no file changes.
+    ///
+    /// This is a client-state condition, not an internal error.  The caller
+    /// should close the issue permanently (e.g. `vai issue close`) rather than
+    /// resetting and re-claiming it, which would create an infinite loop.
+    #[error("workspace is empty — the issue appears already resolved; run `vai issue close <id>` to close it permanently")]
+    WorkspaceEmpty,
+
     #[error("{0}")]
     Other(String),
 }
@@ -1208,11 +1216,39 @@ pub fn submit(dir: &Path, work_dir: &Path) -> Result<SubmitResult, AgentError> {
         let modified = upload["modified"].as_u64().unwrap_or(0) as usize;
         let deleted = upload["deleted"].as_u64().unwrap_or(0) as usize;
 
-        // Step 2: Submit workspace.
-        let submit_path = format!("api/repos/{}/workspaces/{}/submit", config.repo, state.workspace_id);
-        let submit_val: serde_json::Value =
-            agent_post(&config.server, &submit_path, api_key_ref, &serde_json::json!({}))
-                .await?;
+        // Step 2: Submit workspace.  We inline this call (instead of using
+        // agent_post) so we can distinguish the workspace_empty 409 from
+        // other errors and surface a recoverable AgentError to the CLI.
+        let submit_url = format!(
+            "{}/api/repos/{}/workspaces/{}/submit",
+            config.server.trim_end_matches('/'),
+            config.repo,
+            state.workspace_id,
+        );
+        let mut submit_req = client.post(&submit_url).json(&serde_json::json!({}));
+        if let Some(key) = api_key_ref {
+            submit_req = submit_req.header("Authorization", format!("Bearer {key}"));
+        }
+        let submit_resp = submit_req.send().await.map_err(|e| AgentError::ServerUnreachable {
+            url: submit_url.clone(),
+            reason: e.to_string(),
+        })?;
+        if !submit_resp.status().is_success() {
+            let status = submit_resp.status().as_u16();
+            let body = submit_resp.text().await.unwrap_or_default();
+            if status == 409 {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if v.get("error").and_then(|e| e.as_str()) == Some("workspace_empty") {
+                        return Err(AgentError::WorkspaceEmpty);
+                    }
+                }
+            }
+            return Err(AgentError::Other(format!("submit returned {status}: {body}")));
+        }
+        let submit_val: serde_json::Value = submit_resp
+            .json()
+            .await
+            .map_err(|e| AgentError::Other(format!("submit JSON parse error: {e}")))?;
         let version_id = submit_val["version"].as_str().map(|s| s.to_string());
 
         // Step 3: Close issue.
