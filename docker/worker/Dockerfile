@@ -52,7 +52,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             --profile minimal \
             --no-modify-path \
     && rustup component add clippy rustfmt \
-    && cargo install cargo-audit --locked \
     && rm -rf /usr/local/cargo/registry \
     && chmod -R a+rX /usr/local/rustup /usr/local/cargo
 
