@@ -5515,7 +5515,7 @@ async fn test_destroy_worker_endpoint() {
         .json::<serde_json::Value>()
         .await
         .unwrap();
-    let user_token = user_key["key"].as_str().unwrap();
+    let user_token = user_key["token"].as_str().unwrap();
     let resp = client
         .delete(format!("{base}/api/agent-workers/{worker_id}"))
         .bearer_auth(user_token)
