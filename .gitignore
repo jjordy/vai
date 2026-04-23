@@ -25,8 +25,8 @@ infra/terraform/terraform.tfstate
 infra/terraform/terraform.tfstate.backup
 infra/terraform/terraform.tfvars
 
-# Claude Code user-local settings
-.claude/settings.local.json
+# Claude Code user-local state (settings, scheduled tasks, worktrees)
+.claude/
 
 # Playwright MCP test artifacts
 .playwright-mcp/
