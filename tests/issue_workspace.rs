@@ -161,15 +161,15 @@ fn test_issue_filter_by_status_after_transitions() {
     store.set_in_progress(i3.id, ws3, &mut log).unwrap();
     store.resolve(i3.id, Some("v2".into()), &mut log).unwrap();
 
-    let open_issues = store.list(&IssueFilter { status: Some(IssueStatus::Open), ..Default::default() }).unwrap();
+    let open_issues = store.list(&IssueFilter { status: Some(vec![IssueStatus::Open]), ..Default::default() }).unwrap();
     assert_eq!(open_issues.len(), 1);
     assert_eq!(open_issues[0].id, i1.id);
 
-    let in_progress = store.list(&IssueFilter { status: Some(IssueStatus::InProgress), ..Default::default() }).unwrap();
+    let in_progress = store.list(&IssueFilter { status: Some(vec![IssueStatus::InProgress]), ..Default::default() }).unwrap();
     assert_eq!(in_progress.len(), 1);
     assert_eq!(in_progress[0].id, i2.id);
 
-    let resolved = store.list(&IssueFilter { status: Some(IssueStatus::Resolved), ..Default::default() }).unwrap();
+    let resolved = store.list(&IssueFilter { status: Some(vec![IssueStatus::Resolved]), ..Default::default() }).unwrap();
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].id, i3.id);
 }

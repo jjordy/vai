@@ -1547,7 +1547,7 @@ async fn status_handler(
 
     let issue_count = ctx.storage.issues()
         .list_issues(&ctx.repo_id, &IssueFilter {
-            status: Some(IssueStatus::Open),
+            status: Some(vec![IssueStatus::Open]),
             ..Default::default()
         }, &ListQuery::default())
         .await

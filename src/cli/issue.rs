@@ -219,8 +219,13 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
         }
         IssueCommands::List { status, priority, label, created_by, blocked_by } => {
             let status_filter = if let Some(s) = status {
-                Some(IssueStatus::from_db_str(&s)
-                    .ok_or_else(|| CliError::Other(format!("unknown status: {s}")))?)
+                if s == "open" {
+                    // "open" is an alias for all non-closed statuses.
+                    Some(vec![IssueStatus::Open, IssueStatus::InProgress, IssueStatus::Resolved])
+                } else {
+                    Some(vec![IssueStatus::from_db_str(&s)
+                        .ok_or_else(|| CliError::Other(format!("unknown status: {s}")))?])
+                }
             } else {
                 None
             };

@@ -80,9 +80,15 @@ impl IssueStore for PostgresStorage {
         let mut conditions = vec!["repo_id = $1".to_string()];
         let mut param_idx = 2usize;
 
-        if filter.status.is_some() {
-            conditions.push(format!("LOWER(status) = ${param_idx}"));
-            param_idx += 1;
+        if let Some(ref statuses) = filter.status {
+            if statuses.len() == 1 {
+                conditions.push(format!("LOWER(status) = ${param_idx}"));
+            } else if !statuses.is_empty() {
+                conditions.push(format!("LOWER(status) = ANY(${param_idx})"));
+            }
+            if !statuses.is_empty() {
+                param_idx += 1;
+            }
         }
         if filter.priority.is_some() {
             conditions.push(format!("LOWER(priority) = ${param_idx}"));
@@ -149,8 +155,13 @@ impl IssueStore for PostgresStorage {
             ($q:expr) => {{
                 let mut q = $q;
                 q = q.bind(*repo_id);
-                if let Some(ref s) = filter.status {
-                    q = q.bind(s.as_str().to_string());
+                if let Some(ref statuses) = filter.status {
+                    if statuses.len() == 1 {
+                        q = q.bind(statuses[0].as_str().to_string());
+                    } else if !statuses.is_empty() {
+                        let vals: Vec<String> = statuses.iter().map(|s| s.as_str().to_string()).collect();
+                        q = q.bind(vals);
+                    }
                 }
                 if let Some(ref p) = filter.priority {
                     q = q.bind(p.as_str().to_string());

@@ -885,9 +885,12 @@ pub(super) async fn list_issues_handler(
     require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, crate::storage::RepoRole::Read).await?;
     use crate::issue::{IssueFilter, IssueStatus, IssuePriority};
 
-    let status = query.status.as_deref()
-        .map(|s| IssueStatus::from_db_str(s).ok_or_else(|| ApiError::bad_request(format!("unknown status `{s}`"))))
-        .transpose()?;
+    let status: Option<Vec<IssueStatus>> = match query.status.as_deref() {
+        None => None,
+        Some("open") => Some(vec![IssueStatus::Open, IssueStatus::InProgress, IssueStatus::Resolved]),
+        Some(s) => Some(vec![IssueStatus::from_db_str(s)
+            .ok_or_else(|| ApiError::bad_request(format!("unknown status `{s}`")))?]),
+    };
     let priority = query.priority.as_deref()
         .map(|p| IssuePriority::from_db_str(p).ok_or_else(|| ApiError::bad_request(format!("unknown priority `{p}`"))))
         .transpose()?;

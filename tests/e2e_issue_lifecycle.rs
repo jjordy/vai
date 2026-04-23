@@ -169,7 +169,7 @@ fn test_full_issue_lifecycle() {
     // Verify all 5 issues are open.
     let all_open = store
         .list(&IssueFilter {
-            status: Some(IssueStatus::Open),
+            status: Some(vec![IssueStatus::Open]),
             ..Default::default()
         })
         .unwrap();

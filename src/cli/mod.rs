@@ -570,7 +570,9 @@ pub enum IssueCommands {
     },
     /// List issues with optional filters.
     List {
-        /// Filter by status: open, in_progress, resolved, closed.
+        /// Filter by status. `open` matches all non-closed statuses
+        /// (open, in_progress, resolved). Use `in_progress`, `resolved`, or
+        /// `closed` to match a single state exactly.
         #[arg(long)]
         status: Option<String>,
         /// Filter by priority: critical, high, medium, low.

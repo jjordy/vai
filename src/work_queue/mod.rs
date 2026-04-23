@@ -286,7 +286,7 @@ pub fn compute(
 ) -> Result<WorkQueue, WorkQueueError> {
     let issue_store = IssueStore::open(vai_dir)?;
     let open_issues = issue_store.list(&IssueFilter {
-        status: Some(IssueStatus::Open),
+        status: Some(vec![IssueStatus::Open]),
         ..Default::default()
     })?;
 

@@ -61,7 +61,7 @@ pub(super) async fn get_work_queue_handler(
     // Fetch open issues from storage (works for both SQLite and Postgres backends).
     let open_issues = ctx.storage.issues()
         .list_issues(&ctx.repo_id, &IssueFilter {
-            status: Some(IssueStatus::Open),
+            status: Some(vec![IssueStatus::Open]),
             ..Default::default()
         }, &ListQuery::default())
         .await

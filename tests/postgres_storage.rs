@@ -255,7 +255,7 @@ async fn test_issue_store_crud() {
 
     // list — open issues
     let filter = IssueFilter {
-        status: Some(IssueStatus::Open),
+        status: Some(vec![IssueStatus::Open]),
         ..Default::default()
     };
     let issues = storage
@@ -273,7 +273,7 @@ async fn test_issue_store_crud() {
 
     // list — open issues should now be empty
     let open = storage
-        .list_issues(&repo_id, &IssueFilter { status: Some(IssueStatus::Open), ..Default::default() }, &ListQuery::default())
+        .list_issues(&repo_id, &IssueFilter { status: Some(vec![IssueStatus::Open]), ..Default::default() }, &ListQuery::default())
         .await
         .expect("list_issues after close failed");
     assert!(open.items.is_empty());
@@ -323,7 +323,7 @@ async fn test_issue_list_paginated_status_filter() {
     let open = storage
         .list_issues(
             &repo_id,
-            &IssueFilter { status: Some(IssueStatus::Open), ..Default::default() },
+            &IssueFilter { status: Some(vec![IssueStatus::Open]), ..Default::default() },
             &ListQuery::default(),
         )
         .await
@@ -340,7 +340,7 @@ async fn test_issue_list_paginated_status_filter() {
     let closed = storage
         .list_issues(
             &repo_id,
-            &IssueFilter { status: Some(IssueStatus::Closed), ..Default::default() },
+            &IssueFilter { status: Some(vec![IssueStatus::Closed]), ..Default::default() },
             &ListQuery::default(),
         )
         .await
@@ -364,7 +364,7 @@ async fn test_issue_list_paginated_status_filter() {
         .list_issues(
             &repo_id,
             &IssueFilter {
-                status: Some(IssueStatus::Open),
+                status: Some(vec![IssueStatus::Open]),
                 priority: Some(IssuePriority::High),
                 ..Default::default()
             },

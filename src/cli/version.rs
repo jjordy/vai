@@ -327,8 +327,8 @@ pub(super) fn handle_status(others: bool, json: bool, local: bool) -> Result<(),
             // Query issue counts (best-effort; zero if store doesn't exist yet).
             let issue_counts = {
                 if let Ok(store) = crate::issue::IssueStore::open(&vai_dir) {
-                    let open = store.list(&IssueFilter { status: Some(IssueStatus::Open), ..Default::default() }).unwrap_or_default().len();
-                    let in_progress = store.list(&IssueFilter { status: Some(IssueStatus::InProgress), ..Default::default() }).unwrap_or_default().len();
+                    let open = store.list(&IssueFilter { status: Some(vec![IssueStatus::Open]), ..Default::default() }).unwrap_or_default().len();
+                    let in_progress = store.list(&IssueFilter { status: Some(vec![IssueStatus::InProgress]), ..Default::default() }).unwrap_or_default().len();
                     Some((open, in_progress))
                 } else {
                     None

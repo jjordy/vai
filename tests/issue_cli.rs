@@ -83,17 +83,48 @@ fn test_issue_full_lifecycle() {
 
     // Filter by status open — should show only i1.
     let open_issues = store
-        .list(&IssueFilter { status: Some(IssueStatus::Open), ..Default::default() })
+        .list(&IssueFilter { status: Some(vec![IssueStatus::Open]), ..Default::default() })
         .unwrap();
     assert_eq!(open_issues.len(), 1);
     assert_eq!(open_issues[0].id, i1.id);
 
     // Filter by status closed.
     let closed_issues = store
-        .list(&IssueFilter { status: Some(IssueStatus::Closed), ..Default::default() })
+        .list(&IssueFilter { status: Some(vec![IssueStatus::Closed]), ..Default::default() })
         .unwrap();
     assert_eq!(closed_issues.len(), 1);
     assert_eq!(closed_issues[0].id, i2.id);
+}
+
+#[test]
+fn test_status_open_alias_includes_in_progress() {
+    let (_tmp, vai_dir) = setup();
+    let store = IssueStore::open(&vai_dir).unwrap();
+    let mut log = EventLog::open(&vai_dir).unwrap();
+
+    let i1 = store.create("Open issue", "", IssuePriority::Medium, vec![], "alice", &mut log).unwrap();
+    let i2 = store.create("In-progress issue", "", IssuePriority::Medium, vec![], "alice", &mut log).unwrap();
+    let i3 = store.create("Resolved issue", "", IssuePriority::Medium, vec![], "alice", &mut log).unwrap();
+    let i4 = store.create("Closed issue", "", IssuePriority::Medium, vec![], "alice", &mut log).unwrap();
+
+    let ws = uuid::Uuid::new_v4();
+    store.set_in_progress(i2.id, ws, &mut log).unwrap();
+    store.resolve(i3.id, None, &mut log).unwrap();
+    store.close(i4.id, "done", &mut log).unwrap();
+
+    // Multi-status "open alias": [Open, InProgress, Resolved] → 3 results.
+    let not_closed = store
+        .list(&IssueFilter {
+            status: Some(vec![IssueStatus::Open, IssueStatus::InProgress, IssueStatus::Resolved]),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(not_closed.len(), 3, "open alias should include open, in_progress, and resolved");
+    let ids: std::collections::HashSet<_> = not_closed.iter().map(|i| i.id).collect();
+    assert!(ids.contains(&i1.id), "open issue should be included");
+    assert!(ids.contains(&i2.id), "in_progress issue should be included");
+    assert!(ids.contains(&i3.id), "resolved issue should be included");
+    assert!(!ids.contains(&i4.id), "closed issue should be excluded");
 }
 
 #[test]

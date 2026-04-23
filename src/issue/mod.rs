@@ -250,9 +250,15 @@ pub struct Issue {
 // ── Filter for list queries ───────────────────────────────────────────────────
 
 /// Filters for [`IssueStore::list`].
+///
+/// When `status` contains more than one value the filter matches issues with
+/// ANY of the listed statuses (SQL `IN` / `= ANY`). Passing
+/// `vec![Open, InProgress, Resolved]` implements the "open" alias meaning
+/// "not closed".
 #[derive(Debug, Default, Clone)]
 pub struct IssueFilter {
-    pub status: Option<IssueStatus>,
+    /// Match issues whose status is one of these values.  `None` = no filter.
+    pub status: Option<Vec<IssueStatus>>,
     pub priority: Option<IssuePriority>,
     /// Filter by label substring (case-insensitive).
     pub label: Option<String>,
@@ -648,21 +654,32 @@ impl IssueStore {
         let mut conditions: Vec<String> = Vec::new();
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
-        if let Some(status) = &filter.status {
-            conditions.push(format!("status = ?{}", conditions.len() + 1));
-            values.push(Box::new(status.as_str().to_string()));
+        if let Some(statuses) = &filter.status {
+            if statuses.len() == 1 {
+                conditions.push(format!("status = ?{}", values.len() + 1));
+                values.push(Box::new(statuses[0].as_str().to_string()));
+            } else if !statuses.is_empty() {
+                let start = values.len() + 1;
+                let placeholders: Vec<String> = (start..start + statuses.len())
+                    .map(|i| format!("?{i}"))
+                    .collect();
+                conditions.push(format!("status IN ({})", placeholders.join(", ")));
+                for s in statuses {
+                    values.push(Box::new(s.as_str().to_string()));
+                }
+            }
         }
         if let Some(priority) = &filter.priority {
-            conditions.push(format!("priority = ?{}", conditions.len() + 1));
+            conditions.push(format!("priority = ?{}", values.len() + 1));
             values.push(Box::new(priority.as_str().to_string()));
         }
         if let Some(label) = &filter.label {
+            let n1 = values.len() + 1;
+            let n2 = values.len() + 2;
+            let n3 = values.len() + 3;
+            let n4 = values.len() + 4;
             conditions.push(format!(
-                "(labels = ?{n} OR labels LIKE ?{n2} OR labels LIKE ?{n3} OR labels LIKE ?{n4})",
-                n = conditions.len() + 1,
-                n2 = conditions.len() + 2,
-                n3 = conditions.len() + 3,
-                n4 = conditions.len() + 4,
+                "(labels = ?{n1} OR labels LIKE ?{n2} OR labels LIKE ?{n3} OR labels LIKE ?{n4})"
             ));
             values.push(Box::new(label.clone()));
             values.push(Box::new(format!("{},%", label)));
@@ -670,13 +687,13 @@ impl IssueStore {
             values.push(Box::new(format!("%,{},%", label)));
         }
         if let Some(creator) = &filter.creator {
-            conditions.push(format!("creator = ?{}", conditions.len() + 1));
+            conditions.push(format!("creator = ?{}", values.len() + 1));
             values.push(Box::new(creator.clone()));
         }
         if let Some(blocker_id) = &filter.blocked_by {
             conditions.push(format!(
                 "id IN (SELECT issue_id FROM issue_dependencies WHERE depends_on_id = ?{})",
-                conditions.len() + 1
+                values.len() + 1
             ));
             values.push(Box::new(blocker_id.to_string()));
         }
