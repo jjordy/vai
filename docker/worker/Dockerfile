@@ -9,7 +9,9 @@
 # routine toolchain bumps do not invalidate expensive browser or AI-tools layers.
 
 # ── Layer 1: Base OS + system packages ────────────────────────────────────────
-FROM debian:bookworm-slim
+# Trixie (Debian 13) is required because the vai release binary is built on
+# ubuntu-24.04 (glibc 2.39). Bookworm's glibc 2.36 fails at runtime.
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
