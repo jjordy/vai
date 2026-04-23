@@ -131,6 +131,8 @@ const IGNORE_DIRS: &[&str] = &[
     ".vai", ".git", "target", "node_modules", "dist", "__pycache__",
 ];
 
+use crate::ignore_rules::is_builtin_secret_file;
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Computes diffs between the local working directory and the remote server.
@@ -378,6 +380,9 @@ fn collect_recursive(
             }
             collect_recursive(repo_root, &path, map)?;
         } else if path.is_file() {
+            if is_builtin_secret_file(&name) {
+                continue;
+            }
             if let Ok(rel) = path.strip_prefix(repo_root) {
                 let rel_str = rel
                     .components()

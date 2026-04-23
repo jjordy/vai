@@ -94,6 +94,13 @@ fn collect_impl(
                 return None;
             }
 
+            // Skip built-in secret files regardless of ignore configuration.
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                if is_builtin_secret_file(file_name) {
+                    return None;
+                }
+            }
+
             // Apply extra vai.toml patterns — check every path component so that
             // directory-level patterns like `node_modules/` and `target/` work
             // correctly regardless of nesting depth.
@@ -116,6 +123,27 @@ fn collect_impl(
 
     files.sort();
     files
+}
+
+/// Returns `true` if `name` is a built-in secret or credential file that vai
+/// never tracks, regardless of ignore configuration.
+///
+/// Covers common dotenv variants and TLS/SSH key material.  Conservative by
+/// design — only near-universally-secret filenames are included.
+pub(crate) fn is_builtin_secret_file(name: &str) -> bool {
+    // Exact matches: .env and .env.<variant>
+    if name == ".env" || name.starts_with(".env.") {
+        return true;
+    }
+    // Key material and certificates.
+    if name.ends_with(".pem") || name.ends_with(".key") {
+        return true;
+    }
+    // SSH private key default names.
+    if name.starts_with("id_rsa") || name.starts_with("id_ed25519") {
+        return true;
+    }
+    false
 }
 
 /// Returns `true` if `path` is inside `.vai/` or `.git/` relative to `root`.
@@ -288,5 +316,44 @@ mod tests {
         let path = std::path::Path::new("node_modules/pkg/index.js");
         assert!(any_component_matches(path, &["node_modules/".to_string()]));
         assert!(!any_component_matches(path, &["target/".to_string()]));
+    }
+
+    #[test]
+    fn builtin_secret_file_excludes_env_and_keys() {
+        // .env variants
+        assert!(is_builtin_secret_file(".env"));
+        assert!(is_builtin_secret_file(".env.local"));
+        assert!(is_builtin_secret_file(".env.production"));
+        assert!(is_builtin_secret_file(".env.development"));
+        assert!(is_builtin_secret_file(".env.test"));
+        // certificate / key material
+        assert!(is_builtin_secret_file("server.key"));
+        assert!(is_builtin_secret_file("cert.pem"));
+        assert!(is_builtin_secret_file("id_rsa"));
+        assert!(is_builtin_secret_file("id_rsa.pub"));
+        assert!(is_builtin_secret_file("id_ed25519"));
+        // safe files — must NOT be excluded
+        assert!(!is_builtin_secret_file("main.rs"));
+        assert!(!is_builtin_secret_file(".envrc"));  // direnv, not a secret file
+        assert!(!is_builtin_secret_file("env.sh"));
+        assert!(!is_builtin_secret_file("README.md"));
+    }
+
+    #[test]
+    fn collect_all_files_excludes_secret_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        make_file(root, "src/lib.rs");
+        make_file(root, ".env");
+        make_file(root, ".env.local");
+        make_file(root, "secrets/server.key");
+        make_file(root, "cert.pem");
+
+        let files = collect_all_files(root, &[]);
+        assert!(files.iter().any(|p| p.file_name().unwrap() == "lib.rs"));
+        assert!(!files.iter().any(|p| p.file_name().unwrap() == ".env"));
+        assert!(!files.iter().any(|p| p.file_name().unwrap() == ".env.local"));
+        assert!(!files.iter().any(|p| p.file_name().unwrap() == "server.key"));
+        assert!(!files.iter().any(|p| p.file_name().unwrap() == "cert.pem"));
     }
 }

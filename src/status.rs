@@ -114,6 +114,9 @@ const IGNORE_DIRS: &[&str] = &[
     ".vai", ".git", "target", "node_modules", "dist", "__pycache__",
 ];
 
+// Re-use the shared secret-file predicate from ignore_rules.
+use crate::ignore_rules::is_builtin_secret_file;
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Compares the local working directory against the remote server state.
@@ -312,6 +315,9 @@ fn collect_recursive(
             }
             collect_recursive(repo_root, &path, map)?;
         } else if path.is_file() {
+            if is_builtin_secret_file(&name) {
+                continue;
+            }
             if let Ok(rel) = path.strip_prefix(repo_root) {
                 let rel_str = rel
                     .components()
@@ -365,6 +371,31 @@ mod tests {
         assert!(map.contains_key("readme.md"));
         assert!(!map.contains_key(".vai/head"));
         assert!(!map.contains_key("target/debug/binary"));
+    }
+
+    #[test]
+    fn collect_local_hashes_skips_secret_files() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path();
+
+        fs::write(root_path.join("src.rs"), b"code").unwrap();
+        fs::write(root_path.join(".env"), b"SECRET=abc").unwrap();
+        fs::write(root_path.join(".env.local"), b"SECRET=local").unwrap();
+        fs::write(root_path.join(".env.production"), b"SECRET=prod").unwrap();
+        fs::write(root_path.join("server.key"), b"-----BEGIN").unwrap();
+        fs::write(root_path.join("cert.pem"), b"-----BEGIN").unwrap();
+        fs::write(root_path.join("id_rsa"), b"-----BEGIN").unwrap();
+        fs::write(root_path.join("id_ed25519"), b"-----BEGIN").unwrap();
+
+        let map = collect_local_hashes(root_path).unwrap();
+        assert!(map.contains_key("src.rs"), "regular file should be tracked");
+        assert!(!map.contains_key(".env"), ".env must not be tracked");
+        assert!(!map.contains_key(".env.local"));
+        assert!(!map.contains_key(".env.production"));
+        assert!(!map.contains_key("server.key"));
+        assert!(!map.contains_key("cert.pem"));
+        assert!(!map.contains_key("id_rsa"));
+        assert!(!map.contains_key("id_ed25519"));
     }
 
     #[test]

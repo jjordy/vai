@@ -20,6 +20,8 @@ pub(super) fn is_ignored_dir(name: &str) -> bool {
     IGNORE_DIRS.contains(&name)
 }
 
+use crate::ignore_rules::is_builtin_secret_file;
+
 // ── Tarball building ──────────────────────────────────────────────────────────
 
 /// Builds a gzip tarball containing every file under `repo_dir`,
@@ -57,6 +59,9 @@ fn append_dir_to_tar<W: std::io::Write>(
             }
             append_dir_to_tar(tar, &path, base)?;
         } else {
+            if is_builtin_secret_file(name_str.as_ref()) {
+                continue;
+            }
             let rel = path
                 .strip_prefix(base)
                 .unwrap_or(&path)
@@ -127,6 +132,9 @@ fn collect_recursive(
             }
             collect_recursive(repo_root, &path, map, hasher)?;
         } else if path.is_file() {
+            if is_builtin_secret_file(&name) {
+                continue;
+            }
             if let Ok(rel) = path.strip_prefix(repo_root) {
                 let rel_str = rel
                     .components()

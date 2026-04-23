@@ -195,12 +195,24 @@ impl Default for VaiToml {
         VaiToml {
             languages: vec!["auto".to_string()],
             ignore: vec![
+                // Build artefacts and dependency directories.
                 ".vai/".to_string(),
                 ".git/".to_string(),
                 "target/".to_string(),
                 "node_modules/".to_string(),
                 "*.o".to_string(),
                 "*.class".to_string(),
+                // Secret / credential files — vai never tracks these by default.
+                // vai treats .env as ignored (like .gitignore) — see vai.toml's `ignore` field.
+                ".env".to_string(),
+                ".env.local".to_string(),
+                ".env.development".to_string(),
+                ".env.production".to_string(),
+                ".env.test".to_string(),
+                "*.pem".to_string(),
+                "*.key".to_string(),
+                "id_rsa".to_string(),
+                "id_ed25519".to_string(),
             ],
         }
     }
