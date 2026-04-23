@@ -107,6 +107,29 @@ Every state-changing handler must BOTH:
 - If partially complete, leave a comment summarizing progress and remaining work.
 - If you hit a blocker, leave a comment describing it and move on.
 
+## ISSUE ATTRIBUTION (CRITICAL — DO NOT DRIFT)
+
+Attribute every commit to the issue number you were *actually selected to work on* this iteration. If you discover that the work you need to do belongs to a different issue — including a closed one — stop and do one of these:
+
+1. **Reopen the correct issue** with `gh issue reopen <number>` and a brief comment explaining why, then commit referencing that number.
+2. **Post a comment** on your selected issue describing the blocker ("this requires work from #X which is closed-as-gated; reopening"), then pick a different issue next iteration.
+
+Do NOT roll work from issue A onto issue B's commit just because B is the only one open. That corrupts the audit trail. Historical case: PRD 28 Phase 1 (#335–#341) was closed as a "gating convention" but never reopened; RALPH later did the work and attributed all of it to #350 (the staking issue), which destroyed the link between code and its real requirement.
+
+If you notice stale "gated pending #X" close comments on issues whose prerequisites have since landed, call that out in an iteration comment — don't silently work around it.
+
+## HUMAN HANDOFF DETECTION
+
+If the issue body explicitly says "human-in-the-loop" / "not a code-only task" / "manual step" — or if after a thorough read you determine the remaining work requires infrastructure you can't access (cloud accounts, billing, deploys, registry publishes, staging observability) — do this:
+
+1. Summarize what's complete on the code side
+2. List what remains and why it needs a human
+3. Post that as a GitHub issue comment with `gh issue comment <N>`
+4. Close the issue with `gh issue close <N> --reason completed`
+5. Do NOT keep making polish commits to reach acceptance — that just adds churn
+
+The RALPH loop is for code tasks. Recognize when an issue has outgrown that.
+
 ## FINAL RULES
 
 - Only work on ONE task per iteration
