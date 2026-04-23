@@ -142,13 +142,13 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
                 } else {
                     Some(blocked_by)
                 };
-                let req = serde_json::json!({
-                    "priority": priority,
-                    "title": title,
-                    "description": body,
-                    "labels": new_labels,
-                    "blocked_by": blocked_by_opt,
-                });
+                let mut req = serde_json::Map::new();
+                if let Some(p) = priority { req.insert("priority".into(), serde_json::Value::String(p)); }
+                if let Some(t) = title { req.insert("title".into(), serde_json::Value::String(t)); }
+                if let Some(d) = body { req.insert("description".into(), serde_json::Value::String(d)); }
+                if let Some(l) = new_labels { req.insert("labels".into(), serde_json::to_value(l).unwrap()); }
+                if let Some(b) = blocked_by_opt { req.insert("blocked_by".into(), serde_json::to_value(b).unwrap()); }
+                let req = serde_json::Value::Object(req);
                 let path = format!("/api/repos/{repo_name}/issues/{id}");
                 let issue: serde_json::Value = rt.block_on(client.patch(&path, &req))?;
                 if json {

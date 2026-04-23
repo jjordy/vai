@@ -99,6 +99,19 @@ pub(super) struct AgentSourceRequest {
     details: serde_json::Value,
 }
 
+/// Deserializes a JSON array or `null` into `Vec<T>`, treating `null` as empty.
+///
+/// Needed because Rust serializers commonly emit `null` for `Option<Vec<T>>`
+/// when the field is absent, but serde rejects `null` for bare `Vec<T>`.
+fn deserialize_null_as_empty_vec<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    let opt: Option<Vec<T>> = serde::Deserialize::deserialize(de)?;
+    Ok(opt.unwrap_or_default())
+}
+
 fn default_priority() -> String {
     "medium".to_string()
 }
@@ -121,7 +134,8 @@ pub(super) struct UpdateIssueRequest {
     /// Testable conditions that define when the issue is complete.
     acceptance_criteria: Option<Vec<String>>,
     /// Add blockers: issue IDs that block this issue (appends; does not remove existing).
-    #[serde(default)]
+    /// Accepts `null` or an absent field as equivalent to an empty list.
+    #[serde(default, deserialize_with = "crate::server::issue::deserialize_null_as_empty_vec")]
     blocked_by: Vec<String>,
 }
 
