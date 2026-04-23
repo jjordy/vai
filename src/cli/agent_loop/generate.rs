@@ -454,4 +454,55 @@ mod tests {
         let result = substitute(tmpl, "myrepo", "https://example.com", "claude-code");
         assert_eq!(result, "repo=myrepo url=https://example.com agent=claude-code");
     }
+
+    #[test]
+    fn bare_claude_guards_download() {
+        let dir = tmp();
+        let vai = dir.path().join(".vai");
+        let cfg = basic_config(AgentKind::ClaudeCode, RunMode::Bare);
+        let out = generate(&cfg, &vai).unwrap();
+        let content = std::fs::read_to_string(&out.loop_sh).unwrap();
+        assert!(
+            content.contains("if ! vai agent download"),
+            "bare claude script must guard vai agent download"
+        );
+        assert!(
+            content.contains("vai agent reset"),
+            "bare claude script must reset on download failure"
+        );
+    }
+
+    #[test]
+    fn bare_codex_guards_download() {
+        let dir = tmp();
+        let vai = dir.path().join(".vai");
+        let cfg = basic_config(AgentKind::Codex, RunMode::Bare);
+        let out = generate(&cfg, &vai).unwrap();
+        let content = std::fs::read_to_string(&out.loop_sh).unwrap();
+        assert!(
+            content.contains("if ! vai agent download"),
+            "bare codex script must guard vai agent download"
+        );
+        assert!(
+            content.contains("vai agent reset"),
+            "bare codex script must reset on download failure"
+        );
+    }
+
+    #[test]
+    fn custom_agent_guards_download() {
+        let dir = tmp();
+        let vai = dir.path().join(".vai");
+        let cfg = basic_config(AgentKind::Custom, RunMode::Bare);
+        let out = generate(&cfg, &vai).unwrap();
+        let content = std::fs::read_to_string(&out.loop_sh).unwrap();
+        assert!(
+            content.contains("if ! vai agent download"),
+            "custom loop script must guard vai agent download"
+        );
+        assert!(
+            content.contains("vai agent reset"),
+            "custom loop script must reset on download failure"
+        );
+    }
 }

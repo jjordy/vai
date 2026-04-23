@@ -33,7 +33,12 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
     exit 0
   fi
 
-  vai agent download ./work
+  if ! vai agent download ./work; then
+    echo "download failed, resetting workspace and continuing loop" >&2
+    vai agent reset
+    rm -rf ./work
+    continue
+  fi
 
   # Run Codex; pipe in the vai prompt.
   vai agent prompt | codex \

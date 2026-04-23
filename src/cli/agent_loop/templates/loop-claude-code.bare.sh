@@ -34,7 +34,12 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
     exit 0
   fi
 
-  vai agent download ./work
+  if ! vai agent download ./work; then
+    echo "download failed, resetting workspace and continuing loop" >&2
+    vai agent reset
+    rm -rf ./work
+    continue
+  fi
 
   # Run Claude Code; pipe in the vai prompt.  The '|| true' prevents the loop
   # from aborting if claude exits non-zero (e.g. on soft model errors).
