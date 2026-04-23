@@ -5463,6 +5463,116 @@ async fn test_spawn_if_capacity_on_issue_create() {
     shutdown_tx.send(()).ok();
 }
 
+/// DELETE /api/agent-workers/:id — admin can forcibly terminate a running worker.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_destroy_worker_endpoint() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx, provider) = start_for_testing_pg_with_compute(tmp.path(), &url)
+        .await
+        .expect("start server");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create a repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": format!("e2e-destroy-{}", unique_suffix()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let repo_id = repo["id"].as_str().unwrap();
+
+    // Insert a worker row directly.
+    let pg_pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let worker_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO agent_workers (repo_id, provider, state) VALUES ($1::uuid, 'fly', 'running')
+         RETURNING id",
+    )
+    .bind(repo_id)
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+
+    // Non-admin request should be forbidden.
+    let user_key = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": "destroy-test-key",
+            "repo_id": repo_id,
+            "role": "member"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let user_token = user_key["key"].as_str().unwrap();
+    let resp = client
+        .delete(format!("{base}/api/agent-workers/{worker_id}"))
+        .bearer_auth(user_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "non-admin should get 403");
+
+    // Admin destroy — should be 204.
+    let resp = client
+        .delete(format!("{base}/api/agent-workers/{worker_id}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "admin destroy should be 204");
+
+    // Worker should now be in 'dead' state.
+    let resp = client
+        .get(format!("{base}/api/agent-workers/{worker_id}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["state"].as_str(),
+        Some("dead"),
+        "destroyed worker should be 'dead'"
+    );
+
+    // Second destroy on same worker should still be 204 (idempotent via mark_done).
+    let resp = client
+        .delete(format!("{base}/api/agent-workers/{worker_id}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "second destroy should still be 204");
+
+    // 404 for unknown worker.
+    let resp = client
+        .delete(format!("{base}/api/agent-workers/{}", uuid::Uuid::new_v4()))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "unknown worker should be 404");
+
+    // InMemoryProvider was not given a machine_id so destroy was a no-op there.
+    let _ = provider.worker_count();
+
+    pg_pool.close().await;
+    shutdown_tx.send(()).ok();
+}
+
 /// Extracts the content of a file from a gzip tarball by path suffix.
 fn extract_file_from_tarball(bytes: &[u8], path_suffix: &str) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;

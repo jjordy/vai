@@ -3,15 +3,16 @@
 //! (PRD 28).
 //!
 //! Endpoints:
-//!   - `GET  /api/agent-workers/:id`           — fetch worker state
-//!   - `GET  /api/agent-workers/:id/logs`      — fetch log chunks
-//!   - `POST /api/agent-workers/:id/heartbeat` — keep a running worker alive
-//!   - `POST /api/agent-workers/:id/logs`      — ingest a batch of log chunks
-//!   - `POST /api/agent-workers/:id/done`      — mark a worker terminal
+//!   - `GET    /api/agent-workers/:id`           — fetch worker state
+//!   - `GET    /api/agent-workers/:id/logs`      — fetch log chunks
+//!   - `POST   /api/agent-workers/:id/heartbeat` — keep a running worker alive
+//!   - `POST   /api/agent-workers/:id/logs`      — ingest a batch of log chunks
+//!   - `POST   /api/agent-workers/:id/done`      — mark a worker terminal
+//!   - `DELETE /api/agent-workers/:id`           — forcibly destroy a worker (admin)
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,7 @@ use uuid::Uuid;
 
 use crate::storage::{AgentWorker, LogStream, WorkerDoneReason, WorkerLog};
 
-use super::{ApiError, AppState, ErrorBody};
+use super::{AgentIdentity, ApiError, AppState, ErrorBody, require_server_admin};
 
 // ── Request / response types ──────────────────────────────────────────────────
 
@@ -233,5 +234,88 @@ pub(super) async fn mark_done_handler(
             crate::storage::StorageError::NotFound(_) => ApiError::not_found(e.to_string()),
             _ => ApiError::internal(e.to_string()),
         })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/agent-workers/{id}",
+    params(
+        ("id" = Uuid, Path, description = "Agent worker UUID"),
+    ),
+    responses(
+        (status = 204, description = "Worker destroyed"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden — admin key required", body = ErrorBody),
+        (status = 404, description = "Worker not found", body = ErrorBody),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "agent-workers"
+)]
+/// `DELETE /api/agent-workers/:id` — forcibly terminate a cloud worker (admin only).
+///
+/// Destroys the backing compute machine if one is assigned, discards any held
+/// workspace so the linked issue re-queues, and marks the row terminal.  The
+/// compute destroy is best-effort — a `NotFound` from the provider is silently
+/// ignored since the machine may have already exited on its own.
+pub(super) async fn destroy_worker_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AgentIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    require_server_admin(&identity)?;
+
+    let workers = state.storage.workers();
+    let worker = workers
+        .get_worker(&id)
+        .await
+        .map_err(|e| match &e {
+            crate::storage::StorageError::NotFound(_) => ApiError::not_found(e.to_string()),
+            _ => ApiError::internal(e.to_string()),
+        })?;
+
+    // Destroy the compute machine — best-effort, never fatal.
+    if let (Some(ref compute), Some(ref machine_id)) = (&state.compute, &worker.machine_id) {
+        let mid = super::compute::MachineId(machine_id.clone());
+        match compute.destroy(&mid).await {
+            Ok(()) | Err(super::compute::ProviderError::NotFound(_)) => {}
+            Err(e) => {
+                tracing::warn!(
+                    worker_id = %id,
+                    machine_id = %machine_id,
+                    error = %e,
+                    "admin destroy: compute provider error (continuing)"
+                );
+            }
+        }
+    }
+
+    // Discard held workspace so the linked issue transitions back to Open.
+    if let Some(ws_id) = worker.workspace_id {
+        let workspaces = state.storage.workspaces();
+        if let Ok(meta) = workspaces.get_workspace(&worker.repo_id, &ws_id).await {
+            let _ = workspaces.discard_workspace(&worker.repo_id, &ws_id).await;
+            if let Some(issue_id) = meta.issue_id {
+                let _ = state
+                    .storage
+                    .issues()
+                    .update_issue(
+                        &worker.repo_id,
+                        &issue_id,
+                        crate::storage::IssueUpdate {
+                            status: Some(crate::issue::IssueStatus::Open),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+            }
+        }
+    }
+
+    workers
+        .mark_done(&id, WorkerDoneReason::Terminated)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
     Ok(StatusCode::NO_CONTENT)
 }

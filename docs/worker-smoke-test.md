@@ -195,7 +195,7 @@ fly machine list --app vai-workers
 # Destroy a specific machine:
 fly machine destroy <machine-id> --app vai-workers --force
 
-# Or via the admin API once the destroy endpoint is implemented (Phase 2+):
+# Or via the admin API:
 curl -s -X DELETE "$SERVER/api/agent-workers/$WORKER_ID" \
   -H "Authorization: Bearer $VAI_ADMIN_KEY"
 ```

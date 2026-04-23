@@ -3134,6 +3134,7 @@ impl utoipa::Modify for SecurityAddon {
         worker::heartbeat_handler,
         worker::append_logs_handler,
         worker::mark_done_handler,
+        worker::destroy_worker_handler,
         admin::create_repo_handler,
         admin::list_repos_handler,
         admin::get_repo_handler,
@@ -3409,6 +3410,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/keys/:id", delete(admin::revoke_key_handler))
         // Agent worker lifecycle — read, heartbeat, log ingest, terminal state (PRD 28).
         .route("/api/agent-workers/:id", get(worker::get_worker_handler))
+        .route("/api/agent-workers/:id", delete(worker::destroy_worker_handler))
         .route("/api/agent-workers/:id/logs", get(worker::get_logs_handler))
         .route("/api/agent-workers/:id/heartbeat", post(worker::heartbeat_handler))
         .route("/api/agent-workers/:id/logs", post(worker::append_logs_handler))
