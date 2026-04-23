@@ -41,7 +41,7 @@ pub(super) fn handle(issue_cmd: IssueCommands, json: bool, local: bool) -> Resul
                 if json {
                     println!("{}", serde_json::to_string_pretty(&issues).unwrap());
                 } else {
-                    let arr = issues.as_array().cloned().unwrap_or_default();
+                    let arr = issues["data"].as_array().cloned().unwrap_or_default();
                     if arr.is_empty() {
                         println!("No issues found.");
                     } else {

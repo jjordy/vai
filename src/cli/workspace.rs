@@ -86,7 +86,7 @@ pub(super) fn handle(
                 if json {
                     println!("{}", serde_json::to_string_pretty(&workspaces).unwrap());
                 } else {
-                    let arr = workspaces.as_array().cloned().unwrap_or_default();
+                    let arr = workspaces["data"].as_array().cloned().unwrap_or_default();
                     if arr.is_empty() {
                         println!("No active workspaces.");
                     } else {
