@@ -154,6 +154,7 @@ mod issue;
 mod me;
 mod version;
 mod watcher;
+mod worker;
 mod work_queue;
 mod workspace;
 mod ws;
@@ -3106,6 +3107,9 @@ impl utoipa::Modify for SecurityAddon {
         watcher::pause_watcher_handler,
         watcher::resume_watcher_handler,
         watcher::submit_discovery_handler,
+        worker::heartbeat_handler,
+        worker::append_logs_handler,
+        worker::mark_done_handler,
         admin::create_repo_handler,
         admin::list_repos_handler,
         admin::get_repo_handler,
@@ -3201,6 +3205,11 @@ impl utoipa::Modify for SecurityAddon {
             watcher::WatcherResponse,
             watcher::SubmitDiscoveryRequest,
             watcher::DiscoveryOutcomeResponse,
+            worker::AppendLogsRequest,
+            worker::MarkDoneRequest,
+            worker::WorkerAckResponse,
+            crate::storage::LogStream,
+            crate::storage::WorkerDoneReason,
             admin::CreateRepoRequest,
             admin::RepoResponse,
             admin::QuotaExceededBody,
@@ -3280,6 +3289,7 @@ impl utoipa::Modify for SecurityAddon {
         (name = "escalations", description = "Escalation management"),
         (name = "work-queue", description = "Work queue and task claiming"),
         (name = "watchers", description = "Watcher agent registration"),
+        (name = "agent-workers", description = "Cloud agent worker lifecycle (PRD 28)"),
         (name = "repos", description = "Repository management"),
         (name = "orgs", description = "Organization management"),
         (name = "users", description = "User management"),
@@ -3367,6 +3377,10 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/keys", get(admin::list_keys_handler))
         .route("/api/keys", delete(admin::bulk_revoke_keys_handler))
         .route("/api/keys/:id", delete(admin::revoke_key_handler))
+        // Agent worker lifecycle — heartbeat, log ingest, terminal state (PRD 28).
+        .route("/api/agent-workers/:id/heartbeat", post(worker::heartbeat_handler))
+        .route("/api/agent-workers/:id/logs", post(worker::append_logs_handler))
+        .route("/api/agent-workers/:id/done", post(worker::mark_done_handler))
         // Per-user onboarding state (PRD 26).
         .route("/api/me/onboarding", get(me::get_onboarding_handler))
         .route("/api/me/onboarding-complete", post(me::complete_onboarding_handler))

@@ -1569,6 +1569,64 @@ pub trait WatcherRegistryStore: Send + Sync {
     ) -> Result<DiscoveryRecord, StorageError>;
 }
 
+// ── WorkerStore ───────────────────────────────────────────────────────────────
+
+/// Log stream source for agent worker log shipping.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "full", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+
+/// Reason an agent worker ended.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "full", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerDoneReason {
+    /// Worker finished its work queue normally.
+    Completed,
+    /// Worker encountered a fatal error.
+    Failed,
+    /// Worker received SIGTERM (e.g., `docker stop`).
+    Terminated,
+}
+
+/// Manages agent worker lifecycle events and log persistence.
+///
+/// Backed by `agent_workers` and `agent_worker_logs` Postgres tables (PRD 28).
+/// Not available in local SQLite mode.
+#[async_trait::async_trait]
+pub trait WorkerStore: Send + Sync {
+    /// Update `last_heartbeat_at` to now for the given worker.
+    ///
+    /// Returns `StorageError::NotFound` if no worker with that ID exists.
+    async fn update_heartbeat(&self, worker_id: &Uuid) -> Result<(), StorageError>;
+
+    /// Append a batch of log chunks from `stream` to `agent_worker_logs`.
+    ///
+    /// Returns `StorageError::NotFound` if no worker with that ID exists.
+    async fn append_logs(
+        &self,
+        worker_id: &Uuid,
+        stream: LogStream,
+        chunks: &[String],
+    ) -> Result<(), StorageError>;
+
+    /// Mark a worker as terminal and record its end time.
+    ///
+    /// Sets `state` to `"completed"`, `"failed"`, or `"dead"` depending on
+    /// `reason`, and writes `ended_at = now()`.
+    ///
+    /// Returns `StorageError::NotFound` if no worker with that ID exists.
+    async fn mark_done(
+        &self,
+        worker_id: &Uuid,
+        reason: WorkerDoneReason,
+    ) -> Result<(), StorageError>;
+}
+
 // ── StorageBackend factory ────────────────────────────────────────────────────
 
 /// A constructed, ready-to-use storage backend.
@@ -1932,6 +1990,23 @@ impl StorageBackend {
             }
             #[cfg(feature = "s3")]
             StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn WatcherRegistryStore>,
+        }
+    }
+
+    /// Returns the worker lifecycle store.
+    ///
+    /// - [`StorageBackend::Local`]: returns a stub that errors on all calls (PRD 28 is server-only).
+    /// - [`StorageBackend::Server`] / [`StorageBackend::ServerWithS3`] /
+    ///   [`StorageBackend::ServerWithMemFs`]: Postgres-backed.
+    pub fn workers(&self) -> Arc<dyn WorkerStore> {
+        match self {
+            StorageBackend::Local(s) => Arc::clone(s) as Arc<dyn WorkerStore>,
+            #[cfg(feature = "postgres")]
+            StorageBackend::Server(s) | StorageBackend::ServerWithMemFs(s, _) => {
+                Arc::clone(s) as Arc<dyn WorkerStore>
+            }
+            #[cfg(feature = "s3")]
+            StorageBackend::ServerWithS3(s, _) => Arc::clone(s) as Arc<dyn WorkerStore>,
         }
     }
 }

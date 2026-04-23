@@ -1479,6 +1479,42 @@ impl crate::storage::OnboardingStore for SqliteStorage {
     }
 }
 
+// ── WorkerStore ───────────────────────────────────────────────────────────────
+//
+// Cloud agent workers (PRD 28) are a server-only feature. These stubs return a
+// clear error so that accidental usage in local CLI mode is surfaced immediately.
+
+fn worker_store_unsupported() -> StorageError {
+    StorageError::InvalidTransition(
+        "WorkerStore is not supported in local CLI mode; use the hosted server backend"
+            .to_string(),
+    )
+}
+
+#[async_trait]
+impl super::WorkerStore for SqliteStorage {
+    async fn update_heartbeat(&self, _worker_id: &Uuid) -> Result<(), StorageError> {
+        Err(worker_store_unsupported())
+    }
+
+    async fn append_logs(
+        &self,
+        _worker_id: &Uuid,
+        _stream: super::LogStream,
+        _chunks: &[String],
+    ) -> Result<(), StorageError> {
+        Err(worker_store_unsupported())
+    }
+
+    async fn mark_done(
+        &self,
+        _worker_id: &Uuid,
+        _reason: super::WorkerDoneReason,
+    ) -> Result<(), StorageError> {
+        Err(worker_store_unsupported())
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

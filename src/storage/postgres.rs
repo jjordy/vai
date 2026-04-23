@@ -43,6 +43,7 @@ mod file;
 mod org;
 mod onboarding;
 mod watcher;
+mod worker;
 
 // ── PostgresStorage ───────────────────────────────────────────────────────────
 
