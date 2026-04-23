@@ -20,8 +20,6 @@
 //! - Decrypted values live only in memory for the duration of a request.
 //! - [`list_secret_keys`] returns only key names, never values.
 
-// HTTP handlers (issue #351) will wire these into routes; suppress dead_code until then.
-#![allow(dead_code)]
 
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -42,10 +40,6 @@ pub enum SecretsError {
     /// The env var is set but is not valid base64 or not exactly 32 bytes.
     #[error("invalid master key: {0}")]
     MasterKeyInvalid(String),
-
-    /// The requested secret key does not exist for this repo.
-    #[error("secret not found")]
-    KeyNotFound,
 
     /// Decryption failed — wrong master key or corrupt ciphertext.
     #[error("decryption failed — wrong master key or corrupt ciphertext")]
@@ -100,6 +94,8 @@ fn encrypt_value(key: &[u8; 32], value: &str) -> Result<(Vec<u8>, Vec<u8>), Secr
     Ok((ciphertext, nonce.to_vec()))
 }
 
+// get_secret and decrypt_value are wired in by issue #352 (worker spawn).
+#[allow(dead_code)]
 /// Decrypt `ciphertext` with `key` and `nonce_bytes`. Returns plaintext string.
 fn decrypt_value(
     key: &[u8; 32],
@@ -153,6 +149,7 @@ pub async fn set_secret(
 /// Returns `None` if no secret with `key` exists for this repo.
 /// Returns `Err(SecretsError::DecryptionFailed)` if decryption fails (wrong
 /// master key or corrupt data).
+#[allow(dead_code)] // wired in by issue #352
 pub async fn get_secret(
     db: &PgPool,
     repo_id: &Uuid,

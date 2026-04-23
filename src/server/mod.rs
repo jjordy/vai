@@ -161,6 +161,8 @@ mod workspace;
 mod ws;
 #[cfg(feature = "postgres")]
 pub(crate) mod secrets;
+#[cfg(feature = "postgres")]
+mod agent_secrets;
 
 use crate::auth as crate_auth;
 use crate::conflict;
@@ -3323,6 +3325,7 @@ impl utoipa::Modify for SecurityAddon {
         (name = "work-queue", description = "Work queue and task claiming"),
         (name = "watchers", description = "Watcher agent registration"),
         (name = "agent-workers", description = "Cloud agent worker lifecycle (PRD 28)"),
+        (name = "agent-secrets", description = "Per-repo encrypted agent secrets (PRD 28)"),
         (name = "repos", description = "Repository management"),
         (name = "orgs", description = "Organization management"),
         (name = "users", description = "User management"),
@@ -3347,7 +3350,15 @@ struct VaiApi;
     tag = "status"
 )]
 async fn openapi_handler() -> impl IntoResponse {
-    Json(VaiApi::openapi())
+    let mut doc = VaiApi::openapi();
+    // Merge postgres-only endpoint specs so they appear in /api/openapi.json
+    // even though they can't be included in the compile-time VaiApi derive.
+    #[cfg(feature = "postgres")]
+    {
+        use utoipa::OpenApi as _;
+        doc.merge(agent_secrets::AgentSecretsApiDoc::openapi());
+    }
+    Json(doc)
 }
 
 // ── Router builder (pub(crate) for integration tests) ────────────────────────
@@ -3513,7 +3524,19 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/ws/events", get(ws::ws_events_handler))
         // Migration endpoints (PRD 12.2, 12.5) — multi-repo mode.
         .route("/migrate", post(migrate_handler).layer(DefaultBodyLimit::max(MIGRATE_BODY_LIMIT)))
-        .route("/migration-stats", get(migration_stats_handler))
+        .route("/migration-stats", get(migration_stats_handler));
+
+    // Agent secrets endpoints require Postgres for AES-GCM encryption.
+    #[cfg(feature = "postgres")]
+    let repo_scoped = repo_scoped
+        .route("/agent-secrets", post(agent_secrets::set_agent_secret_handler))
+        .route("/agent-secrets", get(agent_secrets::list_agent_secrets_handler))
+        .route(
+            "/agent-secrets/:key",
+            axum::routing::delete(agent_secrets::delete_agent_secret_handler),
+        );
+
+    let repo_scoped = repo_scoped
         // Apply repo resolution first (outermost = runs last).
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),

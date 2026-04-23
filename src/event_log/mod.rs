@@ -217,6 +217,16 @@ pub enum EventKind {
         /// UUIDs of users/agents that were @mentioned in the comment body.
         mentions: Vec<Uuid>,
     },
+    /// A per-repo agent secret was set (created or updated).
+    RepoAgentSecretSet {
+        repo_id: Uuid,
+        key: String,
+    },
+    /// A per-repo agent secret was deleted.
+    RepoAgentSecretDeleted {
+        repo_id: Uuid,
+        key: String,
+    },
 }
 
 impl EventKind {
@@ -247,6 +257,8 @@ impl EventKind {
             EventKind::EscalationCreated { .. } => "EscalationCreated",
             EventKind::EscalationResolved { .. } => "EscalationResolved",
             EventKind::CommentCreated { .. } => "CommentCreated",
+            EventKind::RepoAgentSecretSet { .. } => "RepoAgentSecretSet",
+            EventKind::RepoAgentSecretDeleted { .. } => "RepoAgentSecretDeleted",
         }
     }
 

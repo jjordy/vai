@@ -5573,6 +5573,246 @@ async fn test_destroy_worker_endpoint() {
     shutdown_tx.send(()).ok();
 }
 
+/// Full roundtrip for per-repo agent secrets: set → list → delete → list empty.
+///
+/// Also verifies that a non-admin key is rejected with 403.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_agent_secrets_roundtrip() {
+    let Some(url) = db_url() else { return };
+
+    // Set a valid 32-byte AES key so encryption/decryption works.
+    // base64([0u8; 32]) = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    std::env::set_var(
+        "VAI_SECRETS_MASTER_KEY",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start server for agent secrets test");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": format!("e2e-secrets-{}", unique_suffix()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let repo_name = repo["name"].as_str().unwrap();
+    let rp = format!("{base}/api/repos/{repo_name}");
+
+    // Non-admin key (not user-associated) should get 403.
+    let non_admin_resp = client
+        .post(format!("{rp}/agent-secrets"))
+        .bearer_auth("not-an-admin-key")
+        .json(&serde_json::json!({ "key": "ANTHROPIC_API_KEY", "value": "sk-test" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        non_admin_resp.status(),
+        401,
+        "unauthenticated key should be 401"
+    );
+
+    // List on empty repo returns empty keys array.
+    let resp = client
+        .get(format!("{rp}/agent-secrets"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "list empty");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["keys"].as_array().unwrap().len(), 0, "should be empty initially");
+
+    // Set ANTHROPIC_API_KEY.
+    let resp = client
+        .post(format!("{rp}/agent-secrets"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "key": "ANTHROPIC_API_KEY", "value": "sk-ant-test-value" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "set ANTHROPIC_API_KEY: {}", resp.text().await.unwrap_or_default());
+
+    // Set GITHUB_TOKEN.
+    let resp = client
+        .post(format!("{rp}/agent-secrets"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "key": "GITHUB_TOKEN", "value": "ghp_test" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "set GITHUB_TOKEN");
+
+    // List should return both key names (sorted), never values.
+    let resp = client
+        .get(format!("{rp}/agent-secrets"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "list after set");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let keys = body["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 2, "should have 2 keys");
+    assert_eq!(keys[0].as_str().unwrap(), "ANTHROPIC_API_KEY");
+    assert_eq!(keys[1].as_str().unwrap(), "GITHUB_TOKEN");
+
+    // Overwrite ANTHROPIC_API_KEY (upsert semantics).
+    let resp = client
+        .post(format!("{rp}/agent-secrets"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "key": "ANTHROPIC_API_KEY", "value": "sk-ant-updated" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "overwrite ANTHROPIC_API_KEY");
+
+    // List still shows exactly 2 keys (not 3).
+    let resp = client
+        .get(format!("{rp}/agent-secrets"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["keys"].as_array().unwrap().len(), 2, "still 2 after overwrite");
+
+    // Delete GITHUB_TOKEN.
+    let resp = client
+        .delete(format!("{rp}/agent-secrets/GITHUB_TOKEN"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "delete GITHUB_TOKEN");
+
+    // Delete again — idempotent, still 200.
+    let resp = client
+        .delete(format!("{rp}/agent-secrets/GITHUB_TOKEN"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "second delete is idempotent");
+
+    // List now shows only ANTHROPIC_API_KEY.
+    let resp = client
+        .get(format!("{rp}/agent-secrets"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "list after delete");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let keys = body["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 1, "should have 1 key after delete");
+    assert_eq!(keys[0].as_str().unwrap(), "ANTHROPIC_API_KEY");
+
+    // Delete ANTHROPIC_API_KEY too.
+    let resp = client
+        .delete(format!("{rp}/agent-secrets/ANTHROPIC_API_KEY"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "delete ANTHROPIC_API_KEY");
+
+    // List is now empty again.
+    let resp = client
+        .get(format!("{rp}/agent-secrets"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "list after all deleted");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["keys"].as_array().unwrap().len(), 0, "empty after all deletes");
+
+    shutdown_tx.send(()).ok();
+}
+
+/// Validates key name rules for agent-secrets endpoints.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_agent_secrets_key_validation() {
+    let Some(url) = db_url() else { return };
+
+    std::env::set_var(
+        "VAI_SECRETS_MASTER_KEY",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start server");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": format!("e2e-secrets-val-{}", unique_suffix()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let repo_name = repo["name"].as_str().unwrap();
+    let rp = format!("{base}/api/repos/{repo_name}");
+
+    let bad_keys = [
+        ("", "empty key"),
+        ("lowercase_key", "lowercase letters"),
+        ("KEY WITH SPACES", "spaces"),
+        ("KEY-WITH-DASH", "dashes"),
+    ];
+    for (bad_key, reason) in bad_keys {
+        let resp = client
+            .post(format!("{rp}/agent-secrets"))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({ "key": bad_key, "value": "val" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "expected 400 for key {:?} ({})",
+            bad_key,
+            reason
+        );
+    }
+
+    // Valid keys should succeed.
+    let good_keys = ["MY_KEY", "KEY_123", "A", "KEY123", "MY_LONG_KEY_NAME_456"];
+    for good_key in good_keys {
+        let resp = client
+            .post(format!("{rp}/agent-secrets"))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({ "key": good_key, "value": "val" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "key {:?} should be valid", good_key);
+    }
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Extracts the content of a file from a gzip tarball by path suffix.
 fn extract_file_from_tarball(bytes: &[u8], path_suffix: &str) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;
