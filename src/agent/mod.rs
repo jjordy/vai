@@ -316,25 +316,79 @@ pub fn clear_state(dir: &Path) -> Result<(), AgentError> {
 
 // ── HTTP client helpers ───────────────────────────────────────────────────────
 
-/// Build an authenticated `reqwest::Client` request with `Authorization: Bearer <key>`.
-fn authed_client(api_key: Option<&str>) -> reqwest::Client {
-    let _ = api_key; // used at call site via header injection
-    reqwest::Client::new()
+/// Maximum total attempts for transient-network retries on idempotent GET operations.
+///
+/// Gives 3 retries with delays of 1 s, 2 s, 4 s → at most ~7 s of backoff before
+/// the fourth and final attempt.  Only used for idempotent calls.
+const RETRY_MAX_ATTEMPTS: u32 = 4;
+
+/// Base delay in milliseconds for retry exponential backoff.
+#[cfg(not(test))]
+const RETRY_BASE_DELAY_MS: u64 = 1_000;
+/// Near-zero delay in tests so the retry loop does not slow the suite.
+#[cfg(test)]
+const RETRY_BASE_DELAY_MS: u64 = 1;
+
+/// Returns `true` if the reqwest error is likely transient and worth retrying.
+///
+/// Transient means the error is at the network/transport layer: DNS resolution
+/// failures, connection refused, TLS handshake failures, TCP resets, and
+/// timeouts.  Application-layer errors (invalid URL, decode failure) are
+/// terminal and must not be retried.
+pub(crate) fn is_transient_reqwest_error(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout()
+}
+
+/// Send a request produced by `make_req`, retrying on transient network errors.
+///
+/// `make_req` is called once per attempt to produce a fresh [`reqwest::RequestBuilder`]
+/// (builders are consumed by `send()`).  On transient errors a message is logged to
+/// stderr and the next attempt waits with exponential backoff.  After
+/// [`RETRY_MAX_ATTEMPTS`] total attempts the final error is returned.
+///
+/// Only call this for idempotent operations (GET, HEAD, etc.).
+async fn send_with_retry<F>(make_req: F) -> Result<reqwest::Response, reqwest::Error>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    for attempt in 1u32.. {
+        match make_req().send().await {
+            Ok(resp) => return Ok(resp),
+            Err(e) if is_transient_reqwest_error(&e) && attempt < RETRY_MAX_ATTEMPTS => {
+                let delay_ms =
+                    std::cmp::min(RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1)), 8_000);
+                eprintln!(
+                    "  transient network error (attempt {attempt}/{RETRY_MAX_ATTEMPTS}), \
+                     retrying in {delay_ms}ms: {e}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
 }
 
 /// Make an authenticated GET request and parse the JSON response.
+///
+/// Retries up to [`RETRY_MAX_ATTEMPTS`] times on transient network errors.
 async fn agent_get<T: serde::de::DeserializeOwned>(
     server: &str,
     path: &str,
     api_key: Option<&str>,
 ) -> Result<T, AgentError> {
     let url = format!("{}/{}", server.trim_end_matches('/'), path.trim_start_matches('/'));
-    let client = authed_client(api_key);
-    let mut req = client.get(&url);
-    if let Some(key) = api_key {
-        req = req.header("Authorization", format!("Bearer {key}"));
-    }
-    let resp = req.send().await.map_err(|e| AgentError::ServerUnreachable {
+    let client = reqwest::Client::new();
+    let auth_header: Option<String> = api_key.map(|k| format!("Bearer {k}"));
+    let resp = send_with_retry(|| {
+        let mut req = client.get(&url);
+        if let Some(ref h) = auth_header {
+            req = req.header("Authorization", h.as_str());
+        }
+        req
+    })
+    .await
+    .map_err(|e| AgentError::ServerUnreachable {
         url: url.clone(),
         reason: e.to_string(),
     })?;
@@ -347,6 +401,8 @@ async fn agent_get<T: serde::de::DeserializeOwned>(
 }
 
 /// Make an authenticated POST request with a JSON body and parse the JSON response.
+///
+/// POST is not idempotent so no retry is applied.
 async fn agent_post<B: serde::Serialize, T: serde::de::DeserializeOwned>(
     server: &str,
     path: &str,
@@ -354,7 +410,7 @@ async fn agent_post<B: serde::Serialize, T: serde::de::DeserializeOwned>(
     body: &B,
 ) -> Result<T, AgentError> {
     let url = format!("{}/{}", server.trim_end_matches('/'), path.trim_start_matches('/'));
-    let client = authed_client(api_key);
+    let client = reqwest::Client::new();
     let mut req = client.post(&url).json(body);
     if let Some(key) = api_key {
         req = req.header("Authorization", format!("Bearer {key}"));
@@ -720,11 +776,16 @@ pub fn fetch_issue_raw(dir: &Path) -> Result<String, AgentError> {
             state.issue_id
         );
         let client = reqwest::Client::new();
-        let mut req = client.get(&url);
-        if let Some(key) = api_key.as_deref() {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = req.send().await.map_err(|e| AgentError::ServerUnreachable {
+        let auth_header: Option<String> = api_key.map(|k| format!("Bearer {k}"));
+        let resp = send_with_retry(|| {
+            let mut req = client.get(&url);
+            if let Some(ref h) = auth_header {
+                req = req.header("Authorization", h.as_str());
+            }
+            req
+        })
+        .await
+        .map_err(|e| AgentError::ServerUnreachable {
             url: url.clone(),
             reason: e.to_string(),
         })?;
@@ -914,6 +975,8 @@ pub fn download(dir: &Path, target_dir: &Path) -> Result<DownloadResult, AgentEr
 ///
 /// Returns the raw gzip bytes and the expected file count declared by the
 /// server in the `X-Vai-Expected-Files` response header (if present).
+///
+/// Retries up to [`RETRY_MAX_ATTEMPTS`] times on transient network errors.
 async fn fetch_files_tarball(
     server: &str,
     repo: &str,
@@ -925,11 +988,16 @@ async fn fetch_files_tarball(
         repo
     );
     let client = reqwest::Client::new();
-    let mut req = client.get(&url);
-    if let Some(key) = api_key {
-        req = req.header("Authorization", format!("Bearer {key}"));
-    }
-    let resp = req.send().await.map_err(|e| AgentError::ServerUnreachable {
+    let auth_header: Option<String> = api_key.map(|k| format!("Bearer {k}"));
+    let resp = send_with_retry(|| {
+        let mut req = client.get(&url);
+        if let Some(ref h) = auth_header {
+            req = req.header("Authorization", h.as_str());
+        }
+        req
+    })
+    .await
+    .map_err(|e| AgentError::ServerUnreachable {
         url: url.clone(),
         reason: e.to_string(),
     })?;
@@ -2568,6 +2636,92 @@ mod tests {
         assert!(
             path.ends_with(".vai/prompt.md"),
             "should fall back to legacy path, got {path:?}"
+        );
+    }
+
+    // ── retry policy tests ────────────────────────────────────────────────────
+
+    /// Return a port that is almost certainly not listening (bound briefly then freed).
+    fn unused_local_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    #[tokio::test]
+    async fn is_transient_on_connection_refused() {
+        let port = unused_local_port();
+        let err = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            is_transient_reqwest_error(&err),
+            "connection refused should be classified transient, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_not_transient_on_builder_error() {
+        // An invalid scheme produces a builder/URL error, not a network error.
+        let err = reqwest::Client::new()
+            .get("not-a-valid-url://host/path")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            !is_transient_reqwest_error(&err),
+            "builder error should NOT be classified transient, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_retries_transient_errors() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let port = unused_local_port();
+        let url = format!("http://127.0.0.1:{port}");
+        let call_count = Arc::new(AtomicU32::new(0));
+        let counter = call_count.clone();
+
+        let client = reqwest::Client::new();
+        let result = send_with_retry(|| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            client.get(&url)
+        })
+        .await;
+
+        assert!(result.is_err(), "all attempts should fail for unreachable port");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            RETRY_MAX_ATTEMPTS,
+            "should attempt exactly RETRY_MAX_ATTEMPTS={RETRY_MAX_ATTEMPTS} times before giving up"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_does_not_retry_on_non_transient_error() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let counter = call_count.clone();
+
+        let client = reqwest::Client::new();
+        let result = send_with_retry(|| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            client.get("not-a-valid-url://host")
+        })
+        .await;
+
+        assert!(result.is_err(), "should return error for bad URL");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "non-transient error must not be retried"
         );
     }
 }
