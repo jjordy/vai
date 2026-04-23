@@ -226,7 +226,7 @@ vai workspace discard <workspace-id>   # run from a machine with vai CLI + DB ac
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| Machine boots but immediately exits | `VAI_API_KEY` or `ANTHROPIC_API_KEY` not injected by orchestrator | Check `repo_agent_secrets` row exists; verify `FlyMachinesProvider::spawn()` injects env vars |
+| Machine boots but immediately exits | `VAI_API_KEY` or `ANTHROPIC_API_KEY` not injected by orchestrator | Verify `ANTHROPIC_API_KEY` is set as a Fly secret on the vai-server app (`fly secrets set ANTHROPIC_API_KEY=... --app vai-server`); `VAI_API_KEY` is a JWT minted by the server at spawn time — check server logs for `worker.spawned` events |
 | Worker claims but `vai agent download` fails | Staging server URL wrong or S3 credentials missing | Check `VAI_SERVER_URL` env var in machine; verify S3 bucket policy |
 | `cargo test` fails in vai canary | Rust toolchain version mismatch | Check `rust-toolchain.toml` in vai repo vs `rustup default stable` in image; pin image to same channel |
 | `playwright test` fails in dashboard canary | Chromium not found | Verify `PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/playwright-browsers` is set; re-run `playwright install chromium` in image build |
