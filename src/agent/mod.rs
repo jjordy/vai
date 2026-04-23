@@ -222,11 +222,77 @@ pub struct AgentState {
     pub claimed_at: DateTime<Utc>,
 }
 
+// ── Project-level config (vai.toml) ──────────────────────────────────────────
+
+/// Agent section of `vai.toml` — the tracked, project-wide quality-check config.
+///
+/// Structured as `[agent]` in `vai.toml` at the repository root. This is the
+/// authoritative source for check commands; `.vai/agent.toml [checks]` is the
+/// legacy fallback.
+///
+/// ```toml
+/// # vai.toml
+/// [agent]
+/// setup = ["pnpm install --frozen-lockfile"]
+/// commands = ["npx biome check src/", "npx tsc --noEmit", "pnpm test"]
+/// teardown = []
+///
+/// [agent.ignore]
+/// patterns = [".auth/", "e2e/results/"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectAgentConfig {
+    /// Shell commands to run before check commands (build, start servers, etc.).
+    #[serde(default)]
+    pub setup: Vec<String>,
+
+    /// Shell commands to verify agent output, run sequentially.
+    #[serde(default)]
+    pub commands: Vec<String>,
+
+    /// Shell commands to run after checks complete (pass or fail).
+    #[serde(default)]
+    pub teardown: Vec<String>,
+
+    /// Additional glob patterns to exclude from the submission tarball.
+    #[serde(default)]
+    pub ignore: Option<IgnoreConfig>,
+}
+
+impl ProjectAgentConfig {
+    /// Convert into a [`ChecksConfig`] for use in [`verify`].
+    fn into_checks_config(self) -> ChecksConfig {
+        ChecksConfig {
+            setup: self.setup,
+            commands: self.commands,
+            teardown: self.teardown,
+        }
+    }
+}
+
+/// Project-level vai configuration stored in `vai.toml` at the repository root.
+///
+/// Tracked in the repo like `Cargo.toml` or `package.json`. Contains settings
+/// that should apply to all developers and agents cloning the project.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VaiProjectConfig {
+    /// Agent verification and submission configuration.
+    #[serde(default)]
+    pub agent: Option<ProjectAgentConfig>,
+}
+
 // ── File path helpers ─────────────────────────────────────────────────────────
 
 /// Path of the agent config file within `dir`.
 pub fn config_path(dir: &Path) -> PathBuf {
     dir.join(".vai").join("agent.toml")
+}
+
+/// Path of the project-level config file at the repo root.
+///
+/// Unlike `.vai/agent.toml`, this file is tracked in the repository.
+pub fn project_config_path(dir: &Path) -> PathBuf {
+    dir.join("vai.toml")
 }
 
 /// Path of the agent state file within `dir`.
@@ -245,6 +311,55 @@ pub fn load_config(dir: &Path) -> Result<AgentConfig, AgentError> {
         .map_err(|e| AgentError::Other(format!("cannot read {}: {}", path.display(), e)))?;
     let config: AgentConfig = toml::from_str(&contents)?;
     Ok(config)
+}
+
+/// Load project-level configuration from `<dir>/vai.toml`.
+///
+/// Returns `Ok(None)` if `vai.toml` does not exist (not an error — the project
+/// may not have migrated yet).  Returns `Err` only on parse failure.
+pub fn load_project_config(dir: &Path) -> Result<Option<VaiProjectConfig>, AgentError> {
+    let path = project_config_path(dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&path)
+        .map_err(|e| AgentError::Other(format!("cannot read {}: {}", path.display(), e)))?;
+    let config: VaiProjectConfig = toml::from_str(&contents)?;
+    Ok(Some(config))
+}
+
+/// Resolve the effective [`ChecksConfig`] and ignore patterns, applying config precedence.
+///
+/// Precedence:
+/// 1. `vai.toml` `[agent]` section at repo root (tracked, authoritative)
+/// 2. `.vai/agent.toml` `[checks]` section (legacy, per-developer override)
+///
+/// Returns `(checks, ignore_patterns, used_legacy)`.  When `used_legacy` is `true`
+/// the caller should emit a deprecation hint.
+pub fn resolve_checks_config(
+    dir: &Path,
+) -> Result<(Option<ChecksConfig>, Vec<String>, bool), AgentError> {
+    if let Some(proj) = load_project_config(dir)? {
+        let ignore = proj
+            .agent
+            .as_ref()
+            .and_then(|a| a.ignore.as_ref())
+            .map(|i| i.patterns.clone())
+            .unwrap_or_default();
+        let checks = proj.agent.map(ProjectAgentConfig::into_checks_config);
+        return Ok((checks, ignore, false));
+    }
+
+    // Fall back to legacy .vai/agent.toml
+    let legacy = load_config(dir).ok();
+    let checks = legacy.as_ref().and_then(|c| c.checks.clone());
+    let ignore = legacy
+        .as_ref()
+        .and_then(|c| c.ignore.as_ref())
+        .map(|i| i.patterns.clone())
+        .unwrap_or_default();
+    let used_legacy = checks.is_some();
+    Ok((checks, ignore, used_legacy))
 }
 
 /// Resolve the effective agent config, merging file, env vars, and CLI overrides.
@@ -1170,11 +1285,8 @@ pub fn submit(dir: &Path, work_dir: &Path) -> Result<SubmitResult, AgentError> {
     let api_key = AgentConfig::resolve_api_key();
     let api_key_ref = api_key.as_deref();
 
-    let ignore_patterns = config
-        .ignore
-        .as_ref()
-        .map(|i| i.patterns.clone())
-        .unwrap_or_default();
+    // Ignore patterns: vai.toml [agent.ignore] takes precedence over .vai/agent.toml [ignore].
+    let (_checks, ignore_patterns, _used_legacy) = resolve_checks_config(dir)?;
 
     let tarball = build_agent_tarball(work_dir, &ignore_patterns)?;
 
@@ -1707,11 +1819,16 @@ pub struct VerifyResult {
     pub no_checks_configured: bool,
 }
 
-/// Run quality checks configured under `[checks]` in `.vai/agent.toml`.
+/// Run quality checks configured under `[agent]` in `vai.toml` (or the legacy
+/// `[checks]` section in `.vai/agent.toml`).
 ///
-/// Each command in `checks.commands` is executed sequentially with `work_dir`
-/// as its working directory.  If a command exits non-zero, execution continues
-/// so that all failures are collected and reported.
+/// Config precedence:
+/// 1. `vai.toml` `[agent]` at repo root — tracked, authoritative
+/// 2. `.vai/agent.toml` `[checks]` — legacy, per-developer override
+///
+/// Each command in `commands` is executed sequentially with `work_dir` as its
+/// working directory.  If a command exits non-zero, execution continues so that
+/// all failures are collected and reported.
 ///
 /// Returns [`VerifyResult`] with results for every check.  The caller should
 /// inspect `all_passed` and exit with a non-zero code on failure.
@@ -1719,8 +1836,15 @@ pub struct VerifyResult {
 /// If no checks are configured the function returns successfully with
 /// `no_checks_configured = true`.
 pub fn verify(dir: &Path, work_dir: &Path) -> Result<VerifyResult, AgentError> {
-    let config = load_config(dir)?;
-    let checks_config = config.checks;
+    let (checks_config, _ignore, used_legacy) = resolve_checks_config(dir)?;
+
+    if used_legacy && checks_config.is_some() {
+        eprintln!(
+            "hint: move [checks] from .vai/agent.toml to [agent] in vai.toml \
+             for project-wide agent config that ships with the repo"
+        );
+    }
+
     let commands = checks_config
         .as_ref()
         .map(|c| c.commands.clone())
@@ -2437,6 +2561,91 @@ mod tests {
         };
         let toml = toml::to_string(&cfg).unwrap();
         fs::write(vai_dir.join("agent.toml"), toml).unwrap();
+    }
+
+    fn write_vai_toml(dir: &Path, commands: Vec<&str>) {
+        let cmds: Vec<String> = commands.into_iter().map(String::from).collect();
+        let content = format!(
+            "[agent]\ncommands = {}\n",
+            serde_json::to_string(&cmds).unwrap()
+        );
+        fs::write(dir.join("vai.toml"), content).unwrap();
+    }
+
+    // ── vai.toml config precedence tests ─────────────────────────────────────
+
+    #[test]
+    fn resolve_checks_vai_toml_wins_over_legacy() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // Write vai.toml with one command.
+        write_vai_toml(dir, vec!["true"]);
+        // Write legacy .vai/agent.toml with a different command that would fail.
+        write_config_with_checks(dir, vec!["false"]);
+
+        let result = verify(dir, dir).unwrap();
+        assert!(result.all_passed, "vai.toml should take precedence and run `true`");
+        assert!(!result.no_checks_configured);
+        assert_eq!(result.checks.len(), 1);
+    }
+
+    #[test]
+    fn resolve_checks_only_vai_toml() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_vai_toml(dir, vec!["true", "echo hello"]);
+
+        let result = verify(dir, dir).unwrap();
+        assert!(result.all_passed);
+        assert!(!result.no_checks_configured);
+        assert_eq!(result.checks.len(), 2);
+    }
+
+    #[test]
+    fn resolve_checks_only_legacy_agent_toml() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // No vai.toml — falls back to .vai/agent.toml.
+        write_config_with_checks(dir, vec!["true"]);
+
+        let (checks, _ignore, used_legacy) = resolve_checks_config(dir).unwrap();
+        assert!(used_legacy, "should report legacy path used");
+        assert!(checks.is_some());
+        assert!(!checks.unwrap().commands.is_empty());
+    }
+
+    #[test]
+    fn resolve_checks_neither_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join(".vai")).unwrap();
+        // Write a minimal agent.toml with no checks section.
+        let cfg = AgentConfig {
+            server: "https://vai.example.com".to_string(),
+            repo: "myrepo".to_string(),
+            prompt_template: None,
+            default_agent: None,
+            checks: None,
+            ignore: None,
+        };
+        fs::write(dir.join(".vai").join("agent.toml"), toml::to_string(&cfg).unwrap()).unwrap();
+
+        let result = verify(dir, dir).unwrap();
+        assert!(result.all_passed, "no checks → trivially passes");
+        assert!(result.no_checks_configured);
+        assert!(result.checks.is_empty());
+    }
+
+    #[test]
+    fn vai_toml_ignore_patterns_used_in_resolve() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let content = "[agent]\ncommands = [\"true\"]\n\n[agent.ignore]\npatterns = [\".auth/\"]\n";
+        fs::write(dir.join("vai.toml"), content).unwrap();
+
+        let (_checks, ignore, used_legacy) = resolve_checks_config(dir).unwrap();
+        assert!(!used_legacy);
+        assert_eq!(ignore, vec![".auth/"]);
     }
 
     #[test]

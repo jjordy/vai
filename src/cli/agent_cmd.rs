@@ -155,7 +155,10 @@ pub(super) fn handle(agent_cmd: AgentCommands, json: bool) -> Result<(), CliErro
                     std::process::exit(1);
                 }
             } else if result.no_checks_configured {
-                eprintln!("warning: no checks configured in .vai/agent.toml — nothing to verify");
+                eprintln!(
+                    "warning: no checks configured — add an [agent] section to vai.toml \
+                     (or a legacy [checks] section in .vai/agent.toml) to enable verification"
+                );
             } else if result.all_passed {
                 use colored::Colorize;
                 let count = result.checks.len();
