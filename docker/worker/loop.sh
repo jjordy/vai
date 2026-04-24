@@ -18,6 +18,7 @@
 #   EMPTY_QUEUE_SLEEP       — seconds to sleep when no issues are available (default: 30)
 #   MAX_HTTP_RETRIES        — max retries for transient HTTP failures (default: 5)
 #   DEV_SERVER_TIMEOUT_SECS — seconds to wait for dev server ready before aborting (default: 180)
+#   DEV_SERVER_MAX_CONSECUTIVE_FAILURES — exit after N consecutive dev-server-timeout iterations (default: 3)
 #   VAI_WORKER_STALE_SECS   — server-side: seconds without heartbeat before worker is reaped (default: 900)
 #                             bump this if verify steps (tsc, test suites) take longer than 15 min
 set -euo pipefail
@@ -36,6 +37,8 @@ LOG_BATCH_INTERVAL="${LOG_BATCH_INTERVAL:-5}"
 EMPTY_QUEUE_SLEEP="${EMPTY_QUEUE_SLEEP:-30}"
 MAX_HTTP_RETRIES="${MAX_HTTP_RETRIES:-5}"
 DEV_SERVER_TIMEOUT_SECS="${DEV_SERVER_TIMEOUT_SECS:-180}"
+DEV_SERVER_MAX_CONSECUTIVE_FAILURES="${DEV_SERVER_MAX_CONSECUTIVE_FAILURES:-3}"
+DEV_SERVER_CONSECUTIVE_FAILURES=0
 
 WORK_DIR="${HOME}/work"
 # Capture all output to a log file so the background shipper can read it.
@@ -308,12 +311,19 @@ while true; do
             sleep 1
         done
         if [ "$dev_ready" -eq 0 ]; then
-            echo "[worker] Dev server did not respond within ${DEV_SERVER_TIMEOUT_SECS}s — aborting iteration" >&2
+            DEV_SERVER_CONSECUTIVE_FAILURES=$((DEV_SERVER_CONSECUTIVE_FAILURES + 1))
+            echo "[worker] Dev server did not respond within ${DEV_SERVER_TIMEOUT_SECS}s (failure ${DEV_SERVER_CONSECUTIVE_FAILURES}/${DEV_SERVER_MAX_CONSECUTIVE_FAILURES})" >&2
             cleanup_iteration
             vai agent reset || true
             rm -rf "${WORK_DIR}"
+            if [ "$DEV_SERVER_CONSECUTIVE_FAILURES" -ge "$DEV_SERVER_MAX_CONSECUTIVE_FAILURES" ]; then
+                echo "[worker] Too many consecutive dev server failures — exiting" >&2
+                exit 2
+            fi
             continue
         fi
+        # Reset failure counter on successful dev server start.
+        DEV_SERVER_CONSECUTIVE_FAILURES=0
     fi
 
     # ── Agent invocation ──────────────────────────────────────────────────────
