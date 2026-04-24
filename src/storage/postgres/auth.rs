@@ -30,6 +30,45 @@ impl AuthStore for PostgresStorage {
         let key_hash = hash_token(&token);
         let key_prefix = token[..8].to_string();
 
+        // When a user_id is present, upsert: rotate any existing non-revoked key
+        // with the same (user_id, name) rather than accumulating duplicates.
+        // Relies on the partial unique index api_keys_user_name_active.
+        if user_id.is_some() {
+            let row = sqlx::query(
+                r#"
+                INSERT INTO api_keys
+                    (id, repo_id, name, key_hash, key_prefix, user_id, role_override,
+                     agent_type, expires_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (user_id, name) WHERE NOT revoked AND user_id IS NOT NULL
+                DO UPDATE SET
+                    key_hash      = EXCLUDED.key_hash,
+                    key_prefix    = EXCLUDED.key_prefix,
+                    created_at    = now(),
+                    last_used_at  = NULL,
+                    role_override = COALESCE(api_keys.role_override, EXCLUDED.role_override)
+                RETURNING id, name, key_prefix, last_used_at, created_at, revoked,
+                          user_id, role_override, agent_type, expires_at
+                "#,
+            )
+            .bind(&id)
+            .bind(repo_id)
+            .bind(name)
+            .bind(&key_hash)
+            .bind(&key_prefix)
+            .bind(user_id)
+            .bind(role_override)
+            .bind(agent_type)
+            .bind(expires_at)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+            let key = row_to_api_key(row)?;
+            return Ok((key, token));
+        }
+
+        // No user_id → plain INSERT (repo-scoped keys, admin keys, etc.)
         sqlx::query(
             r#"
             INSERT INTO api_keys

@@ -5918,6 +5918,140 @@ async fn test_agent_secrets_key_validation() {
     shutdown_tx.send(()).ok();
 }
 
+/// Verifies that calling `POST /api/keys` twice with the same user + name rotates
+/// (upserts) the key instead of accumulating duplicates.
+///
+/// Flow:
+/// 1. Create a user
+/// 2. Mint key #1 with name "my-cli-key" via admin `for_user_id`
+/// 3. Mint key #2 with the same name — should succeed and return a *different* token
+/// 4. Old token #1 must now be invalid (rotated out)
+/// 5. New token #2 must be valid
+/// 6. `GET /api/keys` for the user shows exactly one active key with that name
+/// 7. Mint key with a *different* name — two separate active keys now exist
+#[tokio::test(flavor = "multi_thread")]
+async fn test_api_key_login_upsert() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("server start failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+    let sfx = unique_suffix();
+
+    // 1. Create a user.
+    let resp = client
+        .post(format!("{base}/api/users"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("Bob-{sfx}"),
+            "email": format!("bob-{sfx}@example.com"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create user: {}", resp.text().await.unwrap_or_default());
+    let user: serde_json::Value = resp.json().await.unwrap();
+    let user_id = user["id"].as_str().unwrap().to_string();
+
+    // 2. Mint key #1.
+    let resp = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("CLI on bob-laptop-{sfx}"),
+            "for_user_id": user_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create key #1: {}", resp.text().await.unwrap_or_default());
+    let k1: serde_json::Value = resp.json().await.unwrap();
+    let token1 = k1["token"].as_str().unwrap().to_string();
+    let key_id1 = k1["key"]["id"].as_str().unwrap().to_string();
+
+    // 3. Mint key #2 — same name → should rotate and return a different token.
+    let resp = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("CLI on bob-laptop-{sfx}"),
+            "for_user_id": user_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create key #2 (upsert): {}", resp.text().await.unwrap_or_default());
+    let k2: serde_json::Value = resp.json().await.unwrap();
+    let token2 = k2["token"].as_str().unwrap().to_string();
+    let key_id2 = k2["key"]["id"].as_str().unwrap().to_string();
+    assert_ne!(token1, token2, "rotated key must have a different token");
+    assert_eq!(key_id1, key_id2, "rotated key must reuse the same row id");
+
+    // 4. Old token #1 must now be invalid (secret rotated out).
+    let resp = client
+        .get(format!("{base}/api/keys"))
+        .bearer_auth(&token1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "old token must be rejected after rotation");
+
+    // 5. New token #2 must be valid.
+    let resp = client
+        .get(format!("{base}/api/keys"))
+        .bearer_auth(&token2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "new token must be accepted: {}", resp.text().await.unwrap_or_default());
+
+    // 6. Exactly one active key with the upserted name.
+    let keys: serde_json::Value = resp.json().await.unwrap();
+    let matching: Vec<&serde_json::Value> = keys
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|k| k["name"].as_str() == Some(&format!("CLI on bob-laptop-{sfx}")))
+        .collect();
+    assert_eq!(matching.len(), 1, "must have exactly one active key for that name, got {}", matching.len());
+
+    // 7. A key with a *different* name creates a separate row.
+    let resp = client
+        .post(format!("{base}/api/keys"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "name": format!("CI bot-{sfx}"),
+            "for_user_id": user_id,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "different name creates new key");
+    let token3 = resp.json::<serde_json::Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(token2, token3, "separate name must yield a separate key");
+
+    // Both token2 and token3 are valid simultaneously.
+    for tok in [&token2, &token3] {
+        let resp = client
+            .get(format!("{base}/api/keys"))
+            .bearer_auth(tok)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "token {tok} should still be valid");
+    }
+
+    shutdown_tx.send(()).ok();
+}
+
 /// Extracts the content of a file from a gzip tarball by path suffix.
 fn extract_file_from_tarball(bytes: &[u8], path_suffix: &str) -> Option<Vec<u8>> {
     use flate2::read::GzDecoder;
