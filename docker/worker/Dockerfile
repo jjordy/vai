@@ -109,5 +109,7 @@ ENV HOME=/home/agent \
 WORKDIR /home/agent
 
 # loop.sh is the worker entrypoint (issue #348).
-# Until it is present the container exits non-zero at runtime — this is expected.
+# Built files from repo's docker/worker/ are the build context for this image.
+COPY --chmod=0755 loop.sh /usr/local/bin/loop.sh
+
 CMD ["/usr/local/bin/loop.sh"]
