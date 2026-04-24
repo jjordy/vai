@@ -12,10 +12,12 @@
 #   ANTHROPIC_API_KEY — required by Claude Code; injected by the orchestrator
 #
 # Optional environment variables:
-#   HEARTBEAT_INTERVAL   — seconds between heartbeat POSTs (default: 30)
-#   LOG_BATCH_INTERVAL   — seconds between log batch POSTs (default: 5)
-#   EMPTY_QUEUE_SLEEP    — seconds to sleep when no issues are available (default: 30)
-#   MAX_HTTP_RETRIES     — max retries for transient HTTP failures (default: 5)
+#   HEARTBEAT_INTERVAL      — seconds between heartbeat POSTs (default: 30)
+#   HEARTBEAT_MAX_FAILURES  — consecutive heartbeat failures before self-terminating (default: 10)
+#   LOG_BATCH_INTERVAL      — seconds between log batch POSTs (default: 5)
+#   EMPTY_QUEUE_SLEEP       — seconds to sleep when no issues are available (default: 30)
+#   MAX_HTTP_RETRIES        — max retries for transient HTTP failures (default: 5)
+#   DEV_SERVER_TIMEOUT_SECS — seconds to wait for dev server ready before aborting (default: 180)
 set -euo pipefail
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -27,9 +29,11 @@ set -euo pipefail
 : "${ANTHROPIC_API_KEY:?Required: ANTHROPIC_API_KEY (injected by the orchestrator)}"
 
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"
+HEARTBEAT_MAX_FAILURES="${HEARTBEAT_MAX_FAILURES:-10}"
 LOG_BATCH_INTERVAL="${LOG_BATCH_INTERVAL:-5}"
 EMPTY_QUEUE_SLEEP="${EMPTY_QUEUE_SLEEP:-30}"
 MAX_HTTP_RETRIES="${MAX_HTTP_RETRIES:-5}"
+DEV_SERVER_TIMEOUT_SECS="${DEV_SERVER_TIMEOUT_SECS:-180}"
 
 WORK_DIR="${HOME}/work"
 # Capture all output to a log file so the background shipper can read it.
@@ -100,10 +104,20 @@ api_post() {
 # ── Heartbeat loop (background) ───────────────────────────────────────────────
 
 heartbeat_loop() {
+    local failures=0
     while true; do
         sleep "$HEARTBEAT_INTERVAL"
-        api_post "/api/agent-workers/${VAI_WORKER_ID}/heartbeat" '{}' \
-            || echo "[worker] heartbeat failed (continuing)" >&2
+        if api_post "/api/agent-workers/${VAI_WORKER_ID}/heartbeat" '{}'; then
+            failures=0
+        else
+            failures=$((failures + 1))
+            echo "[worker] heartbeat failed (${failures}/${HEARTBEAT_MAX_FAILURES} consecutive)" >&2
+            if [ "$failures" -ge "$HEARTBEAT_MAX_FAILURES" ]; then
+                echo "[worker] heartbeat failed ${HEARTBEAT_MAX_FAILURES} times — terminating worker" >&2
+                kill "$$"
+                return
+            fi
+        fi
     done
 }
 
@@ -190,7 +204,7 @@ cleanup() {
     exit 0
 }
 
-trap cleanup SIGTERM SIGINT
+trap cleanup SIGTERM SIGINT EXIT
 
 # ── MCP config (written once, reused each iteration) ─────────────────────────
 
@@ -280,9 +294,9 @@ while true; do
         DEV_PID=$!
         echo "[worker] Dev server started, PID=${DEV_PID}"
 
-        # Wait up to 60 s for the dev server to respond on port 3000.
+        # Wait up to DEV_SERVER_TIMEOUT_SECS for the dev server to respond.
         dev_ready=0
-        for i in $(seq 1 60); do
+        for i in $(seq 1 "$DEV_SERVER_TIMEOUT_SECS"); do
             if curl -sS -o /dev/null -w '%{http_code}' http://localhost:3000 2>/dev/null \
                | grep -qE '^(200|302|307)$'; then
                 echo "[worker] Dev server ready after ${i}s"
@@ -292,7 +306,11 @@ while true; do
             sleep 1
         done
         if [ "$dev_ready" -eq 0 ]; then
-            echo "[worker] Dev server did not respond within 60s — claude will proceed anyway" >&2
+            echo "[worker] Dev server did not respond within ${DEV_SERVER_TIMEOUT_SECS}s — aborting iteration" >&2
+            cleanup_iteration
+            vai agent reset || true
+            rm -rf "${WORK_DIR}"
+            continue
         fi
     fi
 

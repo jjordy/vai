@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::storage::{NewWorker, WorkerDoneReason, WorkerStore};
 
-use super::compute::{ComputeProvider, MachineId, WorkerSpec};
+use super::compute::{ComputeProvider, MachineId, ProviderError, WorkerSpec};
 
 /// Hard-coded per-repo concurrency cap used until org-level plan billing lands
 /// (PRD 28 Phase 4).  Mirrors the `free` tier in the `plans` table.
@@ -171,7 +171,7 @@ pub async fn spawn_if_capacity(
     let spec = WorkerSpec {
         image: config.worker_image.to_string(),
         env,
-        resources: super::compute::ResourceClass::Medium,
+        resources: super::compute::ResourceClass::Large,
         labels: {
             let mut l = std::collections::HashMap::new();
             l.insert("vai_repo_id".into(), repo_id.to_string());
@@ -214,10 +214,14 @@ pub async fn spawn_if_capacity(
 const DEFAULT_STALE_SECS: u32 = 300;
 
 /// Reconcile one pass: find stale workers, discard their workspaces, reopen
-/// their issues, and mark them dead.
+/// their issues, mark them dead, and destroy their Fly machines.
 ///
 /// Returns the number of workers marked dead.
-async fn reconcile_once(storage: &crate::storage::StorageBackend, stale_secs: u32) -> u32 {
+async fn reconcile_once(
+    storage: &crate::storage::StorageBackend,
+    stale_secs: u32,
+    compute: &Arc<dyn ComputeProvider>,
+) -> u32 {
     let workers = storage.workers();
     let stale = match workers.list_stale_workers(stale_secs).await {
         Ok(v) => v,
@@ -286,6 +290,31 @@ async fn reconcile_once(storage: &crate::storage::StorageBackend, stale_secs: u3
                     "dead-worker reconciliation: worker marked dead"
                 );
                 marked += 1;
+
+                // Destroy the Fly machine so it stops burning compute quota.
+                if let Some(mid) = &worker.machine_id {
+                    let mid = MachineId(mid.clone());
+                    match compute.destroy(&mid).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                worker_id = %worker.id,
+                                machine_id = %mid,
+                                "dead-worker reconciliation: machine destroyed"
+                            );
+                        }
+                        Err(ProviderError::NotFound(_)) => {
+                            // Machine already gone — nothing to do.
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                worker_id = %worker.id,
+                                machine_id = %mid,
+                                error = %e,
+                                "dead-worker reconciliation: destroy machine failed (non-fatal)"
+                            );
+                        }
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -304,7 +333,13 @@ async fn reconcile_once(storage: &crate::storage::StorageBackend, stale_secs: u3
 ///
 /// Interval defaults to 60 s (`VAI_WORKER_RECONCILE_INTERVAL_SECS`) and stale
 /// threshold defaults to 300 s (`VAI_WORKER_STALE_SECS`).
-pub fn run_reconciliation_loop(storage: crate::storage::StorageBackend) {
+///
+/// When a stale worker is reaped, its backing Fly machine is destroyed via
+/// `compute` so it stops burning quota.
+pub fn run_reconciliation_loop(
+    storage: crate::storage::StorageBackend,
+    compute: Arc<dyn ComputeProvider>,
+) {
     let interval_secs: u64 = std::env::var("VAI_WORKER_RECONCILE_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -328,7 +363,7 @@ pub fn run_reconciliation_loop(storage: crate::storage::StorageBackend) {
 
         loop {
             tick.tick().await;
-            let n = reconcile_once(&storage, stale_secs).await;
+            let n = reconcile_once(&storage, stale_secs, &compute).await;
             if n > 0 {
                 tracing::info!(workers_reaped = n, "dead-worker reconciliation completed");
             }
