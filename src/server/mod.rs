@@ -590,6 +590,14 @@ pub struct AgentIdentity {
     /// When present, the key's effective permissions are the lesser of the
     /// user's computed role and this override value.
     pub role_override: Option<String>,
+    /// Repository the JWT is scoped to, if the token carried a `repo_id` claim.
+    ///
+    /// Used for user-less service tokens (e.g. cloud-worker JWTs minted by
+    /// `spawn_if_capacity`) that grant per-repo access without being attached
+    /// to a user in the orgs table. `require_repo_permission` accepts such
+    /// tokens when `role_override == Some("worker")` and the scope matches
+    /// the target repo.
+    pub jwt_repo_scope: Option<uuid::Uuid>,
     /// How this request was authenticated.
     pub auth_source: AuthSource,
 }
@@ -790,12 +798,17 @@ async fn auth_middleware(
                 let user_id = uuid::Uuid::parse_str(&claims.sub).ok();
                 let is_admin = claims.role.as_deref() == Some("admin");
                 let name = claims.name.unwrap_or_else(|| claims.sub.clone());
+                let jwt_repo_scope = claims
+                    .repo_id
+                    .as_deref()
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
                 request.extensions_mut().insert(AgentIdentity {
                     key_id: format!("jwt:{}", claims.sub),
                     name,
                     is_admin,
                     user_id,
                     role_override: claims.role,
+                    jwt_repo_scope,
                     auth_source: AuthSource::Jwt,
                 });
                 return next.run(request).await;
@@ -840,6 +853,7 @@ async fn auth_middleware(
                 is_admin: false,
                 user_id: api_key.user_id,
                 role_override: api_key.role_override,
+                jwt_repo_scope: None,
                 auth_source: AuthSource::ApiKey,
             });
             return next.run(request).await;
@@ -863,6 +877,7 @@ async fn auth_middleware(
             is_admin: true,
             user_id: None,
             role_override: None,
+            jwt_repo_scope: None,
             auth_source: AuthSource::AdminKey,
         });
         return next.run(request).await;
@@ -1359,6 +1374,39 @@ async fn require_repo_permission(
     // In local (SQLite) mode there are no users/orgs — any valid key passes.
     if matches!(storage, StorageBackend::Local(_)) {
         return Ok(RepoRole::Owner);
+    }
+
+    // Cloud-worker JWT path: tokens minted by `spawn_if_capacity` have
+    // role_override="worker" and a repo_id claim, but no user association.
+    // They grant Write access when the scope matches the target repo.
+    if identity.role_override.as_deref() == Some("worker") {
+        if identity.jwt_repo_scope == Some(*repo_id) {
+            // Worker role is capped at Write; reject if caller needs
+            // Admin / Owner.
+            if matches!(required, RepoRole::Admin | RepoRole::Owner) {
+                tracing::warn!(
+                    event = "permission.denied",
+                    actor = %identity.name,
+                    repo = %repo_id,
+                    required = %required.as_str(),
+                    reason = "worker_role_insufficient",
+                    "permission denied: worker role capped at Write"
+                );
+                return Err(ApiError::forbidden("worker role cannot perform this action"));
+            }
+            return Ok(RepoRole::Write);
+        }
+        tracing::warn!(
+            event = "permission.denied",
+            actor = %identity.name,
+            repo = %repo_id,
+            required = %required.as_str(),
+            reason = "worker_scope_mismatch",
+            "permission denied: worker JWT scoped to a different repo"
+        );
+        return Err(ApiError::forbidden(
+            "worker token is not scoped to this repo",
+        ));
     }
 
     let user_id = match &identity.user_id {

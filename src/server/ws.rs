@@ -150,12 +150,17 @@ pub(super) async fn ws_events_handler(
                 let user_id = uuid::Uuid::parse_str(&claims.sub).ok();
                 let is_admin = claims.role.as_deref() == Some("admin");
                 let name = claims.name.unwrap_or_else(|| claims.sub.clone());
+                let jwt_repo_scope = claims
+                    .repo_id
+                    .as_deref()
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
                 AgentIdentity {
                     key_id: format!("jwt:{}", claims.sub),
                     name,
                     is_admin,
                     user_id,
                     role_override: claims.role,
+                    jwt_repo_scope,
                     auth_source: AuthSource::Jwt,
                 }
             }
@@ -185,6 +190,7 @@ pub(super) async fn ws_events_handler(
                                     is_admin: false,
                                     user_id: Some(user.id),
                                     role_override: None,
+                                    jwt_repo_scope: None,
                                     auth_source: AuthSource::Jwt,
                                 }
                             }
@@ -207,6 +213,7 @@ pub(super) async fn ws_events_handler(
             is_admin: true,
             user_id: None,
             role_override: None,
+            jwt_repo_scope: None,
             auth_source: AuthSource::AdminKey,
         }
     } else {
@@ -220,6 +227,7 @@ pub(super) async fn ws_events_handler(
                     is_admin: false,
                     user_id: api_key.user_id,
                     role_override: api_key.role_override,
+                    jwt_repo_scope: None,
                     auth_source: AuthSource::ApiKey,
                 }
             }
