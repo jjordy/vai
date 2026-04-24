@@ -5,7 +5,7 @@
 //! issue-creation handler after a new issue is persisted.
 //!
 //! [`run_reconciliation_loop`] is a background task that periodically finds
-//! stale workers (no heartbeat for `VAI_WORKER_STALE_SECS`, default 300 s)
+//! stale workers (no heartbeat for `VAI_WORKER_STALE_SECS`, default 900 s)
 //! and marks them dead, discarding their claimed workspaces so the linked
 //! issues requeue automatically.
 
@@ -211,7 +211,7 @@ pub async fn spawn_if_capacity(
 
 /// Default stale threshold in seconds (5 minutes = 10 missed heartbeats at
 /// the default 30 s interval).
-const DEFAULT_STALE_SECS: u32 = 300;
+const DEFAULT_STALE_SECS: u32 = 900;
 
 /// Reconcile one pass: find stale workers, discard their workspaces, reopen
 /// their issues, mark them dead, and destroy their Fly machines.
@@ -332,7 +332,7 @@ async fn reconcile_once(
 /// Spawn a background task that periodically reconciles dead workers.
 ///
 /// Interval defaults to 60 s (`VAI_WORKER_RECONCILE_INTERVAL_SECS`) and stale
-/// threshold defaults to 300 s (`VAI_WORKER_STALE_SECS`).
+/// threshold defaults to 900 s (`VAI_WORKER_STALE_SECS`).
 ///
 /// When a stale worker is reaped, its backing Fly machine is destroyed via
 /// `compute` so it stops burning quota.

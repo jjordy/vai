@@ -18,6 +18,8 @@
 #   EMPTY_QUEUE_SLEEP       — seconds to sleep when no issues are available (default: 30)
 #   MAX_HTTP_RETRIES        — max retries for transient HTTP failures (default: 5)
 #   DEV_SERVER_TIMEOUT_SECS — seconds to wait for dev server ready before aborting (default: 180)
+#   VAI_WORKER_STALE_SECS   — server-side: seconds without heartbeat before worker is reaped (default: 900)
+#                             bump this if verify steps (tsc, test suites) take longer than 15 min
 set -euo pipefail
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
