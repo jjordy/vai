@@ -755,18 +755,24 @@ pub(super) async fn discard_workspace_handler(
     // Remove from conflict engine — workspace is no longer active.
     state.conflict_engine.lock().await.remove_workspace(&ws_uuid);
 
-    // If workspace was linked to an issue, transition it back to Open.
+    // If workspace was linked to an issue, transition it back to Open — but only
+    // if the issue is currently InProgress.  If the operator already closed or
+    // resolved the issue, do not overwrite their intent.
     if let Some(iid) = issue_id {
-        let _ = ctx.storage.issues()
-            .update_issue(
-                &ctx.repo_id,
-                &iid,
-                crate::storage::IssueUpdate {
-                    status: Some(crate::issue::IssueStatus::Open),
-                    ..Default::default()
-                },
-            )
-            .await;
+        if let Ok(current) = ctx.storage.issues().get_issue(&ctx.repo_id, &iid).await {
+            if current.status == crate::issue::IssueStatus::InProgress {
+                let _ = ctx.storage.issues()
+                    .update_issue(
+                        &ctx.repo_id,
+                        &iid,
+                        crate::storage::IssueUpdate {
+                            status: Some(crate::issue::IssueStatus::Open),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+            }
+        }
     }
 
     // Append event to event store — triggers pg_notify in Postgres mode.

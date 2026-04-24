@@ -399,6 +399,180 @@ async fn test_workspace_discard() {
     shutdown_tx.send(()).ok();
 }
 
+/// Verifies that discarding a workspace whose linked issue is already closed
+/// does NOT reopen the issue.  This guards against the discard handler
+/// unconditionally calling `status = open` even on operator-closed issues.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_workspace_discard_does_not_reopen_closed_issue() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start_for_testing_pg_multi_repo failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": format!("e2e-discard-closed-{}", unique_suffix()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // Create and claim an issue.
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "discard-closed test issue",
+            "description": "operator will close before discard",
+            "priority": "low"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    let issue_id = issue["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim: {}", resp.text().await.unwrap_or_default());
+    let claim: serde_json::Value = resp.json().await.unwrap();
+    let ws_id = claim["workspace_id"].as_str().unwrap().to_string();
+
+    // Operator closes the issue while the workspace is still alive.
+    let resp = client
+        .post(format!("{rp}/issues/{issue_id}/close"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "resolution": "resolved" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "close: {}", resp.text().await.unwrap_or_default());
+
+    // Discard the workspace (simulates a reset after empty-workspace submit).
+    let resp = client
+        .delete(format!("{rp}/workspaces/{ws_id}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "discard: {}", resp.text().await.unwrap_or_default());
+
+    // Issue must remain closed — discard must NOT have reopened it.
+    let resp = client
+        .get(format!("{rp}/issues/{issue_id}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let issue_after: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        issue_after["status"].as_str().unwrap_or(""),
+        "closed",
+        "discard must NOT reopen an already-closed issue"
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
+/// Verifies that discarding a workspace whose linked issue is Open (never
+/// transitioned to InProgress — unusual but possible) leaves it Open without
+/// error.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_workspace_discard_leaves_open_issue_open() {
+    let Some(url) = db_url() else { return };
+
+    let tmp = TempDir::new().unwrap();
+    let (addr, shutdown_tx) = start_for_testing_pg_multi_repo(tmp.path(), &url)
+        .await
+        .expect("start_for_testing_pg_multi_repo failed");
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let admin = "vai_admin_test";
+
+    // Create repo.
+    let resp = client
+        .post(format!("{base}/api/repos"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "name": format!("e2e-discard-open-{}", unique_suffix()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo: serde_json::Value = resp.json().await.unwrap();
+    let rp = format!("{base}/api/repos/{}", repo["name"].as_str().unwrap());
+
+    // Create and claim an issue (this sets it to InProgress).
+    let resp = client
+        .post(format!("{rp}/issues"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({
+            "title": "discard-open test issue",
+            "description": "should reopen after discard",
+            "priority": "low"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let issue: serde_json::Value = resp.json().await.unwrap();
+    let issue_id = issue["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{rp}/work-queue/claim"))
+        .bearer_auth(admin)
+        .json(&serde_json::json!({ "issue_id": issue_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "claim: {}", resp.text().await.unwrap_or_default());
+    let claim: serde_json::Value = resp.json().await.unwrap();
+    let ws_id = claim["workspace_id"].as_str().unwrap().to_string();
+
+    // Discard — issue was InProgress so it should go back to Open.
+    let resp = client
+        .delete(format!("{rp}/workspaces/{ws_id}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "discard: {}", resp.text().await.unwrap_or_default());
+
+    // Issue must be Open again.
+    let resp = client
+        .get(format!("{rp}/issues/{issue_id}"))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let issue_after: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        issue_after["status"].as_str().unwrap_or(""),
+        "open",
+        "InProgress issue must become Open after workspace discard"
+    );
+
+    shutdown_tx.send(()).ok();
+}
+
 // ── WebSocket events ──────────────────────────────────────────────────────────
 
 /// Verifies that key operations fire WebSocket events on
