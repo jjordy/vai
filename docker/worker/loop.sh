@@ -214,6 +214,14 @@ while true; do
         --allowedTools 'Read,Edit,Write,Bash,Glob,Grep' \
         || true
 
+    # If Claude submitted via the Bash tool, agent state is already cleared.
+    # Skip loop.sh's verify+submit to avoid a spurious "Submit failed" log line.
+    if ! vai agent status >/dev/null 2>&1; then
+        echo "[worker] Agent state already cleared by claude — skipping verify+submit"
+        rm -rf "${WORK_DIR}"
+        continue
+    fi
+
     # Verify quality checks (if configured in vai.toml).
     if vai agent verify "${WORK_DIR}"; then
         submit_exit=0
