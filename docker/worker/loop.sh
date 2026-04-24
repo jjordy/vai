@@ -38,6 +38,7 @@ LOG_SHIPPED_LINES=0  # last line number successfully shipped
 DONE_POSTED=0
 HEARTBEAT_PID=""
 LOG_SHIP_PID=""
+DEV_PID=""
 
 # Tee all stdout/stderr through the log file so the shipping loop can read it.
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -152,9 +153,23 @@ log_ship_loop() {
     done
 }
 
+# ── Dev server cleanup (per iteration) ───────────────────────────────────────
+
+cleanup_iteration() {
+    if [ -n "${DEV_PID:-}" ]; then
+        echo "[worker] stopping dev server PID=${DEV_PID}"
+        kill "$DEV_PID" 2>/dev/null || true
+        wait "$DEV_PID" 2>/dev/null || true
+        DEV_PID=""
+    fi
+}
+
 # ── SIGTERM / SIGINT handler ──────────────────────────────────────────────────
 
 cleanup() {
+    # Stop the dev server before shutting down.
+    cleanup_iteration
+
     if [ "$DONE_POSTED" -eq 0 ]; then
         DONE_POSTED=1
         echo "[worker] Received termination signal — flushing logs and posting done"
@@ -176,6 +191,33 @@ cleanup() {
 }
 
 trap cleanup SIGTERM SIGINT
+
+# ── MCP config (written once, reused each iteration) ─────────────────────────
+
+cat > /tmp/mcp-config.json << 'MCPEOF'
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp", "--headless", "--browser", "chromium"]
+    }
+  }
+}
+MCPEOF
+echo "[worker] MCP config written to /tmp/mcp-config.json"
+
+ALLOWED_TOOLS="Read,Edit,Write,Bash,Glob,Grep,\
+mcp__playwright__browser_navigate,\
+mcp__playwright__browser_screenshot,\
+mcp__playwright__browser_click,\
+mcp__playwright__browser_type,\
+mcp__playwright__browser_fill,\
+mcp__playwright__browser_select_option,\
+mcp__playwright__browser_hover,\
+mcp__playwright__browser_press_key,\
+mcp__playwright__browser_snapshot,\
+mcp__playwright__browser_wait_for,\
+mcp__playwright__browser_close"
 
 # ── Initialization ────────────────────────────────────────────────────────────
 
@@ -209,15 +251,65 @@ while true; do
         continue
     fi
 
+    # ── Pre-agent setup ───────────────────────────────────────────────────────
+
+    # Run [agent].setup commands from vai.toml (e.g. pnpm install, cargo build).
+    # Non-fatal: repos without setup configured exit 0 silently.
+    echo "[worker] Running vai.toml [agent].setup commands"
+    vai agent setup "${WORK_DIR}" || true
+
+    # Belt-and-suspenders: always install JS/TS dependencies when package.json
+    # is present, even if [agent].setup already includes a pnpm install step.
+    # pnpm is idempotent and fast on cache hits; this catches repos that have
+    # not yet configured [agent].setup.
+    if [ -f "${WORK_DIR}/package.json" ]; then
+        echo "[worker] Installing JS dependencies (pnpm install)"
+        (cd "${WORK_DIR}" && pnpm install --silent 2>/dev/null) || true
+    fi
+
+    # ── Dev server ────────────────────────────────────────────────────────────
+
+    # Start a background dev server for repos that expose a 'dev' npm script.
+    # The server runs inside WORK_DIR so hot-reload and e2e tests find files.
+    DEV_PID=""
+    if [ -f "${WORK_DIR}/package.json" ] && \
+       jq -e '.scripts.dev' "${WORK_DIR}/package.json" >/dev/null 2>&1; then
+        echo "[worker] Starting dev server (pnpm dev)"
+        (cd "${WORK_DIR}" && pnpm dev > /tmp/dev-server.log 2>&1) &
+        DEV_PID=$!
+        echo "[worker] Dev server started, PID=${DEV_PID}"
+
+        # Wait up to 60 s for the dev server to respond on port 3000.
+        dev_ready=0
+        for i in $(seq 1 60); do
+            if curl -sS -o /dev/null -w '%{http_code}' http://localhost:3000 2>/dev/null \
+               | grep -qE '^(200|302|307)$'; then
+                echo "[worker] Dev server ready after ${i}s"
+                dev_ready=1
+                break
+            fi
+            sleep 1
+        done
+        if [ "$dev_ready" -eq 0 ]; then
+            echo "[worker] Dev server did not respond within 60s — claude will proceed anyway" >&2
+        fi
+    fi
+
+    # ── Agent invocation ──────────────────────────────────────────────────────
+
     # Run Claude Code with the vai-generated prompt.
+    # Playwright MCP browser tools are included so claude can explore and verify
+    # UI changes. The --mcp-config file tells claude how to start the MCP server.
     vai agent prompt | claude -p \
-        --allowedTools 'Read,Edit,Write,Bash,Glob,Grep' \
+        --allowedTools "${ALLOWED_TOOLS}" \
+        --mcp-config /tmp/mcp-config.json \
         || true
 
     # If Claude submitted via the Bash tool, agent state is already cleared.
     # Skip loop.sh's verify+submit to avoid a spurious "Submit failed" log line.
     if ! vai agent status >/dev/null 2>&1; then
         echo "[worker] Agent state already cleared by claude — skipping verify+submit"
+        cleanup_iteration
         rm -rf "${WORK_DIR}"
         continue
     fi
@@ -248,5 +340,6 @@ while true; do
         vai agent reset || true
     fi
 
+    cleanup_iteration
     rm -rf "${WORK_DIR}"
 done

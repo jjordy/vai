@@ -1791,6 +1791,85 @@ pub fn prompt(dir: &Path, template_override: Option<&str>) -> Result<PromptResul
     })
 }
 
+// ── setup ─────────────────────────────────────────────────────────────────────
+
+/// Result of a single setup command execution.
+#[derive(Debug, Serialize)]
+pub struct SetupCommandResult {
+    /// The command string that was executed.
+    pub command: String,
+    /// Combined stdout output of the command.
+    pub stdout: String,
+    /// Combined stderr output of the command.
+    pub stderr: String,
+    /// Exit code returned by the command.
+    pub exit_code: i32,
+    /// Whether this command succeeded (exit code 0).
+    pub passed: bool,
+}
+
+/// Result of a [`setup`] call.
+#[derive(Debug, Serialize)]
+pub struct SetupResult {
+    /// Individual results for each configured setup command.
+    pub commands: Vec<SetupCommandResult>,
+    /// `true` if all setup commands succeeded (or no setup was configured).
+    pub all_passed: bool,
+    /// `true` when no setup commands were configured in `vai.toml`.
+    pub no_setup_configured: bool,
+}
+
+/// Run setup commands configured under `[agent].setup` in `<work_dir>/vai.toml`.
+///
+/// This is the pre-claude step: install dependencies, prepare the working
+/// directory, etc.  Unlike [`verify`], this only runs the `setup` commands —
+/// not the full check pipeline.
+///
+/// `work_dir` is both the directory searched for `vai.toml` and the working
+/// directory in which commands are executed.  In cloud worker mode this is the
+/// downloaded repo (e.g. `~/work`), so `vai.toml` is found in the right place.
+///
+/// Returns [`SetupResult`] with per-command results.  If no setup is configured
+/// the function returns successfully with `no_setup_configured = true`.
+pub fn setup(work_dir: &Path) -> Result<SetupResult, AgentError> {
+    let setup_cmds = load_project_config(work_dir)?
+        .and_then(|proj| proj.agent)
+        .map(|a| a.setup)
+        .unwrap_or_default();
+
+    if setup_cmds.is_empty() {
+        return Ok(SetupResult {
+            commands: Vec::new(),
+            all_passed: true,
+            no_setup_configured: true,
+        });
+    }
+
+    let mut results = Vec::with_capacity(setup_cmds.len());
+
+    for cmd in &setup_cmds {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(work_dir)
+            .output()
+            .map_err(|e| AgentError::Other(format!("failed to run setup `{cmd}`: {e}")))?;
+
+        let exit_code = output.status.code().unwrap_or(-1);
+        let passed = output.status.success();
+        results.push(SetupCommandResult {
+            command: cmd.clone(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code,
+            passed,
+        });
+    }
+
+    let all_passed = results.iter().all(|r| r.passed);
+    Ok(SetupResult { commands: results, all_passed, no_setup_configured: false })
+}
+
 // ── verify ────────────────────────────────────────────────────────────────────
 
 /// Result of a single quality check command.

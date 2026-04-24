@@ -505,6 +505,19 @@ pub enum AgentCommands {
         dir: std::path::PathBuf,
     },
 
+    /// Run setup commands from `[agent].setup` in `<dir>/vai.toml`.
+    ///
+    /// Reads `setup` from the project-level `vai.toml` in `<dir>` and runs
+    /// each command sequentially in that directory.  Used by agent loops to
+    /// install dependencies (e.g. `pnpm install`) before invoking the agent.
+    ///
+    /// Exits 0 if all setup commands succeed or if no setup is configured.
+    /// Exits 1 if any setup command fails.
+    Setup {
+        /// Directory containing the downloaded repo (and its `vai.toml`).
+        dir: std::path::PathBuf,
+    },
+
     /// Manage agent loop configurations.
     #[command(subcommand)]
     Loop(LoopCommands),

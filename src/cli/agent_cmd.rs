@@ -144,6 +144,43 @@ pub(super) fn handle(agent_cmd: AgentCommands, json: bool) -> Result<(), CliErro
                 Err(e) => return Err(e.into()),
             }
         }
+        AgentCommands::Setup { dir } => {
+            let result = agent::setup(&dir)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                if !result.all_passed {
+                    std::process::exit(1);
+                }
+            } else if result.no_setup_configured {
+                // Nothing configured — normal for repos without [agent].setup.
+            } else if result.all_passed {
+                use colored::Colorize;
+                let count = result.commands.len();
+                println!(
+                    "{} {} setup command{} ran",
+                    "✓".green().bold(),
+                    count,
+                    if count == 1 { "" } else { "s" }
+                );
+            } else {
+                use colored::Colorize;
+                let failed: Vec<_> = result.commands.iter().filter(|c| !c.passed).collect();
+                eprintln!(
+                    "{} {}/{} setup command{} failed",
+                    "✗".red().bold(),
+                    failed.len(),
+                    result.commands.len(),
+                    if failed.len() == 1 { "" } else { "s" }
+                );
+                for cmd in &failed {
+                    eprintln!("[setup] {} (exit {})", cmd.command, cmd.exit_code);
+                    if !cmd.stderr.is_empty() {
+                        eprint!("{}", cmd.stderr);
+                    }
+                }
+                std::process::exit(1);
+            }
+        }
         AgentCommands::Loop(loop_cmd) => {
             return agent_loop::handle_loop(loop_cmd, json);
         }
