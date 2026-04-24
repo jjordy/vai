@@ -233,6 +233,7 @@ pub struct AgentState {
 /// ```toml
 /// # vai.toml
 /// [agent]
+/// prompt_template = "docs/agent-prompt.md"
 /// setup = ["pnpm install --frozen-lockfile"]
 /// commands = ["npx biome check src/", "npx tsc --noEmit", "pnpm test"]
 /// teardown = []
@@ -242,6 +243,13 @@ pub struct AgentState {
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectAgentConfig {
+    /// Path to the prompt template file, relative to the repo root.
+    ///
+    /// When set, `vai agent prompt` reads this file instead of `.vai/prompt.md`.
+    /// Tracked in the repo so all developers and cloud workers use the same prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_template: Option<String>,
+
     /// Shell commands to run before check commands (build, start servers, etc.).
     #[serde(default)]
     pub setup: Vec<String>,
@@ -1641,24 +1649,56 @@ pub struct PromptResult {
     /// Path to the template file that was used, or `None` if the built-in
     /// default was used.
     pub template_path: Option<String>,
+    /// Optional deprecation hint to emit to stderr when the legacy `.vai/prompt.md`
+    /// path is in use and could be migrated to `vai.toml [agent].prompt_template`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecation_hint: Option<String>,
 }
 
 /// Resolve the base template path and display string for `vai agent prompt`.
 ///
 /// Discovery order:
 /// 1. `template_override` (from `--template` flag) — used as-is relative to `dir`.
-/// 2. `.vai/agents/<default_agent>/prompt.md` if `config.default_agent` is set
+/// 2. `vai.toml [agent].prompt_template` (tracked, authoritative) — error if set
+///    but the file does not exist.
+/// 3. `.vai/agents/<default_agent>/prompt.md` if `config.default_agent` is set
 ///    and the file exists (new layout introduced by PRD 26 V-11).
-/// 3. `config.prompt_template_path(dir)` — defaults to `.vai/prompt.md` (legacy).
+/// 4. `.vai/prompt.md` (legacy) — emits a deprecation hint in the returned value.
 ///
-/// Returns `(absolute_path, display_string_if_any)`.
+/// Returns `(absolute_path, display_string_if_any, deprecation_hint_if_any)`.
 fn resolve_prompt_base_path(
     dir: &Path,
     template_override: Option<&str>,
-) -> Result<(PathBuf, Option<String>), AgentError> {
+) -> Result<(PathBuf, Option<String>, Option<String>), AgentError> {
     if let Some(override_path) = template_override {
         let p = dir.join(override_path);
-        return Ok((p, Some(override_path.to_string())));
+        return Ok((p, Some(override_path.to_string()), None));
+    }
+
+    // Check vai.toml [agent].prompt_template first (tracked, authoritative).
+    if let Some(proj) = load_project_config(dir)? {
+        if let Some(agent) = proj.agent {
+            if let Some(rel_path) = agent.prompt_template {
+                let p = dir.join(&rel_path);
+                if !p.exists() {
+                    return Err(AgentError::Other(format!(
+                        "prompt_template points at {rel_path} which does not exist"
+                    )));
+                }
+                // Check whether .vai/prompt.md also exists — if so, note it's superseded.
+                let legacy = dir.join(".vai").join("prompt.md");
+                let hint = if legacy.exists() {
+                    Some(
+                        "hint: .vai/prompt.md is superseded by vai.toml \
+                         [agent].prompt_template — consider removing .vai/prompt.md"
+                            .to_string(),
+                    )
+                } else {
+                    None
+                };
+                return Ok((p, Some(rel_path), hint));
+            }
+        }
     }
 
     let config = load_config(dir)?;
@@ -1668,14 +1708,24 @@ fn resolve_prompt_base_path(
         let p = dir.join(".vai").join("agents").join(name).join("prompt.md");
         if p.exists() {
             let s = p.to_string_lossy().into_owned();
-            return Ok((p, Some(s)));
+            return Ok((p, Some(s), None));
         }
     }
 
-    // Legacy layout: .vai/prompt.md (or explicit prompt_template)
+    // Legacy layout: .vai/prompt.md (or explicit prompt_template in .vai/agent.toml).
     let p = config.prompt_template_path(dir);
     let s = config.prompt_template.clone();
-    Ok((p, s))
+    // Emit deprecation hint when landing on .vai/prompt.md with no vai.toml override.
+    let hint = if p.exists() && s.is_none() {
+        Some(
+            "hint: move prompt template to vai.toml [agent].prompt_template \
+             so cloud workers use it too"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    Ok((p, s, hint))
 }
 
 /// Assemble the final prompt text from its three parts.
@@ -1708,11 +1758,11 @@ fn assemble_prompt(base: &str, overlay: Option<&str>, issue_json: &str) -> Strin
 /// ## Template discovery
 ///
 /// 1. If `template_override` is set, use that path directly (relative to `dir`).
-/// 2. Else if `config.default_agent` is set and
+/// 2. Else `vai.toml [agent].prompt_template` if set (tracked, authoritative).
+/// 3. Else if `config.default_agent` is set and
 ///    `.vai/agents/<default_agent>/prompt.md` exists, use that file (new layout).
-/// 3. Else fall back to `config.prompt_template_path(dir)`, which defaults to
-///    `.vai/prompt.md` (legacy layout).
-/// 4. If none of the above exist, use the built-in default prompt.
+/// 4. Else fall back to `.vai/prompt.md` (legacy layout).
+/// 5. If none of the above exist, use the built-in default prompt.
 ///
 /// ## Custom overlay
 ///
@@ -1729,7 +1779,8 @@ fn assemble_prompt(base: &str, overlay: Option<&str>, issue_json: &str) -> Strin
 ///
 /// When no overlay exists the output is simply `base + "\n\n" + issue_json`.
 pub fn prompt(dir: &Path, template_override: Option<&str>) -> Result<PromptResult, AgentError> {
-    let (base_path, base_path_str) = resolve_prompt_base_path(dir, template_override)?;
+    let (base_path, base_path_str, deprecation_hint) =
+        resolve_prompt_base_path(dir, template_override)?;
 
     // Fetch issue JSON from server (requires valid state + API key).
     let issue_json = fetch_issue_raw(dir)?;
@@ -1788,6 +1839,7 @@ pub fn prompt(dir: &Path, template_override: Option<&str>) -> Result<PromptResul
     Ok(PromptResult {
         prompt: full_prompt,
         template_path: resolved_path,
+        deprecation_hint,
     })
 }
 
@@ -2908,9 +2960,10 @@ mod tests {
         fs::create_dir_all(&prompt_dir).unwrap();
         fs::write(prompt_dir.join("prompt.md"), "New layout base.\n").unwrap();
 
-        let (path, _display) = resolve_prompt_base_path(dir, None).unwrap();
+        let (path, _display, hint) = resolve_prompt_base_path(dir, None).unwrap();
         assert!(path.ends_with("agents/claude-code/prompt.md"), "expected new layout path, got {path:?}");
         assert!(path.exists());
+        assert!(hint.is_none(), "no hint expected for new layout");
     }
 
     #[test]
@@ -2922,8 +2975,9 @@ mod tests {
         write_agent_toml(dir, None); // no default_agent
         fs::write(dir.join(".vai").join("prompt.md"), "Legacy base.\n").unwrap();
 
-        let (path, _display) = resolve_prompt_base_path(dir, None).unwrap();
+        let (path, _display, hint) = resolve_prompt_base_path(dir, None).unwrap();
         assert!(path.ends_with("prompt.md"), "expected legacy path, got {path:?}");
+        assert!(hint.is_some(), "deprecation hint expected when only .vai/prompt.md is present");
     }
 
     #[test]
@@ -2941,9 +2995,10 @@ mod tests {
         let custom = dir.join("custom.md");
         fs::write(&custom, "Override base.\n").unwrap();
 
-        let (path, display) = resolve_prompt_base_path(dir, Some("custom.md")).unwrap();
+        let (path, display, hint) = resolve_prompt_base_path(dir, Some("custom.md")).unwrap();
         assert!(path.ends_with("custom.md"), "expected override path, got {path:?}");
         assert_eq!(display.as_deref(), Some("custom.md"));
+        assert!(hint.is_none(), "no hint expected for explicit override");
     }
 
     #[test]
@@ -2956,11 +3011,101 @@ mod tests {
         // No .vai/agents/claude-code/prompt.md created.
         fs::write(dir.join(".vai").join("prompt.md"), "Legacy fallback.\n").unwrap();
 
-        let (path, _display) = resolve_prompt_base_path(dir, None).unwrap();
+        let (path, _display, hint) = resolve_prompt_base_path(dir, None).unwrap();
         assert!(
             path.ends_with(".vai/prompt.md"),
             "should fall back to legacy path, got {path:?}"
         );
+        assert!(hint.is_some(), "deprecation hint expected for legacy fallback");
+    }
+
+    // ── vai.toml prompt_template tests ────────────────────────────────────────
+
+    /// Write a minimal `vai.toml` with `[agent].prompt_template` set.
+    fn write_vai_toml_with_prompt(dir: &Path, prompt_template: &str) {
+        fs::write(
+            dir.join("vai.toml"),
+            format!("[agent]\nprompt_template = \"{prompt_template}\"\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_prompt_base_path_vai_toml_prompt_template_only() {
+        // (a) Only vai.toml [agent].prompt_template set — uses it, no hint.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_agent_toml(dir, None);
+        write_vai_toml_with_prompt(dir, "docs/agent-prompt.md");
+        fs::create_dir_all(dir.join("docs")).unwrap();
+        fs::write(dir.join("docs").join("agent-prompt.md"), "Tracked prompt.\n").unwrap();
+
+        let (path, display, hint) = resolve_prompt_base_path(dir, None).unwrap();
+        assert!(
+            path.ends_with("docs/agent-prompt.md"),
+            "expected vai.toml prompt path, got {path:?}"
+        );
+        assert_eq!(display.as_deref(), Some("docs/agent-prompt.md"));
+        assert!(hint.is_none(), "no hint when only vai.toml prompt_template is set");
+    }
+
+    #[test]
+    fn resolve_prompt_base_path_vai_toml_wins_over_legacy() {
+        // (c) Both vai.toml [agent].prompt_template AND .vai/prompt.md — vai.toml wins,
+        //     hint emitted about .vai/prompt.md being superseded.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_agent_toml(dir, None);
+        write_vai_toml_with_prompt(dir, "docs/agent-prompt.md");
+        fs::create_dir_all(dir.join("docs")).unwrap();
+        fs::write(dir.join("docs").join("agent-prompt.md"), "Tracked prompt.\n").unwrap();
+        // Also write the legacy file.
+        fs::write(dir.join(".vai").join("prompt.md"), "Legacy prompt.\n").unwrap();
+
+        let (path, _display, hint) = resolve_prompt_base_path(dir, None).unwrap();
+        assert!(
+            path.ends_with("docs/agent-prompt.md"),
+            "vai.toml prompt_template should win, got {path:?}"
+        );
+        assert!(
+            hint.is_some(),
+            "deprecation hint expected when .vai/prompt.md is superseded"
+        );
+        let hint_text = hint.unwrap();
+        assert!(
+            hint_text.contains("superseded"),
+            "hint should mention superseded: {hint_text}"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_base_path_vai_toml_missing_file_errors() {
+        // vai.toml [agent].prompt_template points at a non-existent file → clear error.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_agent_toml(dir, None);
+        write_vai_toml_with_prompt(dir, "missing/prompt.md");
+
+        let err = resolve_prompt_base_path(dir, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing/prompt.md") && msg.contains("does not exist"),
+            "error should mention the missing path: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_base_path_neither_returns_default_path_no_hint() {
+        // (d) No vai.toml, no .vai/prompt.md — returns .vai/prompt.md path, no hint
+        //     (file doesn't exist so prompt() will use built-in default).
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        write_agent_toml(dir, None);
+        // Neither vai.toml nor .vai/prompt.md created.
+
+        let (path, _display, hint) = resolve_prompt_base_path(dir, None).unwrap();
+        assert!(path.ends_with(".vai/prompt.md"), "expected default legacy path, got {path:?}");
+        assert!(hint.is_none(), "no hint when .vai/prompt.md does not exist");
     }
 
     // ── retry policy tests ────────────────────────────────────────────────────

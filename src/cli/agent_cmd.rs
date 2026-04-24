@@ -111,6 +111,9 @@ pub(super) fn handle(agent_cmd: AgentCommands, json: bool) -> Result<(), CliErro
             if json {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
             } else {
+                if let Some(hint) = &result.deprecation_hint {
+                    eprintln!("{hint}");
+                }
                 print!("{}", result.prompt);
             }
         }
