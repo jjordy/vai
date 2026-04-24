@@ -1,6 +1,6 @@
 [package]
 name = "vai"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2021"
 description = "A version control system built for AI agents"
 license = "MIT"
