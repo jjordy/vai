@@ -25,6 +25,10 @@ pub struct FlyMachinesProvider {
     region: String,
     token: String,
     client: reqwest::Client,
+    /// When set, attach this named Fly volume at `/pnpm-store` and inject
+    /// `PNPM_STORE_PATH=/pnpm-store` so the pnpm content store persists across
+    /// worker spawns. Read from `VAI_COMPUTE_FLY_PNPM_STORE_VOLUME`.
+    pnpm_store_volume: Option<String>,
 }
 
 impl FlyMachinesProvider {
@@ -33,13 +37,17 @@ impl FlyMachinesProvider {
     /// Reads `VAI_COMPUTE_FLY_TOKEN` for the API token.
     /// `app_name` is the Fly app that will host worker machines.
     /// `region` is the preferred spawn region (e.g. `"iad"`).
+    /// Reads `VAI_COMPUTE_FLY_PNPM_STORE_VOLUME` to enable a persistent pnpm
+    /// content store via a named Fly volume (optional).
     pub fn from_env(app_name: impl Into<String>, region: impl Into<String>) -> Option<Self> {
         let token = std::env::var("VAI_COMPUTE_FLY_TOKEN").ok()?;
+        let pnpm_store_volume = std::env::var("VAI_COMPUTE_FLY_PNPM_STORE_VOLUME").ok();
         Some(Self {
             app_name: app_name.into(),
             region: region.into(),
             token,
             client: reqwest::Client::new(),
+            pnpm_store_volume,
         })
     }
 
@@ -85,13 +93,29 @@ fn resource_class_to_guest(class: ResourceClass) -> serde_json::Value {
 #[async_trait]
 impl ComputeProvider for FlyMachinesProvider {
     async fn spawn(&self, spec: WorkerSpec) -> Result<MachineId, ProviderError> {
+        let mut env = spec.env.clone();
+
+        // Persistent pnpm content store: inject the store path so all pnpm
+        // invocations inside the worker share one directory backed by the Fly
+        // volume rather than cold-downloading packages on every spawn.
+        let mounts: serde_json::Value = if let Some(vol) = &self.pnpm_store_volume {
+            env.insert("PNPM_STORE_PATH".to_string(), "/pnpm-store".to_string());
+            serde_json::json!([{
+                "volume": vol,
+                "path": "/pnpm-store"
+            }])
+        } else {
+            serde_json::json!([])
+        };
+
         let body = serde_json::json!({
             "config": {
                 "image": spec.image,
-                "env": spec.env,
+                "env": env,
                 "auto_destroy": true,
                 "restart": { "policy": "no" },
                 "guest": resource_class_to_guest(spec.resources),
+                "mounts": mounts,
             },
             "region": self.region,
             "name": format!("vai-worker-{}", &spec.idempotency_key[..8.min(spec.idempotency_key.len())]),

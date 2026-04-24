@@ -254,16 +254,17 @@ while true; do
     # ── Pre-agent setup ───────────────────────────────────────────────────────
 
     # Run [agent].setup commands from vai.toml (e.g. pnpm install, cargo build).
-    # Non-fatal: repos without setup configured exit 0 silently.
+    # Exit codes: 0 = setup ran and passed, 1 = setup ran but failed,
+    # 2 = no [agent].setup configured in vai.toml.
     echo "[worker] Running vai.toml [agent].setup commands"
-    vai agent setup "${WORK_DIR}" || true
+    setup_exit=0
+    vai agent setup "${WORK_DIR}" || setup_exit=$?
 
-    # Belt-and-suspenders: always install JS/TS dependencies when package.json
-    # is present, even if [agent].setup already includes a pnpm install step.
-    # pnpm is idempotent and fast on cache hits; this catches repos that have
-    # not yet configured [agent].setup.
-    if [ -f "${WORK_DIR}/package.json" ]; then
-        echo "[worker] Installing JS dependencies (pnpm install)"
+    # Only run implicit pnpm install when the repo has NOT declared its own
+    # [agent].setup (exit 2). If setup WAS declared, trust it — running pnpm
+    # install a second time wastes 1-3 minutes on cold workers.
+    if [ "$setup_exit" -eq 2 ] && [ -f "${WORK_DIR}/package.json" ]; then
+        echo "[worker] No [agent].setup in vai.toml — installing JS dependencies (pnpm install)"
         (cd "${WORK_DIR}" && pnpm install --silent 2>/dev/null) || true
     fi
 

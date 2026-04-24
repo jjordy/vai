@@ -155,7 +155,9 @@ pub(super) fn handle(agent_cmd: AgentCommands, json: bool) -> Result<(), CliErro
                     std::process::exit(1);
                 }
             } else if result.no_setup_configured {
-                // Nothing configured — normal for repos without [agent].setup.
+                // Exit 2 signals "no setup configured" to loop.sh so it can
+                // decide whether to run an implicit pnpm install fallback.
+                std::process::exit(2);
             } else if result.all_passed {
                 use colored::Colorize;
                 let count = result.commands.len();
