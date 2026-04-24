@@ -1,14 +1,12 @@
-name: Publish Worker Image
+name: Publish Worker Image (manual)
 
+# Automatic publishing is handled by the publish-worker job in release.yml,
+# which runs within the same workflow token and avoids the GITHUB_TOKEN
+# anti-recursion rule that prevents cross-workflow cascade.
+#
+# Use this workflow to manually rebuild the worker image for an already-published
+# tag (e.g. infrastructure failure, Dockerfile fix without a new release).
 on:
-  # Fires AFTER release.yml publishes the GitHub Release with binary tarballs.
-  # Triggering on `push: tags` would race with release.yml and the Dockerfile's
-  # curl step hits a 404 before the release assets exist.
-  release:
-    types: [published]
-  # Allow manual rebuilds against an already-published tag, e.g. when the
-  # worker image fails for an infrastructure reason and we don't want to cut
-  # a new release just to retry.
   workflow_dispatch:
     inputs:
       tag:

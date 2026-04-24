@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -123,3 +124,56 @@ jobs:
           files: |
             artifacts/vai-*.tar.gz
             artifacts/SHA256SUMS
+
+  publish-worker:
+    name: Build & push worker image
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (multi-arch emulation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image version from tag
+        id: version
+        run: |
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/worker
+          file: docker/worker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/jjordy/vai-worker:${{ steps.version.outputs.version }}
+            ghcr.io/jjordy/vai-worker:latest
+          build-args: |
+            VAI_VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test — vai --version matches release tag
+        run: |
+          IMAGE="ghcr.io/jjordy/vai-worker:${{ steps.version.outputs.version }}"
+          docker pull "$IMAGE"
+          REPORTED=$(docker run --rm "$IMAGE" vai --version | awk '{print $NF}')
+          EXPECTED="${{ steps.version.outputs.version }}"
+          echo "Image reports vai $REPORTED, tag is $EXPECTED"
+          if [ "$REPORTED" != "$EXPECTED" ]; then
+            echo "::error::Version mismatch: image says $REPORTED, tag is $EXPECTED"
+            exit 1
+          fi
+          echo "Smoke test passed."
