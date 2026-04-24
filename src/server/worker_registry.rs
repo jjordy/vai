@@ -26,35 +26,45 @@ const DEFAULT_MAX_CONCURRENT: u64 = 3;
 /// Abstracts over per-repo secret retrieval for [`spawn_if_capacity`].
 ///
 /// Implemented for [`sqlx::PgPool`] (when the `postgres` feature is enabled)
-/// via [`super::secrets::get_secret`], and by [`NoopSecretsStore`] for
-/// test / non-postgres builds.
+/// via [`super::secrets`], and by [`NoopSecretsStore`] for test / non-postgres
+/// builds.
 #[async_trait]
 pub(crate) trait SecretsStore: Send + Sync {
-    /// Retrieve the plaintext value for `key` scoped to `repo_id`.
+    /// Retrieve all secrets for `repo_id` as a decrypted key→value map.
     ///
-    /// Returns `None` if no secret with that key exists for this repo.
-    /// Returns `Err` only for vault failures (DB errors, decryption errors).
-    async fn get_secret(&self, repo_id: &Uuid, key: &str) -> Result<Option<String>, String>;
+    /// Used to bulk-inject repo secrets into worker environment variables so
+    /// tools like Vite that read env vars at startup can find `DATABASE_URL`,
+    /// `BETTER_AUTH_SECRET`, etc. without a `.env` file on disk.
+    async fn list_and_get_all(
+        &self,
+        repo_id: &Uuid,
+    ) -> Result<std::collections::HashMap<String, String>, String>;
 }
 
-/// No-op secrets store — always returns `None`.
+/// No-op secrets store — always returns empty results.
 ///
 /// Used in local / test builds where no Postgres vault is available.
 pub(crate) struct NoopSecretsStore;
 
 #[async_trait]
 impl SecretsStore for NoopSecretsStore {
-    async fn get_secret(&self, _repo_id: &Uuid, _key: &str) -> Result<Option<String>, String> {
-        Ok(None)
+    async fn list_and_get_all(
+        &self,
+        _repo_id: &Uuid,
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        Ok(std::collections::HashMap::new())
     }
 }
 
-/// Postgres vault implementation — delegates to [`super::secrets::get_secret`].
+/// Postgres vault implementation — delegates to [`super::secrets::get_all_secrets`].
 #[cfg(feature = "postgres")]
 #[async_trait]
 impl SecretsStore for sqlx::PgPool {
-    async fn get_secret(&self, repo_id: &Uuid, key: &str) -> Result<Option<String>, String> {
-        super::secrets::get_secret(self, repo_id, key)
+    async fn list_and_get_all(
+        &self,
+        repo_id: &Uuid,
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        super::secrets::get_all_secrets(self, repo_id)
             .await
             .map_err(|e| e.to_string())
     }
@@ -124,18 +134,23 @@ pub async fn spawn_if_capacity(
         return Ok(None);
     }
 
-    // Resolve the Anthropic API key: per-repo vault first, server-wide fallback second.
-    let vault_key = secrets
-        .get_secret(repo_id, "ANTHROPIC_API_KEY")
+    // Fetch all per-repo secrets from the vault.  Every key is injected into the
+    // worker env so tools like Vite (DATABASE_URL, BETTER_AUTH_SECRET, …) can
+    // start without a .env file on disk.
+    let mut vault_secrets = secrets
+        .list_and_get_all(repo_id)
         .await
         .map_err(RegistryError::Provider)?;
-    let anthropic_key = match vault_key {
-        Some(k) => k,
-        None if !fallback_key.is_empty() => fallback_key.to_string(),
-        None => {
+
+    // Resolve ANTHROPIC_API_KEY: vault value takes precedence; fall back to the
+    // server-wide key; error if neither is present.
+    if !vault_secrets.contains_key("ANTHROPIC_API_KEY") {
+        if !fallback_key.is_empty() {
+            vault_secrets.insert("ANTHROPIC_API_KEY".into(), fallback_key.to_string());
+        } else {
             return Err(RegistryError::MissingRepoSecret("ANTHROPIC_API_KEY"));
         }
-    };
+    }
 
     // Insert the worker row in 'spawning' state before calling the provider,
     // so a crash after spawn but before insert doesn't orphan a live machine.
@@ -159,12 +174,12 @@ pub async fn spawn_if_capacity(
     // Mint a unique idempotency key for this spawn attempt.
     let idempotency_key = Uuid::new_v4().to_string();
 
-    // Build environment for the worker.
-    let mut env = std::collections::HashMap::new();
+    // Build environment for the worker: start from all decrypted repo secrets,
+    // then layer the vai-specific vars on top (they take precedence).
+    let mut env = vault_secrets;
     env.insert("VAI_SERVER_URL".into(), config.server_url.to_string());
     env.insert("VAI_REPO".into(), config.repo_name.to_string());
     env.insert("VAI_API_KEY".into(), config.vai_api_key.to_string());
-    env.insert("ANTHROPIC_API_KEY".into(), anthropic_key);
     env.insert("VAI_REPO_ID".into(), repo_id.to_string());
     env.insert("VAI_WORKER_ID".into(), worker.id.to_string());
 
@@ -381,28 +396,36 @@ mod tests {
     // ── Mock secrets store ────────────────────────────────────────────────────
 
     struct MockSecretsStore {
-        /// Value returned for `ANTHROPIC_API_KEY`, or `None` if absent.
-        anthropic_key: Option<String>,
+        secrets: std::collections::HashMap<String, String>,
     }
 
     impl MockSecretsStore {
         fn with_key(key: impl Into<String>) -> Arc<dyn SecretsStore> {
-            Arc::new(Self { anthropic_key: Some(key.into()) })
+            let mut m = std::collections::HashMap::new();
+            m.insert("ANTHROPIC_API_KEY".into(), key.into());
+            Arc::new(Self { secrets: m })
+        }
+
+        fn with_secrets(pairs: &[(&str, &str)]) -> Arc<dyn SecretsStore> {
+            let secrets = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            Arc::new(Self { secrets })
         }
 
         fn empty() -> Arc<dyn SecretsStore> {
-            Arc::new(Self { anthropic_key: None })
+            Arc::new(Self { secrets: std::collections::HashMap::new() })
         }
     }
 
     #[async_trait]
     impl SecretsStore for MockSecretsStore {
-        async fn get_secret(&self, _repo_id: &Uuid, key: &str) -> Result<Option<String>, String> {
-            if key == "ANTHROPIC_API_KEY" {
-                Ok(self.anthropic_key.clone())
-            } else {
-                Ok(None)
-            }
+        async fn list_and_get_all(
+            &self,
+            _repo_id: &Uuid,
+        ) -> Result<std::collections::HashMap<String, String>, String> {
+            Ok(self.secrets.clone())
         }
     }
 
@@ -656,6 +679,33 @@ mod tests {
 
         assert!(result.unwrap().is_none());
         assert!(!compute.was_spawned());
+    }
+
+    #[tokio::test]
+    async fn all_vault_secrets_injected_into_worker_env() {
+        // Verifies that DATABASE_URL, BETTER_AUTH_SECRET, etc. from the vault
+        // are all injected so dev servers that need them can start.
+        let repo_id = Uuid::new_v4();
+        let secrets = MockSecretsStore::with_secrets(&[
+            ("ANTHROPIC_API_KEY", "vault-key"),
+            ("DATABASE_URL", "postgres://test/db"),
+            ("BETTER_AUTH_SECRET", "s3cr3t"),
+        ]);
+        let workers = MockWorkerStore::new(true, 0);
+        let compute = MockCompute::new();
+
+        let result = spawn_if_capacity(
+            &repo_id,
+            compute.as_ref(),
+            workers.clone(),
+            secrets,
+            "",
+            &test_config(),
+        )
+        .await;
+
+        assert!(result.unwrap().is_some(), "worker should have been spawned");
+        assert!(compute.was_spawned());
     }
 
     #[tokio::test]

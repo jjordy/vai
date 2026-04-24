@@ -214,6 +214,41 @@ pub async fn list_secret_keys(db: &PgPool, repo_id: &Uuid) -> Result<Vec<String>
         .collect()
 }
 
+/// Retrieve and decrypt all secrets for a repository as a key→value map.
+///
+/// This is used by the worker registry to inject every provisioned secret into
+/// the spawned machine's environment, so `.env`-dependent tools (Vite, Better
+/// Auth, etc.) can start without a file on disk.
+pub async fn get_all_secrets(
+    db: &PgPool,
+    repo_id: &Uuid,
+) -> Result<std::collections::HashMap<String, String>, SecretsError> {
+    let master_key = get_master_key()?;
+
+    let rows = sqlx::query(
+        "SELECT key, encrypted_value, nonce FROM repo_agent_secrets WHERE repo_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_all(db)
+    .await?;
+
+    let mut map = std::collections::HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let key: String = row
+            .try_get("key")
+            .map_err(|e| SecretsError::Database(e.to_string()))?;
+        let encrypted_value: Vec<u8> = row
+            .try_get("encrypted_value")
+            .map_err(|e| SecretsError::Database(e.to_string()))?;
+        let nonce_bytes: Vec<u8> = row
+            .try_get("nonce")
+            .map_err(|e| SecretsError::Database(e.to_string()))?;
+        let plaintext = decrypt_value(&master_key, &encrypted_value, &nonce_bytes)?;
+        map.insert(key, plaintext);
+    }
+    Ok(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
