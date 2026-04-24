@@ -59,7 +59,7 @@ Do **not** silence clippy warnings with `#[allow(...)]` unless the lint is a fal
 If all checks pass:
 
 ```bash
-vai agent submit ./work
+vai agent submit --close-if-empty ./work
 rm -rf ./work
 ```
 

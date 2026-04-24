@@ -64,7 +64,7 @@ Do **not** skip or comment out failing tests. Fix them.
 If all checks pass:
 
 ```bash
-vai agent submit ./work
+vai agent submit --close-if-empty ./work
 rm -rf ./work
 ```
 

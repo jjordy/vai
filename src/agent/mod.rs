@@ -1639,6 +1639,70 @@ pub fn print_reset_result(r: &ResetResult) {
     println!("  Issue: {}", r.issue_title);
 }
 
+// ── Close as resolved ─────────────────────────────────────────────────────────
+
+/// Result of closing an already-resolved issue from [`close_issue_as_resolved`].
+#[derive(Debug, Serialize)]
+pub struct CloseResolvedResult {
+    /// Issue ID that was closed.
+    pub issue_id: String,
+    /// Human-readable title of the issue that was closed.
+    pub issue_title: String,
+}
+
+/// Close the currently-claimed issue as resolved without submitting any files.
+///
+/// Used when `vai agent submit` returns [`AgentError::WorkspaceEmpty`] to
+/// signal that the requested fix is already in place.  Calling this instead of
+/// [`reset`] prevents the infinite claim/download loop that would otherwise
+/// occur because `reset` re-opens the issue.
+///
+/// Steps:
+/// 1. `POST /api/repos/:repo/issues/:id/close` — marks the issue resolved.
+/// 2. Clears `.vai/agent-state.json`.
+pub fn close_issue_as_resolved(dir: &Path) -> Result<CloseResolvedResult, AgentError> {
+    let config = load_config(dir)?;
+    let state = load_state(dir)?;
+    let api_key = AgentConfig::resolve_api_key();
+    let api_key_ref = api_key.as_deref();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| AgentError::Other(format!("cannot create tokio runtime: {e}")))?;
+
+    rt.block_on(async {
+        let path = format!(
+            "api/repos/{}/issues/{}/close",
+            config.repo, state.issue_id
+        );
+        let _: serde_json::Value = agent_post(
+            &config.server,
+            &path,
+            api_key_ref,
+            &serde_json::json!({ "resolution": "resolved" }),
+        )
+        .await?;
+        Ok::<_, AgentError>(())
+    })?;
+
+    clear_state(dir)?;
+
+    Ok(CloseResolvedResult {
+        issue_id: state.issue_id,
+        issue_title: state.issue_title,
+    })
+}
+
+/// Print a human-readable summary of a [`CloseResolvedResult`].
+pub fn print_close_resolved_result(r: &CloseResolvedResult) {
+    use colored::Colorize;
+    println!(
+        "{} Issue already resolved — closed issue {}",
+        "✓".green().bold(),
+        r.issue_id[..8.min(r.issue_id.len())].cyan(),
+    );
+    println!("  Issue: {}", r.issue_title);
+}
+
 // ── Prompt ────────────────────────────────────────────────────────────────────
 
 /// Result of building a prompt from a template.

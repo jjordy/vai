@@ -50,7 +50,7 @@ Do **not** use `// @ts-ignore` or `// @ts-expect-error` to silence type errors. 
 If all checks pass:
 
 ```bash
-vai agent submit ./work
+vai agent submit --close-if-empty ./work
 rm -rf ./work
 ```
 

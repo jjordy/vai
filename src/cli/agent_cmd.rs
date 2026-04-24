@@ -117,7 +117,7 @@ pub(super) fn handle(agent_cmd: AgentCommands, json: bool) -> Result<(), CliErro
                 print!("{}", result.prompt);
             }
         }
-        AgentCommands::Submit { dir } => {
+        AgentCommands::Submit { dir, close_if_empty } => {
             match agent::submit(&cwd, &dir) {
                 Ok(result) => {
                     if json {
@@ -126,19 +126,32 @@ pub(super) fn handle(agent_cmd: AgentCommands, json: bool) -> Result<(), CliErro
                         agent::print_submit_result(&result);
                     }
                 }
+                Err(agent::AgentError::WorkspaceEmpty) if close_if_empty => {
+                    match agent::close_issue_as_resolved(&cwd) {
+                        Ok(result) => {
+                            if json {
+                                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                            } else {
+                                agent::print_close_resolved_result(&result);
+                            }
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
                 Err(agent::AgentError::WorkspaceEmpty) => {
                     if json {
                         println!(
                             "{}",
                             serde_json::json!({
                                 "error": "workspace_empty",
-                                "message": "No changes to submit — the issue appears already resolved."
+                                "message": "No changes to submit — the issue appears already resolved.",
+                                "hint": "Re-run with --close-if-empty to close the issue permanently instead of resetting."
                             })
                         );
                     } else {
                         eprintln!("No changes to submit — the issue appears already resolved.");
                         eprintln!(
-                            "Hint: run `vai issue close <id>` to close it permanently \
+                            "Hint: re-run with `--close-if-empty` to close it permanently \
                              instead of resetting (which re-opens it)."
                         );
                     }

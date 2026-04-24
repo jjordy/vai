@@ -476,9 +476,19 @@ pub enum AgentCommands {
     /// Agent state is preserved if any step fails so you can retry.
     ///
     /// Exits 0 on success, 1 on any error (state preserved for retry).
+    /// Exits 3 if the workspace is empty (issue already resolved) and
+    /// `--close-if-empty` is not set.
     Submit {
         /// Directory containing the agent's modified working tree.
         dir: std::path::PathBuf,
+        /// When the workspace is empty (no file changes), automatically close
+        /// the issue as resolved and exit 0 instead of exiting 3.
+        ///
+        /// Use this in agent loop scripts to avoid an infinite claim/download
+        /// cycle when the requested fix is already in place.  Without this
+        /// flag the caller receives exit 3 and can decide independently.
+        #[arg(long, default_value_t = false)]
+        close_if_empty: bool,
     },
 
     /// Run quality checks configured in `.vai/agent.toml`.

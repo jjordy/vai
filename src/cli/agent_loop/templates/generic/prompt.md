@@ -41,7 +41,7 @@ Run whatever quality checks apply to this project. Ensure the code compiles and 
 
 ```bash
 # On success:
-vai agent submit ./work && rm -rf ./work
+vai agent submit --close-if-empty ./work && rm -rf ./work
 
 # On failure:
 vai agent reset && rm -rf ./work

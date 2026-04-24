@@ -339,18 +339,10 @@ while true; do
     # Verify quality checks (if configured in vai.toml).
     if vai agent verify "${WORK_DIR}"; then
         submit_exit=0
-        vai agent submit "${WORK_DIR}" || submit_exit=$?
+        vai agent submit --close-if-empty "${WORK_DIR}" || submit_exit=$?
         case $submit_exit in
             0)
                 echo "[worker] Submitted successfully"
-                ;;
-            3)
-                # Workspace was empty — issue already resolved, close it.
-                echo "[worker] Workspace empty — closing issue as already resolved"
-                ISSUE_ID=$(vai --json agent status 2>/dev/null | jq -r '.issue_id // empty')
-                if [ -n "$ISSUE_ID" ]; then
-                    vai issue close "$ISSUE_ID" --resolution resolved || true
-                fi
                 ;;
             *)
                 echo "[worker] Submit failed (exit ${submit_exit}) — resetting" >&2

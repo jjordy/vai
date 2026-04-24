@@ -46,16 +46,9 @@ for ((i = 1; i <= MAX_ITERATIONS; i++)); do
 
   if vai agent verify ./work; then
     submit_exit=0
-    vai agent submit ./work || submit_exit=$?
+    vai agent submit --close-if-empty ./work || submit_exit=$?
     case $submit_exit in
-      0) ;;  # submitted successfully
-      3)
-        echo "Workspace empty — closing issue as already resolved."
-        ISSUE_ID=$(vai --json agent status | jq -r .issue_id)
-        if [ -n "$ISSUE_ID" ] && [ "$ISSUE_ID" != "null" ]; then
-          vai issue close "$ISSUE_ID" --resolution resolved || true
-        fi
-        ;;
+      0) ;;  # submitted successfully (or closed as already resolved)
       *)
         echo "Submit failed (exit ${submit_exit}) — resetting workspace." >&2
         vai agent reset
