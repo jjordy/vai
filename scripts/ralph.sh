@@ -168,13 +168,14 @@ $RECENT_COMMITS
       docker exec -i "$CONTAINER_NAME" bash -c "
         cd /home/agent/repo
         cat /tmp/ralph_prompt.md | claude -p \
+          --model sonnet \
           --allowedTools 'Read,Edit,Write,Bash,Glob,Grep'
       "
     else
       printf "Fix these errors. Run the failing checks yourself to verify they pass before finishing.\n\n%s" "$ERRORS" \
         | docker exec -i "$CONTAINER_NAME" bash -c "
           cd /home/agent/repo
-          claude -p --allowedTools 'Read,Edit,Write,Bash,Glob,Grep'
+          claude -p --model sonnet --allowedTools 'Read,Edit,Write,Bash,Glob,Grep'
         "
     fi
 

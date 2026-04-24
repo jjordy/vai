@@ -301,6 +301,7 @@ while true; do
     # Playwright MCP browser tools are included so claude can explore and verify
     # UI changes. The --mcp-config file tells claude how to start the MCP server.
     vai agent prompt | claude -p \
+        --model sonnet \
         --allowedTools "${ALLOWED_TOOLS}" \
         --mcp-config /tmp/mcp-config.json \
         || true
