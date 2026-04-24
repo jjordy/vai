@@ -149,6 +149,13 @@ pub async fn spawn_if_capacity(
         })
         .await?;
 
+    tracing::info!(
+        event = "worker_registry.pre_spawn",
+        worker_id = %worker.id,
+        repo_id = %repo_id,
+        "worker row created, about to call compute.spawn"
+    );
+
     // Mint a unique idempotency key for this spawn attempt.
     let idempotency_key = Uuid::new_v4().to_string();
 

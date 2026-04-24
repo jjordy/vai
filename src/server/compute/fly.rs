@@ -97,26 +97,45 @@ impl ComputeProvider for FlyMachinesProvider {
             "name": format!("vai-worker-{}", &spec.idempotency_key[..8.min(spec.idempotency_key.len())]),
         });
 
+        let url = self.machines_url();
+        tracing::info!(
+            event = "fly.spawn.request",
+            url = %url,
+            image = %spec.image,
+            region = %self.region,
+            "posting to Fly Machines API"
+        );
+
         let resp = self
             .client
-            .post(self.machines_url())
+            .post(&url)
             .header("Authorization", self.auth_header())
             .header("Idempotency-Key", &spec.idempotency_key)
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::Transient(e.to_string()))?;
+            .map_err(|e| {
+                tracing::warn!(event = "fly.spawn.transport_error", error = %e, "reqwest send failed");
+                ProviderError::Transient(e.to_string())
+            })?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let status = resp.status();
+        tracing::info!(
+            event = "fly.spawn.response",
+            status = %status,
+            "got response from Fly"
+        );
+
+        if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            tracing::warn!(event = "fly.spawn.non_success", status = %status, body = %text, "Fly rejected spawn");
             return Err(ProviderError::Provider(format!("{status}: {text}")));
         }
 
-        let machine: FlyMachine = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Transient(e.to_string()))?;
+        let machine: FlyMachine = resp.json().await.map_err(|e| {
+            tracing::warn!(event = "fly.spawn.decode_error", error = %e, "failed to parse FlyMachine response");
+            ProviderError::Transient(e.to_string())
+        })?;
 
         Ok(MachineId(machine.id))
     }
