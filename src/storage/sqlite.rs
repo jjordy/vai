@@ -1314,6 +1314,14 @@ impl OrgStore for SqliteStorage {
     ) -> Result<Option<RepoRole>, StorageError> {
         Err(org_store_unsupported())
     }
+
+    async fn get_or_create_personal_org(
+        &self,
+        _user_id: &Uuid,
+        _user_name: &str,
+    ) -> Result<Organization, StorageError> {
+        Err(org_store_unsupported())
+    }
 }
 
 // ── WatcherRegistryStore ──────────────────────────────────────────────────────

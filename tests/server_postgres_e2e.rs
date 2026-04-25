@@ -2990,7 +2990,8 @@ async fn test_non_admin_repo_creation() {
         .unwrap();
     assert_eq!(resp.status(), 200, "GET /me: {}", resp.text().await.unwrap_or_default());
     let me: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(me["role"].as_str(), Some("admin"), "creator must have admin role");
+    // Personal org ownership gives the creator "owner" effective role.
+    assert_eq!(me["role"].as_str(), Some("owner"), "creator must have owner role via personal org");
     assert_eq!(me["user_id"].as_str(), Some(user_id.as_str()));
 
     shutdown_tx.send(()).ok();
@@ -3346,10 +3347,12 @@ async fn test_device_code_key_grants_creator_collaborator() {
         .unwrap();
     assert_eq!(resp.status(), 200, "GET /me (initial key): {}", resp.text().await.unwrap_or_default());
     let me: serde_json::Value = resp.json().await.unwrap();
+    // Personal org ownership elevates the creator's effective role to "owner"
+    // even though the direct collaborator row is "admin" (issue #305).
     assert_eq!(
         me["role"].as_str(),
-        Some("admin"),
-        "collaborator row must be admin role (issue #305)"
+        Some("owner"),
+        "creator must have owner effective role via personal org"
     );
     assert_eq!(me["user_id"].as_str(), Some(user_id.as_str()));
 

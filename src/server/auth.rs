@@ -119,6 +119,21 @@ pub(super) async fn token_exchange_handler(
             })?;
             let (user_id, user_name) = (user.id, user.name);
 
+            // Ensure the user has a personal org (idempotent).  Better Auth
+            // writes the users row at signup but doesn't touch organizations;
+            // we lazily create it here on first login.
+            if let Err(e) = state.storage.orgs()
+                .get_or_create_personal_org(&user_id, &user_name)
+                .await
+            {
+                tracing::warn!(
+                    event = "auth.personal_org_failed",
+                    user_id = %user_id,
+                    error = %e,
+                    "failed to ensure personal org on login"
+                );
+            }
+
             // No automatic repo grants on login — users see only repos they
             // created or were explicitly added to as collaborators.
 

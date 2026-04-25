@@ -215,6 +215,29 @@ pub(super) async fn create_repo_handler(
         let created_at = chrono::Utc::now();
         let version_uuid = uuid::Uuid::new_v4();
 
+        // Resolve the creator's personal org so the new repo has an org_id.
+        // Done before the transaction to avoid holding the Postgres connection
+        // longer than needed for the upsert.
+        let personal_org_id: Option<uuid::Uuid> = if let Some(user_id) = &identity.user_id {
+            match state.storage.orgs()
+                .get_or_create_personal_org(user_id, &identity.name)
+                .await
+            {
+                Ok(org) => Some(org.id),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "repo.personal_org_lookup_failed",
+                        user_id = %user_id,
+                        error = %e,
+                        "could not resolve personal org; repo will be created without org_id"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // All four inserts (repo, version, head, collaborator) happen in a
         // single transaction so there is no window where the repo exists but
         // the creator has no access to it.
@@ -225,10 +248,11 @@ pub(super) async fn create_repo_handler(
             .map_err(|e| ApiError::internal(format!("failed to begin transaction: {e}")))?;
 
         sqlx::query(
-            "INSERT INTO repos (id, name, created_at) VALUES ($1, $2, $3)",
+            "INSERT INTO repos (id, name, org_id, created_at) VALUES ($1, $2, $3, $4)",
         )
         .bind(repo_id)
         .bind(&body.name)
+        .bind(personal_org_id)
         .bind(created_at)
         .execute(&mut *tx)
         .await
@@ -993,9 +1017,19 @@ pub(super) async fn create_user_handler(
     let user = state
         .storage
         .orgs()
-        .create_user(NewUser { email: body.email, name: body.name })
+        .create_user(NewUser { email: body.email, name: body.name.clone() })
         .await
         .map_err(ApiError::from)?;
+
+    // Auto-create the user's personal org so org-scoped routes work immediately.
+    if let Err(e) = state.storage.orgs().get_or_create_personal_org(&user.id, &user.name).await {
+        tracing::warn!(
+            event = "admin.user.personal_org_failed",
+            user_id = %user.id,
+            error = %e,
+            "failed to create personal org for new user"
+        );
+    }
 
     tracing::info!(
         event = "admin.user.created",

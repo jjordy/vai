@@ -590,4 +590,45 @@ impl OrgStore for PostgresStorage {
             (None, None) => None,
         })
     }
+
+    async fn get_or_create_personal_org(
+        &self,
+        user_id: &Uuid,
+        user_name: &str,
+    ) -> Result<Organization, StorageError> {
+        let slug = format!("user-{}", user_id);
+        // Upsert the org row: if the slug already exists keep it unchanged.
+        let row = sqlx::query(
+            "INSERT INTO organizations (name, slug)
+             VALUES ($1, $2)
+             ON CONFLICT (slug) DO UPDATE SET slug = EXCLUDED.slug
+             RETURNING id, name, slug, created_at",
+        )
+        .bind(user_name)
+        .bind(&slug)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let org = Organization {
+            id: row.get("id"),
+            name: row.get("name"),
+            slug: row.get("slug"),
+            created_at: row.get("created_at"),
+        };
+
+        // Ensure the user is owner of their personal org (idempotent).
+        sqlx::query(
+            "INSERT INTO org_members (org_id, user_id, role)
+             VALUES ($1, $2, 'owner')
+             ON CONFLICT (org_id, user_id) DO NOTHING",
+        )
+        .bind(org.id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        Ok(org)
+    }
 }

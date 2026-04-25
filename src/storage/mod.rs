@@ -1327,6 +1327,19 @@ pub trait OrgStore: Send + Sync {
         user_id: &Uuid,
         repo_id: &Uuid,
     ) -> Result<Option<RepoRole>, StorageError>;
+
+    /// Returns the personal [`Organization`] for `user_id`, creating it
+    /// atomically if it does not yet exist.
+    ///
+    /// The personal org slug is always `user-{user_id}` and is never exposed
+    /// to the user as a meaningful identifier.  The display name is set to
+    /// `user_name` on creation.  If the org already exists the name is not
+    /// updated (callers that need a rename should call `update_org` directly).
+    async fn get_or_create_personal_org(
+        &self,
+        user_id: &Uuid,
+        user_name: &str,
+    ) -> Result<Organization, StorageError>;
 }
 
 // ── FileStore ─────────────────────────────────────────────────────────────────
