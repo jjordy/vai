@@ -335,6 +335,7 @@ while true; do
         --model sonnet \
         --allowedTools "${ALLOWED_TOOLS}" \
         --mcp-config /tmp/mcp-config.json \
+        -- "${WORK_DIR}" \
         || true
 
     # If Claude submitted via the Bash tool, agent state is already cleared.
