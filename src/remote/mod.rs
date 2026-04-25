@@ -357,6 +357,8 @@ pub struct PullOutcome {
     pub new_version: String,
     pub files_updated: Vec<String>,
     pub files_removed: Vec<String>,
+    /// Files that existed on the server but were absent locally and were restored.
+    pub files_restored: Vec<String>,
     pub already_up_to_date: bool,
     /// `true` if this was a force (full-tarball) pull.
     pub force: bool,
@@ -396,6 +398,16 @@ impl PullOutcome {
             println!("  Removed  : {} file(s)", self.files_removed.len());
             for f in &self.files_removed {
                 println!("    {} {f}", "-".red());
+            }
+        }
+        if !self.files_restored.is_empty() {
+            println!(
+                "  {} Restored {} file(s) that were missing locally but present on server:",
+                "!".yellow().bold(),
+                self.files_restored.len(),
+            );
+            for f in &self.files_restored {
+                println!("    {} {f}", "~".yellow());
             }
         }
     }
@@ -612,6 +624,12 @@ impl Session {
     // ── Pull ──────────────────────────────────────────────────────────────────
 
     /// Pulls changes from the server since the local HEAD version.
+    ///
+    /// This performs two passes:
+    /// 1. Apply incremental server-side changes (Added/Modified/Removed since local HEAD).
+    /// 2. Restore any files that exist on the server but are absent locally — these
+    ///    are files the user may have deleted on disk without pushing a deletion.
+    ///    Leaving them absent would cause a silent server-side delete on the next push.
     pub async fn pull(&self) -> Result<PullOutcome, RemoteError> {
         let vai_dir = self.repo_root.join(".vai");
         let local_head = read_local_head(&vai_dir)?;
@@ -619,76 +637,107 @@ impl Session {
         let result =
             self.adapter.pull_incremental(&self.repo_name, &local_head).await?;
 
-        if result.head_version == local_head || result.files.is_empty() {
-            return Ok(PullOutcome {
-                previous_version: local_head.clone(),
-                new_version: result.head_version,
-                files_updated: vec![],
-                files_removed: vec![],
-                already_up_to_date: true,
-                force: false,
-            });
-        }
-
         let mut files_updated = Vec::new();
         let mut files_removed = Vec::new();
 
-        let to_write: Vec<&FilePullEntry> = result
-            .files
-            .iter()
-            .filter(|e| matches!(e.change, ChangeKind::Added | ChangeKind::Modified))
-            .collect();
-        let to_remove: Vec<&FilePullEntry> = result
-            .files
-            .iter()
-            .filter(|e| matches!(e.change, ChangeKind::Removed))
-            .collect();
+        // ── Pass 1: apply incremental server-side changes ─────────────────────
+        if result.head_version != local_head && !result.files.is_empty() {
+            let to_write: Vec<&FilePullEntry> = result
+                .files
+                .iter()
+                .filter(|e| matches!(e.change, ChangeKind::Added | ChangeKind::Modified))
+                .collect();
+            let to_remove: Vec<&FilePullEntry> = result
+                .files
+                .iter()
+                .filter(|e| matches!(e.change, ChangeKind::Removed))
+                .collect();
 
-        if !to_write.is_empty() {
-            let pb = make_progress_bar(to_write.len() as u64, "Pulling");
-            for entry in &to_write {
-                pb.set_message(entry.path.clone());
-                if let Some(ref b64) = entry.content_base64 {
-                    let content = BASE64.decode(b64.as_bytes())?;
-                    let dest = self.repo_root.join(&entry.path);
-                    if let Some(parent) = dest.parent() {
-                        std::fs::create_dir_all(parent)?;
+            if !to_write.is_empty() {
+                let pb = make_progress_bar(to_write.len() as u64, "Pulling");
+                for entry in &to_write {
+                    pb.set_message(entry.path.clone());
+                    if let Some(ref b64) = entry.content_base64 {
+                        let content = BASE64.decode(b64.as_bytes())?;
+                        let dest = self.repo_root.join(&entry.path);
+                        if let Some(parent) = dest.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(&dest, &content)?;
+                        tarball::set_executable_if_shebang(&dest, &content)?;
+                        files_updated.push(entry.path.clone());
                     }
-                    std::fs::write(&dest, &content)?;
-                    tarball::set_executable_if_shebang(&dest, &content)?;
-                    files_updated.push(entry.path.clone());
+                    pb.inc(1);
                 }
-                pb.inc(1);
+                pb.finish_and_clear();
             }
-            pb.finish_and_clear();
+
+            for entry in &to_remove {
+                let dest = self.repo_root.join(&entry.path);
+                if dest.exists() {
+                    std::fs::remove_file(&dest)?;
+                }
+                files_removed.push(entry.path.clone());
+            }
         }
 
-        for entry in &to_remove {
-            let dest = self.repo_root.join(&entry.path);
-            if dest.exists() {
-                std::fs::remove_file(&dest)?;
+        // ── Pass 2: restore locally-absent server files ───────────────────────
+        // A file may be absent locally even if it didn't change on the server —
+        // e.g. the user ran `rm` without a push, or a prior interrupted pull
+        // left the working tree partial.  Without this step, the next `vai push`
+        // would silently delete those files from the server.
+        let manifest = self.adapter.get_manifest(&self.repo_name).await?;
+        let local_map = tarball::collect_local_hashes(&self.repo_root)?;
+
+        let newly_updated: HashSet<&str> = files_updated.iter().map(String::as_str).collect();
+        let mut files_restored: Vec<String> = Vec::new();
+
+        for entry in &manifest.files {
+            // Skip files already downloaded in pass 1.
+            if newly_updated.contains(entry.path.as_str()) {
+                continue;
             }
-            files_removed.push(entry.path.clone());
+            if !local_map.contains_key(&entry.path) {
+                let content =
+                    self.adapter.download_file(&self.repo_name, &entry.path).await?;
+                let dest = self.repo_root.join(&entry.path);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&dest, &content)?;
+                tarball::set_executable_if_shebang(&dest, &content)?;
+                files_restored.push(entry.path.clone());
+            }
         }
+        files_restored.sort();
 
-        std::fs::write(vai_dir.join("head"), format!("{}\n", result.head_version))?;
+        let new_version = result.head_version;
+        let already_up_to_date = files_updated.is_empty()
+            && files_removed.is_empty()
+            && files_restored.is_empty()
+            && new_version == local_head;
 
-        // Fetch version metadata for each version in (local_head, new_head] and
-        // write it to .vai/versions/<id>.toml so that `vai log` stays accurate.
-        write_version_metas(
-            &vai_dir,
-            &self.adapter,
-            &self.repo_name,
-            parse_version_num_str(&local_head),
-        )
-        .await?;
+        if new_version != local_head {
+            std::fs::write(vai_dir.join("head"), format!("{}\n", new_version))?;
+
+            // Fetch version metadata for each version in (local_head, new_head]
+            // and write it to .vai/versions/<id>.toml so `vai log` stays accurate.
+            write_version_metas(
+                &vai_dir,
+                &self.adapter,
+                &self.repo_name,
+                parse_version_num_str(&local_head),
+            )
+            .await?;
+        }
 
         Ok(PullOutcome {
             previous_version: local_head,
-            new_version: result.head_version,
+            new_version,
             files_updated,
             files_removed,
-            already_up_to_date: false,
+            files_restored,
+            already_up_to_date,
             force: false,
         })
     }
@@ -733,6 +782,7 @@ impl Session {
             new_version: dl.head_version,
             files_updated,
             files_removed,
+            files_restored: vec![],
             already_up_to_date: false,
             force: true,
         })
@@ -1367,6 +1417,67 @@ mod tests {
         let outcome = session.pull().await.unwrap();
 
         assert!(outcome.already_up_to_date);
+    }
+
+    #[tokio::test]
+    async fn pull_restores_locally_deleted_server_files() {
+        // Reproduce the issue: user deletes files locally without pushing, then
+        // pulls.  Pull should restore files present on the server so that a
+        // subsequent push cannot silently delete them from the server.
+        let root = tempfile::tempdir().unwrap();
+        setup_repo(root.path(), "v1");
+
+        let adapter = Arc::new(InMemoryAdapter::new());
+        adapter.seed_file("present.rs", b"server content");
+        adapter.seed_file("missing.rs", b"server content");
+        adapter.seed_version("v1", vec![
+            ("present.rs", ChangeKind::Added),
+            ("missing.rs", ChangeKind::Added),
+        ]);
+        // "present.rs" exists locally; "missing.rs" was deleted locally.
+        fs::write(root.path().join("present.rs"), b"server content").unwrap();
+
+        let session = make_session(root.path(), adapter);
+        let outcome = session.pull().await.unwrap();
+
+        // Already at HEAD (v1 == v1) but missing.rs was absent locally.
+        assert!(!outcome.already_up_to_date);
+        assert!(outcome.files_restored.contains(&"missing.rs".to_string()));
+        assert!(root.path().join("missing.rs").exists(), "missing.rs should be restored");
+        assert_eq!(
+            fs::read(root.path().join("missing.rs")).unwrap(),
+            b"server content",
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_restores_missing_files_alongside_incremental_changes() {
+        // Server advances from v1 → v2 (adding new.rs) while the user had
+        // locally deleted deleted_locally.rs.  Pull should apply new.rs AND
+        // restore deleted_locally.rs in one pass.
+        let root = tempfile::tempdir().unwrap();
+        setup_repo(root.path(), "v1");
+
+        let adapter = Arc::new(InMemoryAdapter::new());
+        adapter.seed_file("existing.rs", b"existing");
+        adapter.seed_file("new.rs", b"new");
+        adapter.seed_file("deleted_locally.rs", b"should be restored");
+        adapter.seed_version("v1", vec![
+            ("existing.rs", ChangeKind::Added),
+            ("deleted_locally.rs", ChangeKind::Added),
+        ]);
+        adapter.seed_version("v2", vec![("new.rs", ChangeKind::Added)]);
+        // existing.rs is present locally; deleted_locally.rs was deleted.
+        fs::write(root.path().join("existing.rs"), b"existing").unwrap();
+
+        let session = make_session(root.path(), adapter);
+        let outcome = session.pull().await.unwrap();
+
+        assert_eq!(outcome.new_version, "v2");
+        assert!(outcome.files_updated.contains(&"new.rs".to_string()));
+        assert!(outcome.files_restored.contains(&"deleted_locally.rs".to_string()));
+        assert!(root.path().join("new.rs").exists());
+        assert!(root.path().join("deleted_locally.rs").exists());
     }
 
     #[tokio::test]
