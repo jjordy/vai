@@ -23,7 +23,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 use std::os::unix::fs::PermissionsExt;
 
 use chrono::{DateTime, Utc};
@@ -1256,6 +1256,9 @@ pub fn print_download_result(result: &DownloadResult) {
 // ── submit ────────────────────────────────────────────────────────────────────
 
 /// Directory names always excluded from the submission tarball.
+///
+/// Used by [`build_agent_tarball`] which is exercised in tests only.
+#[cfg(test)]
 const EXCLUDED_DIRS: &[&str] =
     &[".vai", ".git", "target", "node_modules", "dist", "__pycache__"];
 
@@ -1278,100 +1281,82 @@ pub struct SubmitResult {
 /// and clear agent state.
 ///
 /// Steps:
-/// 1. Build a gzipped tarball of `work_dir` (excluding standard build
-///    artefacts and any extra patterns configured under `[ignore]` in
-///    `agent.toml`).
-/// 2. `POST /api/workspaces/:id/upload-snapshot` — uploads the tarball.
-/// 3. `POST /api/workspaces/:id/submit` — triggers the server-side merge.
-/// 4. `POST /api/issues/:id/close` — closes the issue as `resolved`.
-/// 5. Clears `.vai/agent-state.json`.
+/// 1. Open a [`FileWorkspace`] for the existing workspace (from agent state).
+/// 2. `upload_workspace` + `submit_workspace` via [`FileWorkspace::submit_forcing_deletions`].
+///    Using `submit_forcing_deletions` because the agent uploads a full snapshot;
+///    server-only files being absent is intentional, not a signal to abort.
+/// 3. `POST /api/issues/:id/close` — closes the issue as `resolved`.
+///    (FileWorkspace does a best-effort local IssueStore close which is a no-op
+///    for server-only repos, so the HTTP close is still needed.)
+/// 4. Clears `.vai/agent-state.json`.
 ///
 /// State is preserved if any step fails so the caller can retry.
+///
+/// Note: custom ignore patterns from `vai.toml [agent.ignore]` are not applied
+/// to the uploaded snapshot; only the standard build-artifact excludes
+/// (`.vai/`, `.git/`, `target/`, `node_modules/`) are used.
 pub fn submit(dir: &Path, work_dir: &Path) -> Result<SubmitResult, AgentError> {
     let config = load_config(dir)?;
     let state = load_state(dir)?;
     let api_key = AgentConfig::resolve_api_key();
     let api_key_ref = api_key.as_deref();
-
-    // Ignore patterns: vai.toml [agent.ignore] takes precedence over .vai/agent.toml [ignore].
-    let (_checks, ignore_patterns, _used_legacy) = resolve_checks_config(dir)?;
-
-    let tarball = build_agent_tarball(work_dir, &ignore_patterns)?;
+    let issue_title = state.issue_title.clone();
 
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| AgentError::Other(format!("cannot create tokio runtime: {e}")))?;
 
     let (added, modified, deleted, version_id) = rt.block_on(async {
-        // Step 1: Upload snapshot.
-        let upload_url = format!(
-            "{}/api/repos/{}/workspaces/{}/upload-snapshot",
-            config.server.trim_end_matches('/'),
-            config.repo,
-            state.workspace_id
-        );
-        let client = reqwest::Client::new();
-        let mut req = client
-            .post(&upload_url)
-            .header("Content-Type", "application/gzip")
-            .body(tarball);
-        if let Some(key) = api_key_ref {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
-        let resp = req.send().await.map_err(|e| AgentError::ServerUnreachable {
-            url: upload_url.clone(),
-            reason: e.to_string(),
-        })?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(AgentError::Other(format!(
-                "upload-snapshot returned {status}: {body}"
-            )));
-        }
-        let upload: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| AgentError::Other(format!("upload-snapshot JSON parse error: {e}")))?;
-        let added = upload["added"].as_u64().unwrap_or(0) as usize;
-        let modified = upload["modified"].as_u64().unwrap_or(0) as usize;
-        let deleted = upload["deleted"].as_u64().unwrap_or(0) as usize;
+        let workspace_id: uuid::Uuid = state
+            .workspace_id
+            .parse()
+            .map_err(|e| AgentError::Other(format!("invalid workspace_id: {e}")))?;
+        let issue_id_uuid: Option<uuid::Uuid> = state.issue_id.parse().ok();
 
-        // Step 2: Submit workspace.  We inline this call (instead of using
-        // agent_post) so we can distinguish the workspace_empty 409 from
-        // other errors and surface a recoverable AgentError to the CLI.
-        let submit_url = format!(
-            "{}/api/repos/{}/workspaces/{}/submit",
-            config.server.trim_end_matches('/'),
-            config.repo,
-            state.workspace_id,
-        );
-        let mut submit_req = client.post(&submit_url).json(&serde_json::json!({}));
-        if let Some(key) = api_key_ref {
-            submit_req = submit_req.header("Authorization", format!("Bearer {key}"));
-        }
-        let submit_resp = submit_req.send().await.map_err(|e| AgentError::ServerUnreachable {
-            url: submit_url.clone(),
-            reason: e.to_string(),
-        })?;
-        if !submit_resp.status().is_success() {
-            let status = submit_resp.status().as_u16();
-            let body = submit_resp.text().await.unwrap_or_default();
-            if status == 409 {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                    if v.get("error").and_then(|e| e.as_str()) == Some("workspace_empty") {
-                        return Err(AgentError::WorkspaceEmpty);
-                    }
+        let remote_config = crate::clone::RemoteConfig {
+            server_url: config.server.trim_end_matches('/').to_string(),
+            repo_name: config.repo.clone(),
+            api_key: api_key_ref.unwrap_or("").to_string(),
+            cloned_at_version: String::new(),
+        };
+        let remote = crate::file_workspace::HttpRemoteRepo::new(remote_config);
+
+        let opts = crate::file_workspace::OpenOptions {
+            repo_root: dir.to_path_buf(),
+            backend: crate::file_workspace::Backend::Remote(remote),
+            intent: crate::file_workspace::Intent::AgentWork {
+                workspace_id,
+                issue_id: issue_id_uuid,
+                intent: state.issue_title.clone(),
+                work_dir: work_dir.to_path_buf(),
+            },
+        };
+
+        let mut fw = crate::file_workspace::FileWorkspace::open(opts)
+            .await
+            .map_err(|e| AgentError::Other(format!("open workspace: {e}")))?;
+
+        // submit_forcing_deletions: agent uploads a full snapshot so
+        // ServerHasFileLocalDoesNot is expected, not a blocking surprise.
+        let applied = fw
+            .submit_forcing_deletions(crate::file_workspace::Submit::Required(
+                state.issue_title.clone(),
+            ))
+            .await
+            .map_err(|e| {
+                if matches!(e, crate::file_workspace::FwError::WorkspaceEmpty) {
+                    AgentError::WorkspaceEmpty
+                } else {
+                    AgentError::Other(format!("submit: {e}"))
                 }
-            }
-            return Err(AgentError::Other(format!("submit returned {status}: {body}")));
-        }
-        let submit_val: serde_json::Value = submit_resp
-            .json()
-            .await
-            .map_err(|e| AgentError::Other(format!("submit JSON parse error: {e}")))?;
-        let version_id = submit_val["version"].as_str().map(|s| s.to_string());
+            })?;
 
-        // Step 3: Close issue.
+        let snapshot = applied.snapshot;
+        let added = snapshot.as_ref().map(|s| s.added).unwrap_or(0);
+        let modified = snapshot.as_ref().map(|s| s.modified).unwrap_or(0);
+        let deleted_count = snapshot.as_ref().map(|s| s.deleted).unwrap_or(0);
+        let version_id = applied.version;
+
+        // Close the linked issue on the server.
         let close_path = format!("api/repos/{}/issues/{}/close", config.repo, state.issue_id);
         let _: serde_json::Value = agent_post(
             &config.server,
@@ -1381,10 +1366,10 @@ pub fn submit(dir: &Path, work_dir: &Path) -> Result<SubmitResult, AgentError> {
         )
         .await?;
 
-        Ok::<_, AgentError>((added, modified, deleted, version_id))
+        Ok::<_, AgentError>((added, modified, deleted_count, Some(version_id)))
     })?;
 
-    // Step 4: Clear state — only reached on full success.
+    // Clear state — only reached on full success.
     clear_state(dir)?;
 
     Ok(SubmitResult {
@@ -1392,12 +1377,13 @@ pub fn submit(dir: &Path, work_dir: &Path) -> Result<SubmitResult, AgentError> {
         modified,
         deleted,
         version_id,
-        issue_title: state.issue_title,
+        issue_title,
     })
 }
 
 /// Build a gzip-compressed tarball of `dir`, excluding standard build
 /// artefact directories and any additional `ignore_patterns`.
+#[cfg(test)]
 fn build_agent_tarball(dir: &Path, ignore_patterns: &[String]) -> Result<Vec<u8>, AgentError> {
     use flate2::{write::GzEncoder, Compression};
 
@@ -1419,6 +1405,7 @@ fn build_agent_tarball(dir: &Path, ignore_patterns: &[String]) -> Result<Vec<u8>
 /// Skips [`EXCLUDED_DIRS`] and any path component matching an entry in
 /// `ignore_patterns`.  Patterns may be exact names or simple prefix globs
 /// ending with `*`.
+#[cfg(test)]
 fn append_dir_to_agent_tar<W: std::io::Write>(
     tar: &mut tar::Builder<W>,
     current: &Path,
@@ -1472,14 +1459,14 @@ fn append_dir_to_agent_tar<W: std::io::Write>(
 /// On Unix, reads the actual file permissions from disk so that the executable
 /// bit is preserved for scripts.  On non-Unix platforms, falls back to a
 /// shebang-line heuristic: files starting with `#!` get `0o755`, others `0o644`.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn file_mode_for_path(path: &Path, content: &[u8]) -> u32 {
     std::fs::metadata(path)
         .map(|m| m.permissions().mode() & 0o777)
         .unwrap_or_else(|_| if content.starts_with(b"#!") { 0o755 } else { 0o644 })
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn file_mode_for_path(_path: &Path, content: &[u8]) -> u32 {
     if content.starts_with(b"#!") { 0o755 } else { 0o644 }
 }
@@ -1490,6 +1477,7 @@ fn file_mode_for_path(_path: &Path, content: &[u8]) -> u32 {
 /// - Exact match: `"dist"` matches any component named `dist` or the full path.
 /// - Suffix glob: `"*.log"` matches any path component ending with `.log`.
 /// - Prefix glob: `"build*"` matches any path component starting with `build`.
+#[cfg(test)]
 fn matches_ignore_pattern(pattern: &str, path: &str) -> bool {
     if pattern.starts_with('*') {
         // Suffix pattern: *.log → any segment ending with ".log".

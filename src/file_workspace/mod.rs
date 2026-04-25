@@ -96,6 +96,19 @@ pub enum Intent {
         text: String,
         issue_id: Option<Uuid>,
     },
+    /// Use an existing workspace identified by `workspace_id`.
+    ///
+    /// Unlike [`Existing`], the caller supplies the IDs directly (read from
+    /// `.vai/agent-state.json` by the agent). The workspace is treated as an
+    /// upload-from-root submit: `work_dir` is packed and uploaded as a full
+    /// snapshot rather than tracking a workspace overlay.
+    AgentWork {
+        workspace_id: Uuid,
+        issue_id: Option<Uuid>,
+        intent: String,
+        /// Directory whose files will be listed and uploaded.
+        work_dir: PathBuf,
+    },
 }
 
 /// Instruction for [`FileWorkspace::submit`]: how to handle the commit message
@@ -313,6 +326,11 @@ impl RemoteRepo for HttpRemoteRepo {
         let result = crate::remote_workspace::submit_workspace(&self.remote, ws_id)
             .await
             .map_err(|e| match e {
+                crate::remote_workspace::RemoteWorkspaceError::MergeConflict(ref body)
+                    if body.contains("workspace_empty") =>
+                {
+                    FwError::WorkspaceEmpty
+                }
                 crate::remote_workspace::RemoteWorkspaceError::MergeConflict(body) => {
                     FwError::Remote(format!("merge conflict on server: {body}"))
                 }
@@ -447,6 +465,15 @@ pub enum FwError {
     #[error("workspace has no changes to submit")]
     Empty,
 
+    /// Server rejected the submit because the uploaded snapshot contains no
+    /// file changes relative to the current server HEAD.
+    ///
+    /// Distinct from [`Empty`]: `Empty` is a client-side check (no files in
+    /// the overlay), while `WorkspaceEmpty` is a server-side verdict (uploaded
+    /// content is identical to HEAD after diffing).
+    #[error("workspace has no changes relative to server HEAD")]
+    WorkspaceEmpty,
+
     /// Submit was refused because the plan contains surprises.
     ///
     /// Inspect [`Plan::surprises`] and either abort or call
@@ -465,17 +492,22 @@ pub enum FwError {
 /// Created via [`FileWorkspace::open`]; used via [`plan`], [`submit`], [`pull`].
 pub struct FileWorkspace {
     repo_root: PathBuf,
+    /// Directory used for file listing and upload in push-from-root mode.
+    ///
+    /// Equals `repo_root` in the standard push path; equals the agent's
+    /// `work_dir` when opened with [`Intent::AgentWork`].
+    upload_root: PathBuf,
     vai_dir: PathBuf,
     ws_meta: workspace::WorkspaceMeta,
     merge_fs: Box<dyn MergeFs>,
     /// Consolidated deletions from `.vai-deleted` and `workspace.deleted_paths`.
     deleted_paths: Vec<String>,
     backend: BackendKind,
-    /// When `true`, [`plan`] and [`submit`] operate on the repo root directly
+    /// When `true`, [`plan`] and [`submit`] operate on `upload_root` directly
     /// (full-working-tree push) rather than a workspace overlay subdirectory.
     ///
-    /// Set by [`open`] when [`Intent::CreateFor`] is combined with
-    /// [`Backend::Remote`], i.e. `vai push` from the working directory.
+    /// Set by [`open`] when [`Intent::CreateFor`] or [`Intent::AgentWork`] is
+    /// combined with [`Backend::Remote`].
     is_push_from_root: bool,
 }
 
@@ -503,11 +535,14 @@ impl FileWorkspace {
 
         let head = repo::read_head(&vai_dir)?;
 
-        // Each arm resolves to (WorkspaceMeta, BackendKind, is_push_from_root).
-        let (ws_meta, backend_kind, is_push_from_root) = match (opts.backend, opts.intent) {
+        // Each arm resolves to (WorkspaceMeta, BackendKind, is_push_from_root, upload_root_override).
+        // `upload_root_override` is Some when the files to list/upload differ from `repo_root`
+        // (currently only for Intent::AgentWork).
+        let (ws_meta, backend_kind, is_push_from_root, upload_root_override): (_, _, _, Option<PathBuf>) =
+            match (opts.backend, opts.intent) {
             (Backend::Local, Intent::Existing) => {
                 let meta = workspace::active(&vai_dir)?;
-                (meta, BackendKind::Local, false)
+                (meta, BackendKind::Local, false, None)
             }
             (Backend::Local, Intent::CreateFor { text, issue_id }) => {
                 let mut result = workspace::create(&vai_dir, &text, &head)?;
@@ -515,11 +550,16 @@ impl FileWorkspace {
                     result.workspace.issue_id = Some(iid);
                     workspace::update_meta(&vai_dir, &result.workspace)?;
                 }
-                (result.workspace, BackendKind::Local, false)
+                (result.workspace, BackendKind::Local, false, None)
+            }
+            (Backend::Local, Intent::AgentWork { .. }) => {
+                return Err(FwError::Remote(
+                    "Intent::AgentWork requires Backend::Remote".to_string(),
+                ));
             }
             (Backend::Remote(remote), Intent::Existing) => {
                 let meta = workspace::active(&vai_dir)?;
-                (meta, BackendKind::Remote(remote), false)
+                (meta, BackendKind::Remote(remote), false, None)
             }
             (Backend::Remote(remote), Intent::CreateFor { text, issue_id }) => {
                 // Register a workspace on the server to obtain the canonical ID,
@@ -541,23 +581,45 @@ impl FileWorkspace {
                     updated_at: now,
                     deleted_paths: Vec::new(),
                 };
-                (meta, BackendKind::Remote(remote), true)
+                (meta, BackendKind::Remote(remote), true, None)
+            }
+            (Backend::Remote(remote), Intent::AgentWork { workspace_id, issue_id, intent, work_dir }) => {
+                // The workspace already exists on the server (created by `vai agent claim`).
+                // Build an in-memory WorkspaceMeta using the IDs from agent-state.json.
+                // The full `work_dir` is uploaded as a snapshot; we do not track an overlay.
+                let now = Utc::now();
+                let meta = workspace::WorkspaceMeta {
+                    id: workspace_id,
+                    intent,
+                    status: workspace::WorkspaceStatus::Active,
+                    base_version: head,
+                    issue_id,
+                    created_at: now,
+                    updated_at: now,
+                    deleted_paths: Vec::new(),
+                };
+                (meta, BackendKind::Remote(remote), true, Some(work_dir))
             }
         };
+
+        let upload_root = upload_root_override.unwrap_or_else(|| opts.repo_root.clone());
 
         let deleted_paths = if is_push_from_root {
             Vec::new()
         } else {
             load_deleted_paths(&vai_dir, &ws_meta)?
         };
+        // DiskMergeFs uses `upload_root` for "base/" key mapping so that
+        // `plan_repo_root_push` lists files from the correct directory.
         let merge_fs: Box<dyn MergeFs> = Box::new(DiskMergeFs::new(
             &vai_dir,
             &ws_meta.id.to_string(),
-            &opts.repo_root,
+            &upload_root,
         ));
 
         Ok(FileWorkspace {
             repo_root: opts.repo_root,
+            upload_root,
             vai_dir,
             ws_meta,
             merge_fs,
@@ -847,12 +909,12 @@ impl FileWorkspace {
                 let remote = Arc::clone(remote);
                 let ws_id = self.ws_meta.id.to_string();
 
-                // For push-from-root, upload the entire repo root as the overlay
-                // (the server treats it as a full snapshot regardless of size).
+                // For push-from-root (vai push, vai agent submit), upload `upload_root`
+                // as a full snapshot; the server derives the overlay by diffing vs HEAD.
                 // For workspace-overlay submits, upload only the overlay dir.
                 let (upload_dir, deleted_paths_ref): (std::borrow::Cow<'_, Path>, &[String]) =
                     if self.is_push_from_root {
-                        (std::borrow::Cow::Borrowed(self.repo_root.as_path()), &[])
+                        (std::borrow::Cow::Borrowed(self.upload_root.as_path()), &[])
                     } else {
                         let overlay = workspace::overlay_dir(&self.vai_dir, &ws_id);
                         (std::borrow::Cow::Owned(overlay), self.deleted_paths.as_slice())
@@ -861,7 +923,7 @@ impl FileWorkspace {
                 let snapshot = remote
                     .upload_workspace(
                         &ws_id,
-                        &self.repo_root,
+                        &self.upload_root,
                         &upload_dir,
                         &self.ws_meta.base_version,
                         deleted_paths_ref,
