@@ -286,6 +286,12 @@ pub enum Commands {
         /// Show what would be pushed without actually pushing.
         #[arg(long)]
         dry_run: bool,
+        /// Allow the push to delete server-side files that are absent locally.
+        ///
+        /// By default, vai aborts and lists the files that would be deleted.
+        /// Pass --force to confirm you intend the deletions and proceed.
+        #[arg(long)]
+        force: bool,
     },
     /// Pull the latest changes from the remote server (incremental).
     Sync,
@@ -917,8 +923,8 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
         Some(Commands::Pull { from, key, repo, force }) => {
             remote::handle_pull(from, key, repo, force, cli.json)?;
         }
-        Some(Commands::Push { message, to, key, repo, dry_run }) => {
-            remote::handle_push(message, to, key, repo, dry_run, cli.json)?;
+        Some(Commands::Push { message, to, key, repo, dry_run, force }) => {
+            remote::handle_push(message, to, key, repo, dry_run, force, cli.json)?;
         }
         Some(Commands::Sync) => {
             remote::handle_sync(cli.json)?;

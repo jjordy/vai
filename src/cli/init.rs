@@ -178,7 +178,7 @@ pub fn run_init(
         .build()?;
 
     let rt = make_rt()?;
-    match rt.block_on(session.push("initial commit", false)) {
+    match rt.block_on(session.push("initial commit", false, true)) {
         Err(RemoteError::NothingToPush) => {
             if !json {
                 println!("Repo registered (no files to push).");

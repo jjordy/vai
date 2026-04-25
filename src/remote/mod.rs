@@ -76,6 +76,13 @@ pub enum RemoteError {
     #[error("nothing to push — working directory matches server state")]
     NothingToPush,
 
+    /// Push would delete one or more server-side files that are absent locally.
+    ///
+    /// Returned when `force` is `false`. The caller should display `paths` and
+    /// ask the user to re-run with `--force` if the deletions are intentional.
+    #[error("push would delete {count} file(s) from the server that are missing locally — re-run with --force to proceed\n{list}", count = paths.len(), list = paths.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n"))]
+    PushWouldDeleteFiles { paths: Vec<String> },
+
     #[error("merge conflict — server rejected push:\n{0}\nRun `vai pull` to sync, then retry.")]
     MergeConflict(String),
 
@@ -293,6 +300,9 @@ pub struct PushOutcome {
     pub files_added: usize,
     pub files_modified: usize,
     pub files_deleted: usize,
+    /// Paths deleted from the server.  Populated on dry-run; empty on live push
+    /// (the push already checked for unwanted deletions via [`RemoteError::PushWouldDeleteFiles`]).
+    pub deleted_paths: Vec<String>,
     pub files_applied: usize,
     /// `true` if this was a dry run (no data was sent).
     pub dry_run: bool,
@@ -302,11 +312,24 @@ impl PushOutcome {
     /// Prints a human-readable summary to stdout.
     pub fn print(&self) {
         if self.dry_run {
-            println!(
-                "{} Dry run — {} file(s) would be pushed",
-                "·".dimmed(),
-                self.files_added + self.files_modified + self.files_deleted,
-            );
+            let total = self.files_added + self.files_modified + self.files_deleted;
+            println!("{} Dry run — {} file(s) would be pushed", "·".dimmed(), total);
+            if self.files_added > 0 {
+                println!("    {} {} added", "+".green(), self.files_added);
+            }
+            if self.files_modified > 0 {
+                println!("    {} {} modified", "~".yellow(), self.files_modified);
+            }
+            if self.files_deleted > 0 {
+                println!("    {} {} would be DELETED from server", "-".red(), self.files_deleted);
+                for path in &self.deleted_paths {
+                    println!("      {} {}", "-".red(), path);
+                }
+                println!(
+                    "  {} Re-run with --force to allow deletions, or investigate why these files are missing locally.",
+                    "!".yellow()
+                );
+            }
             return;
         }
         println!("{} Pushed — version {}", "✓".green().bold(), self.version.bold());
@@ -482,7 +505,7 @@ impl Session {
     /// 2. If nothing to push, return [`RemoteError::NothingToPush`].
     /// 3. Create workspace → upload snapshot → submit.
     /// 4. Update `.vai/head`.
-    pub async fn push(&self, message: &str, dry_run: bool) -> Result<PushOutcome, RemoteError> {
+    pub async fn push(&self, message: &str, dry_run: bool, force: bool) -> Result<PushOutcome, RemoteError> {
         let vai_dir = self.repo_root.join(".vai");
 
         // ── 1. Fetch manifest & compute diff ──────────────────────────────
@@ -493,7 +516,6 @@ impl Session {
 
         let mut files_modified = 0usize;
         let mut files_added = 0usize;
-        let mut files_deleted = 0usize;
 
         for (path, local_hash) in &local_map {
             match server_map.get(path) {
@@ -502,14 +524,26 @@ impl Session {
                 _ => {}
             }
         }
-        for path in server_map.keys() {
-            if !local_map.contains_key(path) {
-                files_deleted += 1;
-            }
-        }
+
+        // Collect paths that exist on the server but are absent locally —
+        // these would be deleted on push.
+        let mut deleted_paths: Vec<String> = server_map
+            .keys()
+            .filter(|p| !local_map.contains_key(*p))
+            .cloned()
+            .collect();
+        deleted_paths.sort();
+        let files_deleted = deleted_paths.len();
 
         if files_modified == 0 && files_added == 0 && files_deleted == 0 {
             return Err(RemoteError::NothingToPush);
+        }
+
+        // Guard against silent deletions: require explicit --force unless the
+        // caller has opted in.  Dry-run skips this check so the user can see
+        // what would be deleted before deciding whether to pass --force.
+        if !force && !dry_run && !deleted_paths.is_empty() {
+            return Err(RemoteError::PushWouldDeleteFiles { paths: deleted_paths });
         }
 
         if dry_run {
@@ -518,6 +552,7 @@ impl Session {
                 files_added,
                 files_modified,
                 files_deleted,
+                deleted_paths: if dry_run { deleted_paths } else { vec![] },
                 files_applied: 0,
                 dry_run: true,
             });
@@ -549,6 +584,7 @@ impl Session {
             files_added: upload_stats.added,
             files_modified: upload_stats.modified,
             files_deleted: upload_stats.deleted,
+            deleted_paths: vec![],
             files_applied: submit_result.files_applied,
             dry_run: false,
         })
@@ -838,12 +874,12 @@ impl Builder {
 /// Reads connection details from `.vai/config.toml`. For CLI flag overrides,
 /// use [`Session::builder`] instead.
 pub async fn push(repo_root: &Path, message: &str) -> Result<PushOutcome, RemoteError> {
-    Session::open(repo_root)?.build()?.push(message, false).await
+    Session::open(repo_root)?.build()?.push(message, false, false).await
 }
 
 /// Pushes local changes to the server (dry-run: no data is sent).
 pub async fn push_dry_run(repo_root: &Path, message: &str) -> Result<PushOutcome, RemoteError> {
-    Session::open(repo_root)?.build()?.push(message, true).await
+    Session::open(repo_root)?.build()?.push(message, true, false).await
 }
 
 /// Pulls changes from the server since the local HEAD version.
@@ -1044,7 +1080,7 @@ mod tests {
         adapter.seed_version("v1", vec![]);
 
         let session = make_session(root.path(), adapter.clone());
-        let outcome = session.push("initial commit", false).await.unwrap();
+        let outcome = session.push("initial commit", false, true).await.unwrap();
 
         assert!(!outcome.version.is_empty());
         assert!(!outcome.dry_run);
@@ -1065,7 +1101,7 @@ mod tests {
         adapter.set_force_merge_conflict(true);
 
         let session = make_session(root.path(), adapter);
-        let err = session.push("conflicting work", false).await.unwrap_err();
+        let err = session.push("conflicting work", false, true).await.unwrap_err();
         assert!(matches!(err, RemoteError::MergeConflict(_)));
     }
 
@@ -1080,7 +1116,7 @@ mod tests {
         adapter.set_force_upload_failure(true);
 
         let session = make_session(root.path(), adapter);
-        let _ = session.push("will fail", false).await;
+        let _ = session.push("will fail", false, true).await;
 
         // HEAD should remain unchanged
         let head = fs::read_to_string(root.path().join(".vai/head")).unwrap();
@@ -1100,8 +1136,40 @@ mod tests {
         fs::write(root.path().join("main.rs"), content).unwrap();
 
         let session = make_session(root.path(), adapter);
-        let err = session.push("nothing changed", false).await.unwrap_err();
+        let err = session.push("nothing changed", false, false).await.unwrap_err();
         assert!(matches!(err, RemoteError::NothingToPush));
+    }
+
+    #[tokio::test]
+    async fn push_without_force_aborts_when_server_files_would_be_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        setup_repo(root.path(), "v1");
+
+        // Local has main.rs; server has main.rs AND old.rs (not present locally).
+        let adapter = Arc::new(InMemoryAdapter::new());
+        adapter.seed_file("main.rs", b"fn main() {}");
+        adapter.seed_file("old.rs", b"fn old() {}");
+        adapter.seed_version("v1", vec![
+            ("main.rs", ChangeKind::Added),
+            ("old.rs", ChangeKind::Added),
+        ]);
+        // Write a modified main.rs locally so there IS something to push.
+        fs::write(root.path().join("main.rs"), b"fn main() { println!(\"hi\"); }").unwrap();
+        // old.rs is intentionally absent locally.
+
+        let session = make_session(root.path(), adapter.clone());
+
+        // Without --force, push should abort with PushWouldDeleteFiles.
+        let err = session.push("will delete old.rs", false, false).await.unwrap_err();
+        let RemoteError::PushWouldDeleteFiles { paths } = err else {
+            panic!("expected PushWouldDeleteFiles, got {err:?}");
+        };
+        assert_eq!(paths, vec!["old.rs"]);
+
+        // With --force, push should succeed.
+        let session2 = make_session(root.path(), adapter);
+        let outcome = session2.push("will delete old.rs", false, true).await.unwrap();
+        assert!(!outcome.version.is_empty());
     }
 
     // ── pull tests ────────────────────────────────────────────────────────────

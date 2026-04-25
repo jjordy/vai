@@ -567,6 +567,7 @@ pub(super) fn handle_push(
     key: Option<String>,
     repo: Option<String>,
     dry_run: bool,
+    force: bool,
     json: bool,
 ) -> Result<(), CliError> {
     let cwd = std::env::current_dir()
@@ -577,12 +578,25 @@ pub(super) fn handle_push(
     let msg = message.ok_or(RemoteError::MissingMessage)?;
     let session = build_session(&root, to, key, repo)?;
 
-    let result = make_rt()?.block_on(session.push(&msg, dry_run))?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
-    } else {
-        result.print();
+    match make_rt()?.block_on(session.push(&msg, dry_run, force)) {
+        Err(RemoteError::PushWouldDeleteFiles { paths }) => {
+            eprintln!("{} Push aborted — the following {} file(s) exist on the server but are MISSING locally and would be deleted:", "✗".red().bold(), paths.len());
+            for path in &paths {
+                eprintln!("  {} {}", "-".red(), path);
+            }
+            eprintln!();
+            eprintln!("  This may indicate an incomplete pull or ignored files. Investigate before pushing.");
+            eprintln!("  Re-run with {} to confirm the deletions are intentional.", "--force".bold());
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e.into()),
+        Ok(result) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            } else {
+                result.print();
+            }
+        }
     }
     Ok(())
 }
