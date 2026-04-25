@@ -18,9 +18,8 @@
 //!
 //! ## Migration status
 //!
-//! This is a parallel module. Existing callers in `cli/` still call
-//! `merge::submit` and `remote_workspace::*` directly. Future iterations will
-//! migrate those call-sites here and delete the now-orphaned orchestration.
+//! Step 1 built the parallel module. Step 2 migrates `cli/workspace.rs::Submit`
+//! and provides [`HttpRemoteRepo`] for production remote I/O.
 
 use std::collections::HashSet;
 use std::fs;
@@ -29,6 +28,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -56,6 +56,24 @@ impl OpenOptions {
         Self {
             repo_root,
             backend: Backend::Local,
+            intent: Intent::Existing,
+        }
+    }
+
+    /// Auto-detects the backend from the repo's `.vai/config.toml`.
+    ///
+    /// If a remote is configured, returns a [`Backend::Remote`] backed by
+    /// [`HttpRemoteRepo`]. Otherwise returns [`Backend::Local`].
+    pub fn from_root(repo_root: PathBuf) -> Self {
+        let vai_dir = repo_root.join(".vai");
+        let backend = if let Some(remote) = crate::clone::read_remote_config(&vai_dir) {
+            Backend::Remote(HttpRemoteRepo::new(remote))
+        } else {
+            Backend::Local
+        };
+        Self {
+            repo_root,
+            backend,
             intent: Intent::Existing,
         }
     }
@@ -158,8 +176,21 @@ pub enum ConflictKind {
     RemovedModified,
 }
 
+/// Upload statistics for a remote snapshot (delta or full).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotInfo {
+    /// Files present in the upload but absent from the server's HEAD.
+    pub added: usize,
+    /// Files whose content changed relative to the server's HEAD.
+    pub modified: usize,
+    /// Files removed (listed in the delta manifest or absent from the tarball).
+    pub deleted: usize,
+    /// `true` when the server processed the upload in delta mode.
+    pub is_delta: bool,
+}
+
 /// Result of a successful [`FileWorkspace::submit`] or [`FileWorkspace::pull`].
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Applied {
     /// New version ID created (submit) or synced to (pull).
     pub version: String,
@@ -167,6 +198,13 @@ pub struct Applied {
     pub files: usize,
     /// Number of entity-level changes applied.
     pub entities: usize,
+    /// Stable IDs of entities touched (populated for local submit only).
+    pub entity_ids: Vec<String>,
+    /// Workspace intent text (populated for local submit only).
+    pub intent: String,
+    /// Remote snapshot upload stats — `Some` for remote submit, `None` for local.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotInfo>,
 }
 
 // ── RemoteRepo port ───────────────────────────────────────────────────────────
@@ -175,8 +213,7 @@ pub struct Applied {
 /// [`Backend::Remote`] mode.
 ///
 /// Production implementation: [`HttpRemoteRepo`] (wraps `remote_workspace::*`).
-/// Test implementation: use an [`InMemoryRemoteRepo`] injected via
-/// [`Backend::Remote`].
+/// Test implementation: [`InMemoryRemoteRepo`] (in tests module).
 #[async_trait]
 pub trait RemoteRepo: Send + Sync {
     /// Returns all file paths present at the server's current HEAD.
@@ -186,6 +223,8 @@ pub trait RemoteRepo: Send + Sync {
     async fn head_version(&self) -> Result<String, FwError>;
 
     /// Uploads the workspace overlay to the server.
+    ///
+    /// Returns upload statistics (added/modified/deleted counts and mode).
     async fn upload_workspace(
         &self,
         ws_id: &str,
@@ -193,13 +232,163 @@ pub trait RemoteRepo: Send + Sync {
         overlay_dir: &Path,
         base_version: &str,
         deleted_paths: &[String],
-    ) -> Result<(), FwError>;
+    ) -> Result<SnapshotInfo, FwError>;
 
     /// Triggers a server-side merge for the workspace.
     async fn submit_workspace(&self, ws_id: &str) -> Result<Applied, FwError>;
 
     /// Downloads the given file paths from the server's current HEAD.
     async fn download_files(&self, paths: &[String]) -> Result<Vec<(String, Vec<u8>)>, FwError>;
+}
+
+// ── HttpRemoteRepo ────────────────────────────────────────────────────────────
+
+/// Production [`RemoteRepo`] implementation that talks to a vai server over HTTP.
+///
+/// Wraps the HTTP functions in `remote_workspace` and the file-download endpoint
+/// (`GET /api/repos/:repo/files/*path`).
+pub struct HttpRemoteRepo {
+    remote: crate::clone::RemoteConfig,
+}
+
+impl HttpRemoteRepo {
+    /// Creates a new `HttpRemoteRepo` wrapped in an `Arc` for use with
+    /// [`Backend::Remote`].
+    pub fn new(remote: crate::clone::RemoteConfig) -> Arc<Self> {
+        Arc::new(Self { remote })
+    }
+}
+
+#[async_trait]
+impl RemoteRepo for HttpRemoteRepo {
+    async fn list_head_files(&self) -> Result<Vec<String>, FwError> {
+        let resp = self.files_list_response().await?;
+        Ok(resp.files)
+    }
+
+    async fn head_version(&self) -> Result<String, FwError> {
+        let resp = self.files_list_response().await?;
+        Ok(resp.head_version)
+    }
+
+    async fn upload_workspace(
+        &self,
+        ws_id: &str,
+        repo_root: &Path,
+        overlay_dir: &Path,
+        base_version: &str,
+        deleted_paths: &[String],
+    ) -> Result<SnapshotInfo, FwError> {
+        let result = crate::remote_workspace::upload_snapshot(
+            &self.remote,
+            ws_id,
+            repo_root,
+            overlay_dir,
+            base_version,
+            deleted_paths,
+        )
+        .await
+        .map_err(|e| FwError::Remote(e.to_string()))?;
+
+        Ok(SnapshotInfo {
+            added: result.added,
+            modified: result.modified,
+            deleted: result.deleted,
+            is_delta: result.is_delta,
+        })
+    }
+
+    async fn submit_workspace(&self, ws_id: &str) -> Result<Applied, FwError> {
+        let result = crate::remote_workspace::submit_workspace(&self.remote, ws_id)
+            .await
+            .map_err(|e| match e {
+                crate::remote_workspace::RemoteWorkspaceError::MergeConflict(body) => {
+                    FwError::Remote(format!("merge conflict on server: {body}"))
+                }
+                other => FwError::Remote(other.to_string()),
+            })?;
+
+        Ok(Applied {
+            version: result.version,
+            files: result.files_applied,
+            entities: result.entities_changed,
+            entity_ids: vec![],
+            intent: String::new(),
+            snapshot: None,
+        })
+    }
+
+    async fn download_files(&self, paths: &[String]) -> Result<Vec<(String, Vec<u8>)>, FwError> {
+        let client = reqwest::Client::new();
+        let mut out = Vec::with_capacity(paths.len());
+
+        for path in paths {
+            let encoded = path.replace('/', "%2F");
+            let url = format!(
+                "{}/api/repos/{}/files/{}",
+                self.remote.server_url, self.remote.repo_name, encoded
+            );
+            let resp = client
+                .get(&url)
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", self.remote.api_key),
+                )
+                .send()
+                .await
+                .map_err(|e| FwError::Remote(e.to_string()))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(FwError::Remote(format!("download {path}: {status} {body}")));
+            }
+
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| FwError::Remote(e.to_string()))?;
+            out.push((path.clone(), bytes.to_vec()));
+        }
+
+        Ok(out)
+    }
+}
+
+impl HttpRemoteRepo {
+    async fn files_list_response(&self) -> Result<FilesListResponse, FwError> {
+        let client = reqwest::Client::new();
+        let url = format!(
+            "{}/api/repos/{}/files",
+            self.remote.server_url, self.remote.repo_name
+        );
+        let resp = client
+            .get(&url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.remote.api_key),
+            )
+            .send()
+            .await
+            .map_err(|e| FwError::Remote(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(FwError::Remote(format!("list files: {status} {body}")));
+        }
+
+        resp.json::<FilesListResponse>()
+            .await
+            .map_err(|e| FwError::Remote(e.to_string()))
+    }
+}
+
+/// Subset of the server's `GET /api/repos/:repo/files` response shape.
+#[derive(Deserialize)]
+struct FilesListResponse {
+    files: Vec<String>,
+    head_version: String,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -224,6 +413,12 @@ pub enum FwError {
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("issue error: {0}")]
+    Issue(#[from] crate::issue::IssueError),
+
+    #[error("event log error: {0}")]
+    EventLog(#[from] crate::event_log::EventLogError),
 
     #[error("not inside a vai repository")]
     NotARepo,
@@ -437,6 +632,9 @@ impl FileWorkspace {
                 version: self.ws_meta.base_version.clone(),
                 files: 0,
                 entities: 0,
+                entity_ids: vec![],
+                intent: String::new(),
+                snapshot: None,
             }),
             BackendKind::Remote(_) => self.do_pull(false).await,
         }
@@ -461,6 +659,9 @@ impl FileWorkspace {
                 version: self.ws_meta.base_version.clone(),
                 files: 0,
                 entities: 0,
+                entity_ids: vec![],
+                intent: String::new(),
+                snapshot: None,
             }),
             BackendKind::Remote(_) => self.do_pull(true).await,
         }
@@ -476,21 +677,38 @@ impl FileWorkspace {
             return Err(FwError::Empty);
         }
 
-        match &self.backend {
+        let applied = match &self.backend {
             BackendKind::Local => {
                 let result = merge::submit(&self.vai_dir, &self.repo_root)?;
-                Ok(Applied {
-                    version: result.version.version_id,
+
+                // Best-effort scope history recording.
+                let history_path = self.vai_dir.join("graph").join("history.db");
+                if let Ok(hist) = crate::scope_history::ScopeHistoryStore::open(&history_path) {
+                    let terms = crate::scope_inference::extract_terms(&result.version.intent);
+                    let _ = hist.record(
+                        &result.version.intent,
+                        &terms,
+                        &[],
+                        &result.entity_ids,
+                        Some(&self.ws_meta.id.to_string()),
+                    );
+                }
+
+                Applied {
+                    version: result.version.version_id.clone(),
                     files: result.files_applied,
                     entities: result.entities_changed,
-                })
+                    entity_ids: result.entity_ids,
+                    intent: result.version.intent,
+                    snapshot: None,
+                }
             }
             BackendKind::Remote(remote) => {
                 let remote = Arc::clone(remote);
                 let ws_id = self.ws_meta.id.to_string();
                 let overlay_dir = workspace::overlay_dir(&self.vai_dir, &ws_id);
 
-                remote
+                let snapshot = remote
                     .upload_workspace(
                         &ws_id,
                         &self.repo_root,
@@ -500,21 +718,35 @@ impl FileWorkspace {
                     )
                     .await?;
 
-                let applied = remote.submit_workspace(&ws_id).await?;
+                let mut submitted = remote.submit_workspace(&ws_id).await?;
+                submitted.snapshot = Some(snapshot);
 
-                // Update local HEAD and workspace status atomically.
+                // Update local HEAD and workspace status.
                 fs::write(
                     self.vai_dir.join("head"),
-                    format!("{}\n", applied.version),
+                    format!("{}\n", submitted.version),
                 )?;
                 self.ws_meta.status = workspace::WorkspaceStatus::Submitted;
                 self.ws_meta.updated_at = Utc::now();
                 workspace::update_meta(&self.vai_dir, &self.ws_meta)?;
 
-                let _ = s.message(); // suppress unused warning; message used by remote
-                Ok(applied)
+                let _ = s.message(); // message is carried by the workspace intent on the server
+                submitted
+            }
+        };
+
+        // Issue resolution — best-effort in both modes.
+        if let Some(issue_id) = self.ws_meta.issue_id {
+            if let Ok(store) = crate::issue::IssueStore::open(&self.vai_dir) {
+                if let Ok(mut event_log) =
+                    crate::event_log::EventLog::open(&self.vai_dir.join("event_log"))
+                {
+                    let _ = store.resolve(issue_id, Some(applied.version.clone()), &mut event_log);
+                }
             }
         }
+
+        Ok(applied)
     }
 
     async fn do_pull(&mut self, _force: bool) -> Result<Applied, FwError> {
@@ -556,6 +788,9 @@ impl FileWorkspace {
                 version: server_head,
                 files: 0,
                 entities: 0,
+                entity_ids: vec![],
+                intent: String::new(),
+                snapshot: None,
             });
         }
 
@@ -580,6 +815,9 @@ impl FileWorkspace {
             version: server_head,
             files: files_written,
             entities: 0,
+            entity_ids: vec![],
+            intent: String::new(),
+            snapshot: None,
         })
     }
 }
@@ -662,11 +900,16 @@ mod tests {
             overlay_dir: &Path,
             _base_version: &str,
             deleted_paths: &[String],
-        ) -> Result<(), FwError> {
+        ) -> Result<SnapshotInfo, FwError> {
             let mut files = self.files.lock().unwrap();
+            let mut deleted = 0usize;
             for path in deleted_paths {
-                files.remove(path);
+                if files.remove(path).is_some() {
+                    deleted += 1;
+                }
             }
+            let mut added = 0usize;
+            let mut modified = 0usize;
             if overlay_dir.exists() {
                 for entry in walk_files(overlay_dir) {
                     let rel = entry
@@ -675,10 +918,19 @@ mod tests {
                         .to_string_lossy()
                         .to_string();
                     let content = fs::read(&entry).unwrap_or_default();
-                    files.insert(rel, content);
+                    if files.insert(rel, content).is_none() {
+                        added += 1;
+                    } else {
+                        modified += 1;
+                    }
                 }
             }
-            Ok(())
+            Ok(SnapshotInfo {
+                added,
+                modified,
+                deleted,
+                is_delta: true,
+            })
         }
 
         async fn submit_workspace(&self, _ws_id: &str) -> Result<Applied, FwError> {
@@ -690,6 +942,9 @@ mod tests {
                 version: new_ver,
                 files: file_count,
                 entities: 0,
+                entity_ids: vec![],
+                intent: String::new(),
+                snapshot: None,
             })
         }
 

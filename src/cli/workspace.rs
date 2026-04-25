@@ -5,11 +5,9 @@ use colored::Colorize;
 
 use crate::diff;
 use crate::event_log::EventLog;
-use crate::merge;
+use crate::file_workspace::{self, FileWorkspace, OpenOptions};
 use crate::remote_workspace;
 use crate::repo;
-use crate::scope_history::ScopeHistoryStore;
-use crate::scope_inference;
 use crate::workspace;
 
 use super::{CliError, WorkspaceCommands};
@@ -19,7 +17,7 @@ use super::{format_age, make_rt, resolve_issue, truncate};
 pub(super) fn handle(
     ws_cmd: WorkspaceCommands,
     json: bool,
-    quiet: bool,
+    _quiet: bool,
     local: bool,
 ) -> Result<(), CliError> {
     let cwd = std::env::current_dir()
@@ -227,125 +225,42 @@ pub(super) fn handle(
             }
         }
         WorkspaceCommands::Submit => {
-            if let Some(remote) = crate::clone::read_remote_config(&vai_dir) {
-                // ── Remote submit path ─────────────────────────────
-                // 1. Determine active workspace ID and capture issue link.
-                let active_id = workspace::active_id(&vai_dir)
-                    .ok_or_else(|| CliError::Other("no active workspace".to_string()))?;
-                let active_ws_meta = workspace::get(&vai_dir, &active_id)?;
-                let linked_issue_id = active_ws_meta.issue_id;
-                let overlay = workspace::overlay_dir(&vai_dir, &active_id);
+            let rt = make_rt()?;
+            let mut fw = rt
+                .block_on(FileWorkspace::open(OpenOptions::from_root(root.clone())))
+                .map_err(|e| CliError::Other(format!("workspace: {e}")))?;
 
-                // 2. Upload workspace snapshot to server.
-                //    upload_snapshot auto-selects full vs delta mode based on
-                //    repo size: repos > 50 MiB use a delta tarball (overlay
-                //    files only); smaller repos send the full working tree.
-                let rt = tokio::runtime::Runtime::new()
-                    .map_err(|e| CliError::Other(format!("cannot create async runtime: {e}")))?;
+            let applied = match rt.block_on(fw.submit(file_workspace::Submit::Required(String::new()))) {
+                Err(file_workspace::FwError::Surprises(plan)) => {
+                    return Err(CliError::Other(format!(
+                        "submit refused: {} surprise(s) — run `vai workspace diff` to inspect",
+                        plan.surprises.len()
+                    )));
+                }
+                other => other.map_err(|e| CliError::Other(format!("submit: {e}")))?,
+            };
 
-                let snapshot_result = rt.block_on(remote_workspace::upload_snapshot(
-                    &remote,
-                    &active_id,
-                    &root,
-                    &overlay,
-                    &active_ws_meta.base_version,
-                    &active_ws_meta.deleted_paths,
-                ))?;
-
-                if !quiet && !json {
-                    let mode = if snapshot_result.is_delta { "delta" } else { "full" };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&applied).unwrap());
+            } else {
+                let label = if applied.snapshot.is_some() { " (server)" } else { "" };
+                println!(
+                    "{} Merged workspace → {}{}",
+                    "✓".green().bold(),
+                    applied.version.bold(),
+                    label,
+                );
+                if !applied.intent.is_empty() {
+                    println!("  Intent   : {}", applied.intent);
+                }
+                println!("  Files    : {}", applied.files);
+                println!("  Entities : {}", applied.entities);
+                if let Some(snap) = &applied.snapshot {
+                    let mode = if snap.is_delta { "delta" } else { "full" };
                     println!(
                         "  Snapshot : {} added, {} modified, {} deleted ({mode} mode)",
-                        snapshot_result.added,
-                        snapshot_result.modified,
-                        snapshot_result.deleted,
+                        snap.added, snap.modified, snap.deleted,
                     );
-                }
-
-                // 3. Trigger server-side merge.
-                let submit_result = rt
-                    .block_on(remote_workspace::submit_workspace(&remote, &active_id))
-                    .map_err(|e| match e {
-                        remote_workspace::RemoteWorkspaceError::MergeConflict(body) => {
-                            CliError::Other(format!("merge conflict on server: {body}"))
-                        }
-                        other => CliError::RemoteWorkspace(other),
-                    })?;
-
-                // 4. Update local HEAD to match the new server version.
-                std::fs::write(
-                    vai_dir.join("head"),
-                    format!("{}\n", submit_result.version),
-                )
-                .map_err(|e| CliError::Other(format!("update local HEAD: {e}")))?;
-
-                // 5. Mark local workspace as submitted.
-                let mut meta = workspace::get(&vai_dir, &active_id)?;
-                meta.status = workspace::WorkspaceStatus::Submitted;
-                meta.updated_at = chrono::Utc::now();
-                workspace::update_meta(&vai_dir, &meta)?;
-
-                // 6. If linked to an issue, resolve it.
-                if let Some(issue_id) = linked_issue_id {
-                    let store = crate::issue::IssueStore::open(&vai_dir)?;
-                    let mut event_log = EventLog::open(&vai_dir.join("event_log"))
-                        .map_err(|e| CliError::Other(format!("cannot open event log: {e}")))?;
-                    let _ = store.resolve(issue_id, Some(submit_result.version.clone()), &mut event_log);
-                }
-
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&submit_result).unwrap());
-                } else {
-                    println!(
-                        "{} Merged workspace → {} (server)",
-                        "✓".green().bold(),
-                        submit_result.version.bold()
-                    );
-                    println!("  Files    : {}", submit_result.files_applied);
-                    println!("  Entities : {}", submit_result.entities_changed);
-                }
-            } else {
-                // ── Local submit path ──────────────────────────────
-                // Capture linked issue before submit (workspace meta still accessible after).
-                let active_ws_meta = workspace::active(&vai_dir)?;
-                let linked_issue_id = active_ws_meta.issue_id;
-                let intent_text = active_ws_meta.intent.clone();
-                let workspace_id = active_ws_meta.id.to_string();
-
-                let result = merge::submit(&vai_dir, &root)?;
-
-                // Record intent → actual entities in history store.
-                let history_path = vai_dir.join("graph").join("history.db");
-                if let Ok(hist) = ScopeHistoryStore::open(&history_path) {
-                    let terms = scope_inference::extract_terms(&intent_text);
-                    let _ = hist.record(
-                        &intent_text,
-                        &terms,
-                        &[], // predicted IDs not tracked at submit time
-                        &result.entity_ids,
-                        Some(&workspace_id),
-                    );
-                }
-
-                // If linked to an issue, resolve it now that the workspace merged.
-                if let Some(issue_id) = linked_issue_id {
-                    let store = crate::issue::IssueStore::open(&vai_dir)?;
-                    let mut event_log = EventLog::open(&vai_dir.join("event_log"))
-                        .map_err(|e| CliError::Other(format!("cannot open event log: {e}")))?;
-                    let _ = store.resolve(issue_id, Some(result.version.version_id.clone()), &mut event_log);
-                }
-
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
-                } else {
-                    println!(
-                        "{} Merged workspace → {}",
-                        "✓".green().bold(),
-                        result.version.version_id.bold()
-                    );
-                    println!("  Intent   : {}", result.version.intent);
-                    println!("  Files    : {}", result.files_applied);
-                    println!("  Entities : {}", result.entities_changed);
                 }
             }
         }
