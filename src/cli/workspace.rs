@@ -168,28 +168,42 @@ pub(super) fn handle(
             }
         }
         WorkspaceCommands::Diff { entities_only } => {
-            let workspace_diff = diff::compute(&vai_dir, &root)?;
+            let rt = make_rt()?;
+            let fw = rt
+                .block_on(FileWorkspace::open(OpenOptions::local(root.clone())))
+                .map_err(|e| CliError::Other(format!("workspace: {e}")))?;
 
-            // Record events and transition workspace to Active on first diff.
-            diff::record_events(&vai_dir, &workspace_diff)?;
+            // plan() records workspace activity events as a side effect
+            // (transitions Created → Active on first call) and uses the
+            // canonical unified deletion set from both `.vai-deleted` and
+            // `meta.deleted_paths`.
+            let plan = rt
+                .block_on(fw.plan())
+                .map_err(|e| CliError::Other(format!("diff: {e}")))?;
 
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&workspace_diff).unwrap()
-                );
-            } else if workspace_diff.is_empty() {
+                // Re-derive a WorkspaceDiff-shaped value for JSON consumers
+                // that may depend on the existing schema.
+                let out = serde_json::json!({
+                    "base_version": plan.base_version,
+                    "head_version": plan.head_version,
+                    "file_diffs": plan.file_diffs,
+                    "entity_changes": plan.entity_changes,
+                    "surprises": plan.surprises.len(),
+                });
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else if plan.is_empty() {
                 println!("No changes in active workspace.");
             } else {
                 println!(
                     "{} workspace diff (base: {})",
                     "●".cyan(),
-                    workspace_diff.base_version.bold()
+                    plan.base_version.bold()
                 );
 
-                if !entities_only && !workspace_diff.file_diffs.is_empty() {
+                if !entities_only && !plan.file_diffs.is_empty() {
                     println!("\n{}", "Files changed:".bold());
-                    for fd in &workspace_diff.file_diffs {
+                    for fd in &plan.file_diffs {
                         let sigil = match fd.change_type {
                             diff::FileChangeType::Added => "+".green(),
                             diff::FileChangeType::Modified => "M".yellow(),
@@ -199,9 +213,9 @@ pub(super) fn handle(
                     }
                 }
 
-                if !workspace_diff.entity_changes.is_empty() {
+                if !plan.entity_changes.is_empty() {
                     println!("\n{}", "Entities changed:".bold());
-                    for ec in &workspace_diff.entity_changes {
+                    for ec in &plan.entity_changes {
                         let (sigil, label) = match ec.change_type {
                             diff::EntityChangeType::Added => ("+".green(), "added"),
                             diff::EntityChangeType::Modified => ("~".yellow(), "modified"),
@@ -220,6 +234,36 @@ pub(super) fn handle(
                             location,
                             label
                         );
+                    }
+                }
+
+                if !plan.surprises.is_empty() {
+                    println!("\n{}", "Warnings:".yellow().bold());
+                    for s in &plan.surprises {
+                        match s {
+                            file_workspace::Surprise::BaseDrifted { expected, actual } => {
+                                println!(
+                                    "  {} HEAD has advanced (workspace base: {}, current HEAD: {})",
+                                    "!".yellow(),
+                                    &expected[..8.min(expected.len())],
+                                    &actual[..8.min(actual.len())],
+                                );
+                            }
+                            file_workspace::Surprise::ServerHasFileLocalDoesNot(path) => {
+                                println!(
+                                    "  {} server has {} not present locally — run `vai pull` before submitting",
+                                    "!".yellow(),
+                                    path.display()
+                                );
+                            }
+                            file_workspace::Surprise::ConflictPredicted { path, .. } => {
+                                println!(
+                                    "  {} predicted conflict in {}",
+                                    "!".yellow(),
+                                    path.display()
+                                );
+                            }
+                        }
                     }
                 }
             }

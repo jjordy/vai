@@ -132,6 +132,11 @@ pub struct Plan {
     /// This is the canonical deletion set, sourced from both `.vai-deleted`
     /// and `workspace.deleted_paths` and deduplicated.
     pub dels: Vec<PathBuf>,
+    /// Detailed per-file change records including line counts.
+    ///
+    /// Mirrors the `adds`/`mods`/`dels` lists but with richer detail for
+    /// display purposes (e.g. `vai workspace diff`).
+    pub file_diffs: Vec<diff::FileDiff>,
     /// Entity-level changes (added / modified / removed semantic entities).
     pub entity_changes: Vec<EntityChange>,
     /// State that would surprise a caller relying on plan→submit atomicity.
@@ -552,10 +557,18 @@ impl FileWorkspace {
             .map(PathBuf::from)
             .collect();
 
-        let head_version = repo::read_head(&self.vai_dir)?;
         let mut surprises = Vec::new();
 
-        // Detect base drift: HEAD advanced since workspace was created.
+        // Detect base drift: HEAD has advanced past the workspace's base version.
+        //
+        // In remote mode compare against the server's authoritative HEAD so we
+        // catch concurrent submits from other clients.  In local mode the local
+        // `.vai/head` file is the source of truth.
+        let head_version = match &self.backend {
+            BackendKind::Remote(remote) => remote.head_version().await?,
+            BackendKind::Local => repo::read_head(&self.vai_dir)?,
+        };
+
         if head_version != self.ws_meta.base_version {
             surprises.push(Surprise::BaseDrifted {
                 expected: self.ws_meta.base_version.clone(),
@@ -598,10 +611,19 @@ impl FileWorkspace {
             }
         }
 
+        // Record workspace activity events (side effect: transition Created → Active).
+        // This is idempotent — record_events is a no-op if the workspace is
+        // already Active.  Only applicable in local mode; remote mode handles
+        // activation via the server's upload_snapshot endpoint.
+        if matches!(self.backend, BackendKind::Local) {
+            diff::record_events(&self.vai_dir, &workspace_diff).map_err(FwError::Diff)?;
+        }
+
         Ok(Plan {
             adds,
             mods,
             dels,
+            file_diffs: workspace_diff.file_diffs,
             entity_changes: workspace_diff.entity_changes,
             surprises,
             base_version: self.ws_meta.base_version.clone(),
@@ -1251,5 +1273,173 @@ mod tests {
                 || matches!(err, FwError::Merge(crate::merge::MergeError::EmptyWorkspace)),
             "submit on empty workspace must return Empty or Merge(EmptyWorkspace), got: {err:?}"
         );
+    }
+
+    // ── RacingRemoteRepo ──────────────────────────────────────────────────────
+
+    /// Test double that starts at `initial_version` but returns `racing_version`
+    /// from `head_version()` on its first call.  This simulates a concurrent
+    /// submit on the server advancing HEAD between the time the workspace was
+    /// created (base locked in to `initial_version`) and when `plan()` checks.
+    struct RacingRemoteRepo {
+        inner: Arc<InMemoryRemoteRepo>,
+        racing_version: String,
+    }
+
+    impl RacingRemoteRepo {
+        fn new(
+            initial_version: &str,
+            racing_version: &str,
+            files: impl IntoIterator<Item = (&'static str, Vec<u8>)>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                inner: InMemoryRemoteRepo::new(initial_version, files),
+                racing_version: racing_version.to_string(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RemoteRepo for RacingRemoteRepo {
+        /// Always returns the racing (advanced) version so BaseDrift is detected.
+        async fn head_version(&self) -> Result<String, FwError> {
+            Ok(self.racing_version.clone())
+        }
+
+        async fn list_head_files(&self) -> Result<Vec<String>, FwError> {
+            self.inner.list_head_files().await
+        }
+
+        async fn upload_workspace(
+            &self,
+            ws_id: &str,
+            repo_root: &Path,
+            overlay_dir: &Path,
+            base_version: &str,
+            deleted_paths: &[String],
+        ) -> Result<SnapshotInfo, FwError> {
+            self.inner
+                .upload_workspace(ws_id, repo_root, overlay_dir, base_version, deleted_paths)
+                .await
+        }
+
+        async fn submit_workspace(&self, ws_id: &str) -> Result<Applied, FwError> {
+            self.inner.submit_workspace(ws_id).await
+        }
+
+        async fn download_files(&self, paths: &[String]) -> Result<Vec<(String, Vec<u8>)>, FwError> {
+            self.inner.download_files(paths).await
+        }
+    }
+
+    // ── #371 test 5: server-race → BaseDrift ─────────────────────────────────
+
+    /// When the server HEAD advances between `plan()` and `submit()`, the
+    /// surprise list must contain `BaseDrifted` so the caller can decide
+    /// whether to re-plan or force-submit.
+    #[tokio::test]
+    async fn plan_detects_base_drift_when_head_advances_concurrently() {
+        let (_dir, root) = setup_local_repo(&[("src/file.rs", "fn main() {}")]);
+        let vai_dir = root.join(".vai");
+
+        let result = workspace::create(&vai_dir, "test", "v1").unwrap();
+        make_overlay(
+            &vai_dir,
+            &result.workspace.id,
+            &[("src/file.rs", "fn main() { /* changed */ }")],
+        );
+
+        // Racing repo: starts at v1, advances to v2 after list_head_files.
+        let remote = RacingRemoteRepo::new(
+            "v1",
+            "v2",
+            [("src/file.rs", b"fn main() {}".to_vec())],
+        );
+
+        let fw = FileWorkspace::open(OpenOptions {
+            repo_root: root.clone(),
+            backend: Backend::Remote(remote),
+            intent: Intent::Existing,
+        })
+        .await
+        .unwrap();
+
+        let plan = fw.plan().await.unwrap();
+
+        let has_base_drift = plan.surprises.iter().any(|s| {
+            matches!(
+                s,
+                Surprise::BaseDrifted { expected, actual }
+                    if expected == "v1" && actual == "v2"
+            )
+        });
+
+        assert!(
+            has_base_drift,
+            "plan() must detect BaseDrift when server HEAD advances between plan calls; \
+             surprises: {:?}",
+            plan.surprises
+        );
+    }
+
+    // ── #371 test 6: mode parity ──────────────────────────────────────────────
+
+    /// The same file addition is visible in `plan()` for both local and remote
+    /// backends, confirming that the two modes produce equivalent results.
+    #[tokio::test]
+    async fn plan_add_is_consistent_between_local_and_remote_modes() {
+        // ── Local mode ────────────────────────────────────────────────────────
+        let (_dir_l, root_l) = setup_local_repo(&[]);
+        let vai_dir_l = root_l.join(".vai");
+        let result_l = workspace::create(&vai_dir_l, "add feature", "v1").unwrap();
+        make_overlay(
+            &vai_dir_l,
+            &result_l.workspace.id,
+            &[("src/new.rs", "fn new() {}")],
+        );
+
+        let fw_l = FileWorkspace::open(OpenOptions::local(root_l.clone()))
+            .await
+            .unwrap();
+        let plan_l = fw_l.plan().await.unwrap();
+
+        // ── Remote mode ───────────────────────────────────────────────────────
+        let (_dir_r, root_r) = setup_local_repo(&[]);
+        let vai_dir_r = root_r.join(".vai");
+        let result_r = workspace::create(&vai_dir_r, "add feature", "v1").unwrap();
+        make_overlay(
+            &vai_dir_r,
+            &result_r.workspace.id,
+            &[("src/new.rs", "fn new() {}")],
+        );
+
+        let remote = InMemoryRemoteRepo::new("v1", []);
+        let fw_r = FileWorkspace::open(OpenOptions {
+            repo_root: root_r.clone(),
+            backend: Backend::Remote(remote),
+            intent: Intent::Existing,
+        })
+        .await
+        .unwrap();
+        let plan_r = fw_r.plan().await.unwrap();
+
+        // Both plans must agree on the add.
+        let local_adds: Vec<String> = plan_l
+            .adds
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let remote_adds: Vec<String> = plan_r
+            .adds
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(
+            local_adds, remote_adds,
+            "plan().adds must be identical for local and remote backends (mode parity)"
+        );
+        assert!(plan_l.dels.is_empty());
+        assert!(plan_r.dels.is_empty());
     }
 }

@@ -234,17 +234,31 @@ pub fn compute_with_fs(
 pub fn compute(vai_dir: &Path, repo_root: &Path) -> Result<WorkspaceDiff, DiffError> {
     let meta = workspace::active(vai_dir)?;
 
-    // Read the deletion manifest (workspace metadata, not a source file).
+    // Merge both deletion sources: the `.vai-deleted` manifest (used by local
+    // diff/merge) and `deleted_paths` in meta.toml (used by remote/server mode).
+    // Keeping them in sync here prevents #368-class divergence when the two
+    // sources drift.
     let manifest_path = vai_dir
         .join("workspaces")
         .join(meta.id.to_string())
         .join(".vai-deleted");
-    let deleted_paths: Vec<String> = if manifest_path.exists() {
+    let from_manifest: Vec<String> = if manifest_path.exists() {
         let bytes = fs::read(&manifest_path)?;
         serde_json::from_slice(&bytes).unwrap_or_default()
     } else {
         Vec::new()
     };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut deleted_paths = Vec::new();
+    for path in from_manifest
+        .into_iter()
+        .chain(meta.deleted_paths.iter().cloned())
+    {
+        if seen.insert(path.clone()) {
+            deleted_paths.push(path);
+        }
+    }
 
     let disk_fs = DiskMergeFs::new(vai_dir, &meta.id.to_string(), repo_root);
     compute_with_fs(&disk_fs, meta.id, meta.base_version, deleted_paths)
