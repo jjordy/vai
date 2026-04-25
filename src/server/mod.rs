@@ -4457,11 +4457,27 @@ pub async fn start(vai_dir: &Path, mut config: ServerConfig) -> Result<(), Serve
         worker_anthropic_key: std::env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
     });
 
-    // Start the dead-worker reconciliation background task when a compute
-    // provider is configured (i.e., cloud mode).  The task is a no-op in
-    // local SQLite mode — list_stale_workers returns [] there.
+    // Start background worker reconciliation tasks when a compute provider is
+    // configured (i.e., cloud mode).
     if let Some(compute) = &state.compute {
+        // Dead-worker reaper: marks stale workers terminal and destroys their
+        // Fly machines so they stop burning quota.
         worker_registry::run_reconciliation_loop(state.storage.clone(), compute.clone());
+
+        // Spawn reconciler: periodically tops up running workers so that
+        // toggling cloud mode or filing multiple issues always converges to the
+        // right concurrency level without a manual issue-recreation dance.
+        if !state.worker_server_url.is_empty() {
+            worker_registry::run_spawn_reconciliation_loop(
+                worker_registry::SpawnReconcilerCtx {
+                    storage: state.storage.clone(),
+                    compute: compute.clone(),
+                    jwt_service: Arc::clone(&state.jwt_service),
+                    server_url: state.worker_server_url.clone(),
+                    anthropic_key: state.worker_anthropic_key.clone(),
+                },
+            );
+        }
     }
 
     let app = build_app(state);

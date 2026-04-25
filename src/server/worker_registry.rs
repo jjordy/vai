@@ -123,12 +123,13 @@ pub async fn spawn_if_capacity(
     }
 
     // Check concurrency cap.
+    let cap = configured_max_concurrent();
     let running = workers.count_running_workers(repo_id).await?;
-    if running >= DEFAULT_MAX_CONCURRENT {
+    if running >= cap {
         tracing::debug!(
             repo_id = %repo_id,
             running,
-            cap = DEFAULT_MAX_CONCURRENT,
+            cap,
             "cloud agent concurrency cap reached — skipping spawn"
         );
         return Ok(None);
@@ -344,6 +345,208 @@ async fn reconcile_once(
     marked
 }
 
+/// Read the per-repo concurrency cap from `VAI_WORKER_MAX_CONCURRENT`, defaulting
+/// to [`DEFAULT_MAX_CONCURRENT`].
+fn configured_max_concurrent() -> u64 {
+    std::env::var("VAI_WORKER_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CONCURRENT)
+}
+
+// ── Spawn reconciliation loop ─────────────────────────────────────────────────
+
+/// Context required by the spawn reconciliation loop.
+pub struct SpawnReconcilerCtx {
+    /// Storage backend — used for both worker and issue queries.
+    pub storage: crate::storage::StorageBackend,
+    /// Compute provider for spawning machines.
+    pub compute: Arc<dyn ComputeProvider>,
+    /// JWT service used to mint short-lived worker access tokens.
+    pub jwt_service: Arc<crate::auth::jwt::JwtService>,
+    /// Public URL of this server, injected as `VAI_SERVER_URL` in the worker.
+    pub server_url: String,
+    /// Anthropic API key fallback used when the per-repo vault has no entry.
+    pub anthropic_key: String,
+}
+
+/// One reconciliation pass: for every cloud-enabled repo, top up running
+/// workers to `min(open_issues, max_concurrent)`.
+async fn spawn_reconcile_once(ctx: &SpawnReconcilerCtx) {
+    let max_concurrent = configured_max_concurrent();
+    let workers = ctx.storage.workers();
+
+    let repos = match workers.list_cloud_enabled_repos().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "spawn reconciler: list_cloud_enabled_repos failed");
+            return;
+        }
+    };
+
+    // Build the secrets store once — same for all repos in this tick.
+    #[cfg(feature = "postgres")]
+    let secrets: Arc<dyn SecretsStore> = {
+        match &ctx.storage {
+            crate::storage::StorageBackend::Server(pg)
+            | crate::storage::StorageBackend::ServerWithS3(pg, _)
+            | crate::storage::StorageBackend::ServerWithMemFs(pg, _) => {
+                Arc::new(pg.pool().clone())
+            }
+            _ => Arc::new(NoopSecretsStore),
+        }
+    };
+    #[cfg(not(feature = "postgres"))]
+    let secrets: Arc<dyn SecretsStore> = Arc::new(NoopSecretsStore);
+
+    let worker_image = format!("ghcr.io/jjordy/vai-worker:{}", env!("CARGO_PKG_VERSION"));
+
+    for (repo_id, repo_name) in repos {
+        let running = match workers.count_running_workers(&repo_id).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    repo_id = %repo_id, error = %e,
+                    "spawn reconciler: count_running_workers failed"
+                );
+                continue;
+            }
+        };
+
+        if running >= max_concurrent {
+            continue;
+        }
+
+        // Count open issues to bound how many workers are actually useful.
+        let open_count = match ctx
+            .storage
+            .issues()
+            .list_issues(
+                &repo_id,
+                &crate::issue::IssueFilter {
+                    status: Some(vec![crate::issue::IssueStatus::Open]),
+                    ..Default::default()
+                },
+                &crate::storage::ListQuery { page: 1, per_page: 1, sort: vec![] },
+            )
+            .await
+        {
+            Ok(r) => r.total,
+            Err(e) => {
+                tracing::warn!(
+                    repo_id = %repo_id, error = %e,
+                    "spawn reconciler: list open issues failed"
+                );
+                continue;
+            }
+        };
+
+        let needed = open_count.min(max_concurrent).saturating_sub(running);
+        if needed == 0 {
+            continue;
+        }
+
+        tracing::debug!(
+            repo_id = %repo_id,
+            repo_name = %repo_name,
+            running,
+            open_count,
+            needed,
+            "spawn reconciler: topping up workers"
+        );
+
+        for _ in 0..needed {
+            let worker_token = ctx
+                .jwt_service
+                .sign(
+                    "cloud-worker".to_string(),
+                    None,
+                    Some(repo_id.to_string()),
+                    Some("worker".to_string()),
+                )
+                .unwrap_or_default();
+
+            let config = SpawnConfig {
+                worker_image: &worker_image,
+                server_url: &ctx.server_url,
+                repo_name: &repo_name,
+                vai_api_key: &worker_token,
+            };
+
+            match spawn_if_capacity(
+                &repo_id,
+                ctx.compute.as_ref(),
+                ctx.storage.workers(),
+                Arc::clone(&secrets),
+                &ctx.anthropic_key,
+                &config,
+            )
+            .await
+            {
+                Ok(Some(worker_id)) => {
+                    tracing::info!(
+                        worker_id = %worker_id,
+                        repo_id = %repo_id,
+                        repo_name = %repo_name,
+                        "spawn reconciler: worker spawned"
+                    );
+                }
+                Ok(None) => {
+                    // Concurrency cap reached or cloud disabled — stop for this repo.
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        repo_id = %repo_id,
+                        error = %e,
+                        "spawn reconciler: spawn failed (non-fatal)"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Spawn a background task that periodically tops up cloud workers.
+///
+/// Interval defaults to 30 s (`VAI_WORKER_RECONCILE_SECS`).  On each tick the
+/// reconciler iterates every repo with `cloud_agent_enabled = true` and calls
+/// [`spawn_if_capacity`] until `running_workers == min(open_issues, cap)`.
+///
+/// This ensures that:
+/// - Enabling cloud mode on a repo with an existing backlog spawns workers
+///   within one tick without requiring a new issue to be filed.
+/// - Filing several issues quickly results in up to `cap` concurrent workers,
+///   not just one.
+///
+/// The per-issue-creation webhook in `src/server/issue.rs` is kept as a
+/// fast-path: it triggers immediately on issue creation so the first worker
+/// starts within seconds rather than waiting for the next tick.
+pub fn run_spawn_reconciliation_loop(ctx: SpawnReconcilerCtx) {
+    let interval_secs: u64 = std::env::var("VAI_WORKER_RECONCILE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
+    tokio::spawn(async move {
+        let mut tick =
+            tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        tracing::info!(
+            interval_secs,
+            max_concurrent = configured_max_concurrent(),
+            "spawn reconciliation loop started"
+        );
+
+        loop {
+            tick.tick().await;
+            spawn_reconcile_once(&ctx).await;
+        }
+    });
+}
+
 /// Spawn a background task that periodically reconciles dead workers.
 ///
 /// Interval defaults to 60 s (`VAI_WORKER_RECONCILE_INTERVAL_SECS`) and stale
@@ -534,6 +737,10 @@ mod tests {
             _enabled: bool,
         ) -> Result<(), StorageError> {
             Ok(())
+        }
+
+        async fn list_cloud_enabled_repos(&self) -> Result<Vec<(Uuid, String)>, StorageError> {
+            Ok(vec![])
         }
     }
 
@@ -734,5 +941,22 @@ mod tests {
 
         assert!(result.unwrap().is_none());
         assert!(!compute.was_spawned());
+    }
+
+    #[test]
+    fn configured_max_concurrent_defaults_to_constant() {
+        // Remove the env var in case a prior test set it.
+        std::env::remove_var("VAI_WORKER_MAX_CONCURRENT");
+        assert_eq!(configured_max_concurrent(), DEFAULT_MAX_CONCURRENT);
+    }
+
+    #[test]
+    fn configured_max_concurrent_reads_env_var() {
+        // Safety: this test mutates an env var.  Tests run in separate threads
+        // so we scope the mutation tightly with a restore.
+        std::env::set_var("VAI_WORKER_MAX_CONCURRENT", "7");
+        let result = configured_max_concurrent();
+        std::env::remove_var("VAI_WORKER_MAX_CONCURRENT");
+        assert_eq!(result, 7);
     }
 }

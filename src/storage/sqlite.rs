@@ -1572,6 +1572,10 @@ impl super::WorkerStore for SqliteStorage {
     ) -> Result<(), StorageError> {
         Err(worker_store_unsupported())
     }
+
+    async fn list_cloud_enabled_repos(&self) -> Result<Vec<(uuid::Uuid, String)>, StorageError> {
+        Ok(vec![])
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

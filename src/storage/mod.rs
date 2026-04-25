@@ -1740,6 +1740,12 @@ pub trait WorkerStore: Send + Sync {
         repo_id: &Uuid,
         enabled: bool,
     ) -> Result<(), StorageError>;
+
+    /// Return `(repo_id, repo_name)` for every repo with `cloud_agent_enabled = true`.
+    ///
+    /// Used by the spawn reconciliation loop to enumerate repos that may need
+    /// additional workers.  Returns an empty list in local SQLite mode.
+    async fn list_cloud_enabled_repos(&self) -> Result<Vec<(Uuid, String)>, StorageError>;
 }
 
 // ── StorageBackend factory ────────────────────────────────────────────────────

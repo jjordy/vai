@@ -296,4 +296,22 @@ impl WorkerStore for PostgresStorage {
         }
         Ok(())
     }
+
+    async fn list_cloud_enabled_repos(&self) -> Result<Vec<(Uuid, String)>, StorageError> {
+        use sqlx::Row as _;
+        let rows = sqlx::query(
+            "SELECT id, name FROM repos WHERE cloud_agent_enabled = true",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let id: Uuid = row.try_get("id").map_err(|e| StorageError::Database(e.to_string()))?;
+                let name: String = row.try_get("name").map_err(|e| StorageError::Database(e.to_string()))?;
+                Ok((id, name))
+            })
+            .collect()
+    }
 }
