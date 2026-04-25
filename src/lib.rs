@@ -36,3 +36,4 @@ pub mod version;
 pub mod watcher;
 pub mod work_queue;
 pub mod workspace;
+pub mod file_workspace;
