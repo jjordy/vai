@@ -1474,6 +1474,174 @@ mod tests {
         );
     }
 
+    // ── FailingSubmitRemoteRepo ───────────────────────────────────────────────
+
+    /// Test double that always fails on `submit_workspace` after a successful
+    /// `upload_workspace`.  Used to verify that a mid-submit server error leaves
+    /// the local workspace state unchanged (RFC #371 test 4).
+    struct FailingSubmitRemoteRepo {
+        inner: Arc<InMemoryRemoteRepo>,
+    }
+
+    impl FailingSubmitRemoteRepo {
+        fn new(
+            version: &str,
+            files: impl IntoIterator<Item = (&'static str, Vec<u8>)>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                inner: InMemoryRemoteRepo::new(version, files),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RemoteRepo for FailingSubmitRemoteRepo {
+        async fn list_head_files(&self) -> Result<Vec<String>, FwError> {
+            self.inner.list_head_files().await
+        }
+
+        async fn head_version(&self) -> Result<String, FwError> {
+            self.inner.head_version().await
+        }
+
+        async fn upload_workspace(
+            &self,
+            ws_id: &str,
+            repo_root: &Path,
+            overlay_dir: &Path,
+            base_version: &str,
+            deleted_paths: &[String],
+        ) -> Result<SnapshotInfo, FwError> {
+            self.inner
+                .upload_workspace(ws_id, repo_root, overlay_dir, base_version, deleted_paths)
+                .await
+        }
+
+        async fn submit_workspace(&self, _ws_id: &str) -> Result<Applied, FwError> {
+            Err(FwError::Remote("simulated server error during submit".to_string()))
+        }
+
+        async fn download_files(
+            &self,
+            paths: &[String],
+        ) -> Result<Vec<(String, Vec<u8>)>, FwError> {
+            self.inner.download_files(paths).await
+        }
+
+        async fn create_workspace(&self, intent: &str) -> Result<String, FwError> {
+            self.inner.create_workspace(intent).await
+        }
+    }
+
+    // ── Test 4: atomic submit — failure leaves state unchanged ────────────────
+
+    /// If `submit_workspace` fails on the server after `upload_workspace` succeeds,
+    /// the local workspace status and HEAD must not advance (RFC #371 test 4).
+    #[tokio::test]
+    async fn submit_remote_failure_leaves_workspace_unchanged() {
+        let (_dir, root) = setup_local_repo(&[("src/file.rs", "fn main() {}")]);
+        let vai_dir = root.join(".vai");
+
+        let result = workspace::create(&vai_dir, "test", "v1").unwrap();
+        make_overlay(
+            &vai_dir,
+            &result.workspace.id,
+            &[("src/file.rs", "fn main() { /* v2 */ }")],
+        );
+
+        let remote = FailingSubmitRemoteRepo::new(
+            "v1",
+            [("src/file.rs", b"fn main() {}".to_vec())],
+        );
+
+        let mut fw = FileWorkspace::open(OpenOptions {
+            repo_root: root.clone(),
+            backend: Backend::Remote(remote),
+            intent: Intent::Existing,
+        })
+        .await
+        .unwrap();
+
+        let err = fw
+            .submit(Submit::Required("test".to_string()))
+            .await
+            .unwrap_err();
+
+        assert!(
+            !matches!(err, FwError::Surprises(_)),
+            "expected a server error, not a surprises error"
+        );
+
+        // Workspace status must remain unchanged (not Submitted).
+        let meta = workspace::active(&vai_dir).unwrap();
+        assert_ne!(
+            meta.status,
+            workspace::WorkspaceStatus::Submitted,
+            "workspace status must not advance after failed submit (RFC #371 test 4)"
+        );
+
+        // Local HEAD must not advance.
+        let head = std::fs::read_to_string(vai_dir.join("head")).unwrap();
+        assert_eq!(
+            head.trim(),
+            "v1",
+            "HEAD must not advance after failed submit (RFC #371 test 4)"
+        );
+    }
+
+    // ── Test 7: issue resolution coupling ────────────────────────────────────
+
+    /// A non-empty workspace submit in local mode must resolve the linked issue
+    /// (RFC #371 test 7).
+    #[tokio::test]
+    async fn submit_resolves_linked_issue_in_local_mode() {
+        let (_dir, root) = setup_local_repo(&[("src/file.rs", "fn func() {}")]);
+        let vai_dir = root.join(".vai");
+
+        // Create an issue.
+        let issue_store = crate::issue::IssueStore::open(&vai_dir).unwrap();
+        let mut event_log =
+            crate::event_log::EventLog::open(&vai_dir.join("event_log")).unwrap();
+        let issue = issue_store
+            .create(
+                "Fix the bug",
+                "",
+                crate::issue::IssuePriority::Medium,
+                vec![],
+                "test",
+                &mut event_log,
+            )
+            .unwrap();
+
+        // Create a workspace and link it to the issue.
+        let mut result = workspace::create(&vai_dir, "fix the bug", "v1").unwrap();
+        result.workspace.issue_id = Some(issue.id);
+        workspace::update_meta(&vai_dir, &result.workspace).unwrap();
+
+        // Add changed files to the overlay.
+        make_overlay(
+            &vai_dir,
+            &result.workspace.id,
+            &[("src/file.rs", "fn func() { /* fixed */ }")],
+        );
+
+        // Submit.
+        let mut fw = FileWorkspace::open(OpenOptions::local(root.clone()))
+            .await
+            .unwrap();
+        fw.submit(Submit::Required("fix the bug".to_string()))
+            .await
+            .unwrap();
+
+        // Issue must be resolved.
+        let updated = issue_store.get(issue.id).unwrap();
+        assert_eq!(
+            updated.status,
+            crate::issue::IssueStatus::Resolved,
+            "submit must resolve the linked issue (RFC #371 test 7)"
+        );
+    }
+
     // ── RacingRemoteRepo ──────────────────────────────────────────────────────
 
     /// Test double that starts at `initial_version` but returns `racing_version`
