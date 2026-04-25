@@ -56,6 +56,9 @@ use chrono::{DateTime, Utc};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use crate::event_log::{EventKind, EventLog};
+use crate::version;
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// All errors that can occur during remote push, pull, or sync operations.
@@ -577,6 +580,22 @@ impl Session {
                 vai_dir.join("head"),
                 format!("{}\n", submit_result.version),
             )?;
+
+            // ── 5a. Write local events so `vai diff <old> <new>` works ────
+            // The server records all events in Postgres; locally we only have
+            // the repo working tree.  Write the minimal local event log entries
+            // so that get_version_changes() can reconstruct what changed.
+            // These writes are best-effort — a failure here does not abort push.
+            let _ = write_push_local_events(
+                &vai_dir,
+                &workspace_id,
+                &manifest.version,
+                &submit_result.version,
+                message,
+                &local_map,
+                &server_map,
+                &deleted_paths,
+            );
         }
 
         Ok(PushOutcome {
@@ -953,6 +972,87 @@ async fn write_version_metas(
 /// Returns `0` for any string that doesn't contain a parseable trailing integer.
 pub(crate) fn parse_version_num_str(version_id: &str) -> u64 {
     version_id.trim_start_matches('v').parse().unwrap_or(0)
+}
+
+/// Writes local event log entries and version metadata after a `vai push` so
+/// that `vai diff <old> <new>` can enumerate all changes — including deletions.
+///
+/// This mirrors what the server records in Postgres: FileAdded/FileModified/
+/// FileRemoved events keyed by workspace_id, plus MergeCompleted and
+/// VersionCreated, plus the `.vai/versions/<id>.toml` file.
+///
+/// All writes are best-effort; callers should ignore errors.
+#[allow(clippy::too_many_arguments)]
+fn write_push_local_events(
+    vai_dir: &Path,
+    workspace_id_str: &str,
+    parent_version_id: &str,
+    new_version_id: &str,
+    intent: &str,
+    local_map: &HashMap<String, String>,
+    server_map: &HashMap<String, String>,
+    deleted_paths: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_id = uuid::Uuid::parse_str(workspace_id_str)?;
+
+    let log_dir = vai_dir.join("event_log");
+    let mut log = EventLog::open(&log_dir)?;
+
+    // FileAdded and FileModified from comparing local vs server maps.
+    for (path, local_hash) in local_map {
+        match server_map.get(path) {
+            Some(server_hash) if server_hash != local_hash => {
+                let _ = log.append(EventKind::FileModified {
+                    workspace_id,
+                    path: path.clone(),
+                    old_hash: server_hash.clone(),
+                    new_hash: local_hash.clone(),
+                });
+            }
+            None => {
+                let _ = log.append(EventKind::FileAdded {
+                    workspace_id,
+                    path: path.clone(),
+                    hash: local_hash.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // FileRemoved for each path deleted by this push.
+    for path in deleted_paths {
+        let _ = log.append(EventKind::FileRemoved {
+            workspace_id,
+            path: path.clone(),
+        });
+    }
+
+    // MergeCompleted links the workspace to the new version.
+    let merge_event = log.append(EventKind::MergeCompleted {
+        workspace_id,
+        new_version_id: new_version_id.to_string(),
+        auto_resolved_conflicts: 0,
+    })?;
+
+    log.append(EventKind::VersionCreated {
+        version_id: new_version_id.to_string(),
+        parent_version_id: Some(parent_version_id.to_string()),
+        intent: intent.to_string(),
+    })?;
+
+    // Write the version metadata file so list_versions() finds it.
+    std::fs::create_dir_all(vai_dir.join("versions"))?;
+    version::create_version(
+        vai_dir,
+        new_version_id,
+        Some(parent_version_id),
+        intent,
+        "agent",
+        Some(merge_event.id),
+    )?;
+
+    Ok(())
 }
 
 /// Reads `.vai/head`, returning the trimmed version string.

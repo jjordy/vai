@@ -135,9 +135,35 @@ pub(super) fn handle_diff(
     let vai_dir = root.join(".vai");
 
     match (arg1, arg2) {
-        // ── Two version args → semantic diff (local mode) ─────────────
+        // ── Two version args → semantic diff (local, then server fallback) ─
         (Some(version_a), Some(version_b)) => {
-            let all_changes = version::get_versions_diff(&vai_dir, &version_a, &version_b)?;
+            let mut all_changes =
+                version::get_versions_diff(&vai_dir, &version_a, &version_b)?;
+
+            // When no local version metadata is available (e.g. immediately
+            // after `vai push` before the next `vai pull`), fall back to the
+            // server if a remote is configured.
+            if all_changes.is_empty() {
+                if let Ok(config) = repo::read_config(&vai_dir) {
+                    if let Some(remote) = config.remote {
+                        if let Ok((api_key, _)) = credentials::load_api_key() {
+                            if let Ok(rt) = make_rt() {
+                                if let Ok(server_changes) =
+                                    rt.block_on(fetch_versions_diff_remote(
+                                        &remote.url,
+                                        &api_key,
+                                        &config.name,
+                                        &version_a,
+                                        &version_b,
+                                    ))
+                                {
+                                    all_changes = server_changes;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&all_changes).unwrap());
@@ -156,32 +182,53 @@ pub(super) fn handle_diff(
                         vc.version.version_id.bold(),
                         format!("\"{}\"", vc.version.intent).italic()
                     );
-                    for fc in &vc.file_changes {
-                        let sigil = match fc.change_type {
-                            version::VersionFileChangeType::Added => "+".green(),
-                            version::VersionFileChangeType::Modified => "M".yellow(),
-                            version::VersionFileChangeType::Removed => "-".red(),
-                        };
-                        println!("  {} {}", sigil, fc.path);
+
+                    let added: Vec<_> = vc.file_changes.iter()
+                        .filter(|fc| fc.change_type == version::VersionFileChangeType::Added)
+                        .collect();
+                    let modified: Vec<_> = vc.file_changes.iter()
+                        .filter(|fc| fc.change_type == version::VersionFileChangeType::Modified)
+                        .collect();
+                    let deleted: Vec<_> = vc.file_changes.iter()
+                        .filter(|fc| fc.change_type == version::VersionFileChangeType::Removed)
+                        .collect();
+
+                    println!("\n  {}:", "Added".green().bold());
+                    for fc in &added {
+                        println!("    {} {}", "+".green(), fc.path);
                     }
-                    for ec in &vc.entity_changes {
-                        let sigil = ec.change_type.sigil();
-                        let colored_sigil = match ec.change_type {
-                            version::VersionChangeType::Added => sigil.green(),
-                            version::VersionChangeType::Modified => sigil.yellow(),
-                            version::VersionChangeType::Removed => sigil.red(),
-                        };
-                        if let (Some(kind), Some(name)) = (&ec.kind, &ec.qualified_name) {
-                            println!("  {} {} {}", colored_sigil, kind.cyan(), name.bold());
-                        } else if let Some(desc) = &ec.change_description {
-                            println!("  {} {}", colored_sigil, desc);
-                        } else {
-                            println!(
-                                "  {} entity {} {}",
-                                colored_sigil,
-                                ec.entity_id,
-                                ec.change_type.label()
-                            );
+
+                    println!("  {}:", "Modified".yellow().bold());
+                    for fc in &modified {
+                        println!("    {} {}", "M".yellow(), fc.path);
+                    }
+
+                    println!("  {}:", "Deleted".red().bold());
+                    for fc in &deleted {
+                        println!("    {} {}", "-".red(), fc.path);
+                    }
+
+                    if !vc.entity_changes.is_empty() {
+                        println!("  {}:", "Entities".cyan().bold());
+                        for ec in &vc.entity_changes {
+                            let sigil = ec.change_type.sigil();
+                            let colored_sigil = match ec.change_type {
+                                version::VersionChangeType::Added => sigil.green(),
+                                version::VersionChangeType::Modified => sigil.yellow(),
+                                version::VersionChangeType::Removed => sigil.red(),
+                            };
+                            if let (Some(kind), Some(name)) = (&ec.kind, &ec.qualified_name) {
+                                println!("    {} {} {}", colored_sigil, kind.cyan(), name.bold());
+                            } else if let Some(desc) = &ec.change_description {
+                                println!("    {} {}", colored_sigil, desc);
+                            } else {
+                                println!(
+                                    "    {} entity {} {}",
+                                    colored_sigil,
+                                    ec.entity_id,
+                                    ec.change_type.label()
+                                );
+                            }
                         }
                     }
                 }
@@ -519,4 +566,122 @@ pub(super) fn handle_rollback(
         result.files_restored, result.files_deleted
     );
     Ok(())
+}
+
+// ── Server-side version diff ───────────────────────────────────────────────────
+
+/// Fetches version changes for all versions strictly after `version_a` up to
+/// and including `version_b` from the remote server.
+///
+/// Used as a fallback when local version metadata is absent (e.g. immediately
+/// after `vai push` before the next `vai pull`).
+async fn fetch_versions_diff_remote(
+    server_url: &str,
+    api_key: &str,
+    repo_name: &str,
+    version_a: &str,
+    version_b: &str,
+) -> Result<Vec<version::VersionChanges>, CliError> {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct VersionListItem {
+        version_id: String,
+    }
+
+    #[derive(Deserialize)]
+    struct Pagination {
+        total_pages: u32,
+    }
+
+    #[derive(Deserialize)]
+    struct VersionListPage {
+        data: Vec<VersionListItem>,
+        pagination: Pagination,
+    }
+
+    let client = reqwest::Client::new();
+    let n_a = version::parse_version_number(version_a);
+    let n_b = version::parse_version_number(version_b);
+
+    if n_a >= n_b {
+        return Ok(vec![]);
+    }
+
+    // Collect all versions in (n_a, n_b] from paginated server response.
+    let mut in_range: Vec<VersionListItem> = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let url = format!(
+            "{}/api/repos/{}/versions?sort=created_at:asc&per_page=100&page={}",
+            server_url.trim_end_matches('/'),
+            repo_name,
+            page,
+        );
+        let resp = client
+            .get(&url)
+            .bearer_auth(api_key)
+            .send()
+            .await
+            .map_err(|e| CliError::Other(format!("server request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            return Err(CliError::Other(format!(
+                "server returned {} for versions list",
+                resp.status()
+            )));
+        }
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| CliError::Other(format!("server response error: {e}")))?;
+        let page_resp: VersionListPage = serde_json::from_str(&body)
+            .map_err(|e| CliError::Other(format!("parse error: {e}")))?;
+
+        let total_pages = page_resp.pagination.total_pages;
+        for item in page_resp.data {
+            let n = version::parse_version_number(&item.version_id);
+            if n > n_a && n <= n_b {
+                in_range.push(item);
+            }
+        }
+
+        if page >= total_pages {
+            break;
+        }
+        page += 1;
+    }
+
+    // For each version in range fetch its full VersionChanges.
+    let mut result = Vec::new();
+    for item in in_range {
+        let url = format!(
+            "{}/api/repos/{}/versions/{}",
+            server_url.trim_end_matches('/'),
+            repo_name,
+            item.version_id,
+        );
+        let resp = client
+            .get(&url)
+            .bearer_auth(api_key)
+            .send()
+            .await
+            .map_err(|e| CliError::Other(format!("server request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            continue;
+        }
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| CliError::Other(format!("server response error: {e}")))?;
+
+        if let Ok(changes) = serde_json::from_str::<version::VersionChanges>(&body) {
+            result.push(changes);
+        }
+    }
+
+    Ok(result)
 }

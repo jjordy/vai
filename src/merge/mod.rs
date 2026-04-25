@@ -318,6 +318,17 @@ fn fast_forward_merge(
     // Update semantic graph for changed Rust files.
     update_graph_for_diff(merge_fs, vai_dir, &workspace_diff)?;
 
+    // Emit FileRemoved events for deleted paths so version diff can enumerate
+    // them.  record_events() only runs once (when workspace is Created), so if
+    // files were deleted after an earlier workspace-diff run those events would
+    // be missing without this.
+    for path in deleted_paths {
+        let _ = log.append(EventKind::FileRemoved {
+            workspace_id: ws_meta.id,
+            path: path.clone(),
+        });
+    }
+
     // Record MergeCompleted and VersionCreated.
     let merge_event = log.append(EventKind::MergeCompleted {
         workspace_id: ws_meta.id,
@@ -445,6 +456,17 @@ fn semantic_merge(
 
     // Update graph for changed Rust files.
     update_graph_for_diff(merge_fs, vai_dir, &workspace_diff)?;
+
+    // Emit FileRemoved events for deleted paths so version diff can enumerate
+    // them.  record_events() only runs once (when workspace is Created), so if
+    // files were deleted after an earlier workspace-diff run those events would
+    // be missing without this.
+    for path in deleted_paths {
+        let _ = log.append(EventKind::FileRemoved {
+            workspace_id: ws_meta.id,
+            path: path.clone(),
+        });
+    }
 
     // Record events and create version.
     let merge_event = log.append(EventKind::MergeCompleted {

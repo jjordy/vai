@@ -334,7 +334,11 @@ pub fn get_version_changes(
     let events = log.query_by_workspace(workspace_id)?;
 
     let mut entity_changes = Vec::new();
-    let mut file_changes = Vec::new();
+    // Use an IndexMap-like approach: track per-path change so later events win.
+    // This deduplicates when record_events() and the merge function both emit
+    // FileRemoved for the same path.
+    let mut file_change_map: std::collections::HashMap<String, VersionFileChange> =
+        std::collections::HashMap::new();
 
     for event in events {
         match event.kind {
@@ -373,21 +377,21 @@ pub fn get_version_changes(
                 });
             }
             EventKind::FileAdded { path, hash, .. } => {
-                file_changes.push(VersionFileChange {
+                file_change_map.insert(path.clone(), VersionFileChange {
                     path,
                     change_type: VersionFileChangeType::Added,
                     hash: Some(hash),
                 });
             }
             EventKind::FileModified { path, new_hash, .. } => {
-                file_changes.push(VersionFileChange {
+                file_change_map.insert(path.clone(), VersionFileChange {
                     path,
                     change_type: VersionFileChangeType::Modified,
                     hash: Some(new_hash),
                 });
             }
             EventKind::FileRemoved { path, .. } => {
-                file_changes.push(VersionFileChange {
+                file_change_map.insert(path.clone(), VersionFileChange {
                     path,
                     change_type: VersionFileChangeType::Removed,
                     hash: None,
@@ -396,6 +400,9 @@ pub fn get_version_changes(
             _ => {}
         }
     }
+
+    let mut file_changes: Vec<VersionFileChange> = file_change_map.into_values().collect();
+    file_changes.sort_by(|a, b| a.path.cmp(&b.path));
 
     Ok(VersionChanges {
         version,
@@ -629,7 +636,9 @@ pub fn rollback(
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Parses the numeric part of a version ID like `"v3"` → `3`.
-fn parse_version_number(version_id: &str) -> u64 {
+/// Parses the numeric suffix from a version ID such as `"v42"` → `42`.
+/// Returns `0` for unrecognised formats.
+pub fn parse_version_number(version_id: &str) -> u64 {
     version_id
         .strip_prefix('v')
         .and_then(|s| s.parse::<u64>().ok())
