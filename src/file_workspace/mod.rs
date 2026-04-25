@@ -244,6 +244,12 @@ pub trait RemoteRepo: Send + Sync {
 
     /// Downloads the given file paths from the server's current HEAD.
     async fn download_files(&self, paths: &[String]) -> Result<Vec<(String, Vec<u8>)>, FwError>;
+
+    /// Creates a new workspace on the server and returns the server-assigned ID.
+    ///
+    /// Used by [`FileWorkspace::open`] with [`Intent::CreateFor`] in remote mode so
+    /// that the client and server share the same workspace UUID.
+    async fn create_workspace(&self, intent: &str) -> Result<String, FwError>;
 }
 
 // ── HttpRemoteRepo ────────────────────────────────────────────────────────────
@@ -321,6 +327,13 @@ impl RemoteRepo for HttpRemoteRepo {
             intent: String::new(),
             snapshot: None,
         })
+    }
+
+    async fn create_workspace(&self, intent: &str) -> Result<String, FwError> {
+        let meta = crate::remote_workspace::register_workspace(&self.remote, intent)
+            .await
+            .map_err(|e| FwError::Remote(e.to_string()))?;
+        Ok(meta.id)
     }
 
     async fn download_files(&self, paths: &[String]) -> Result<Vec<(String, Vec<u8>)>, FwError> {
@@ -458,6 +471,12 @@ pub struct FileWorkspace {
     /// Consolidated deletions from `.vai-deleted` and `workspace.deleted_paths`.
     deleted_paths: Vec<String>,
     backend: BackendKind,
+    /// When `true`, [`plan`] and [`submit`] operate on the repo root directly
+    /// (full-working-tree push) rather than a workspace overlay subdirectory.
+    ///
+    /// Set by [`open`] when [`Intent::CreateFor`] is combined with
+    /// [`Backend::Remote`], i.e. `vai push` from the working directory.
+    is_push_from_root: bool,
 }
 
 enum BackendKind {
@@ -484,10 +503,11 @@ impl FileWorkspace {
 
         let head = repo::read_head(&vai_dir)?;
 
-        let (ws_meta, backend_kind) = match (&opts.backend, opts.intent) {
+        // Each arm resolves to (WorkspaceMeta, BackendKind, is_push_from_root).
+        let (ws_meta, backend_kind, is_push_from_root) = match (opts.backend, opts.intent) {
             (Backend::Local, Intent::Existing) => {
                 let meta = workspace::active(&vai_dir)?;
-                (meta, BackendKind::Local)
+                (meta, BackendKind::Local, false)
             }
             (Backend::Local, Intent::CreateFor { text, issue_id }) => {
                 let mut result = workspace::create(&vai_dir, &text, &head)?;
@@ -495,23 +515,41 @@ impl FileWorkspace {
                     result.workspace.issue_id = Some(iid);
                     workspace::update_meta(&vai_dir, &result.workspace)?;
                 }
-                (result.workspace, BackendKind::Local)
+                (result.workspace, BackendKind::Local, false)
             }
             (Backend::Remote(remote), Intent::Existing) => {
                 let meta = workspace::active(&vai_dir)?;
-                let arc = Arc::clone(remote);
-                (meta, BackendKind::Remote(arc))
+                (meta, BackendKind::Remote(remote), false)
             }
-            (Backend::Remote(_), Intent::CreateFor { .. }) => {
-                // Remote CreateFor requires registering on the server; deferred
-                // to a follow-up iteration.
-                return Err(FwError::Remote(
-                    "remote CreateFor not yet implemented".to_string(),
-                ));
+            (Backend::Remote(remote), Intent::CreateFor { text, issue_id }) => {
+                // Register a workspace on the server to obtain the canonical ID,
+                // then keep an in-memory WorkspaceMeta so both sides share the
+                // same UUID.  We do NOT write to disk: the push workspace is
+                // ephemeral and should leave no artifacts on failure.
+                let ws_id_str = remote.create_workspace(&text).await?;
+                let ws_uuid = ws_id_str
+                    .parse::<uuid::Uuid>()
+                    .map_err(|e| FwError::Remote(format!("invalid workspace ID from server: {e}")))?;
+                let now = Utc::now();
+                let meta = workspace::WorkspaceMeta {
+                    id: ws_uuid,
+                    intent: text,
+                    status: workspace::WorkspaceStatus::Created,
+                    base_version: head,
+                    issue_id,
+                    created_at: now,
+                    updated_at: now,
+                    deleted_paths: Vec::new(),
+                };
+                (meta, BackendKind::Remote(remote), true)
             }
         };
 
-        let deleted_paths = load_deleted_paths(&vai_dir, &ws_meta)?;
+        let deleted_paths = if is_push_from_root {
+            Vec::new()
+        } else {
+            load_deleted_paths(&vai_dir, &ws_meta)?
+        };
         let merge_fs: Box<dyn MergeFs> = Box::new(DiskMergeFs::new(
             &vai_dir,
             &ws_meta.id.to_string(),
@@ -525,6 +563,7 @@ impl FileWorkspace {
             merge_fs,
             deleted_paths,
             backend: backend_kind,
+            is_push_from_root,
         })
     }
 
@@ -534,7 +573,14 @@ impl FileWorkspace {
     ///
     /// In [`Backend::Remote`] mode, also queries the server manifest to detect
     /// [`Surprise::ServerHasFileLocalDoesNot`].
+    ///
+    /// When [`is_push_from_root`] is set (i.e. [`Intent::CreateFor`] + remote),
+    /// delegates to [`plan_repo_root_push`] which compares the repo root against
+    /// the server manifest rather than the workspace overlay.
     pub async fn plan(&self) -> Result<Plan, FwError> {
+        if self.is_push_from_root {
+            return self.plan_repo_root_push().await;
+        }
         let workspace_diff = diff::compute_with_fs(
             self.merge_fs.as_ref(),
             self.ws_meta.id,
@@ -691,6 +737,78 @@ impl FileWorkspace {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
+    /// Plan variant for full-working-tree pushes ([`is_push_from_root`]).
+    ///
+    /// Compares the local repo root against the server manifest to compute
+    /// adds/mods and detects surprises (server-only files, base drift).
+    /// No workspace overlay is consulted because the overlay is empty for this
+    /// push mode — the entire repo root is the intended upload.
+    async fn plan_repo_root_push(&self) -> Result<Plan, FwError> {
+        let remote = match &self.backend {
+            BackendKind::Remote(r) => Arc::clone(r),
+            BackendKind::Local => unreachable!("plan_repo_root_push called in local mode"),
+        };
+
+        let server_head = remote.head_version().await?;
+        let server_files: HashSet<String> = remote.list_head_files().await?.into_iter().collect();
+
+        // Local files come from the repo root (DiskMergeFs maps "base/" → repo_root).
+        let local_files: HashSet<String> = self
+            .merge_fs
+            .list_files("base/")?
+            .into_iter()
+            .map(|k| k.strip_prefix("base/").unwrap_or(&k).to_string())
+            .collect();
+
+        // Files only locally → will be added on the server.
+        let mut adds: Vec<PathBuf> = local_files
+            .iter()
+            .filter(|p| !server_files.contains(*p))
+            .map(PathBuf::from)
+            .collect();
+        adds.sort();
+
+        // Files in both → conservatively treated as modified (no hash check here).
+        let mut mods: Vec<PathBuf> = local_files
+            .iter()
+            .filter(|p| server_files.contains(*p))
+            .map(PathBuf::from)
+            .collect();
+        mods.sort();
+
+        let mut surprises = Vec::new();
+
+        // Base drift: HEAD advanced since we snapshotted base_version.
+        if server_head != self.ws_meta.base_version {
+            surprises.push(Surprise::BaseDrifted {
+                expected: self.ws_meta.base_version.clone(),
+                actual: server_head.clone(),
+            });
+        }
+
+        // Server-only files would be implicitly deleted by the push.
+        let mut server_only: Vec<PathBuf> = server_files
+            .iter()
+            .filter(|p| !local_files.contains(*p))
+            .map(PathBuf::from)
+            .collect();
+        server_only.sort();
+        for path in server_only {
+            surprises.push(Surprise::ServerHasFileLocalDoesNot(path));
+        }
+
+        Ok(Plan {
+            adds,
+            mods,
+            dels: Vec::new(), // no explicit workspace deletions in push-from-root mode
+            file_diffs: Vec::new(),
+            entity_changes: Vec::new(),
+            surprises,
+            base_version: self.ws_meta.base_version.clone(),
+            head_version: server_head,
+        })
+    }
+
     async fn do_submit(&mut self, s: Submit, plan: &Plan) -> Result<Applied, FwError> {
         if plan.is_empty() {
             if s.is_close_if_empty() {
@@ -728,29 +846,44 @@ impl FileWorkspace {
             BackendKind::Remote(remote) => {
                 let remote = Arc::clone(remote);
                 let ws_id = self.ws_meta.id.to_string();
-                let overlay_dir = workspace::overlay_dir(&self.vai_dir, &ws_id);
+
+                // For push-from-root, upload the entire repo root as the overlay
+                // (the server treats it as a full snapshot regardless of size).
+                // For workspace-overlay submits, upload only the overlay dir.
+                let (upload_dir, deleted_paths_ref): (std::borrow::Cow<'_, Path>, &[String]) =
+                    if self.is_push_from_root {
+                        (std::borrow::Cow::Borrowed(self.repo_root.as_path()), &[])
+                    } else {
+                        let overlay = workspace::overlay_dir(&self.vai_dir, &ws_id);
+                        (std::borrow::Cow::Owned(overlay), self.deleted_paths.as_slice())
+                    };
 
                 let snapshot = remote
                     .upload_workspace(
                         &ws_id,
                         &self.repo_root,
-                        &overlay_dir,
+                        &upload_dir,
                         &self.ws_meta.base_version,
-                        &self.deleted_paths,
+                        deleted_paths_ref,
                     )
                     .await?;
 
                 let mut submitted = remote.submit_workspace(&ws_id).await?;
                 submitted.snapshot = Some(snapshot);
 
-                // Update local HEAD and workspace status.
+                // Update local HEAD.
                 fs::write(
                     self.vai_dir.join("head"),
                     format!("{}\n", submitted.version),
                 )?;
-                self.ws_meta.status = workspace::WorkspaceStatus::Submitted;
-                self.ws_meta.updated_at = Utc::now();
-                workspace::update_meta(&self.vai_dir, &self.ws_meta)?;
+
+                // For workspace-overlay submits, persist the updated status.
+                // For push-from-root, the workspace is ephemeral (no disk state).
+                if !self.is_push_from_root {
+                    self.ws_meta.status = workspace::WorkspaceStatus::Submitted;
+                    self.ws_meta.updated_at = Utc::now();
+                    workspace::update_meta(&self.vai_dir, &self.ws_meta)?;
+                }
 
                 let _ = s.message(); // message is carried by the workspace intent on the server
                 submitted
@@ -979,6 +1112,10 @@ mod tests {
                 .iter()
                 .filter_map(|p| files.get(p).map(|c| (p.clone(), c.clone())))
                 .collect())
+        }
+
+        async fn create_workspace(&self, _intent: &str) -> Result<String, FwError> {
+            Ok(uuid::Uuid::new_v4().to_string())
         }
     }
 
@@ -1329,6 +1466,10 @@ mod tests {
 
         async fn download_files(&self, paths: &[String]) -> Result<Vec<(String, Vec<u8>)>, FwError> {
             self.inner.download_files(paths).await
+        }
+
+        async fn create_workspace(&self, intent: &str) -> Result<String, FwError> {
+            self.inner.create_workspace(intent).await
         }
     }
 

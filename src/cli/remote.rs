@@ -7,6 +7,9 @@ use crate::credentials;
 use crate::repo;
 use crate::remote::{RemoteError, Session};
 use crate::remote as remote_ops;
+use crate::file_workspace::{
+    Backend, FileWorkspace, FwError, HttpRemoteRepo, Intent, OpenOptions, Plan, Submit, Surprise,
+};
 
 use super::{CliError, RemoteCommands};
 use super::make_rt;
@@ -576,29 +579,168 @@ pub(super) fn handle_push(
         .ok_or_else(|| CliError::Other("not inside a vai repository".to_string()))?;
 
     let msg = message.ok_or(RemoteError::MissingMessage)?;
-    let session = build_session(&root, to, key, repo)?;
+    let remote_cfg = build_remote_config(&root, to, key, repo)?;
+    let opts = OpenOptions {
+        repo_root: root,
+        backend: Backend::Remote(HttpRemoteRepo::new(remote_cfg)),
+        intent: Intent::CreateFor { text: msg.clone(), issue_id: None },
+    };
 
-    match make_rt()?.block_on(session.push(&msg, dry_run, force)) {
-        Err(RemoteError::PushWouldDeleteFiles { paths }) => {
-            eprintln!("{} Push aborted — the following {} file(s) exist on the server but are MISSING locally and would be deleted:", "✗".red().bold(), paths.len());
-            for path in &paths {
-                eprintln!("  {} {}", "-".red(), path);
-            }
-            eprintln!();
-            eprintln!("  This may indicate an incomplete pull or ignored files. Investigate before pushing.");
-            eprintln!("  Re-run with {} to confirm the deletions are intentional.", "--force".bold());
-            std::process::exit(1);
-        }
-        Err(e) => return Err(e.into()),
-        Ok(result) => {
+    make_rt()?.block_on(async {
+        let mut fw = FileWorkspace::open(opts).await
+            .map_err(|e| CliError::Other(e.to_string()))?;
+
+        if dry_run {
+            let plan = fw.plan().await.map_err(|e| CliError::Other(e.to_string()))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                print_push_plan_json(&plan);
             } else {
-                result.print();
+                print_push_plan(&plan);
+            }
+            return Ok(());
+        }
+
+        let submit_result = fw.submit(Submit::Required(msg.clone())).await;
+        match submit_result {
+            Err(FwError::Surprises(plan)) if !force => {
+                let server_only: Vec<&std::path::Path> = plan.surprises.iter()
+                    .filter_map(|s| if let Surprise::ServerHasFileLocalDoesNot(p) = s { Some(p.as_path()) } else { None })
+                    .collect();
+                eprintln!("{} Push aborted — the following {} file(s) exist on the server but are MISSING locally and would be deleted:",
+                    "✗".red().bold(), server_only.len());
+                for path in &server_only {
+                    eprintln!("  {} {}", "-".red(), path.display());
+                }
+                eprintln!();
+                eprintln!("  This may indicate an incomplete pull or ignored files. Investigate before pushing.");
+                eprintln!("  Re-run with {} to confirm the deletions are intentional.", "--force".bold());
+                std::process::exit(1);
+            }
+            Err(FwError::Surprises(_)) => {
+                let applied = fw.submit_forcing_deletions(Submit::Required(msg))
+                    .await.map_err(|e| CliError::Other(e.to_string()))?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&applied).unwrap());
+                } else {
+                    print_push_applied(&applied);
+                }
+            }
+            Err(FwError::Empty) => return Err(CliError::Other("nothing to push".to_string())),
+            Err(e) => return Err(CliError::Other(e.to_string())),
+            Ok(applied) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&applied).unwrap());
+                } else {
+                    print_push_applied(&applied);
+                }
             }
         }
+        Ok(())
+    })
+}
+
+/// Builds a [`crate::clone::RemoteConfig`] from explicit CLI flags or the
+/// repository's `.vai/` configuration files.
+fn build_remote_config(
+    root: &std::path::Path,
+    server_url: Option<String>,
+    api_key: Option<String>,
+    repo_name: Option<String>,
+) -> Result<crate::clone::RemoteConfig, CliError> {
+    if let Some(url) = server_url {
+        let key = api_key.ok_or(RemoteError::MissingKey)?;
+        let repo = repo_name.ok_or(RemoteError::MissingRepo)?;
+        return Ok(crate::clone::RemoteConfig {
+            server_url: url,
+            api_key: key,
+            repo_name: repo,
+            cloned_at_version: String::new(),
+        });
     }
-    Ok(())
+
+    let vai_dir = root.join(".vai");
+
+    // Try remote.toml first (written by `vai clone`).
+    if let Some(mut rc) = crate::clone::read_remote_config(&vai_dir) {
+        let (key, _) = credentials::load_api_key()
+            .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
+        rc.api_key = key;
+        return Ok(rc);
+    }
+
+    // Fall back to config.toml + credential store (repos added via `vai remote add`).
+    let config = repo::read_config(&vai_dir)?;
+    let remote_cfg = config.remote.ok_or(RemoteError::NoRemote)?;
+    let (key, _) = credentials::load_api_key()
+        .map_err(|e| CliError::Other(format!("credentials error: {e}")))?;
+    let repo = remote_cfg.repo_name.as_deref().unwrap_or(&config.name).to_string();
+
+    // Best-effort drift check.
+    if let Ok(rt) = tokio::runtime::Runtime::new() {
+        let client = crate::remote_client::RemoteClient::new(&remote_cfg.url, &key);
+        rt.block_on(super::warn_if_repo_id_drifted(&client, &repo, config.repo_id));
+    }
+
+    Ok(crate::clone::RemoteConfig {
+        server_url: remote_cfg.url,
+        api_key: key,
+        repo_name: repo,
+        cloned_at_version: String::new(),
+    })
+}
+
+fn print_push_plan(plan: &Plan) {
+    let total = plan.adds.len() + plan.mods.len();
+    let server_only_count = plan.surprises.iter()
+        .filter(|s| matches!(s, Surprise::ServerHasFileLocalDoesNot(_)))
+        .count();
+    println!("{} Dry run — {} file(s) would be pushed", "·".dimmed(), total);
+    if !plan.adds.is_empty() {
+        println!("    {} {} added", "+".green(), plan.adds.len());
+    }
+    if !plan.mods.is_empty() {
+        println!("    {} {} modified", "~".yellow(), plan.mods.len());
+    }
+    if server_only_count > 0 {
+        println!("    {} {} would be DELETED from server", "-".red(), server_only_count);
+        for s in &plan.surprises {
+            if let Surprise::ServerHasFileLocalDoesNot(p) = s {
+                println!("      {} {}", "-".red(), p.display());
+            }
+        }
+        println!(
+            "  {} Re-run with --force to allow deletions, or investigate why these files are missing locally.",
+            "!".yellow()
+        );
+    }
+}
+
+fn print_push_plan_json(plan: &Plan) {
+    let server_only: Vec<String> = plan.surprises.iter()
+        .filter_map(|s| if let Surprise::ServerHasFileLocalDoesNot(p) = s {
+            Some(p.to_string_lossy().to_string())
+        } else { None })
+        .collect();
+    println!("{}", serde_json::json!({
+        "dry_run": true,
+        "files_added": plan.adds.len(),
+        "files_modified": plan.mods.len(),
+        "files_deleted": server_only.len(),
+        "deleted_paths": server_only,
+    }));
+}
+
+fn print_push_applied(applied: &crate::file_workspace::Applied) {
+    let snapshot = applied.snapshot.as_ref();
+    let added = snapshot.map(|s| s.added).unwrap_or(0);
+    let modified = snapshot.map(|s| s.modified).unwrap_or(0);
+    let deleted = snapshot.map(|s| s.deleted).unwrap_or(0);
+    let total = added + modified + deleted;
+    println!("{} Pushed — version {}", "✓".green().bold(), applied.version.bold());
+    println!("  {} file(s) changed", total);
+    if added > 0 { println!("    {} {} added", "+".green(), added); }
+    if modified > 0 { println!("    {} {} modified", "~".yellow(), modified); }
+    if deleted > 0 { println!("    {} {} deleted", "-".red(), deleted); }
 }
 
 /// Handle `vai sync`.
