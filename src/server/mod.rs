@@ -555,6 +555,87 @@ impl AppState {
     }
 }
 
+// ── Cascade workspace + worker teardown ──────────────────────────────────────
+
+/// Discard a workspace and tear down its active cloud worker (if any).
+///
+/// Called when an issue is explicitly closed or when `submit` is rejected
+/// because the linked issue was already closed.  Does NOT update the linked
+/// issue status — the caller owns that transition.
+///
+/// All steps after the initial `discard_workspace` are best-effort: a failure
+/// in worker lookup or machine destruction is logged but never propagates.
+pub(crate) async fn cascade_workspace_teardown(
+    state: &Arc<AppState>,
+    repo_id: &uuid::Uuid,
+    ws_uuid: uuid::Uuid,
+    reason: &str,
+) {
+    let workspaces = state.storage.workspaces();
+    if let Err(e) = workspaces.discard_workspace(repo_id, &ws_uuid).await {
+        tracing::warn!(workspace_id = %ws_uuid, error = %e, "cascade: discard_workspace failed");
+        return;
+    }
+
+    state.conflict_engine.lock().await.remove_workspace(&ws_uuid);
+
+    let _ = state
+        .storage
+        .events()
+        .append(
+            repo_id,
+            crate::event_log::EventKind::WorkspaceDiscarded {
+                workspace_id: ws_uuid,
+                reason: reason.to_string(),
+            },
+        )
+        .await;
+
+    state.broadcast(BroadcastEvent {
+        event_type: "WorkspaceDiscarded".to_string(),
+        event_id: 0,
+        workspace_id: Some(ws_uuid.to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        data: serde_json::json!({ "workspace_id": ws_uuid.to_string() }),
+    });
+
+    // Tear down any active cloud worker holding this workspace.
+    let workers = state.storage.workers();
+    let worker = match workers.get_worker_by_workspace(&ws_uuid).await {
+        Ok(Some(w)) => w,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(workspace_id = %ws_uuid, error = %e, "cascade: get_worker_by_workspace failed");
+            return;
+        }
+    };
+
+    if let (Some(ref compute), Some(ref machine_id)) = (&state.compute, &worker.machine_id) {
+        let mid = compute::MachineId(machine_id.clone());
+        match compute.destroy(&mid).await {
+            Ok(()) | Err(compute::ProviderError::NotFound(_)) => {}
+            Err(e) => {
+                tracing::warn!(
+                    worker_id = %worker.id,
+                    machine_id = %machine_id,
+                    error = %e,
+                    "cascade: destroy machine failed (non-fatal)"
+                );
+            }
+        }
+    }
+
+    let _ = workers
+        .mark_done(&worker.id, crate::storage::WorkerDoneReason::Terminated)
+        .await;
+
+    tracing::info!(
+        workspace_id = %ws_uuid,
+        worker_id = %worker.id,
+        "cascade: workspace discarded and worker torn down"
+    );
+}
+
 // ── Agent identity ────────────────────────────────────────────────────────────
 
 /// How the current request was authenticated.

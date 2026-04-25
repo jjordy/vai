@@ -1714,6 +1714,15 @@ pub trait WorkerStore: Send + Sync {
         reason: WorkerDoneReason,
     ) -> Result<(), StorageError>;
 
+    /// Return the active (`spawning` or `running`) worker holding the given
+    /// workspace, if one exists.
+    ///
+    /// Returns `Ok(None)` when no active worker claims that workspace.
+    async fn get_worker_by_workspace(
+        &self,
+        workspace_id: &Uuid,
+    ) -> Result<Option<AgentWorker>, StorageError>;
+
     /// Return all workers in `spawning` or `running` state whose last activity
     /// (heartbeat or creation) is older than `stale_secs` seconds.
     ///

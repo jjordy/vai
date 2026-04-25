@@ -514,6 +514,13 @@ mod tests {
             Ok(())
         }
 
+        async fn get_worker_by_workspace(
+            &self,
+            _workspace_id: &Uuid,
+        ) -> Result<Option<AgentWorker>, StorageError> {
+            Ok(None)
+        }
+
         async fn list_stale_workers(
             &self,
             _stale_secs: u32,

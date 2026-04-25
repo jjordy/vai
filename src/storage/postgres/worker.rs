@@ -237,6 +237,27 @@ impl WorkerStore for PostgresStorage {
         Ok(())
     }
 
+    async fn get_worker_by_workspace(
+        &self,
+        workspace_id: &Uuid,
+    ) -> Result<Option<AgentWorker>, StorageError> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, repo_id, provider, machine_id, state, workspace_id,
+                   last_heartbeat_at, started_at, ended_at
+            FROM agent_workers
+            WHERE workspace_id = $1 AND state IN ('spawning', 'running')
+            LIMIT 1
+            "#,
+        )
+        .bind(workspace_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        row.map(row_to_worker).transpose()
+    }
+
     async fn list_stale_workers(&self, stale_secs: u32) -> Result<Vec<AgentWorker>, StorageError> {
         let rows = sqlx::query(
             r#"

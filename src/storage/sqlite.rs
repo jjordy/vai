@@ -1554,6 +1554,13 @@ impl super::WorkerStore for SqliteStorage {
         Err(worker_store_unsupported())
     }
 
+    async fn get_worker_by_workspace(
+        &self,
+        _workspace_id: &Uuid,
+    ) -> Result<Option<super::AgentWorker>, StorageError> {
+        Ok(None)
+    }
+
     async fn list_stale_workers(&self, _stale_secs: u32) -> Result<Vec<super::AgentWorker>, StorageError> {
         Ok(vec![])
     }

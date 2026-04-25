@@ -1318,6 +1318,40 @@ pub(super) async fn close_issue_handler(
         issue_id = %issue_id,
         "issue closed"
     );
+
+    // Cascade: discard any Created/Active workspaces linked to this issue and
+    // tear down their cloud workers.  The issue is already Closed so we must
+    // NOT reopen it — cascade_workspace_teardown intentionally skips the issue
+    // status update.
+    let active_workspaces: Vec<uuid::Uuid> = ctx
+        .storage
+        .workspaces()
+        .list_workspaces(&ctx.repo_id, false, &crate::storage::ListQuery::default())
+        .await
+        .map(|r| r.items)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|ws| {
+            ws.issue_id == Some(issue_id)
+                && matches!(
+                    ws.status,
+                    crate::workspace::WorkspaceStatus::Created
+                        | crate::workspace::WorkspaceStatus::Active
+                )
+        })
+        .map(|ws| ws.id)
+        .collect();
+
+    for ws_id in active_workspaces {
+        super::cascade_workspace_teardown(&state, &ctx.repo_id, ws_id, "linked issue closed").await;
+        tracing::info!(
+            event = "issue.close_cascade",
+            issue_id = %issue_id,
+            workspace_id = %ws_id,
+            "discarded workspace on issue close"
+        );
+    }
+
     let linked = linked_workspace_ids(&ctx, issue_id).await;
     let (blocked_by, blocking) = links_for_issue(&ctx, issue_id).await;
     Ok(Json(IssueResponse::from_issue(issue, linked, blocked_by, blocking)))

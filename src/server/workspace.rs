@@ -384,6 +384,27 @@ pub(super) async fn submit_workspace_handler(
     let workspace_uuid = meta.id;
     let workspace_intent = meta.intent.clone();
 
+    // Safety net: refuse to submit against a closed issue.  The primary guard
+    // is the cascade in close_issue_handler, but there is a race window between
+    // issue-close and submit arrival — catch it here and tear down the workspace
+    // so nothing leaks.
+    if let Some(issue_id) = meta.issue_id {
+        if let Ok(issue) = ctx.storage.issues().get_issue(&ctx.repo_id, &issue_id).await {
+            if issue.status == crate::issue::IssueStatus::Closed {
+                super::cascade_workspace_teardown(
+                    &state,
+                    &ctx.repo_id,
+                    workspace_uuid,
+                    "submit rejected: linked issue is closed",
+                )
+                .await;
+                return Err(ApiError::conflict(format!(
+                    "linked issue {issue_id} is closed"
+                )));
+            }
+        }
+    }
+
     // Choose merge strategy based on storage backend.
     // ServerWithMemFs uses the same S3MergeFs path as ServerWithS3 (for testing).
     let using_s3_merge = matches!(
