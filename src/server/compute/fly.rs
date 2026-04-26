@@ -86,7 +86,7 @@ fn resource_class_to_guest(class: ResourceClass) -> serde_json::Value {
     match class {
         ResourceClass::Small => serde_json::json!({ "cpu_kind": "shared", "cpus": 1, "memory_mb": 512 }),
         ResourceClass::Medium => serde_json::json!({ "cpu_kind": "shared", "cpus": 2, "memory_mb": 1024 }),
-        ResourceClass::Large => serde_json::json!({ "cpu_kind": "shared", "cpus": 4, "memory_mb": 4096 }),
+        ResourceClass::Large => serde_json::json!({ "cpu_kind": "performance", "cpus": 2, "memory_mb": 8192 }),
     }
 }
 
