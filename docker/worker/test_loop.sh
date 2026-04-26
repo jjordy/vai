@@ -429,16 +429,78 @@ STUB
     teardown_stubs
 }
 
+# ── Claude timeout: reset workspace and continue ──────────────────────────────
+
+test_claude_timeout() {
+    setup_stubs
+
+    # Override claude stub to sleep longer than CLAUDE_MAX_RUNTIME_SECS.
+    cat > "${STUB_DIR}/claude" <<'STUB'
+#!/usr/bin/env bash
+cat > /dev/null
+sleep 30
+exit 0
+STUB
+    chmod +x "${STUB_DIR}/claude"
+
+    # Write to a file rather than capturing via $() — loop.sh uses
+    # exec > >(tee ...) which has a background subprocess; a file + sleep
+    # avoids the race condition where output arrives after $() completes.
+    local out_file
+    out_file=$(mktemp)
+
+    # Set a very short timeout (1s) so the test finishes quickly.
+    VAI_CLAIM_MAX=1 \
+    VAI_VERIFY_EXIT=0 \
+    VAI_SUBMIT_EXIT=0 \
+    VAI_SERVER_URL="http://vai.test" \
+    VAI_REPO="test-repo" \
+    VAI_API_KEY="test-key" \
+    VAI_WORKER_ID="00000000-0000-0000-0000-000000000005" \
+    ANTHROPIC_API_KEY="test-anthropic-key" \
+    EMPTY_QUEUE_SLEEP=0 \
+    LOG_BATCH_INTERVAL=9999 \
+    HEARTBEAT_INTERVAL=9999 \
+    CLAUDE_MAX_RUNTIME_SECS=1 \
+    timeout 10 bash "$LOOP_SH" > "$out_file" 2>&1 || true
+
+    # Give the tee subprocess inside loop.sh time to flush.
+    sleep 1
+
+    if grep -q "claude_timeout" "$out_file" 2>/dev/null; then
+        pass "structured timeout event logged"
+    else
+        fail "expected claude_timeout log line; output: $(cat "$out_file")"
+    fi
+
+    if grep -q "vai agent reset" "$VAI_CALLS_FILE" 2>/dev/null; then
+        pass "vai agent reset called after claude timeout"
+    else
+        fail "vai agent reset not called after timeout (calls: $(cat "$VAI_CALLS_FILE" 2>/dev/null))"
+    fi
+
+    # submit should NOT have been called — timeout must short-circuit verify+submit.
+    if ! grep -q "vai agent submit" "$VAI_CALLS_FILE" 2>/dev/null; then
+        pass "vai agent submit not called after timeout (correctly skipped)"
+    else
+        fail "vai agent submit was called after timeout — should have been skipped"
+    fi
+
+    rm -f "$out_file"
+    teardown_stubs
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 echo "=== loop.sh test suite ==="
-run_test "Missing env validation"     test_missing_env
-run_test "Happy path (claim→submit)"  test_happy_path
-run_test "Empty queue — sleep retry"  test_empty_queue
-run_test "Download failure → reset"   test_download_failure
-run_test "SIGTERM → cleanup + done"   test_sigterm
-run_test "Heartbeat fires on interval" test_heartbeat_fires
-run_test "Heartbeat retries on 503"   test_heartbeat_retry
+run_test "Missing env validation"       test_missing_env
+run_test "Happy path (claim→submit)"    test_happy_path
+run_test "Empty queue — sleep retry"    test_empty_queue
+run_test "Download failure → reset"     test_download_failure
+run_test "SIGTERM → cleanup + done"     test_sigterm
+run_test "Heartbeat fires on interval"  test_heartbeat_fires
+run_test "Heartbeat retries on 503"     test_heartbeat_retry
+run_test "Claude timeout → reset+continue" test_claude_timeout
 
 echo ""
 echo "=== Results: ${PASS} passed, ${FAIL} failed ==="

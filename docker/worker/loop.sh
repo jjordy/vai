@@ -21,6 +21,7 @@
 #   DEV_SERVER_MAX_CONSECUTIVE_FAILURES — exit after N consecutive dev-server-timeout iterations (default: 3)
 #   VAI_WORKER_STALE_SECS   — server-side: seconds without heartbeat before worker is reaped (default: 900)
 #                             bump this if verify steps (tsc, test suites) take longer than 15 min
+#   CLAUDE_MAX_RUNTIME_SECS — max seconds claude -p may run per issue before SIGTERM + workspace reset (default: 2700 / 45 min)
 set -euo pipefail
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -39,6 +40,7 @@ MAX_HTTP_RETRIES="${MAX_HTTP_RETRIES:-5}"
 DEV_SERVER_TIMEOUT_SECS="${DEV_SERVER_TIMEOUT_SECS:-180}"
 DEV_SERVER_MAX_CONSECUTIVE_FAILURES="${DEV_SERVER_MAX_CONSECUTIVE_FAILURES:-3}"
 DEV_SERVER_CONSECUTIVE_FAILURES=0
+CLAUDE_MAX_RUNTIME_SECS="${CLAUDE_MAX_RUNTIME_SECS:-2700}"
 
 WORK_DIR="${HOME}/work"
 # Capture all output to a log file so the background shipper can read it.
@@ -328,15 +330,28 @@ while true; do
 
     # ── Agent invocation ──────────────────────────────────────────────────────
 
-    # Run Claude Code with the vai-generated prompt.
+    # Run Claude Code with the vai-generated prompt, bounded by CLAUDE_MAX_RUNTIME_SECS.
+    # timeout(1) sends SIGTERM on expiry, then SIGKILL after 10s if the process
+    # is still running. Exit code 124 means the process was killed by timeout.
     # Playwright MCP browser tools are included so claude can explore and verify
     # UI changes. The --mcp-config file tells claude how to start the MCP server.
-    vai agent prompt | claude -p \
-        --model sonnet \
-        --allowedTools "${ALLOWED_TOOLS}" \
-        --mcp-config /tmp/mcp-config.json \
-        -- "${WORK_DIR}" \
-        || true
+    claude_exit=0
+    timeout --kill-after=10s "${CLAUDE_MAX_RUNTIME_SECS}" \
+        bash -c 'vai agent prompt | claude -p \
+            --model sonnet \
+            --allowedTools "$1" \
+            --mcp-config /tmp/mcp-config.json \
+            -- "$2"' _ "${ALLOWED_TOOLS}" "${WORK_DIR}" \
+        || claude_exit=$?
+
+    if [ "$claude_exit" -eq 124 ]; then
+        echo "[worker] {\"event\":\"claude_timeout\",\"worker_id\":\"${VAI_WORKER_ID}\",\"max_secs\":${CLAUDE_MAX_RUNTIME_SECS}}"
+        echo "[worker] claude exceeded ${CLAUDE_MAX_RUNTIME_SECS}s — resetting workspace and continuing to next issue" >&2
+        vai agent reset || true
+        cleanup_iteration
+        rm -rf "${WORK_DIR}"
+        continue
+    fi
 
     # If Claude submitted via the Bash tool, agent state is already cleared.
     # Skip loop.sh's verify+submit to avoid a spurious "Submit failed" log line.
