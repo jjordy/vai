@@ -116,20 +116,13 @@ pub enum Intent {
 pub enum Submit {
     /// Commit the changes; fail with [`FwError::Empty`] if workspace is empty.
     Required(String),
-    /// If the workspace is empty, signal the caller to close the linked issue
-    /// instead of treating it as an error.
-    CloseIfEmpty(String),
 }
 
 impl Submit {
     fn message(&self) -> &str {
         match self {
-            Submit::Required(m) | Submit::CloseIfEmpty(m) => m,
+            Submit::Required(m) => m,
         }
-    }
-
-    fn is_close_if_empty(&self) -> bool {
-        matches!(self, Submit::CloseIfEmpty(_))
     }
 }
 
@@ -873,9 +866,6 @@ impl FileWorkspace {
 
     async fn do_submit(&mut self, s: Submit, plan: &Plan) -> Result<Applied, FwError> {
         if plan.is_empty() {
-            if s.is_close_if_empty() {
-                return Err(FwError::Empty);
-            }
             return Err(FwError::Empty);
         }
 

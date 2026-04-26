@@ -1343,7 +1343,11 @@ pub fn submit(dir: &Path, work_dir: &Path) -> Result<SubmitResult, AgentError> {
             ))
             .await
             .map_err(|e| {
-                if matches!(e, crate::file_workspace::FwError::WorkspaceEmpty) {
+                if matches!(
+                    e,
+                    crate::file_workspace::FwError::WorkspaceEmpty
+                        | crate::file_workspace::FwError::Empty
+                ) {
                     AgentError::WorkspaceEmpty
                 } else {
                     AgentError::Other(format!("submit: {e}"))
