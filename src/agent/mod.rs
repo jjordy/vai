@@ -623,7 +623,12 @@ pub fn claim(
 
         // ── Atomically claim the issue ─────────────────────────────────────
         let claim_path = format!("api/repos/{}/work-queue/claim", config.repo);
-        let claim_body = serde_json::json!({ "issue_id": issue_id });
+        let mut claim_body = serde_json::json!({ "issue_id": issue_id });
+        if let Ok(worker_id) = std::env::var("VAI_WORKER_ID") {
+            if !worker_id.is_empty() {
+                claim_body["worker_id"] = serde_json::Value::String(worker_id);
+            }
+        }
         let result: serde_json::Value =
             agent_post(&config.server, &claim_path, api_key_ref, &claim_body).await?;
 
