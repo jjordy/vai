@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::event_log::EventKind;
-use crate::storage::{ListQuery, RepoRole};
+use crate::storage::{ListQuery, RepoRole, WorkerDoneReason};
 use crate::{merge, workspace};
 
 use super::pagination::{PaginatedResponse, PaginationParams};
@@ -812,6 +812,48 @@ pub(super) async fn discard_workspace_handler(
         timestamp: chrono::Utc::now().to_rfc3339(),
         data: serde_json::json!({ "workspace_id": id }),
     });
+
+    // Best-effort: terminate any cloud worker still holding this workspace.
+    // We do this after responding is safe (best-effort, non-blocking on error).
+    if let Ok(Some(worker)) = ctx.storage.workers().get_worker_by_workspace(&ws_uuid).await {
+        if let (Some(ref compute), Some(ref machine_id)) =
+            (&state.compute, &worker.machine_id)
+        {
+            let mid = super::compute::MachineId(machine_id.clone());
+            match compute.destroy(&mid).await {
+                Ok(()) | Err(super::compute::ProviderError::NotFound(_)) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        worker_id = %worker.id,
+                        machine_id = %machine_id,
+                        error = %e,
+                        "discard_workspace: destroy machine failed (non-fatal)"
+                    );
+                }
+            }
+        }
+        let _ = ctx.storage
+            .workers()
+            .mark_done(&worker.id, WorkerDoneReason::Terminated)
+            .await;
+
+        state.broadcast(BroadcastEvent {
+            event_type: "WorkerTerminated".to_string(),
+            event_id: 0,
+            workspace_id: Some(id.clone()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            data: serde_json::json!({
+                "worker_id": worker.id.to_string(),
+                "workspace_id": id,
+            }),
+        });
+
+        tracing::info!(
+            worker_id = %worker.id,
+            workspace_id = %ws_uuid,
+            "discard_workspace: attached worker terminated"
+        );
+    }
 
     tracing::info!(
         event = "workspace.discarded",
