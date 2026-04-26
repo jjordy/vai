@@ -243,6 +243,20 @@ mcp__playwright__browser_snapshot,\
 mcp__playwright__browser_wait_for,\
 mcp__playwright__browser_close"
 
+# Deny full-suite invocations of test/lint/typecheck commands. Prompt-level
+# prohibitions are unreliable; tool-layer enforcement is not. Word-boundary
+# semantics: `Bash(X)` blocks exact match only; `Bash(X *)` matches `X <any>`.
+# Single-spec/per-file invocations remain allowed (good TDD).
+DISALLOWED_TOOLS="Bash(vai agent verify),\
+Bash(vai agent verify *),\
+Bash(pnpm test:e2e),\
+Bash(pnpm run test:e2e),\
+Bash(pnpm test),\
+Bash(pnpm run test),\
+Bash(npx tsc --noEmit),\
+Bash(npx biome check src/),\
+Bash(npx biome check src)"
+
 # ── Initialization ────────────────────────────────────────────────────────────
 
 vai agent init --server "${VAI_SERVER_URL}" --repo "${VAI_REPO}"
@@ -350,9 +364,10 @@ while true; do
             --output-format stream-json \
             --verbose \
             --allowedTools "$1" \
+            --disallowedTools "$4" \
             --mcp-config /tmp/mcp-config.json \
             -- "$2" | python3 "$3"
-            exit ${PIPESTATUS[1]}' _ "${ALLOWED_TOOLS}" "${WORK_DIR}" "${CLAUDE_LOG_FILTER}" \
+            exit ${PIPESTATUS[1]}' _ "${ALLOWED_TOOLS}" "${WORK_DIR}" "${CLAUDE_LOG_FILTER}" "${DISALLOWED_TOOLS}" \
         || claude_exit=$?
 
     if [ "$claude_exit" -eq 124 ]; then
