@@ -109,7 +109,10 @@ ENV HOME=/home/agent \
 WORKDIR /home/agent
 
 # loop.sh is the worker entrypoint (issue #348).
+# claude-log-filter.py converts claude's stream-json events into human-readable
+# log lines (tool calls, token usage) for worker observability (issue #377).
 # Built files from repo's docker/worker/ are the build context for this image.
 COPY --chmod=0755 loop.sh /usr/local/bin/loop.sh
+COPY --chmod=0755 claude-log-filter.py /usr/local/bin/claude-log-filter.py
 
 CMD ["/usr/local/bin/loop.sh"]

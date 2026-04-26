@@ -41,6 +41,9 @@ DEV_SERVER_TIMEOUT_SECS="${DEV_SERVER_TIMEOUT_SECS:-180}"
 DEV_SERVER_MAX_CONSECUTIVE_FAILURES="${DEV_SERVER_MAX_CONSECUTIVE_FAILURES:-3}"
 DEV_SERVER_CONSECUTIVE_FAILURES=0
 CLAUDE_MAX_RUNTIME_SECS="${CLAUDE_MAX_RUNTIME_SECS:-2700}"
+# Path to the JSON-event filter script that converts claude's stream-json output
+# into human-readable log lines.  Override in tests by setting this env var.
+CLAUDE_LOG_FILTER="${CLAUDE_LOG_FILTER:-/usr/local/bin/claude-log-filter.py}"
 
 WORK_DIR="${HOME}/work"
 # Capture all output to a log file so the background shipper can read it.
@@ -335,13 +338,20 @@ while true; do
     # is still running. Exit code 124 means the process was killed by timeout.
     # Playwright MCP browser tools are included so claude can explore and verify
     # UI changes. The --mcp-config file tells claude how to start the MCP server.
+    #
+    # --output-format stream-json makes claude emit one JSON event per line so
+    # claude-log-filter.py can extract tool calls and token usage in real time,
+    # eliminating silent windows in the worker log.  exit ${PIPESTATUS[1]}
+    # preserves claude's exit code regardless of the filter's exit code.
     claude_exit=0
     timeout --kill-after=10s "${CLAUDE_MAX_RUNTIME_SECS}" \
         bash -c 'vai agent prompt | claude -p \
             --model sonnet \
+            --output-format stream-json \
             --allowedTools "$1" \
             --mcp-config /tmp/mcp-config.json \
-            -- "$2"' _ "${ALLOWED_TOOLS}" "${WORK_DIR}" \
+            -- "$2" | python3 "$3"
+            exit ${PIPESTATUS[1]}' _ "${ALLOWED_TOOLS}" "${WORK_DIR}" "${CLAUDE_LOG_FILTER}" \
         || claude_exit=$?
 
     if [ "$claude_exit" -eq 124 ]; then

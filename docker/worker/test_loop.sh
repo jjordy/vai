@@ -490,6 +490,58 @@ STUB
     teardown_stubs
 }
 
+# ── stream-json filter: tool calls and result summary logged ──────────────────
+
+test_claude_streaming_filter() {
+    # Verify that --output-format stream-json events are converted to
+    # human-readable [claude] lines in the worker log.
+    setup_stubs
+
+    # Emit a minimal tool_use event followed by a result event, then exit 0.
+    cat > "${STUB_DIR}/claude" <<'STUB'
+#!/usr/bin/env bash
+cat > /dev/null  # consume stdin (the prompt)
+printf '{"type":"system","subtype":"init","session_id":"sess-abc"}\n'
+printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}\n'
+printf '{"type":"result","subtype":"success","num_turns":2,"total_cost_usd":0.03,"usage":{"input_tokens":800,"output_tokens":200,"cache_read_input_tokens":100}}\n'
+exit 0
+STUB
+    chmod +x "${STUB_DIR}/claude"
+
+    local out_file
+    out_file=$(mktemp)
+
+    CLAUDE_LOG_FILTER="$(cd "$(dirname "$0")" && pwd)/claude-log-filter.py" \
+    VAI_CLAIM_MAX=1 \
+    VAI_VERIFY_EXIT=0 \
+    VAI_SUBMIT_EXIT=0 \
+    VAI_SERVER_URL="http://vai.test" \
+    VAI_REPO="test-repo" \
+    VAI_API_KEY="test-key" \
+    VAI_WORKER_ID="00000000-0000-0000-0000-000000000007" \
+    ANTHROPIC_API_KEY="test-anthropic-key" \
+    EMPTY_QUEUE_SLEEP=0 \
+    LOG_BATCH_INTERVAL=9999 \
+    HEARTBEAT_INTERVAL=9999 \
+    timeout 10 bash "$LOOP_SH" > "$out_file" 2>&1 || true
+    sleep 1
+
+    if grep -q "\[claude\] tool: Bash" "$out_file"; then
+        pass "stream-json tool_use events logged as [claude] tool: lines"
+    else
+        fail "expected '[claude] tool: Bash' in output; got: $(cat "$out_file")"
+    fi
+
+    if grep -q "\[claude\] result:" "$out_file"; then
+        pass "stream-json result event (token usage) logged"
+    else
+        fail "expected '[claude] result:' in output; got: $(cat "$out_file")"
+    fi
+
+    rm -f "$out_file"
+    teardown_stubs
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 echo "=== loop.sh test suite ==="
@@ -501,6 +553,7 @@ run_test "SIGTERM → cleanup + done"     test_sigterm
 run_test "Heartbeat fires on interval"  test_heartbeat_fires
 run_test "Heartbeat retries on 503"     test_heartbeat_retry
 run_test "Claude timeout → reset+continue" test_claude_timeout
+run_test "stream-json filter → log lines" test_claude_streaming_filter
 
 echo ""
 echo "=== Results: ${PASS} passed, ${FAIL} failed ==="
