@@ -348,6 +348,7 @@ while true; do
         bash -c 'vai agent prompt | claude -p \
             --model sonnet \
             --output-format stream-json \
+            --verbose \
             --allowedTools "$1" \
             --mcp-config /tmp/mcp-config.json \
             -- "$2" | python3 "$3"

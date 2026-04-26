@@ -542,6 +542,74 @@ STUB
     teardown_stubs
 }
 
+# ── claude invocation flags: --verbose required with --output-format stream-json ─
+
+test_claude_verbose_flag() {
+    # Real claude rejects --output-format stream-json without --verbose.
+    # This test simulates that guard: the stub fails if --verbose is absent,
+    # verifying that loop.sh always passes both flags together.
+    setup_stubs
+
+    # Override claude stub to check for --verbose when stream-json is requested.
+    cat > "${STUB_DIR}/claude" <<'STUB'
+#!/usr/bin/env bash
+cat > /dev/null  # consume stdin
+has_stream_json=0
+has_verbose=0
+for arg in "$@"; do
+    case "$arg" in
+        --output-format) ;;
+        stream-json)     has_stream_json=1 ;;
+        --verbose)       has_verbose=1 ;;
+    esac
+done
+# Also handle --output-format=stream-json form.
+for arg in "$@"; do
+    case "$arg" in
+        --output-format=stream-json) has_stream_json=1 ;;
+    esac
+done
+if [ "$has_stream_json" -eq 1 ] && [ "$has_verbose" -eq 0 ]; then
+    echo "Error: When using --print, --output-format=stream-json requires --verbose" >&2
+    exit 1
+fi
+exit 0
+STUB
+    chmod +x "${STUB_DIR}/claude"
+
+    local out_file
+    out_file=$(mktemp)
+
+    VAI_CLAIM_MAX=1 \
+    VAI_VERIFY_EXIT=0 \
+    VAI_SUBMIT_EXIT=0 \
+    VAI_SERVER_URL="http://vai.test" \
+    VAI_REPO="test-repo" \
+    VAI_API_KEY="test-key" \
+    VAI_WORKER_ID="00000000-0000-0000-0000-000000000008" \
+    ANTHROPIC_API_KEY="test-anthropic-key" \
+    EMPTY_QUEUE_SLEEP=0 \
+    LOG_BATCH_INTERVAL=9999 \
+    HEARTBEAT_INTERVAL=9999 \
+    timeout 10 bash "$LOOP_SH" > "$out_file" 2>&1 || true
+    sleep 1
+
+    # The stub exits 1 if --verbose is missing, which causes loop.sh to reset.
+    # If --verbose IS present, the stub exits 0 and submit is called.
+    if grep -q "vai agent submit" "$VAI_CALLS_FILE" 2>/dev/null; then
+        pass "claude invocation includes --verbose (submit reached)"
+    else
+        fail "claude rejected flags (missing --verbose?); output: $(cat "$out_file")"
+    fi
+
+    if grep -q "stream-json requires --verbose" "$out_file" 2>/dev/null; then
+        fail "--verbose missing: claude rejected the flag combination"
+    fi
+
+    rm -f "$out_file"
+    teardown_stubs
+}
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 echo "=== loop.sh test suite ==="
@@ -554,6 +622,7 @@ run_test "Heartbeat fires on interval"  test_heartbeat_fires
 run_test "Heartbeat retries on 503"     test_heartbeat_retry
 run_test "Claude timeout → reset+continue" test_claude_timeout
 run_test "stream-json filter → log lines" test_claude_streaming_filter
+run_test "claude flags: --verbose required with stream-json" test_claude_verbose_flag
 
 echo ""
 echo "=== Results: ${PASS} passed, ${FAIL} failed ==="
