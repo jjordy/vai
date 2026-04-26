@@ -27,6 +27,12 @@ use super::require_repo_permission;
 pub(super) struct ClaimWorkRequest {
     /// Issue ID to claim.
     issue_id: String,
+    /// Optional cloud worker UUID (`VAI_WORKER_ID`) making this claim.
+    ///
+    /// When provided the server links the created workspace back to the worker
+    /// row so the dead-worker reconciler can discard it if the worker goes
+    /// stale before submitting.
+    worker_id: Option<String>,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -276,6 +282,21 @@ pub(super) async fn claim_work_handler(
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Link the worker row back to the workspace so the dead-worker reconciler
+    // can discard it if the worker goes stale before submitting.
+    if let Some(ref wid_str) = body.worker_id {
+        if let Ok(wid) = wid_str.parse::<uuid::Uuid>() {
+            if let Err(e) = ctx.storage.workers().set_workspace_id(&wid, &ws.id).await {
+                tracing::warn!(
+                    worker_id = %wid,
+                    workspace_id = %ws.id,
+                    error = %e,
+                    "claim: set_workspace_id failed (non-fatal)"
+                );
+            }
+        }
+    }
 
     let result = work_queue::ClaimResult {
         issue_id: issue_id.to_string(),

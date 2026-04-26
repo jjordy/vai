@@ -276,6 +276,61 @@ impl WorkerStore for PostgresStorage {
         rows.into_iter().map(row_to_worker).collect()
     }
 
+    async fn set_workspace_id(
+        &self,
+        worker_id: &Uuid,
+        workspace_id: &Uuid,
+    ) -> Result<(), StorageError> {
+        let rows_affected = sqlx::query(
+            "UPDATE agent_workers SET workspace_id = $1 WHERE id = $2",
+        )
+        .bind(workspace_id)
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+        .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(StorageError::NotFound(format!("agent worker {worker_id}")));
+        }
+        Ok(())
+    }
+
+    async fn list_orphaned_issue_workspaces(
+        &self,
+        stale_secs: u32,
+    ) -> Result<Vec<(Uuid, Uuid, Uuid)>, StorageError> {
+        // Find workspaces that are stuck in Created/Active, linked to an issue,
+        // but have no live worker claiming them, older than the staleness threshold.
+        let rows = sqlx::query(
+            r#"
+            SELECT w.id AS workspace_id, w.repo_id, w.issue_id
+            FROM workspaces w
+            LEFT JOIN agent_workers aw
+                   ON aw.workspace_id = w.id
+                  AND aw.state IN ('spawning', 'running')
+            WHERE w.status IN ('Created', 'Active')
+              AND w.issue_id IS NOT NULL
+              AND aw.id IS NULL
+              AND w.created_at < NOW() - ($1 || ' seconds')::INTERVAL
+            "#,
+        )
+        .bind(stale_secs as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let ws_id: Uuid = row.try_get("workspace_id").map_err(|e| StorageError::Database(e.to_string()))?;
+                let repo_id: Uuid = row.try_get("repo_id").map_err(|e| StorageError::Database(e.to_string()))?;
+                let issue_id: Uuid = row.try_get("issue_id").map_err(|e| StorageError::Database(e.to_string()))?;
+                Ok((ws_id, repo_id, issue_id))
+            })
+            .collect()
+    }
+
     async fn set_cloud_agent_enabled(
         &self,
         repo_id: &Uuid,

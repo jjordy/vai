@@ -1732,6 +1732,31 @@ pub trait WorkerStore: Send + Sync {
         stale_secs: u32,
     ) -> Result<Vec<AgentWorker>, StorageError>;
 
+    /// Link a worker row to the workspace it claimed.
+    ///
+    /// Called by the claim handler immediately after a workspace is created so
+    /// the dead-worker reconciler can discard the workspace when the worker
+    /// goes stale.  `worker_id` must refer to an existing worker; a
+    /// `StorageError::NotFound` is returned otherwise.
+    async fn set_workspace_id(
+        &self,
+        worker_id: &Uuid,
+        workspace_id: &Uuid,
+    ) -> Result<(), StorageError>;
+
+    /// Return workspaces that are stuck in `Created`/`Active` state, linked to
+    /// an issue, but have no live (`spawning` or `running`) worker claiming
+    /// them, and were created more than `stale_secs` seconds ago.
+    ///
+    /// Returns `(workspace_id, repo_id, issue_id)` triples.  Used by the
+    /// dead-worker reconciler as a secondary safety net to clean up workspaces
+    /// whose worker row never had `workspace_id` set (e.g. pre-fix stranded
+    /// workspaces).
+    async fn list_orphaned_issue_workspaces(
+        &self,
+        stale_secs: u32,
+    ) -> Result<Vec<(Uuid, Uuid, Uuid)>, StorageError>;
+
     /// Set `cloud_agent_enabled` on a repo row.
     ///
     /// Returns `StorageError::NotFound` if no repo with that UUID exists.

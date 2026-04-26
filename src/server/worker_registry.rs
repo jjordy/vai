@@ -342,7 +342,62 @@ async fn reconcile_once(
         }
     }
 
+    marked += sweep_orphaned_workspaces(storage, stale_secs).await;
     marked
+}
+
+/// Sweep workspaces that are in `Created`/`Active` state, linked to an issue,
+/// but have no live worker claiming them (i.e. the worker row never had its
+/// `workspace_id` set, or the worker was deleted without going through the
+/// normal stale-worker path).
+///
+/// Returns the number of workspaces discarded.
+async fn sweep_orphaned_workspaces(
+    storage: &crate::storage::StorageBackend,
+    stale_secs: u32,
+) -> u32 {
+    let orphans = match storage.workers().list_orphaned_issue_workspaces(stale_secs).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "orphan sweeper: list_orphaned_issue_workspaces failed");
+            return 0;
+        }
+    };
+
+    let mut swept = 0u32;
+    for (ws_id, repo_id, issue_id) in orphans {
+        if let Err(e) = storage.workspaces().discard_workspace(&repo_id, &ws_id).await {
+            tracing::warn!(
+                workspace_id = %ws_id,
+                repo_id = %repo_id,
+                issue_id = %issue_id,
+                error = %e,
+                "orphan sweeper: discard_workspace failed"
+            );
+            continue;
+        }
+
+        let _ = storage
+            .issues()
+            .update_issue(
+                &repo_id,
+                &issue_id,
+                crate::storage::IssueUpdate {
+                    status: Some(crate::issue::IssueStatus::Open),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        tracing::info!(
+            workspace_id = %ws_id,
+            repo_id = %repo_id,
+            issue_id = %issue_id,
+            "orphan sweeper: workspace discarded, issue reopened"
+        );
+        swept += 1;
+    }
+    swept
 }
 
 /// Read the per-repo concurrency cap from `VAI_WORKER_MAX_CONCURRENT`, defaulting
@@ -728,6 +783,21 @@ mod tests {
             &self,
             _stale_secs: u32,
         ) -> Result<Vec<AgentWorker>, StorageError> {
+            Ok(vec![])
+        }
+
+        async fn set_workspace_id(
+            &self,
+            _worker_id: &Uuid,
+            _workspace_id: &Uuid,
+        ) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn list_orphaned_issue_workspaces(
+            &self,
+            _stale_secs: u32,
+        ) -> Result<Vec<(Uuid, Uuid, Uuid)>, StorageError> {
             Ok(vec![])
         }
 

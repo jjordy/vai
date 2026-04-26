@@ -1565,6 +1565,21 @@ impl super::WorkerStore for SqliteStorage {
         Ok(vec![])
     }
 
+    async fn set_workspace_id(
+        &self,
+        _worker_id: &uuid::Uuid,
+        _workspace_id: &uuid::Uuid,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    async fn list_orphaned_issue_workspaces(
+        &self,
+        _stale_secs: u32,
+    ) -> Result<Vec<(uuid::Uuid, uuid::Uuid, uuid::Uuid)>, StorageError> {
+        Ok(vec![])
+    }
+
     async fn set_cloud_agent_enabled(
         &self,
         _repo_id: &uuid::Uuid,
