@@ -3282,6 +3282,7 @@ impl utoipa::Modify for SecurityAddon {
         admin::get_me_handler,
         me::get_onboarding_handler,
         me::complete_onboarding_handler,
+        me::get_plan_handler,
         admin::add_org_member_handler,
         admin::list_org_members_handler,
         admin::update_org_member_handler,
@@ -3388,6 +3389,8 @@ impl utoipa::Modify for SecurityAddon {
             admin::MeResponse,
             me::OnboardingStatusResponse,
             me::OnboardingCompleteResponse,
+            me::PlanResponse,
+            me::PlanMonthlyUsage,
             admin::OrgMemberResponse,
             admin::AddCollaboratorRequest,
             admin::UpdateCollaboratorRequest,
@@ -3563,6 +3566,8 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         // Per-user onboarding state (PRD 26).
         .route("/api/me/onboarding", get(me::get_onboarding_handler))
         .route("/api/me/onboarding-complete", post(me::complete_onboarding_handler))
+        // Per-user plan/usage stub (stops dashboard 404 polling).
+        .route("/api/me/plan", get(me::get_plan_handler))
         // CLI device code authorization (authenticated — requires a user identity).
         .route("/api/auth/cli-device/authorize", post(auth::authorize_device_code_handler))
         // Repository collaborator endpoints (PRD 10.3).

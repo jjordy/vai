@@ -19,6 +19,28 @@ use super::{AgentIdentity, ApiError, AppState};
 
 // ── Response types ─────────────────────────────────────────────────────────────
 
+/// Monthly usage figures for `GET /api/me/plan`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PlanMonthlyUsage {
+    /// Number of agent workers spawned this calendar month.
+    pub workers_spawned: u64,
+    /// Cumulative compute minutes consumed this calendar month.
+    pub compute_minutes: u64,
+    /// Estimated Anthropic token cost in US cents this calendar month.
+    pub anthropic_token_cost_cents: u64,
+}
+
+/// Response body for `GET /api/me/plan`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PlanResponse {
+    /// Plan tier name (e.g. `"Free"`, `"Pro"`, `"Team"`).
+    pub name: String,
+    /// Maximum number of concurrent agent workers permitted under this plan.
+    pub worker_cap: u64,
+    /// Usage counters for the current calendar month.
+    pub monthly_usage: PlanMonthlyUsage,
+}
+
 /// Response body for `GET /api/me/onboarding`.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct OnboardingStatusResponse {
@@ -111,4 +133,35 @@ pub(super) async fn complete_onboarding_handler(
     );
 
     Ok(Json(OnboardingCompleteResponse { completed_at }))
+}
+
+/// `GET /api/me/plan` — returns the caller's plan tier and current-month usage.
+///
+/// Until real plan tiers and usage tracking land, this returns a static stub
+/// with the default worker cap.  The endpoint exists now so the dashboard's
+/// PlanStatusWidget stops receiving 404s on every navigation.
+#[utoipa::path(
+    get,
+    path = "/api/me/plan",
+    responses(
+        (status = 200, description = "Plan tier and monthly usage for the authenticated user", body = PlanResponse),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "users"
+)]
+pub(super) async fn get_plan_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    State(_state): State<Arc<AppState>>,
+) -> Result<Json<PlanResponse>, ApiError> {
+    let _ = require_user_id(&identity)?;
+    Ok(Json(PlanResponse {
+        name: "Free".to_string(),
+        worker_cap: 3,
+        monthly_usage: PlanMonthlyUsage {
+            workers_spawned: 0,
+            compute_minutes: 0,
+            anthropic_token_cost_cents: 0,
+        },
+    }))
 }
