@@ -701,18 +701,16 @@ pub(super) struct UpdateRepoRequest {
     security(("bearer_auth" = [])),
     tag = "repos"
 )]
-/// `PATCH /api/repos/:name` — update repo settings (admin only).
+/// `PATCH /api/repos/:name` — update repo settings.
 ///
-/// Currently supports toggling `cloud_agent_enabled`. Only server-admin keys
-/// may call this endpoint.
+/// Currently supports toggling `cloud_agent_enabled`. Requires repo owner or
+/// admin role; server-admin keys also have access.
 pub(super) async fn update_repo_handler(
     Extension(identity): Extension<AgentIdentity>,
     State(state): State<Arc<AppState>>,
     AxumPath(name): AxumPath<String>,
     Json(body): Json<UpdateRepoRequest>,
 ) -> Result<StatusCode, ApiError> {
-    require_server_admin(&identity)?;
-
     if let crate::storage::StorageBackend::Server(ref pg)
     | crate::storage::StorageBackend::ServerWithS3(ref pg, _)
     | crate::storage::StorageBackend::ServerWithMemFs(ref pg, _) = state.storage
@@ -727,6 +725,14 @@ pub(super) async fn update_repo_handler(
             .ok_or_else(|| ApiError::not_found("repo not found"))?;
 
         let repo_id: uuid::Uuid = row.get("id");
+
+        require_repo_permission(
+            &state.storage,
+            &identity,
+            &repo_id,
+            crate::storage::RepoRole::Admin,
+        )
+        .await?;
 
         if let Some(enabled) = body.cloud_agent_enabled {
             state
