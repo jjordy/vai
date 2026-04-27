@@ -1771,6 +1771,18 @@ pub trait WorkerStore: Send + Sync {
     /// Used by the spawn reconciliation loop to enumerate repos that may need
     /// additional workers.  Returns an empty list in local SQLite mode.
     async fn list_cloud_enabled_repos(&self) -> Result<Vec<(Uuid, String)>, StorageError>;
+
+    /// Return a paginated list of workers for a repository, optionally filtered
+    /// by `state` (e.g. `"running"`, `"spawning"`, `"completed"`, `"failed"`, `"dead"`).
+    ///
+    /// Results are ordered by `started_at DESC` when no explicit sort is given.
+    /// Not available in local SQLite mode.
+    async fn list_workers_by_repo(
+        &self,
+        repo_id: &Uuid,
+        state_filter: Option<&str>,
+        query: &ListQuery,
+    ) -> Result<ListResult<AgentWorker>, StorageError>;
 }
 
 // ── StorageBackend factory ────────────────────────────────────────────────────

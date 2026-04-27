@@ -3,6 +3,7 @@
 //! (PRD 28).
 //!
 //! Endpoints:
+//!   - `GET    /api/repos/:repo/agent-workers`   — list workers for a repo (paginated)
 //!   - `GET    /api/agent-workers/:id`           — fetch worker state
 //!   - `GET    /api/agent-workers/:id/logs`      — fetch log chunks
 //!   - `POST   /api/agent-workers/:id/heartbeat` — keep a running worker alive
@@ -19,9 +20,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::storage::{AgentWorker, LogStream, WorkerDoneReason, WorkerLog};
+use crate::storage::{AgentWorker, ListQuery, LogStream, RepoRole, WorkerDoneReason, WorkerLog};
 
-use super::{AgentIdentity, ApiError, AppState, ErrorBody, require_server_admin};
+use super::pagination::PaginatedResponse;
+use super::{AgentIdentity, ApiError, AppState, ErrorBody, RepoCtx, require_repo_permission, require_server_admin};
 
 // ── Request / response types ──────────────────────────────────────────────────
 
@@ -60,6 +62,17 @@ pub(super) struct LogsResponse {
     pub logs: Vec<WorkerLog>,
     /// `id` of the last returned chunk, usable as the next `since_id`.
     pub last_id: Option<i64>,
+}
+
+/// Query parameters for `GET /api/repos/:repo/agent-workers`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub(super) struct ListWorkersQuery {
+    /// Page number (1-indexed, default 1).
+    pub page: Option<u32>,
+    /// Items per page (default 25, max 100).
+    pub per_page: Option<u32>,
+    /// Filter by worker state: `spawning`, `running`, `completed`, `failed`, `dead`.
+    pub state: Option<String>,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -318,4 +331,39 @@ pub(super) async fn destroy_worker_handler(
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/repos/{repo}/agent-workers",
+    params(
+        ("repo" = String, Path, description = "Repository name"),
+        ("page" = Option<u32>, Query, description = "Page number (1-indexed, default 1)"),
+        ("per_page" = Option<u32>, Query, description = "Items per page (default 25, max 100)"),
+        ("state" = Option<String>, Query, description = "Filter by state: spawning, running, completed, failed, dead"),
+    ),
+    responses(
+        (status = 200, description = "Paginated list of agent workers for the repo", body = PaginatedResponse<AgentWorker>),
+        (status = 400, description = "Invalid pagination params", body = ErrorBody),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "agent-workers"
+)]
+/// `GET /api/repos/:repo/agent-workers` — list cloud workers for a repository.
+pub(super) async fn list_workers_handler(
+    Extension(identity): Extension<AgentIdentity>,
+    ctx: RepoCtx,
+    Query(q): Query<ListWorkersQuery>,
+) -> Result<Json<PaginatedResponse<AgentWorker>>, ApiError> {
+    require_repo_permission(&ctx.storage, &identity, &ctx.repo_id, RepoRole::Read).await?;
+    let query = ListQuery::from_params(q.page, q.per_page, None, &[])
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let result = ctx
+        .storage
+        .workers()
+        .list_workers_by_repo(&ctx.repo_id, q.state.as_deref(), &query)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(PaginatedResponse::new(result.items, result.total, &query)))
 }

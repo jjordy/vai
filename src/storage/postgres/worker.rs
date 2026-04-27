@@ -10,8 +10,10 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use super::super::{
-    AgentWorker, LogStream, NewWorker, StorageError, WorkerDoneReason, WorkerLog, WorkerStore,
+    AgentWorker, ListResult, LogStream, NewWorker, StorageError, WorkerDoneReason, WorkerLog,
+    WorkerStore,
 };
+use super::super::pagination::ListQuery;
 use super::PostgresStorage;
 
 fn row_to_worker(row: sqlx::postgres::PgRow) -> Result<AgentWorker, StorageError> {
@@ -368,5 +370,44 @@ impl WorkerStore for PostgresStorage {
                 Ok((id, name))
             })
             .collect()
+    }
+
+    async fn list_workers_by_repo(
+        &self,
+        repo_id: &Uuid,
+        state_filter: Option<&str>,
+        query: &ListQuery,
+    ) -> Result<ListResult<AgentWorker>, StorageError> {
+        let (limit, offset) = query.sql_limit_offset();
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_workers WHERE repo_id = $1 AND ($2::TEXT IS NULL OR state = $2)",
+        )
+        .bind(repo_id)
+        .bind(state_filter)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = sqlx::query(
+            r#"
+            SELECT id, repo_id, provider, machine_id, state, workspace_id,
+                   last_heartbeat_at, started_at, ended_at
+            FROM agent_workers
+            WHERE repo_id = $1 AND ($2::TEXT IS NULL OR state = $2)
+            ORDER BY started_at DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(repo_id)
+        .bind(state_filter)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let items: Vec<AgentWorker> = rows.into_iter().map(row_to_worker).collect::<Result<_, _>>()?;
+        Ok(ListResult { items, total: total.max(0) as u64 })
     }
 }

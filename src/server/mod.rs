@@ -3262,6 +3262,7 @@ impl utoipa::Modify for SecurityAddon {
         watcher::pause_watcher_handler,
         watcher::resume_watcher_handler,
         watcher::submit_discovery_handler,
+        worker::list_workers_handler,
         worker::get_worker_handler,
         worker::get_logs_handler,
         worker::heartbeat_handler,
@@ -3369,6 +3370,7 @@ impl utoipa::Modify for SecurityAddon {
             worker::WorkerAckResponse,
             worker::LogsQuery,
             worker::LogsResponse,
+            worker::ListWorkersQuery,
             crate::storage::AgentWorker,
             crate::storage::WorkerLog,
             crate::storage::LogStream,
@@ -3551,6 +3553,7 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/keys", delete(admin::bulk_revoke_keys_handler))
         .route("/api/keys/:id", delete(admin::revoke_key_handler))
         // Agent worker lifecycle — read, heartbeat, log ingest, terminal state (PRD 28).
+        .route("/api/repos/:repo/agent-workers", get(worker::list_workers_handler))
         .route("/api/agent-workers/:id", get(worker::get_worker_handler))
         .route("/api/agent-workers/:id", delete(worker::destroy_worker_handler))
         .route("/api/agent-workers/:id/logs", get(worker::get_logs_handler))

@@ -812,6 +812,15 @@ mod tests {
         async fn list_cloud_enabled_repos(&self) -> Result<Vec<(Uuid, String)>, StorageError> {
             Ok(vec![])
         }
+
+        async fn list_workers_by_repo(
+            &self,
+            _repo_id: &Uuid,
+            _state_filter: Option<&str>,
+            _query: &crate::storage::pagination::ListQuery,
+        ) -> Result<crate::storage::ListResult<AgentWorker>, StorageError> {
+            Ok(crate::storage::ListResult { items: vec![], total: 0 })
+        }
     }
 
     // ── Mock compute provider ─────────────────────────────────────────────────
