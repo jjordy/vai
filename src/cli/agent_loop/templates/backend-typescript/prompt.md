@@ -45,6 +45,12 @@ pnpm test                        # unit + integration tests
 
 Do **not** use `// @ts-ignore` or `// @ts-expect-error` to silence type errors. Fix the underlying type issue.
 
+> **Tool enforcement note**: Full-suite invocations of `npm run build`, `npx vitest run`,
+> `tsc --noEmit` (no file arg), `npx playwright test` (no file arg), and equivalents are
+> blocked at the tool layer — they will not execute. Even if you find an alternative
+> invocation that is not blocked, running the full suite is expensive and unnecessary;
+> use `pnpm test <file>` or `pnpm tsc --noEmit <file>` to check only the files you changed.
+
 ## SUBMIT OR RESET
 
 If all checks pass:

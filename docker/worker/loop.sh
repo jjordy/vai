@@ -246,16 +246,50 @@ mcp__playwright__browser_close"
 # Deny full-suite invocations of test/lint/typecheck commands. Prompt-level
 # prohibitions are unreliable; tool-layer enforcement is not. Word-boundary
 # semantics: `Bash(X)` blocks exact match only; `Bash(X *)` matches `X <any>`.
-# Single-spec/per-file invocations remain allowed (good TDD).
+# All forms of full-suite test/build/typecheck are blocked; per-file invocations
+# via `pnpm test <file>` remain allowed.
 DISALLOWED_TOOLS="Bash(vai agent verify),\
 Bash(vai agent verify *),\
+Bash(vai agent verify*),\
 Bash(pnpm test:e2e),\
 Bash(pnpm run test:e2e),\
 Bash(pnpm test),\
 Bash(pnpm run test),\
+Bash(pnpm run build),\
+Bash(pnpm build),\
+Bash(npm run test),\
+Bash(npm test),\
+Bash(npm run build),\
+Bash(npm build),\
 Bash(npx tsc --noEmit),\
+Bash(npx tsc),\
+Bash(tsc --noEmit),\
+Bash(tsc),\
+Bash(npx vitest),\
+Bash(npx vitest run),\
+Bash(npx vitest run *),\
+Bash(npx playwright test),\
+Bash(npx playwright test *),\
+Bash(playwright test),\
+Bash(playwright test *),\
+Bash(npx biome check),\
+Bash(npx biome check *),\
 Bash(npx biome check src/),\
-Bash(npx biome check src)"
+Bash(npx biome check src),\
+Bash(./node_modules/.bin/vitest),\
+Bash(./node_modules/.bin/vitest *),\
+Bash(./node_modules/.bin/playwright),\
+Bash(./node_modules/.bin/playwright *),\
+Bash(./node_modules/.bin/tsc),\
+Bash(./node_modules/.bin/tsc *),\
+Bash(node_modules/.bin/vitest),\
+Bash(node_modules/.bin/vitest *),\
+Bash(node_modules/.bin/playwright),\
+Bash(node_modules/.bin/playwright *),\
+Bash(node_modules/.bin/tsc),\
+Bash(node_modules/.bin/tsc *),\
+Bash(npx vite build),\
+Bash(npx vite build *)"
 
 # ── Initialization ────────────────────────────────────────────────────────────
 

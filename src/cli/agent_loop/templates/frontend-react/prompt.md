@@ -44,6 +44,12 @@ pnpm test              # unit + component tests (vitest / jest)
 pnpm test:e2e          # Playwright end-to-end tests
 ```
 
+> **Tool enforcement note**: Full-suite invocations of `npm run build`, `npx vitest run`,
+> `tsc --noEmit` (no file arg), `playwright test` (no file arg), and equivalents are
+> blocked at the tool layer — they will not execute. Even if you find an alternative
+> invocation that is not blocked, running the full suite is expensive and unnecessary;
+> use `pnpm test <file>` or `pnpm tsc --noEmit <file>` to check only the files you changed.
+
 ### Playwright MCP
 
 For end-to-end tests you have access to the **Playwright MCP** tool. Use it to:
